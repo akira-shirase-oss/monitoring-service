@@ -60,7 +60,12 @@
 				<Card.Root>
 					<Card.Content class="flex items-center justify-between gap-4 p-4">
 						<div class="min-w-0">
-							<p class="truncate font-medium">{monitor.name}</p>
+							<a
+								href="/monitors/{monitor.id}"
+								class="block truncate font-medium hover:underline"
+							>
+								{monitor.name}
+							</a>
 							<p class="truncate font-mono text-xs text-muted-foreground">{monitor.url}</p>
 						</div>
 						<div class="flex shrink-0 items-center gap-3">

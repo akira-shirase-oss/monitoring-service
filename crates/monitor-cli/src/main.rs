@@ -40,6 +40,29 @@ enum Monitors {
         #[arg(long)]
         timeout_s: Option<u64>,
     },
+    /// Show one monitor with its recent checks and incidents.
+    Show { id: String },
+    /// Change a monitor's fields. Any change bumps its generation, which is what makes a
+    /// probe that was already in flight stale — the edit and the invalidation are the same
+    /// committed write.
+    Edit {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        interval_s: Option<u64>,
+        #[arg(long)]
+        timeout_s: Option<u64>,
+    },
+    /// Stop scheduling checks. The monitor's record stays; nothing is checked until `unpause`.
+    Pause { id: String },
+    /// Resume scheduling checks.
+    Unpause { id: String },
+    /// Delete a monitor that has never recorded a check or incident. A monitor with history
+    /// can't be deleted — pause it instead.
+    Delete { id: String },
 }
 
 #[derive(Deserialize)]
@@ -48,6 +71,7 @@ struct MonitorView {
     name: String,
     url: String,
     interval_s: u64,
+    generation: u64,
     paused: bool,
     status: String,
 }
@@ -78,10 +102,15 @@ async fn main() -> Result<()> {
             get(&client, &format!("{base}/readyz")).await?;
             println!("live and ready");
         }
-        Command::Monitors {
-            action: Monitors::List,
-        } => {
-            let body = get(&client, &format!("{base}/api/monitors")).await?;
+        Command::Monitors { action } => monitors(&client, base, action).await?,
+    }
+    Ok(())
+}
+
+async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Result<()> {
+    match action {
+        Monitors::List => {
+            let body = get(client, &format!("{base}/api/monitors")).await?;
             let parsed: serde_json::Value = serde_json::from_str(&body)?;
             let Some(monitors) = parsed["monitors"].as_array() else {
                 anyhow::bail!("unexpected response shape");
@@ -102,14 +131,11 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Monitors {
-            action:
-                Monitors::Add {
-                    name,
-                    url,
-                    interval_s,
-                    timeout_s,
-                },
+        Monitors::Add {
+            name,
+            url,
+            interval_s,
+            timeout_s,
         } => {
             let mut payload = serde_json::json!({ "name": name, "url": url });
             if let Some(interval) = interval_s {
@@ -132,12 +158,139 @@ async fn main() -> Result<()> {
             let created: serde_json::Value = serde_json::from_str(&body)?;
             println!("created {}", created["id"].as_str().unwrap_or("(no id)"));
         }
+        Monitors::Show { id } => show(client, base, &id).await?,
+        Monitors::Edit {
+            id,
+            name,
+            url,
+            interval_s,
+            timeout_s,
+        } => {
+            let mut payload = serde_json::json!({});
+            if let Some(name) = name {
+                payload["name"] = name.into();
+            }
+            if let Some(url) = url {
+                payload["url"] = url.into();
+            }
+            if let Some(interval) = interval_s {
+                payload["interval_s"] = interval.into();
+            }
+            if let Some(timeout) = timeout_s {
+                payload["timeout_s"] = timeout.into();
+            }
+            if payload.as_object().is_none_or(serde_json::Map::is_empty) {
+                anyhow::bail!(
+                    "nothing to change — pass at least one of --name/--url/--interval-s/--timeout-s"
+                );
+            }
+            let body = patch(client, &format!("{base}/api/monitors/{id}"), &payload).await?;
+            print_monitor(&serde_json::from_str(&body)?);
+        }
+        Monitors::Pause { id } => set_paused(client, base, &id, true).await?,
+        Monitors::Unpause { id } => set_paused(client, base, &id, false).await?,
+        Monitors::Delete { id } => {
+            let response = client
+                .delete(format!("{base}/api/monitors/{id}"))
+                .send()
+                .await
+                .context("server unreachable")?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                explain_error(&body)?;
+            }
+            println!("deleted {id}");
+        }
     }
     Ok(())
 }
 
+/// One monitor plus its recent evidence: checks first, then incidents.
+async fn show(client: &reqwest::Client, base: &str, id: &str) -> Result<()> {
+    let body = get(client, &format!("{base}/api/monitors/{id}")).await?;
+    print_monitor(&serde_json::from_str(&body)?);
+    let checks = get(client, &format!("{base}/api/monitors/{id}/checks?limit=20")).await?;
+    let checks: serde_json::Value = serde_json::from_str(&checks)?;
+    println!("recent checks:");
+    for check in checks["checks"].as_array().map_or(&[][..], Vec::as_slice) {
+        println!(
+            "  {}  {}{}{}",
+            check["slot_at"].as_str().unwrap_or("?"),
+            check["outcome"].as_str().unwrap_or("?"),
+            check["http_status"]
+                .as_i64()
+                .map_or_else(String::new, |code| format!(" (HTTP {code})")),
+            check["latency_ms"]
+                .as_i64()
+                .map_or_else(String::new, |ms| format!("  {ms}ms")),
+        );
+    }
+    let incidents = get(
+        client,
+        &format!("{base}/api/incidents?monitor_id={id}&limit=20"),
+    )
+    .await?;
+    let incidents: serde_json::Value = serde_json::from_str(&incidents)?;
+    println!("incidents:");
+    for incident in incidents["incidents"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+    {
+        println!(
+            "  {}  {}  opened {}",
+            incident["state"].as_str().unwrap_or("?"),
+            incident["id"].as_i64().unwrap_or(0),
+            incident["opened_at"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+async fn set_paused(client: &reqwest::Client, base: &str, id: &str, paused: bool) -> Result<()> {
+    let body = patch(
+        client,
+        &format!("{base}/api/monitors/{id}"),
+        &serde_json::json!({ "paused": paused }),
+    )
+    .await?;
+    print_monitor(&serde_json::from_str(&body)?);
+    Ok(())
+}
+
+fn print_monitor(monitor: &MonitorView) {
+    println!(
+        "{}\t{}\t{}\tevery {}s\tgeneration {}\t{}",
+        monitor.id,
+        monitor.status,
+        monitor.name,
+        monitor.interval_s,
+        monitor.generation,
+        if monitor.paused {
+            format!("paused\t{}", monitor.url)
+        } else {
+            monitor.url.clone()
+        },
+    );
+}
+
 async fn get(client: &reqwest::Client, url: &str) -> Result<String> {
     let response = client.get(url).send().await.context("server unreachable")?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        explain_error(&body)?;
+    }
+    Ok(body)
+}
+
+async fn patch(client: &reqwest::Client, url: &str, payload: &serde_json::Value) -> Result<String> {
+    let response = client
+        .patch(url)
+        .json(payload)
+        .send()
+        .await
+        .context("server unreachable")?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {

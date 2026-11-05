@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context;
 use monitor_db::SharedStatuses;
 use monitor_domain::Health;
+use monitor_server::deliver::{Config as DelivererConfig, Deliverer};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config as CoordinatorConfig, Coordinator};
 use monitor_server::{AppState, load_registry, router};
@@ -79,11 +80,32 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let _coordinator_task = Coordinator::spawn(
         registry_rx,
-        writer,
+        writer.clone(),
         probes,
         CoordinatorConfig::default(),
         shutdown.clone(),
     );
+
+    // Alerts only run when a receiver is configured; without one, outbox events stay pending
+    // in the table — visible, never silently dropped.
+    if let Ok(target) = std::env::var("SMON_WEBHOOK_URL") {
+        let target = url::Url::parse(&target).context("SMON_WEBHOOK_URL must be a URL")?;
+        let secret = std::env::var("SMON_WEBHOOK_SECRET")
+            .ok()
+            .map(String::into_bytes);
+        let _deliverer_task = Deliverer::spawn(
+            db.clone(),
+            writer,
+            DelivererConfig {
+                target: Some(target),
+                secret,
+                ..DelivererConfig::default()
+            },
+            shutdown.clone(),
+        );
+    } else {
+        tracing::info!("SMON_WEBHOOK_URL unset; alerts accumulate in the outbox");
+    }
 
     let mut app = router(AppState {
         db,

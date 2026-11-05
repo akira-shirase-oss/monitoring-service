@@ -61,6 +61,15 @@ enum Command {
         observation: Box<Observation>,
         reply: oneshot::Sender<Result<WriteOutcome, QueryError>>,
     },
+    /// The deliverer's bookkeeping: attempt count, scheduled retry or terminal state.
+    /// Delivery writes go through the same single writer — the store has one owner.
+    MarkDelivery {
+        event_id: String,
+        attempts: i64,
+        next_attempt_at: Option<OffsetDateTime>,
+        delivered_at: Option<OffsetDateTime>,
+        reply: oneshot::Sender<Result<(), QueryError>>,
+    },
 }
 
 /// Cloneable sender for the single writer.
@@ -78,6 +87,30 @@ impl WriterHandle {
         self.tx
             .send(Command::Record {
                 observation: Box::new(observation),
+                reply,
+            })
+            .await
+            .map_err(|_| WriterError::Dead)?;
+        rx.await.map_err(|_| WriterError::Dead)?.map_err(Into::into)
+    }
+
+    /// Book a delivery outcome. `delivered_at: Some` marks the event terminal-delivered;
+    /// `delivered_at: None, next_attempt_at: Some` schedules a retry; `None`/`None` with
+    /// `attempts` at the max is terminal-exhausted.
+    pub async fn mark_delivery(
+        &self,
+        event_id: &str,
+        attempts: i64,
+        next_attempt_at: Option<OffsetDateTime>,
+        delivered_at: Option<OffsetDateTime>,
+    ) -> Result<(), WriterError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::MarkDelivery {
+                event_id: event_id.to_owned(),
+                attempts,
+                next_attempt_at,
+                delivered_at,
                 reply,
             })
             .await
@@ -106,10 +139,28 @@ async fn run(
     mut health: HashMap<MonitorId, Health>,
     mut rx: mpsc::Receiver<Command>,
 ) {
-    while let Some(Command::Record { observation, reply }) = rx.recv().await {
-        let outcome = record(&db, &statuses, &mut health, *observation).await;
-        if reply.send(outcome).is_err() {
-            debug!("observation reply channel closed; result still committed");
+    while let Some(command) = rx.recv().await {
+        match command {
+            Command::Record { observation, reply } => {
+                let outcome = record(&db, &statuses, &mut health, *observation).await;
+                if reply.send(outcome).is_err() {
+                    debug!("observation reply channel closed; result still committed");
+                }
+            }
+            Command::MarkDelivery {
+                event_id,
+                attempts,
+                next_attempt_at,
+                delivered_at,
+                reply,
+            } => {
+                let outcome = db
+                    .update_delivery(&event_id, attempts, next_attempt_at, delivered_at)
+                    .await;
+                if reply.send(outcome).is_err() {
+                    debug!("delivery reply channel closed; mark still committed");
+                }
+            }
         }
     }
 }

@@ -86,6 +86,29 @@ pub enum ValidationError {
     },
 }
 
+fn validate_fields(
+    name: &str,
+    url: &Url,
+    interval: Duration,
+    timeout: Duration,
+) -> Result<(), ValidationError> {
+    if name.trim().is_empty() {
+        return Err(ValidationError::EmptyName);
+    }
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ValidationError::UrlNotHttp {
+            scheme: url.scheme().to_owned(),
+        });
+    }
+    if interval < MIN_INTERVAL {
+        return Err(ValidationError::IntervalBelowMinimum { interval });
+    }
+    if timeout > interval {
+        return Err(ValidationError::TimeoutExceedsInterval { timeout, interval });
+    }
+    Ok(())
+}
+
 impl NewMonitor {
     /// Defaults: 60-second interval, 5-second deadline, per the probe contract.
     pub fn new(name: impl Into<String>, url: Url) -> Result<Self, ValidationError> {
@@ -99,20 +122,7 @@ impl NewMonitor {
         timeout: Duration,
     ) -> Result<Self, ValidationError> {
         let name = name.into();
-        if name.trim().is_empty() {
-            return Err(ValidationError::EmptyName);
-        }
-        if url.scheme() != "http" && url.scheme() != "https" {
-            return Err(ValidationError::UrlNotHttp {
-                scheme: url.scheme().to_owned(),
-            });
-        }
-        if interval < MIN_INTERVAL {
-            return Err(ValidationError::IntervalBelowMinimum { interval });
-        }
-        if timeout > interval {
-            return Err(ValidationError::TimeoutExceedsInterval { timeout, interval });
-        }
+        validate_fields(&name, &url, interval, timeout)?;
         Ok(Self {
             name,
             url,
@@ -132,6 +142,36 @@ impl NewMonitor {
             generation: 1,
             paused: false,
         }
+    }
+}
+
+/// A partial management write. `None` fields keep their stored values; the merged result is
+/// revalidated against the same rules a new monitor faces — a patch can't smuggle in what a
+/// create couldn't. `generation` is not set here: the store bumps it atomically so a stale
+/// in-flight result is invalidated by the same write that changes the monitor.
+#[derive(Debug, Clone, Default)]
+pub struct MonitorPatch {
+    pub name: Option<String>,
+    pub url: Option<Url>,
+    pub interval: Option<Duration>,
+    pub timeout: Option<Duration>,
+    pub paused: Option<bool>,
+}
+
+impl MonitorPatch {
+    /// Merge onto the stored monitor and revalidate. Returns the monitor to persist.
+    pub fn apply(&self, monitor: &Monitor) -> Result<Monitor, ValidationError> {
+        let merged = Monitor {
+            id: monitor.id,
+            name: self.name.clone().unwrap_or_else(|| monitor.name.clone()),
+            url: self.url.clone().unwrap_or_else(|| monitor.url.clone()),
+            interval: self.interval.unwrap_or(monitor.interval),
+            timeout: self.timeout.unwrap_or(monitor.timeout),
+            generation: monitor.generation,
+            paused: self.paused.unwrap_or(monitor.paused),
+        };
+        validate_fields(&merged.name, &merged.url, merged.interval, merged.timeout)?;
+        Ok(merged)
     }
 }
 
@@ -467,6 +507,117 @@ mod tests {
             health.record(SlotObservation::Probe(CheckOutcome::Timeout));
         }
         assert!(!health.incident_open());
+    }
+
+    fn monitor() -> Monitor {
+        NewMonitor::with_schedule("m", url(), Duration::from_secs(60), Duration::from_secs(30))
+            .expect("valid")
+            .into_monitor()
+    }
+
+    #[test]
+    fn patch_merges_unset_fields_and_keeps_identity() {
+        let monitor = monitor();
+        let merged = MonitorPatch {
+            name: Some("renamed".to_owned()),
+            ..MonitorPatch::default()
+        }
+        .apply(&monitor)
+        .expect("valid patch");
+        assert_eq!(merged.id, monitor.id);
+        assert_eq!(merged.generation, monitor.generation);
+        assert_eq!(merged.name, "renamed");
+        assert_eq!(merged.url, monitor.url);
+        assert_eq!(merged.interval, monitor.interval);
+        assert_eq!(merged.timeout, monitor.timeout);
+        assert!(!merged.paused);
+    }
+
+    #[test]
+    fn an_empty_patch_is_valid_and_changes_nothing() {
+        let monitor = monitor();
+        let merged = MonitorPatch::default()
+            .apply(&monitor)
+            .expect("no-op patch");
+        assert_eq!(merged.name, monitor.name);
+        assert_eq!(merged.generation, monitor.generation);
+    }
+
+    #[test]
+    fn patch_cannot_smuggle_what_a_create_could_not() {
+        let monitor = monitor();
+        for (patch, matches) in [
+            (
+                MonitorPatch {
+                    name: Some("   ".to_owned()),
+                    ..MonitorPatch::default()
+                },
+                ValidationError::EmptyName,
+            ),
+            (
+                MonitorPatch {
+                    url: Some(Url::parse("ftp://example.com").unwrap()),
+                    ..MonitorPatch::default()
+                },
+                ValidationError::UrlNotHttp {
+                    scheme: String::new(),
+                },
+            ),
+            (
+                MonitorPatch {
+                    interval: Some(Duration::from_secs(10)),
+                    ..MonitorPatch::default()
+                },
+                ValidationError::IntervalBelowMinimum {
+                    interval: Duration::ZERO,
+                },
+            ),
+        ] {
+            let err = patch.apply(&monitor).unwrap_err();
+            assert!(
+                std::mem::discriminant(&err) == std::mem::discriminant(&matches),
+                "expected {matches:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_interval_below_stored_timeout_is_rejected() {
+        // The merged monitor is what gets validated: lowering the interval to 20s while the
+        // stored timeout is 30s produces an invalid monitor, even though each field alone
+        // would pass its own bound.
+        let monitor = monitor();
+        let err = MonitorPatch {
+            interval: Some(Duration::from_secs(20)),
+            ..MonitorPatch::default()
+        }
+        .apply(&monitor)
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::TimeoutExceedsInterval { .. }
+        ));
+    }
+
+    #[test]
+    fn patch_flips_pause_and_preserves_the_rest() {
+        let monitor = monitor();
+        let merged = MonitorPatch {
+            paused: Some(true),
+            ..MonitorPatch::default()
+        }
+        .apply(&monitor)
+        .expect("pause");
+        assert!(merged.paused);
+        assert_eq!(merged.name, monitor.name);
+        // Pausing again is legal and idempotent at the domain level.
+        let again = MonitorPatch {
+            paused: Some(true),
+            ..MonitorPatch::default()
+        }
+        .apply(&merged)
+        .expect("re-pause");
+        assert!(again.paused);
     }
 
     #[test]

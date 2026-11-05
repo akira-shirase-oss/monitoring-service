@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- M2 "notify": the alert path is real. Outbox deliverer with bounded concurrency,
+  deterministic FNV-seeded jitter, per-attempt deadline, HMAC-SHA256 `x-smon-signature` and
+  stable `x-smon-event` identity — delivery bookkeeping still goes through the single
+  writer (`mark_delivery`); exhausted events stay visible in `notify_outbox`. Management
+  writes (`PATCH`, pause/unpause) revalidate the merged monitor and bump `generation`
+  atomically (D-009), so in-flight probes die as stale; `DELETE` is a single conditional
+  statement that refuses once evidence exists (D-008). New routes `GET
+  /api/monitors/{id}/checks` and `GET /api/incidents`, dashboard detail page, CLI
+  `show/edit/pause/unpause/delete`, and `fixtures/fault-server.mjs` (ok/fail/slow/hang/
+  status/flaky + `/sink` receiver). Verified live (incident→webhook, recovery→webhook,
+  hang isolation) and by 61 tests.
 - M1 "check and remember": the observing loop is real. Coordinator with one attempt per
   slot, `try_acquire` global/per-origin bounds and counted `missed` rows (D-007); reqwest
   probe engine with a total deadline, a 64 KiB body bound, classified outcomes and

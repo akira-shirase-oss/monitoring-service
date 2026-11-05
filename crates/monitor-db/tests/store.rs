@@ -183,6 +183,166 @@ async fn statuses_only_move_on_commits() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn update_monitor_bumps_generation_and_rejects_stale_writes() -> anyhow::Result<()> {
+    let (db, monitor, _writer) = store().await?;
+
+    // First write at the generation we read succeeds and bumps.
+    let mut edited = monitor.clone();
+    edited.name = "edited".to_owned();
+    edited.paused = true;
+    let generation = db.update_monitor(&edited, monitor.generation).await?;
+    assert_eq!(generation, Some(monitor.generation + 1));
+
+    // A second write carrying the pre-edit generation is a stale write: it must not apply.
+    let stale = db.update_monitor(&edited, monitor.generation).await?;
+    assert_eq!(stale, None);
+
+    let stored = db
+        .list_monitors()
+        .await?
+        .into_iter()
+        .find(|row| row.id == monitor.id.0.to_string())
+        .expect("monitor row");
+    assert_eq!(stored.name, "edited");
+    assert!(stored.paused);
+    assert_eq!(stored.generation, i64::try_from(monitor.generation)? + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_only_succeeds_without_history() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    assert!(!db.has_history(monitor.id).await?);
+    assert!(db.delete_monitor(monitor.id).await?);
+    assert!(db.list_monitors().await?.is_empty());
+
+    // With a committed check, delete is refused — the row and its evidence both survive.
+    let monitor = NewMonitor::new("kept", url::Url::parse("https://example.com")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+    writer.record(pass(&monitor)).await?;
+    assert!(db.has_history(monitor.id).await?);
+    assert!(!db.delete_monitor(monitor.id).await?);
+    assert_eq!(db.list_checks(monitor.id, 10).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_lifecycle_pending_retry_exhausted_delivered() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    for _ in 0..3 {
+        writer.record(fail(&monitor)).await?;
+    }
+    let outbox = db.list_outbox(monitor.id).await?;
+    assert_eq!(outbox.len(), 1);
+    let event_id = outbox[0].event_id.clone();
+
+    // Fresh event: due immediately.
+    let pending = db.pending_outbox(3, 10).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event_id, event_id);
+    assert_eq!(pending[0].monitor_name, "fixture");
+    assert_eq!(pending[0].kind, "incident_opened");
+
+    // A failed attempt books a retry in the future: no longer due.
+    let later = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    writer
+        .mark_delivery(&event_id, 1, Some(later), None)
+        .await?;
+    assert!(db.pending_outbox(3, 10).await?.is_empty());
+
+    // Past the retry time it is due again — simulate by scheduling in the past.
+    let past = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+    writer.mark_delivery(&event_id, 2, Some(past), None).await?;
+    assert_eq!(db.pending_outbox(3, 10).await?.len(), 1);
+
+    // Exhausted (attempts = max, no next attempt) is terminal: never pending again, but the
+    // row stays in the table.
+    writer.mark_delivery(&event_id, 3, None, None).await?;
+    assert!(db.pending_outbox(3, 10).await?.is_empty());
+    assert_eq!(db.list_outbox(monitor.id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_delivered_event_cannot_be_rewritten() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    for _ in 0..3 {
+        writer.record(fail(&monitor)).await?;
+    }
+    let event_id = db.list_outbox(monitor.id).await?[0].event_id.clone();
+
+    let now = OffsetDateTime::now_utc();
+    writer.mark_delivery(&event_id, 1, None, Some(now)).await?;
+    // The guarded update ignores any write to an already-delivered row.
+    let later = now + time::Duration::minutes(5);
+    writer
+        .mark_delivery(&event_id, 99, Some(later), None)
+        .await?;
+
+    let row = &db.list_outbox(monitor.id).await?[0];
+    assert_eq!(row.attempts, 1);
+    assert!(row.delivered_at.is_some());
+    assert!(row.next_attempt_at.is_none());
+    assert!(db.pending_outbox(8, 10).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn mark_delivery_goes_through_the_single_writer() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    for _ in 0..3 {
+        writer.record(fail(&monitor)).await?;
+    }
+    let event_id = db.list_outbox(monitor.id).await?[0].event_id.clone();
+
+    writer
+        .mark_delivery(&event_id, 1, None, Some(OffsetDateTime::now_utc()))
+        .await?;
+    let row = &db.list_outbox(monitor.id).await?[0];
+    assert_eq!(row.attempts, 1);
+    assert!(row.delivered_at.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_incidents_filters_by_monitor_and_state() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let other = NewMonitor::new("other", url::Url::parse("https://example.org")?)?.into_monitor();
+    db.insert_monitor(&other).await?;
+
+    for _ in 0..3 {
+        writer.record(fail(&monitor)).await?;
+    }
+    // `other` gets its own open incident via direct observations at its own generation.
+    for _ in 0..3 {
+        writer.record(fail(&other)).await?;
+    }
+    for _ in 0..2 {
+        writer.record(pass(&monitor)).await?;
+    }
+
+    assert_eq!(db.list_incidents(None, None, 10).await?.len(), 2);
+    assert_eq!(
+        db.list_incidents(None, Some("open"), 10).await?.len(),
+        1,
+        "only `other` is still open — `monitor` recovered"
+    );
+    assert_eq!(
+        db.list_incidents(Some(monitor.id), Some("resolved"), 10)
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_incidents(Some(other.id), Some("open"), 10)
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
     writer.record(fail(&monitor)).await?;

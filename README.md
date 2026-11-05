@@ -28,9 +28,16 @@ engine (GET only, deadline + body bounds, classified outcomes, URL-layer target 
 single-writer task (check + incident + outbox in one transaction), restart rebuild, and real
 statuses in the API. `SMON_PROFILE=lab` permits loopback targets for fixtures.
 
-Not yet: notifications delivery, monitor edit/pause routes, incidents API, the public status
-renderer, auth, redirect/DNS-level SSRF guards, failure fixtures, load runs. Numbers in docs
-are targets, not measurements.
+M2 "notify" landed: the outbox deliverer posts signed webhook events (`x-smon-event` +
+HMAC-SHA256 `x-smon-signature`, finite jittered retries, exhausted rows stay visible;
+`SMON_WEBHOOK_URL`/`SMON_WEBHOOK_SECRET`), `PATCH`/`DELETE /api/monitors/{id}` bump
+`generation` atomically so late probes die as stale (deletes refuse once evidence exists),
+`GET /api/monitors/{id}/checks` + `GET /api/incidents` feed the dashboard detail page, the
+CLI grew `show/edit/pause/unpause/delete`, and `fixtures/fault-server.mjs` provides
+ok/fail/slow/hang/status/flaky targets plus a `/sink` webhook receiver.
+
+Not yet: the public status renderer, auth, redirect/DNS-level SSRF guards, retention and
+load runs. Numbers in docs are targets, not measurements.
 
 ## Layout
 

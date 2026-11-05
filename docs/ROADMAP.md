@@ -29,14 +29,27 @@ first probe; killed the target → three `transport` checks → incident `open` 
 `incident_opened` outbox in one commit; restarted the server mid-incident → still `down`;
 target back → two fresh passes → `resolved` + `incident_recovered`. First useful release.
 
-## M2 — Notify
+## M2 — Notify *(done)*
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 2.1 outbox + webhook deliverer (module 04) | one logical event delivered at-least-once | stable `event_id`; finite retries + jitter | receiver hangs → delivery pool isolated, probes continue | hanging-receiver fixture; retry schedule test |
-| 2.2 edit/pause/delete monitors | management writes bump generation | stale results invalidated | pause mid-probe → late result dropped | generation test end to end |
-| 2.3 incidents API + dashboard detail | incident timeline + recent checks visible | success vs coverage kept separate | reordered views show evidence times | API + page test |
-| 2.4 fault fixtures v1 (module 09) | Node fault server: healthy/slow/fail/hang | deterministic scenarios | n/a | fixtures run in CI fault tests |
+| 2.1 outbox + webhook deliverer (module 04) | one logical event delivered at-least-once | stable `event_id`; finite retries + jitter | receiver hangs → delivery pool isolated, probes continue | 6 integration tests in `tests/deliver.rs` (hang, retry, exhaustion, restart, signature) |
+| 2.2 edit/pause/delete monitors | management writes bump generation | stale results invalidated | pause mid-probe → late result dropped | `a_stale_observation_after_edit_is_dropped` + patch/delete edge tests in `tests/api.rs` |
+| 2.3 incidents API + dashboard detail | incident timeline + recent checks visible | success vs coverage kept separate | reordered views show evidence times | `checks_and_incidents_endpoints_answer`; detail page live |
+| 2.4 fault fixtures v1 (module 09) | Node fault server: healthy/slow/fail/hang | deterministic scenarios | n/a | `fixtures/fault-server.mjs` + `/sink` receiver |
+
+**M2 exit — verified live:** `/flaky?fail=3&pass=2` monitor cycled incidents open/resolved;
+`incident_opened` and `incident_recovered` both delivered to `/sink` with `x-smon-event` +
+verified `sha256=` signature, first-attempt `delivered_at`. CLI `edit`/`pause`/`unpause`
+bumped generation 2→3→4; stale-`generation` PATCH → `conflict`; delete-with-history →
+`conflict`. Webhook pointed at `/sink/hang`: API stayed responsive, probes kept landing,
+outbox attempts grew bounded (retries scheduled, no deliveries) — a hung receiver occupies a
+delivery slot, never a probe slot.
+
+*Noted during the run:* HTTP clients may transparently retry idempotent requests on stale
+keep-alive connections — the fixture consumes a phase per *request on the wire*, which need
+not equal checks-per-slot. Harmless here (GET-only, observation = last response) but worth
+remembering if a fixture ever counts hits.
 
 ## M3 — Display and public status
 

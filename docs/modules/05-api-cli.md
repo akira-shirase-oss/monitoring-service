@@ -1,6 +1,8 @@
 # Module 05 — Management API + CLI (`monitor-server`, `monitor`)
 
-**Status:** livez/readyz + monitors CRUD-minus-edit landed (M0); auth in M5, edit/pause in M2.
+**Status:** management surface complete (M2): `PATCH`/`DELETE /api/monitors/{id}` (generation
+bump + optional optimistic `generation` guard → `conflict`), `GET …/checks`, `GET /incidents`
+with `monitor_id`/`state` filters; CLI `show/edit/pause/unpause/delete`. Auth remains M5.
 
 ## Purpose
 

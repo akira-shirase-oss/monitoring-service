@@ -1,6 +1,7 @@
 # Module 09 — Fixtures, faults and load (`fixtures/`, `perf/`)
 
-**Status:** placeholders; built alongside M1–M5.
+**Status:** `fixtures/fault-server.mjs` live (M2): ok/fail/slow/hang/status/flaky + `/sink`
+webhook receiver for delivery proofs. Load runs remain M5.
 
 ## Purpose
 

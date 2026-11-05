@@ -112,6 +112,97 @@ impl Db {
         Ok(row)
     }
 
+    /// Persist an edited monitor, bumping `generation` in the same statement. The write is
+    /// conditioned on the generation the caller read — two racing edits can't silently
+    /// overwrite each other. Returns `None` when the generation no longer matches.
+    pub async fn update_monitor(
+        &self,
+        monitor: &Monitor,
+        expected_generation: u64,
+    ) -> Result<Option<u64>, QueryError> {
+        let result = sqlx::query(
+            "UPDATE monitors
+             SET name = ?, url = ?, interval_s = ?, timeout_s = ?, paused = ?,
+                 generation = generation + 1
+             WHERE id = ? AND generation = ?",
+        )
+        .bind(&monitor.name)
+        .bind(monitor.url.as_str())
+        .bind(
+            i64::try_from(monitor.interval.as_secs())
+                .map_err(|_| QueryError::OutOfRange("interval"))?,
+        )
+        .bind(
+            i64::try_from(monitor.timeout.as_secs())
+                .map_err(|_| QueryError::OutOfRange("timeout"))?,
+        )
+        .bind(monitor.paused)
+        .bind(monitor.id.0.to_string())
+        .bind(i64::try_from(expected_generation).map_err(|_| QueryError::OutOfRange("generation"))?)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.monitor_generation(monitor.id).await
+    }
+
+    /// Delete a monitor that has never recorded evidence, in a single conditional statement:
+    /// atomic, so a probe committing a check between "does it have history?" and "delete"
+    /// can't lose its rows. `false` means the row was absent *or* has history — the caller
+    /// distinguishes with `has_history` for the response code.
+    pub async fn delete_monitor(&self, monitor: MonitorId) -> Result<bool, QueryError> {
+        let result = sqlx::query(
+            "DELETE FROM monitors WHERE id = ?
+             AND NOT EXISTS (SELECT 1 FROM checks WHERE monitor_id = ?)
+             AND NOT EXISTS (SELECT 1 FROM incidents WHERE monitor_id = ?)",
+        )
+        .bind(monitor.0.to_string())
+        .bind(monitor.0.to_string())
+        .bind(monitor.0.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Whether the monitor has any recorded evidence (checks or incidents). The FKs would
+    /// refuse the delete anyway; asking first turns a constraint violation into a clean
+    /// answer the API can translate to a `conflict` response.
+    pub async fn has_history(&self, monitor: MonitorId) -> Result<bool, QueryError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM checks WHERE monitor_id = ?
+                           UNION ALL
+                           SELECT 1 FROM incidents WHERE monitor_id = ? LIMIT 1)",
+        )
+        .bind(monitor.0.to_string())
+        .bind(monitor.0.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Incidents, newest first; both filters optional (`None` = unfiltered).
+    pub async fn list_incidents(
+        &self,
+        monitor: Option<MonitorId>,
+        state: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IncidentRow>, QueryError> {
+        let monitor_id = monitor.map(|id| id.0.to_string());
+        let state = state.map(str::to_owned);
+        let rows = sqlx::query_as::<_, IncidentRow>(
+            "SELECT id, monitor_id, opened_at, resolved_at, state FROM incidents
+             WHERE (?1 IS NULL OR monitor_id = ?1) AND (?2 IS NULL OR state = ?2)
+             ORDER BY opened_at DESC, id DESC LIMIT ?3",
+        )
+        .bind(&monitor_id)
+        .bind(&state)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// The monitor's current generation — the writer compares it against the generation an
     /// observation was claimed under.
     pub async fn monitor_generation(&self, monitor: MonitorId) -> Result<Option<u64>, QueryError> {
@@ -175,6 +266,56 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Outbox rows due for delivery: not yet delivered, not exhausted (`attempts < max`), and
+    /// either never attempted or past their scheduled retry. `max` belongs to the deliverer's
+    /// config — the store just records what the deliverer asked it to.
+    pub async fn pending_outbox(
+        &self,
+        max_attempts: i64,
+        limit: i64,
+    ) -> Result<Vec<DeliveryRow>, QueryError> {
+        let rows = sqlx::query_as::<_, DeliveryRow>(
+            "SELECT o.event_id, o.kind, o.attempts, o.created_at,
+                    m.id AS monitor_id, m.name AS monitor_name, m.url AS monitor_url,
+                    i.id AS incident_id, i.opened_at, i.resolved_at
+             FROM notify_outbox o
+             JOIN monitors m ON m.id = o.monitor_id
+             JOIN incidents i ON i.id = o.incident_id
+             WHERE o.delivered_at IS NULL AND o.attempts < ?
+               AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+             ORDER BY o.id LIMIT ?",
+        )
+        .bind(max_attempts)
+        .bind(OffsetDateTime::now_utc())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Record a delivery attempt's bookkeeping. `delivered_at` marks the event terminal;
+    /// `next_attempt_at = None` with `delivered_at = None` is the exhausted terminal state —
+    /// the row stays in the table, visible, never silently dropped.
+    pub(crate) async fn update_delivery(
+        &self,
+        event_id: &str,
+        attempts: i64,
+        next_attempt_at: Option<OffsetDateTime>,
+        delivered_at: Option<OffsetDateTime>,
+    ) -> Result<(), QueryError> {
+        sqlx::query(
+            "UPDATE notify_outbox SET attempts = ?, next_attempt_at = ?, delivered_at = ?
+             WHERE event_id = ? AND delivered_at IS NULL",
+        )
+        .bind(attempts)
+        .bind(next_attempt_at)
+        .bind(delivered_at)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Commit one slot's observation, its incident transition and the notification outbox row
@@ -378,4 +519,19 @@ pub struct OutboxRow {
     pub next_attempt_at: Option<OffsetDateTime>,
     pub delivered_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+}
+
+/// One pending event joined with the monitor and incident its payload needs.
+#[derive(Debug, FromRow)]
+pub struct DeliveryRow {
+    pub event_id: String,
+    pub kind: String,
+    pub attempts: i64,
+    pub created_at: OffsetDateTime,
+    pub monitor_id: String,
+    pub monitor_name: String,
+    pub monitor_url: String,
+    pub incident_id: i64,
+    pub opened_at: OffsetDateTime,
+    pub resolved_at: Option<OffsetDateTime>,
 }

@@ -1,6 +1,8 @@
 # Module 04 — Incidents + notification delivery (`monitor-server` deliverer, `notify_outbox`)
 
-**Status:** schema only; built in M2.
+**Status:** built (M2). Outbox deliverer live: bounded attempts, deterministic FNV jitter,
+HMAC-SHA256 `x-smon-signature` + stable `x-smon-event`, delivery bookkeeping through the
+single writer (`mark_delivery`), exhausted events stay visible in the table.
 
 ## Purpose
 

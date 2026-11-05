@@ -4,13 +4,14 @@
 //! carry the observing loop. Statuses served here come only from the committed-evidence map
 //! the writer publishes — never from in-flight probes.
 
+pub mod deliver;
 pub mod probe;
 pub mod schedule;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -25,8 +26,8 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use monitor_db::{Db, MonitorRow, QueryError, SharedStatuses};
-use monitor_domain::{Monitor, NewMonitor, Status, ValidationError};
+use monitor_db::{CheckRow, Db, IncidentRow, MonitorRow, QueryError, SharedStatuses};
+use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError};
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
 const BODY_LIMIT: usize = 16 * 1024;
@@ -66,7 +67,12 @@ pub async fn load_registry(db: &Db) -> Result<Vec<Monitor>, QueryError> {
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/monitors", get(list_monitors).post(create_monitor))
-        .route("/monitors/{id}", get(get_monitor));
+        .route(
+            "/monitors/{id}",
+            get(get_monitor).patch(patch_monitor).delete(delete_monitor),
+        )
+        .route("/monitors/{id}/checks", get(list_checks))
+        .route("/incidents", get(list_incidents));
 
     Router::new()
         .route("/livez", get(livez))
@@ -125,12 +131,7 @@ async fn get_monitor(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<MonitorView>, ApiError> {
-    let id = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound)?;
-    let monitors = state.db.list_monitors().await?;
-    let row = monitors
-        .into_iter()
-        .find(|row| row.id == id.to_string())
-        .ok_or(ApiError::NotFound)?;
+    let row = find_monitor(&state, &id).await?;
     Ok(Json(view_from_row(row, &state.statuses)?))
 }
 
@@ -166,6 +167,201 @@ async fn create_monitor(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PatchMonitor {
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub interval_s: Option<u64>,
+    pub timeout_s: Option<u64>,
+    pub paused: Option<bool>,
+    /// Optional optimistic-concurrency guard: when present and stale, the write is a
+    /// conflict rather than a blind last-writer-wins.
+    pub generation: Option<u64>,
+}
+
+/// Apply a management write. Any field change bumps `generation` atomically, which is what
+/// makes a probe that was already in flight stale — the write and the invalidation are the
+/// same committed fact.
+async fn patch_monitor(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<PatchMonitor>,
+) -> Result<Json<MonitorView>, ApiError> {
+    let row = find_monitor(&state, &id).await?;
+    let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+    if input
+        .generation
+        .is_some_and(|expected| expected != monitor.generation)
+    {
+        return Err(ApiError::Conflict(
+            "monitor changed since it was read; re-read and retry".into(),
+        ));
+    }
+    let patch = MonitorPatch {
+        name: input.name,
+        url: input
+            .url
+            .map(|value| url::Url::parse(&value))
+            .transpose()
+            .map_err(|_| ApiError::BadUrl)?,
+        interval: input.interval_s.map(Duration::from_secs),
+        timeout: input.timeout_s.map(Duration::from_secs),
+        paused: input.paused,
+    };
+    let merged = patch.apply(&monitor).map_err(ApiError::Validation)?;
+    if state
+        .db
+        .update_monitor(&merged, monitor.generation)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::Conflict(
+            "monitor changed since it was read; re-read and retry".into(),
+        ));
+    }
+    publish_registry(&state).await?;
+    let row = find_monitor(&state, &id).await?;
+    Ok(Json(view_from_row(row, &state.statuses)?))
+}
+
+/// Delete a monitor with no recorded evidence. A monitor with history can't be deleted —
+/// checks and incidents are the record; pause stops monitoring without erasing it.
+async fn delete_monitor(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let row = find_monitor(&state, &id).await?;
+    let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+    if !state.db.delete_monitor(monitor.id).await? {
+        return Err(ApiError::Conflict(
+            "monitor has recorded history; pause it instead".into(),
+        ));
+    }
+    publish_registry(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    pub limit: Option<i64>,
+}
+
+fn bounded_limit(limit: Option<i64>, default: i64, cap: i64) -> i64 {
+    limit.unwrap_or(default).clamp(1, cap)
+}
+
+#[derive(Debug, Serialize)]
+struct CheckView {
+    #[serde(with = "time::serde::rfc3339")]
+    slot_at: OffsetDateTime,
+    outcome: String,
+    http_status: Option<i64>,
+    latency_ms: Option<i64>,
+    detail: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    recorded_at: OffsetDateTime,
+}
+
+impl From<CheckRow> for CheckView {
+    fn from(row: CheckRow) -> Self {
+        Self {
+            slot_at: row.slot_at,
+            outcome: row.outcome,
+            http_status: row.http_status,
+            latency_ms: row.latency_ms,
+            detail: row.detail,
+            recorded_at: row.recorded_at,
+        }
+    }
+}
+
+/// Recent slots for a monitor — the evidence strip. Includes `missed` rows: a gap is part
+/// of the record, not something the API hides.
+async fn list_checks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row = find_monitor(&state, &id).await?;
+    let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+    let checks = state
+        .db
+        .list_checks(monitor.id, bounded_limit(params.limit, 50, 500))
+        .await?;
+    let checks: Vec<CheckView> = checks.into_iter().map(CheckView::from).collect();
+    Ok(Json(serde_json::json!({ "checks": checks })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IncidentParams {
+    pub monitor_id: Option<String>,
+    pub state: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct IncidentView {
+    id: i64,
+    monitor_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    opened_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    resolved_at: Option<OffsetDateTime>,
+    state: String,
+}
+
+impl From<IncidentRow> for IncidentView {
+    fn from(row: IncidentRow) -> Self {
+        Self {
+            id: row.id,
+            monitor_id: row.monitor_id,
+            opened_at: row.opened_at,
+            resolved_at: row.resolved_at,
+            state: row.state,
+        }
+    }
+}
+
+/// The incident timeline — open and resolved. `?monitor_id=` and `?state=open|resolved`
+/// filter; a bogus state value is a bad request, not silently "all".
+async fn list_incidents(
+    State(state): State<AppState>,
+    Query(params): Query<IncidentParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let monitor_id = params
+        .monitor_id
+        .map(|value| Uuid::parse_str(&value).map(MonitorId))
+        .transpose()
+        .map_err(|_| ApiError::BadId)?;
+    let state_filter = match params.state.as_deref() {
+        None => None,
+        Some("open") => Some("open"),
+        Some("resolved") => Some("resolved"),
+        Some(_) => return Err(ApiError::BadId),
+    };
+    let incidents = state
+        .db
+        .list_incidents(
+            monitor_id,
+            state_filter,
+            bounded_limit(params.limit, 50, 500),
+        )
+        .await?;
+    let incidents: Vec<IncidentView> = incidents.into_iter().map(IncidentView::from).collect();
+    Ok(Json(serde_json::json!({ "incidents": incidents })))
+}
+
+async fn find_monitor(state: &AppState, id: &str) -> Result<MonitorRow, ApiError> {
+    let id = Uuid::parse_str(id).map_err(|_| ApiError::NotFound)?;
+    state
+        .db
+        .list_monitors()
+        .await?
+        .into_iter()
+        .find(|row| row.id == id.to_string())
+        .ok_or(ApiError::NotFound)
+}
+
 fn view_from_row(row: MonitorRow, statuses: &SharedStatuses) -> Result<MonitorView, ApiError> {
     let created_at = row.created_at;
     let monitor = monitor_domain::Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
@@ -191,8 +387,12 @@ fn view_from_row(row: MonitorRow, statuses: &SharedStatuses) -> Result<MonitorVi
 pub enum ApiError {
     #[error("monitor not found")]
     NotFound,
+    #[error("invalid parameter")]
+    BadId,
     #[error("`url` must be a valid absolute URL")]
     BadUrl,
+    #[error("{0}")]
+    Conflict(String),
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error("stored data violates the contract")]
@@ -205,7 +405,8 @@ impl ApiError {
     fn code(&self) -> &'static str {
         match self {
             Self::NotFound => "not_found",
-            Self::BadUrl | Self::Validation(_) => "invalid_request",
+            Self::BadId | Self::BadUrl | Self::Validation(_) => "invalid_request",
+            Self::Conflict(_) => "conflict",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
         }
@@ -214,7 +415,8 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadUrl | Self::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::BadId | Self::BadUrl | Self::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

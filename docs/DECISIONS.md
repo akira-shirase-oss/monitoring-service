@@ -2,6 +2,24 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-009 — Edit and invalidation are one write: `generation` bumps atomically
+
+Every management write (`PATCH`, pause/unpause) revalidates the merged monitor through the
+same rules as a create (`MonitorPatch::apply` → `validate_fields`), then one `UPDATE` sets the
+fields *and* `generation = generation + 1` conditioned on the generation read. A late probe
+result claimed under the old generation is dropped by the writer — the edit and the
+invalidation are a single committed fact, so there is no interleaving where the new config
+takes the old probe's outcome. A client-supplied `generation` is an optional optimistic
+guard; a mismatch answers `conflict` rather than last-writer-wins.
+
+## D-008 — Monitors with evidence cannot be deleted
+
+`DELETE` is a single conditional statement: `DELETE … WHERE NOT EXISTS (checks|incidents)`.
+Atomic, so a probe committing between "has history?" and "delete" can't orphan evidence.
+Monitors with recorded checks or incidents get `conflict` — pause stops monitoring without
+erasing the record. The alternative (cascade delete) would let an API call destroy the
+incident history the whole system exists to prove.
+
 ## D-007 — Missed slots are stored `checks` rows, not gaps
 
 The scaffold's schema comment said a missed slot would be "visible by the absence of a row."

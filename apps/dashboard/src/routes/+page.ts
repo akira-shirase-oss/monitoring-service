@@ -6,6 +6,7 @@ export type MonitorView = {
 	url: string;
 	interval_s: number;
 	timeout_s: number;
+	generation: number;
 	paused: boolean;
 	status: 'up' | 'down' | 'unknown';
 };

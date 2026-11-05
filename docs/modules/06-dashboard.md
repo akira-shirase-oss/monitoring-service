@@ -1,6 +1,7 @@
 # Module 06 — Dashboard (`apps/dashboard`)
 
-**Status:** shell + honest unreachable state (M0); real status lands in M1.5, detail in M2.3.
+**Status:** live (M2): list with real status + monitor detail page (recent checks incl.
+`missed`, incident timeline, unreachable vs missing vs ok states).
 
 ## Purpose
 
