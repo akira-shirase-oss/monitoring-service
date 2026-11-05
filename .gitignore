@@ -23,3 +23,6 @@ dist/
 *.db-shm
 *.db-wal
 /var/
+status/
+apps/dashboard/test-results/
+apps/dashboard/playwright-report/

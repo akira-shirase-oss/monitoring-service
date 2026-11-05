@@ -33,7 +33,9 @@ evidence, check history and incident timelines — a client of the API, never of
 ## Testing parameters
 
 - **Unit/component:** badge variant mapping; reachable/unreachable branches.
-- **Playwright (M3.4):** load with server down (banner), with healthy fixtures (badges flip),
-  incident detail timeline, keyboard pass.
+- **Playwright (M3.4, done):** `tests/dashboard.spec.ts` — API-abort banner (no fabricated
+  rows), monitor → `up` badge on committed evidence, real 3-failure incident on the detail
+  page (checks strip, "still open", coverage-vs-success line), keyboard navigation.
+  `scripts/e2e.sh` builds the server + dashboard and runs it.
 - **Load:** not a target — a local operator tool; page weight budget recorded per release
   (module 09).

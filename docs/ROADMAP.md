@@ -58,7 +58,7 @@ remembering if a fixture ever counts hits.
 | 3.1 coverage vs success (module 06) **(done)** | `GET …/stats` returns expected/observed/missed/passed + basis-point ratios; detail page shows coverage and success separately (`null` → "no data") | missing slots never count as passes; undefined denominators stay `null` | 24 h of misses shows 0% coverage, not "down by silence" | `CoverageStats` domain tests, `check_stats` store test, `stats_separates_coverage_from_success` API test; verified live (flaky → 0% success, keeper → 100%) |
 | 3.2 public status snapshot + renderer (module 07) **(done)** | `status.json` snapshot rewritten every beat (tmp+rename); `apps/status/index.html` static renderer | allowlist fields only (sha256 alias, status, incident time); TTL declared in-file | stale snapshot says so | allowlist/TTL unit tests + writer-beats-file test |
 | 3.3 independent heartbeat **(done)** | `fixtures/status-check.mjs` decides from `expires_at`; page shows "monitoring unavailable" on expiry | "monitoring unavailable" ≠ "all down" | monitor host stops → heartbeat expires | verified live: kill → `unavailable` (exit 1), restart → `alive` |
-| 3.4 Playwright suite | dashboard flows verified in a browser | unreachable server state renders | server down mid-session | playwright specs |
+| 3.4 Playwright suite **(done)** | `tests/dashboard.spec.ts` + `scripts/e2e.sh`: API-abort banner, badge on committed evidence, real incident on detail page, keyboard nav | unreachable server state renders | server down mid-session (route abort) | 4 specs, verified run |
 
 ## M4 — Operate
 

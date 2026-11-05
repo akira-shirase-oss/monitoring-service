@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- M3.4 browser suite: `apps/dashboard/tests/dashboard.spec.ts` driven by `scripts/e2e.sh` —
+  Playwright runs the real `monitor-server` (serving the built dashboard on its own origin)
+  plus the fault fixture on e2e-only ports. Specs: aborted API renders "cannot see" with no
+  fabricated rows, a registered monitor's badge turns `up` on committed evidence, a real
+  3-failure sequence opens an incident the detail page shows (checks strip, "still open",
+  coverage-vs-success line), and keyboard navigation reaches the detail route.
 - M3.2/M3.3 public status + heartbeat: `monitor-server` rewrites `status.json` every
   `SMON_STATUS_INTERVAL_S` (default 30 s) into `SMON_STATUS_DIR` — allowlisted fields only
   (sha256 service alias, status, `incident_open_since`; hashing because UUIDv7 prefixes
