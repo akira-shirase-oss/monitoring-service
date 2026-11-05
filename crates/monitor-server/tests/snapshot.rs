@@ -107,7 +107,13 @@ async fn the_writer_beats_a_real_file_with_committed_evidence() {
     let monitor = monitor("snap-target");
     db.insert_monitor(&monitor).await.unwrap();
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::new()));
-    let (writer, _task) = writer::spawn(db.clone(), Arc::clone(&statuses), HashMap::new(), 8);
+    let (writer, _task) = writer::spawn(
+        db.clone(),
+        Arc::clone(&statuses),
+        HashMap::new(),
+        Arc::default(),
+        8,
+    );
     // One committed pass → the snapshot's status comes from the committed map.
     writer
         .record(monitor_db::Observation {

@@ -30,15 +30,19 @@ const REBUILD_TAIL: i64 = 4;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
-        .init();
+    init_logging()?;
 
+    let env_bytes = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
     let database_url =
         std::env::var("SMON_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE.into());
+    // Storage guardrail (M4.2): the database is bounded — writes past the ceiling fail
+    // cleanly instead of silently eating the disk.
+    let max_db_bytes = env_bytes("SMON_MAX_DB_BYTES", 2 * 1024 * 1024 * 1024);
     let listen = std::env::var("SMON_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.into());
     // Where the built dashboard lives; skip static serving when it has not been built.
     let dashboard_dir =
@@ -46,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     // `SMON_PROFILE=lab` permits loopback/private literal targets for local fixtures.
     let lab = std::env::var("SMON_PROFILE").is_ok_and(|profile| profile == "lab");
 
-    let db = monitor_db::Db::connect(&database_url, 4).await?;
+    let db = monitor_db::Db::connect_opts(&database_url, 4, Some(max_db_bytes)).await?;
     db.migrate().await?;
 
     // Boot rebuild: streaks and incidents come back from the store, never from memory.
@@ -66,8 +70,14 @@ async fn main() -> anyhow::Result<()> {
         health.insert(monitor.id, rebuilt);
     }
 
-    let (writer, _writer_task) =
-        monitor_db::writer::spawn(db.clone(), Arc::clone(&statuses), health, WRITER_BOUND);
+    let write_health: monitor_db::WriteHealth = Arc::default();
+    let (writer, _writer_task) = monitor_db::writer::spawn(
+        db.clone(),
+        Arc::clone(&statuses),
+        health,
+        Arc::clone(&write_health),
+        WRITER_BOUND,
+    );
     let (registry_tx, registry_rx) = watch::channel(Arc::new(monitors));
 
     let probes = ProbeClient::new(
@@ -115,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         statuses,
         registry: registry_tx,
+        write_health,
         version: env!("CARGO_PKG_VERSION"),
     });
 
@@ -133,6 +144,35 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown))
         .await?;
+    Ok(())
+}
+
+/// Logging goes to stdout by default. `SMON_LOG_FILE` switches to a byte-bounded file
+/// (`SMON_LOG_MAX_BYTES`, default 64 MiB per generation, two generations kept) — the
+/// disk guardrail applies to our own output too, not just the store.
+fn init_logging() -> anyhow::Result<()> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    match std::env::var("SMON_LOG_FILE") {
+        Ok(path) => {
+            let max = std::env::var("SMON_LOG_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64 * 1024 * 1024);
+            let writer = monitor_server::logfile::BoundedLog::open(&path, max)
+                .with_context(|| format!("opening SMON_LOG_FILE {path}"))?;
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .with_writer(writer)
+                .init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .init();
+        }
+    }
     Ok(())
 }
 

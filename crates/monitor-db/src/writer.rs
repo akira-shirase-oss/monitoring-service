@@ -7,6 +7,7 @@
 //! didn't keep.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
@@ -20,6 +21,13 @@ use crate::{Db, QueryError, RetainReport};
 
 /// The statuses readers see — written only after commits, never from in-flight results.
 pub type SharedStatuses = Arc<RwLock<Statuses>>;
+
+/// Consecutive store-write failures observed by the writer. `0` means the write path is
+/// healthy; anything above it means the last N commits failed (disk full, I/O error) and
+/// readers like `/readyz` must report unavailable rather than lie green. The counter is
+/// bumped by the writer on every failed commit and reset on the first successful one —
+/// recovery is proven by a landed write, not by a timer.
+pub type WriteHealth = Arc<AtomicU64>;
 
 /// One slot's product, sent to the writer by the coordinator.
 #[derive(Debug)]
@@ -138,16 +146,24 @@ impl WriterHandle {
 }
 
 /// Spawn the writer. `health` is the boot-rebuilt map (`Health::rebuild` per monitor); the
-/// writer owns it from here. The task exits when every handle is dropped.
+/// writer owns it from here. `write_health` is bumped on every failed commit and reset on
+/// every landed one. The task exits when every handle is dropped.
 pub fn spawn(
     db: Db,
     statuses: SharedStatuses,
     health: impl IntoIterator<Item = (MonitorId, Health)>,
+    write_health: WriteHealth,
     channel_bound: usize,
 ) -> (WriterHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(channel_bound);
     let handle = WriterHandle { tx };
-    let task = tokio::spawn(run(db, statuses, health.into_iter().collect(), rx));
+    let task = tokio::spawn(run(
+        db,
+        statuses,
+        health.into_iter().collect(),
+        write_health,
+        rx,
+    ));
     (handle, task)
 }
 
@@ -155,12 +171,14 @@ async fn run(
     db: Db,
     statuses: SharedStatuses,
     mut health: HashMap<MonitorId, Health>,
+    write_health: WriteHealth,
     mut rx: mpsc::Receiver<Command>,
 ) {
     while let Some(command) = rx.recv().await {
         match command {
             Command::Record { observation, reply } => {
                 let outcome = record(&db, &statuses, &mut health, *observation).await;
+                track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("observation reply channel closed; result still committed");
                 }
@@ -175,16 +193,29 @@ async fn run(
                 let outcome = db
                     .update_delivery(&event_id, attempts, next_attempt_at, delivered_at)
                     .await;
+                track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("delivery reply channel closed; mark still committed");
                 }
             }
             Command::Retain { cutoff, reply } => {
                 let outcome = db.retain(cutoff).await;
+                track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("retain reply channel closed; pass still committed");
                 }
             }
+        }
+    }
+}
+
+/// Commit landed → the write path is proven healthy; commit failed → consecutive failures
+/// grow. Dropped observations are *not* write failures — no commit was attempted.
+fn track_write<T>(write_health: &WriteHealth, outcome: &Result<T, QueryError>) {
+    match outcome {
+        Ok(_) => write_health.store(0, Ordering::Relaxed),
+        Err(_) => {
+            write_health.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

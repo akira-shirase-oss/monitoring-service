@@ -36,6 +36,7 @@ uuid.workspace = true
 hmac.workspace = true
 http-body-util.workspace = true
 sha2.workspace = true
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

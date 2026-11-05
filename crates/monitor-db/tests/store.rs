@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use monitor_db::{Db, Observation, WriteOutcome, writer};
+use monitor_db::{Db, Observation, WriteHealth, WriteOutcome, writer};
 use monitor_domain::{
     CheckOutcome, Effect, Health, Monitor, MonitorId, NewMonitor, SlotObservation, Status,
 };
@@ -18,7 +18,7 @@ async fn store() -> anyhow::Result<(Db, Monitor, writer::WriterHandle)> {
         NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
     db.insert_monitor(&monitor).await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
-    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), 8);
+    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
     Ok((db, monitor, handle))
 }
 
@@ -248,7 +248,13 @@ async fn statuses_only_move_on_commits() -> anyhow::Result<()> {
     db.migrate().await?;
     let monitor = NewMonitor::new("m", url::Url::parse("https://example.com")?)?.into_monitor();
     db.insert_monitor(&monitor).await?;
-    let (writer, _task) = writer::spawn(db.clone(), Arc::clone(&statuses), HashMap::new(), 8);
+    let (writer, _task) = writer::spawn(
+        db.clone(),
+        Arc::clone(&statuses),
+        HashMap::new(),
+        Arc::default(),
+        8,
+    );
 
     assert_eq!(
         statuses
@@ -469,6 +475,67 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
     assert_eq!(
         health.record(SlotObservation::Probe(CheckOutcome::Pass)),
         Effect::IncidentRecovered
+    );
+    Ok(())
+}
+
+/// Disk guardrail (M4.2): once the page ceiling is hit, a commit fails cleanly — the
+/// observation returns an error, the consecutive-failure counter grows, and the status
+/// map is not advanced (memory can never be ahead of the store).
+#[tokio::test]
+async fn writes_past_the_page_ceiling_fail_and_flag_unhealthy() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let monitor =
+        NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+    // SQLite clamps max_page_count up to the current size, so cap at exactly the used
+    // bytes: the database may not grow, and writes fail once free space runs out.
+    let used = db.used_bytes().await?;
+    db.set_max_bytes(used).await?;
+
+    let statuses = Arc::new(RwLock::new(HashMap::new()));
+    let write_health: WriteHealth = Arc::default();
+    let (handle, _task) = writer::spawn(
+        db.clone(),
+        Arc::clone(&statuses),
+        HashMap::new(),
+        Arc::clone(&write_health),
+        8,
+    );
+
+    // Free pages absorb a few rows; keep writing until the ceiling bites. Every write
+    // either commits or fails — the counter only counts the failures.
+    let mut failures = 0;
+    for _ in 0..400 {
+        if handle.record(pass(&monitor)).await.is_err() {
+            failures += 1;
+        }
+    }
+    assert!(
+        failures > 0,
+        "a capped database must eventually refuse writes"
+    );
+    assert_eq!(
+        write_health.load(std::sync::atomic::Ordering::Relaxed),
+        failures,
+        "consecutive failures counted by the writer, not guessed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_landed_write_clears_the_failure_count() -> anyhow::Result<()> {
+    let (db, monitor, _handle) = store().await?;
+    let statuses = Arc::new(RwLock::new(HashMap::new()));
+    let write_health: WriteHealth = Arc::default();
+    write_health.store(3, std::sync::atomic::Ordering::Relaxed);
+    let (handle, _task) = writer::spawn(db, statuses, HashMap::new(), Arc::clone(&write_health), 8);
+    handle.record(pass(&monitor)).await?;
+    assert_eq!(
+        write_health.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "recovery is proven by a landed write, not a timer"
     );
     Ok(())
 }

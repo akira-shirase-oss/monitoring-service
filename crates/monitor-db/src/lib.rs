@@ -16,7 +16,9 @@ use uuid::Uuid;
 use monitor_domain::{CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation};
 
 pub mod writer;
-pub use writer::{Observation, SharedStatuses, WriteOutcome, WriterError, WriterHandle};
+pub use writer::{
+    Observation, SharedStatuses, WriteHealth, WriteOutcome, WriterError, WriterHandle,
+};
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -24,6 +26,8 @@ pub enum DbError {
     BadUrl(#[from] sqlx::Error),
     #[error("migration failed: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error(transparent)]
+    Query(#[from] QueryError),
 }
 
 #[derive(Debug, Error)]
@@ -57,6 +61,17 @@ impl Db {
     /// `max_connections` exists for tests: an in-memory database must stay on one connection or
     /// every pooled checkout sees a different empty database.
     pub async fn connect(url: &str, max_connections: u32) -> Result<Self, DbError> {
+        Self::connect_opts(url, max_connections, None).await
+    }
+
+    /// `connect` plus an optional database size ceiling: `max_db_bytes` is enforced as
+    /// `PRAGMA max_page_count`, so writes past the ceiling fail `SQLITE_FULL` — a commit
+    /// that cannot land is an error the caller sees, never silent corruption.
+    pub async fn connect_opts(
+        url: &str,
+        max_connections: u32,
+        max_db_bytes: Option<u64>,
+    ) -> Result<Self, DbError> {
         let options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
@@ -65,7 +80,52 @@ impl Db {
             .max_connections(max_connections)
             .connect_with(options)
             .await?;
-        Ok(Self { pool })
+        let db = Self { pool };
+        if let Some(bytes) = max_db_bytes {
+            db.set_max_bytes(bytes).await?;
+        }
+        Ok(db)
+    }
+
+    /// `PRAGMA max_page_count` from a byte ceiling — computed against the database's own
+    /// page size, never an assumed 4 KiB.
+    pub async fn set_max_bytes(&self, bytes: u64) -> Result<(), QueryError> {
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        let page_size = u64::try_from(page_size).unwrap_or(4096).max(1);
+        let pages = (bytes / page_size).max(1);
+        let pages_i64 = i64::try_from(pages).map_err(|_| QueryError::OutOfRange("pages"))?;
+        // PRAGMAs reject bound parameters, so the statement is built dynamically —
+        // `pages_i64` is a computed integer, never input (AssertSqlSafe audited).
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "PRAGMA max_page_count = {pages_i64}"
+        )))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Bytes the database file currently occupies (`page_count * page_size`).
+    pub async fn used_bytes(&self) -> Result<u64, QueryError> {
+        let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(pages).unwrap_or(0) * u64::try_from(page_size).unwrap_or(4096))
+    }
+
+    /// Current size ceiling in bytes — for tests and diagnostics.
+    pub async fn max_bytes(&self) -> Result<u64, QueryError> {
+        let pages: i64 = sqlx::query_scalar("PRAGMA max_page_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(pages).unwrap_or(u64::MAX) * u64::try_from(page_size).unwrap_or(4096))
     }
 
     pub async fn migrate(&self) -> Result<(), DbError> {

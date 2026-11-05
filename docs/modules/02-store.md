@@ -28,7 +28,7 @@ Local file, WAL mode, foreign keys on — no server database, no Redis (guide de
 
 | Trigger | Required result |
 |---|---|
-| Disk write fails | stop authoritative updates; `/readyz` reports unready; never paint unsaved results green |
+| Disk write fails | commit fails → `WriteHealth` consecutive-failure counter grows; `/readyz` answers 503 `unavailable`; the counter resets only when a write lands — never paint unsaved results green |
 | Full disk | admission/write fails safely and visibly (module 08 guardrails) |
 | Restart | open incidents reload; streaks rebuild from stored outcomes |
 

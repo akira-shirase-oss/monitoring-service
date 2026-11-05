@@ -5,6 +5,7 @@
 //! the writer publishes — never from in-flight probes.
 
 pub mod deliver;
+pub mod logfile;
 pub mod probe;
 pub mod schedule;
 pub mod snapshot;
@@ -27,7 +28,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use monitor_db::{CheckRow, Db, IncidentRow, MonitorRow, QueryError, SharedStatuses};
+use monitor_db::{CheckRow, Db, IncidentRow, MonitorRow, QueryError, SharedStatuses, WriteHealth};
 use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError};
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
@@ -42,6 +43,9 @@ pub struct AppState {
     pub statuses: SharedStatuses,
     /// The live monitor set the coordinator schedules against. Management writes re-send it.
     pub registry: watch::Sender<Arc<Vec<Monitor>>>,
+    /// Consecutive store-write failures from the writer — nonzero means the write path is
+    /// broken (disk full, I/O error) and readiness must say so.
+    pub write_health: WriteHealth,
     pub version: &'static str,
 }
 
@@ -97,11 +101,26 @@ async fn livez() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "alive" }))
 }
 
-/// Readiness means the store answers. If the disk write path has failed, readiness must say so —
-/// never paint an unsaved state green.
-async fn readyz(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+/// Readiness means the store answers *and* the write path has landed commits. A read can
+/// succeed while every write fails (disk full) — the counter the writer keeps is the truth
+/// about the write path, never a green that unsaved results would contradict.
+async fn readyz(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     state.db.ping().await?;
-    Ok(Json(serde_json::json!({ "status": "ready" })))
+    let failures = state
+        .write_health
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if failures > 0 {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "reason": "store writes failing",
+                "consecutive_failures": failures,
+            })),
+        )
+            .into_response());
+    }
+    Ok(Json(serde_json::json!({ "status": "ready" })).into_response())
 }
 
 #[derive(Debug, Serialize)]

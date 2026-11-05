@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- M4.2 disk guardrails: `SMON_MAX_DB_BYTES` (default 2 GiB) caps the database via
+  `PRAGMA max_page_count` at connect — writes past the ceiling fail `SQLITE_FULL`, never
+  corrupt. The writer counts consecutive commit failures in `WriteHealth`; `/readyz`
+  answers a real 503 `unavailable` while it is nonzero and clears only when a write lands
+  (recovery proven by a commit, not a timer). `SMON_LOG_FILE`/`SMON_LOG_MAX_BYTES` add a
+  byte-bounded rotating log (two generations) so our own output honors the same guardrail.
 - M4.1 retention: checks older than `SMON_RETENTION_S` (default 7 d) roll into
   `check_stats_daily` (per-day outcome counts, migration 0002) and delete in the same
   transaction — one commit, so a crash can't leave history that is neither raw nor summed.

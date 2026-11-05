@@ -13,19 +13,26 @@ use tokio::sync::watch;
 use tower::ServiceExt;
 
 /// Builds the router and returns it with the shared pieces tests drive directly.
-async fn app() -> anyhow::Result<(Router, Arc<RwLock<monitor_domain::Statuses>>, Db)> {
+async fn app() -> anyhow::Result<(
+    Router,
+    Arc<RwLock<monitor_domain::Statuses>>,
+    Db,
+    monitor_db::WriteHealth,
+)> {
     // One connection: pooled checkouts of sqlite::memory: would each see a different database.
     let db = Db::connect("sqlite::memory:", 1).await?;
     db.migrate().await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
+    let write_health: monitor_db::WriteHealth = Arc::default();
     let (registry, _rx) = watch::channel(Arc::new(Vec::new()));
     let app = router(AppState {
         db: db.clone(),
         statuses: Arc::clone(&statuses),
         registry,
+        write_health: Arc::clone(&write_health),
         version: "test",
     });
-    Ok((app, statuses, db))
+    Ok((app, statuses, db, write_health))
 }
 
 async fn json_body(response: axum::response::Response) -> anyhow::Result<serde_json::Value> {
@@ -35,7 +42,7 @@ async fn json_body(response: axum::response::Response) -> anyhow::Result<serde_j
 
 #[tokio::test]
 async fn livez_and_readyz_answer() {
-    let (app, _statuses, _db) = app().await.unwrap();
+    let (app, _statuses, _db, _wh) = app().await.unwrap();
     for path in ["/livez", "/readyz"] {
         let response = app
             .clone()
@@ -46,9 +53,25 @@ async fn livez_and_readyz_answer() {
     }
 }
 
+/// Disk guardrail (M4.2): while the writer reports consecutive store-write failures, a
+/// readable store still isn't ready — readiness is a real 503, never a green lie.
+#[tokio::test]
+async fn readyz_reports_unavailable_when_writes_fail() {
+    let (app, _statuses, _db, write_health) = app().await.unwrap();
+    write_health.store(2, std::sync::atomic::Ordering::Relaxed);
+    let response = app
+        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await.unwrap();
+    assert_eq!(body["status"], "unavailable");
+    assert_eq!(body["consecutive_failures"], 2);
+}
+
 #[tokio::test]
 async fn create_then_list_a_monitor() {
-    let (app, _statuses, _db) = app().await.unwrap();
+    let (app, _statuses, _db, _wh) = app().await.unwrap();
 
     let response = app
         .clone()
@@ -131,7 +154,7 @@ async fn send(
 
 #[tokio::test]
 async fn patch_edits_a_monitor_and_bumps_generation() {
-    let (app, _statuses, _db) = app().await.unwrap();
+    let (app, _statuses, _db, _wh) = app().await.unwrap();
     let id = create(&app, "before").await.unwrap();
 
     let (status, body) = send(
@@ -172,7 +195,7 @@ async fn patch_edits_a_monitor_and_bumps_generation() {
 
 #[tokio::test]
 async fn patch_revalidates_against_create_rules() {
-    let (app, _statuses, _db) = app().await.unwrap();
+    let (app, _statuses, _db, _wh) = app().await.unwrap();
     let id = create(&app, "m").await.unwrap();
 
     for payload in [
@@ -195,7 +218,7 @@ async fn patch_revalidates_against_create_rules() {
 
 #[tokio::test]
 async fn patch_and_delete_on_missing_or_malformed_monitors() {
-    let (app, _statuses, _db) = app().await.unwrap();
+    let (app, _statuses, _db, _wh) = app().await.unwrap();
     let missing = uuid::Uuid::now_v7();
 
     for path in [
@@ -224,7 +247,7 @@ async fn patch_and_delete_on_missing_or_malformed_monitors() {
 
 #[tokio::test]
 async fn delete_removes_a_monitor_without_history() {
-    let (app, _statuses, _db) = app().await.unwrap();
+    let (app, _statuses, _db, _wh) = app().await.unwrap();
     let id = create(&app, "ephemeral").await.unwrap();
 
     let (status, _body) = send(&app, "DELETE", &format!("/api/monitors/{id}"), None)
@@ -245,8 +268,13 @@ fn seed_writer(
     db: &Db,
     statuses: &Arc<RwLock<monitor_domain::Statuses>>,
 ) -> monitor_db::writer::WriterHandle {
-    let (writer, _task) =
-        monitor_db::writer::spawn(db.clone(), Arc::clone(statuses), HashMap::new(), 8);
+    let (writer, _task) = monitor_db::writer::spawn(
+        db.clone(),
+        Arc::clone(statuses),
+        HashMap::new(),
+        Arc::default(),
+        8,
+    );
     // The JoinHandle detaches on drop; the writer lives as long as the handle is used.
     writer
 }
@@ -274,7 +302,7 @@ async fn seed_check(
 
 #[tokio::test]
 async fn a_monitor_with_history_cannot_be_deleted() {
-    let (app, statuses, db) = app().await.unwrap();
+    let (app, statuses, db, _wh) = app().await.unwrap();
     let id = create(&app, "keeper").await.unwrap();
     let writer = seed_writer(&db, &statuses);
     seed_check(&db, &writer, &id, monitor_domain::CheckOutcome::Pass)
@@ -296,7 +324,7 @@ async fn a_monitor_with_history_cannot_be_deleted() {
 
 #[tokio::test]
 async fn checks_and_incidents_endpoints_answer() {
-    let (app, statuses, db) = app().await.unwrap();
+    let (app, statuses, db, _wh) = app().await.unwrap();
     let id = create(&app, "watched").await.unwrap();
     let writer = seed_writer(&db, &statuses);
     for _ in 0..3 {
@@ -353,7 +381,7 @@ async fn checks_and_incidents_endpoints_answer() {
 
 #[tokio::test]
 async fn a_stale_observation_after_edit_is_dropped() {
-    let (app, statuses, db) = app().await.unwrap();
+    let (app, statuses, db, _wh) = app().await.unwrap();
     let id = create(&app, "stale-check").await.unwrap();
     let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(&id).unwrap());
 
@@ -369,7 +397,8 @@ async fn a_stale_observation_after_edit_is_dropped() {
     assert_eq!(status, StatusCode::OK);
 
     // An observation claimed under generation 1 arrives late: the writer must drop it.
-    let (writer, _task) = monitor_db::writer::spawn(db.clone(), statuses, HashMap::new(), 8);
+    let (writer, _task) =
+        monitor_db::writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
     let outcome = writer
         .record(monitor_db::Observation {
             monitor_id,
@@ -388,7 +417,7 @@ async fn a_stale_observation_after_edit_is_dropped() {
 
 #[tokio::test]
 async fn stats_separates_coverage_from_success() {
-    let (app, statuses, db) = app().await.unwrap();
+    let (app, statuses, db, _wh) = app().await.unwrap();
     let id = create(&app, "stats").await.unwrap();
     let writer = seed_writer(&db, &statuses);
     let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(&id).unwrap());
@@ -459,7 +488,7 @@ async fn stats_separates_coverage_from_success() {
 
 #[tokio::test]
 async fn invalid_input_gets_an_error_envelope() {
-    let (app, _statuses, _db) = app().await.unwrap();
+    let (app, _statuses, _db, _wh) = app().await.unwrap();
     let response = app
         .oneshot(
             Request::post("/api/monitors")

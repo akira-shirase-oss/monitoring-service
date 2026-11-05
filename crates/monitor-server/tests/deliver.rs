@@ -82,7 +82,7 @@ async fn rig() -> anyhow::Result<(Db, writer::WriterHandle)> {
     let db = Db::connect("sqlite::memory:", 1).await?;
     db.migrate().await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
-    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), 8);
+    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
     Ok((db, handle))
 }
 
