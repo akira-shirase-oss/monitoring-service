@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- M3.1 coverage vs success: `GET /api/monitors/{id}/stats` answers "did we look" and
+  "what did we see" as separate numbers — `expected` slots from interval over elapsed wall
+  clock (bounded `?window_s=`), `observed`/`missed`/`passed` from stored rows, ratios in
+  basis points with `null` for undefined denominators. A monitor born seconds ago reports
+  `coverage_bps: null`, not 100%; a window of misses is 0% coverage with undefined success,
+  never "down by silence". The detail page renders both.
 - M2 "notify": the alert path is real. Outbox deliverer with bounded concurrency,
   deterministic FNV-seeded jitter, per-attempt deadline, HMAC-SHA256 `x-smon-signature` and
   stable `x-smon-event` identity — delivery bookkeeping still goes through the single

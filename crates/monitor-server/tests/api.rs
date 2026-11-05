@@ -387,6 +387,77 @@ async fn a_stale_observation_after_edit_is_dropped() {
 }
 
 #[tokio::test]
+async fn stats_separates_coverage_from_success() {
+    let (app, statuses, db) = app().await.unwrap();
+    let id = create(&app, "stats").await.unwrap();
+    let writer = seed_writer(&db, &statuses);
+    let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(&id).unwrap());
+
+    // In-window rows: two passes, one transport failure, one missed slot.
+    for outcome in [
+        monitor_domain::CheckOutcome::Pass,
+        monitor_domain::CheckOutcome::Pass,
+        monitor_domain::CheckOutcome::Transport,
+    ] {
+        seed_check(&db, &writer, &id, outcome).await.unwrap();
+    }
+    let generation = db
+        .monitor_generation(monitor_id)
+        .await
+        .unwrap()
+        .unwrap_or(1);
+    writer
+        .record(monitor_db::Observation {
+            monitor_id,
+            generation,
+            slot_at: time::OffsetDateTime::now_utc(),
+            slot: monitor_domain::SlotObservation::Missed,
+            http_status: None,
+            latency_ms: None,
+            detail: None,
+        })
+        .await
+        .unwrap();
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/api/monitors/{id}/stats?window_s=3600"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["observed"], 3);
+    assert_eq!(body["missed"], 1);
+    assert_eq!(body["passed"], 2);
+    // Success = passed/observed = 2/3; missed slots never enter the denominator.
+    assert_eq!(body["success_bps"], 6_666);
+    // The monitor was created moments ago — the window owes ~0 slots, so coverage is
+    // honestly undefined (null), never 0% or 100% guessed.
+    assert!(body["coverage_bps"].is_null(), "{body}");
+
+    // Window bounds: too-large windows clamp rather than scan unbounded history.
+    let (_status, body) = send(
+        &app,
+        "GET",
+        &format!("/api/monitors/{id}/stats?window_s=99999999"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(body["window_s"], 7 * 86_400);
+
+    // Missing monitor still gets the envelope.
+    let missing = uuid::Uuid::now_v7();
+    let (status, body) = send(&app, "GET", &format!("/api/monitors/{missing}/stats"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
 async fn invalid_input_gets_an_error_envelope() {
     let (app, _statuses, _db) = app().await.unwrap();
     let response = app

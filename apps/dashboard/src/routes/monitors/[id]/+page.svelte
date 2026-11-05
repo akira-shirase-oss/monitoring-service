@@ -24,6 +24,12 @@
 		}
 		return check.outcome;
 	}
+
+	// Basis points → percent, one decimal. `null` means undefined denominator — display
+	// "no data", never a guessed number.
+	function pct(bps: number | null): string {
+		return bps == null ? 'no data' : `${(bps / 100).toFixed(1)}%`;
+	}
 </script>
 
 <svelte:head>
@@ -69,6 +75,12 @@
 			<p class="mt-0.5 text-sm text-muted-foreground">
 				every {data.monitor.interval_s}s · deadline {data.monitor.timeout_s}s · generation {data
 					.monitor.generation}
+			</p>
+			<p class="mt-0.5 text-sm text-muted-foreground">
+				last {Math.round(data.stats.window_s / 3600)}h · coverage {pct(data.stats.coverage_bps)}
+				({data.stats.observed}/{data.stats.expected} slots{data.stats.missed > 0
+					? `, ${data.stats.missed} missed`
+					: ''}) · success {pct(data.stats.success_bps)}
 			</p>
 		</div>
 

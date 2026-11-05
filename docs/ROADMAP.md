@@ -55,7 +55,7 @@ remembering if a fixture ever counts hits.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 3.1 coverage vs success (module 06) | coverage % separate from pass % | missing slots never count as passes | 24 h of misses shows 0% coverage, not "down by silence" | seeded-history API test |
+| 3.1 coverage vs success (module 06) **(done)** | `GET …/stats` returns expected/observed/missed/passed + basis-point ratios; detail page shows coverage and success separately (`null` → "no data") | missing slots never count as passes; undefined denominators stay `null` | 24 h of misses shows 0% coverage, not "down by silence" | `CoverageStats` domain tests, `check_stats` store test, `stats_separates_coverage_from_success` API test; verified live (flaky → 0% success, keeper → 100%) |
 | 3.2 public status snapshot + renderer (module 07) | read-only public page, sanitized + expiring | no internals; snapshot has TTL | stale snapshot says so | snapshot content test |
 | 3.3 independent heartbeat | external checker notices monitor death | "monitoring unavailable" ≠ "all down" | monitor host stops → heartbeat expires | simulated heartbeat expiry |
 | 3.4 Playwright suite | dashboard flows verified in a browser | unreachable server state renders | server down mid-session | playwright specs |

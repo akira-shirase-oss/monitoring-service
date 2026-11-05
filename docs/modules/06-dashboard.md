@@ -1,7 +1,8 @@
 # Module 06 — Dashboard (`apps/dashboard`)
 
-**Status:** live (M2): list with real status + monitor detail page (recent checks incl.
-`missed`, incident timeline, unreachable vs missing vs ok states).
+**Status:** live (M2–M3): list with real status + monitor detail page — recent checks incl.
+`missed`, incident timeline, coverage-vs-success line from `GET …/stats` (nulls render as
+"no data"), unreachable vs missing vs ok states.
 
 ## Purpose
 

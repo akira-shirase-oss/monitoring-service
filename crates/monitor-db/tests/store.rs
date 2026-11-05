@@ -124,6 +124,34 @@ async fn a_missed_slot_is_stored_but_resets_the_streak() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn check_stats_counts_window_rows_and_leaves_expected_to_the_caller() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    // Before the window: must not be counted.
+    let mut old = pass(&monitor);
+    old.slot_at = OffsetDateTime::now_utc() - time::Duration::days(2);
+    writer.record(old).await?;
+    // In-window: two passes, one failure, one missed.
+    writer.record(pass(&monitor)).await?;
+    writer.record(pass(&monitor)).await?;
+    writer.record(fail(&monitor)).await?;
+    writer.record(missed(&monitor)).await?;
+
+    let stats = db
+        .check_stats(
+            monitor.id,
+            OffsetDateTime::now_utc() - time::Duration::hours(1),
+        )
+        .await?;
+    assert_eq!(stats.observed, 3);
+    assert_eq!(stats.passed, 2);
+    assert_eq!(stats.missed, 1);
+    // `expected` is the caller's job (interval over elapsed wall clock); the store reports 0.
+    assert_eq!(stats.expected, 0);
+    assert_eq!(stats.coverage_bps(), None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn stale_and_unknown_observations_are_dropped() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
 

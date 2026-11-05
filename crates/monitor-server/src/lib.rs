@@ -72,6 +72,7 @@ pub fn router(state: AppState) -> Router {
             get(get_monitor).patch(patch_monitor).delete(delete_monitor),
         )
         .route("/monitors/{id}/checks", get(list_checks))
+        .route("/monitors/{id}/stats", get(monitor_stats))
         .route("/incidents", get(list_incidents));
 
     Router::new()
@@ -290,6 +291,69 @@ async fn list_checks(
         .await?;
     let checks: Vec<CheckView> = checks.into_iter().map(CheckView::from).collect();
     Ok(Json(serde_json::json!({ "checks": checks })))
+}
+
+/// Coverage vs success over a recent window — separate numbers, per the contract: coverage
+/// is "how much scheduled monitoring actually ran" (observed/expected slots), success is
+/// "of what ran, how much passed" (passed/observed). A window of misses is 0% coverage with
+/// undefined success — never "down by silence".
+#[derive(Debug, Deserialize)]
+pub struct StatsParams {
+    /// Window in seconds; default 24h, bounded to [60s, 7d].
+    pub window_s: Option<u64>,
+}
+
+const DEFAULT_STATS_WINDOW: u64 = 86_400;
+const MAX_STATS_WINDOW: u64 = 7 * 86_400;
+
+#[derive(Debug, Serialize)]
+struct StatsView {
+    window_s: u64,
+    expected: u64,
+    observed: u64,
+    missed: u64,
+    passed: u64,
+    /// Basis points; `null` when the denominator is undefined — "no data" is an answer,
+    /// not a number.
+    coverage_bps: Option<u32>,
+    success_bps: Option<u32>,
+}
+
+async fn monitor_stats(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<StatsParams>,
+) -> Result<Json<StatsView>, ApiError> {
+    let row = find_monitor(&state, &id).await?;
+    let created_at = row.created_at;
+    let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+    let window_s = params
+        .window_s
+        .unwrap_or(DEFAULT_STATS_WINDOW)
+        .clamp(60, MAX_STATS_WINDOW);
+    let now = OffsetDateTime::now_utc();
+    let window = time::Duration::seconds(i64::try_from(window_s).unwrap_or(i64::MAX));
+    let since = now - window;
+    // The window starts at the later of `since` and the monitor's creation — a monitor born
+    // an hour ago can't owe 24h of slots.
+    let window_start = if created_at > since {
+        created_at
+    } else {
+        since
+    };
+    let elapsed = u64::try_from((now - window_start).whole_seconds().max(0)).unwrap_or(0);
+    let expected = elapsed / monitor.interval.as_secs().max(1);
+    let mut counts = state.db.check_stats(monitor.id, since).await?;
+    counts.expected = expected;
+    Ok(Json(StatsView {
+        window_s,
+        expected: counts.expected,
+        observed: counts.observed,
+        missed: counts.missed,
+        passed: counts.passed,
+        coverage_bps: counts.coverage_bps(),
+        success_bps: counts.success_bps(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

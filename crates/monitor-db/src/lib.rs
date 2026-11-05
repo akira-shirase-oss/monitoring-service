@@ -12,7 +12,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use monitor_domain::{CheckOutcome, Effect, Monitor, MonitorId, SlotObservation};
+use monitor_domain::{CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation};
 
 pub mod writer;
 pub use writer::{Observation, SharedStatuses, WriteOutcome, WriterError, WriterHandle};
@@ -235,6 +235,42 @@ impl Db {
             .rev()
             .map(|(outcome, http_status)| decode_outcome(outcome, *http_status))
             .collect()
+    }
+
+    /// Outcome counts for a monitor since `since` — the row half of `CoverageStats`;
+    /// the API computes `expected` from the monitor's interval over the elapsed window.
+    pub async fn check_stats(
+        &self,
+        monitor: MonitorId,
+        since: OffsetDateTime,
+    ) -> Result<CoverageStats, QueryError> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT outcome, COUNT(*) FROM checks
+             WHERE monitor_id = ? AND slot_at >= ? GROUP BY outcome",
+        )
+        .bind(monitor.0.to_string())
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let (mut observed, mut missed, mut passed) = (0_u64, 0_u64, 0_u64);
+        for (outcome, count) in rows {
+            let count = u64::try_from(count).map_err(|_| QueryError::Corrupt("count".into()))?;
+            match outcome.as_str() {
+                "missed" => missed += count,
+                "pass" => {
+                    observed += count;
+                    passed += count;
+                }
+                "http_fail" | "transport" | "timeout" => observed += count,
+                other => return Err(QueryError::Corrupt(format!("outcome {other}"))),
+            }
+        }
+        Ok(CoverageStats {
+            expected: 0,
+            observed,
+            missed,
+            passed,
+        })
     }
 
     /// Check history for a monitor, newest first.

@@ -175,6 +175,47 @@ impl MonitorPatch {
     }
 }
 
+/// Coverage vs success over a slot window — the two questions ("did we look?" and "what did
+/// we see?") get separate numbers, never blended. Ratios are basis points so the domain
+/// stays integer-exact; `None` means "undefined denominator" — a real answer, never 0% or
+/// 100% guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageStats {
+    /// Slots the schedule owed in the window (interval over elapsed time, floored).
+    pub expected: u64,
+    /// Slots that produced a stored observation (any probe outcome).
+    pub observed: u64,
+    /// Slots recorded as `missed` — the schedule failed to claim them.
+    pub missed: u64,
+    /// Observed slots that passed.
+    pub passed: u64,
+}
+
+impl CoverageStats {
+    /// `observed / expected`, capped at 100% — a monitor whose interval shrank mid-window can
+    /// record more rows than the *current* interval owes; coverage still tops out at full.
+    #[must_use]
+    pub fn coverage_bps(&self) -> Option<u32> {
+        if self.expected == 0 {
+            return None;
+        }
+        let ratio =
+            u128::from(self.observed.min(self.expected)) * 10_000 / u128::from(self.expected);
+        Some(u32::try_from(ratio).unwrap_or(u32::MAX))
+    }
+
+    /// `passed / observed` — failures, timeouts and HTTP errors count against success;
+    /// missed slots never enter this denominator.
+    #[must_use]
+    pub fn success_bps(&self) -> Option<u32> {
+        if self.observed == 0 {
+            return None;
+        }
+        let ratio = u128::from(self.passed) * 10_000 / u128::from(self.observed);
+        Some(u32::try_from(ratio).unwrap_or(u32::MAX))
+    }
+}
+
 /// What one probe produced. These variants are kept distinct end to end because the contract
 /// treats them differently: an HTTP failure is evidence about the target, a timeout is evidence
 /// about *this observation*, and a missed slot is no evidence at all.
@@ -631,5 +672,68 @@ mod tests {
             health.record(SlotObservation::Probe(CheckOutcome::Pass)),
             Effect::IncidentRecovered
         );
+    }
+
+    #[test]
+    fn coverage_counts_looked_slots_not_outcomes() {
+        // 6 of 8 slots observed; of those, 5 passed. Coverage and success answer
+        // different questions: 75% and ~83% — never blended into one number.
+        let stats = CoverageStats {
+            expected: 8,
+            observed: 6,
+            missed: 2,
+            passed: 5,
+        };
+        assert_eq!(stats.coverage_bps(), Some(7_500));
+        assert_eq!(stats.success_bps(), Some(8_333));
+    }
+
+    #[test]
+    fn a_full_missed_window_is_zero_coverage_not_failure() {
+        // The guide's hard case: 24h of misses shows 0% coverage, NOT "down by silence" —
+        // success is undefined because nothing was observed.
+        let stats = CoverageStats {
+            expected: 96,
+            observed: 0,
+            missed: 96,
+            passed: 0,
+        };
+        assert_eq!(stats.coverage_bps(), Some(0));
+        assert_eq!(stats.success_bps(), None);
+    }
+
+    #[test]
+    fn coverage_and_success_are_undefined_on_empty_denominators() {
+        let fresh = CoverageStats {
+            expected: 0,
+            observed: 0,
+            missed: 0,
+            passed: 0,
+        };
+        assert_eq!(fresh.coverage_bps(), None);
+        assert_eq!(fresh.success_bps(), None);
+        // Rows exist but the window owes nothing (just-created monitor): still undefined,
+        // never 100%.
+        let skewed = CoverageStats {
+            expected: 0,
+            observed: 3,
+            missed: 0,
+            passed: 3,
+        };
+        assert_eq!(skewed.coverage_bps(), None);
+        assert_eq!(skewed.success_bps(), Some(10_000));
+    }
+
+    #[test]
+    fn coverage_caps_at_full_when_rows_outrun_the_interval() {
+        // Interval shrank mid-window: more stored rows than the current interval owes.
+        // Coverage is capped at 100% rather than reporting >100%.
+        let stats = CoverageStats {
+            expected: 4,
+            observed: 6,
+            missed: 0,
+            passed: 6,
+        };
+        assert_eq!(stats.coverage_bps(), Some(10_000));
     }
 }
