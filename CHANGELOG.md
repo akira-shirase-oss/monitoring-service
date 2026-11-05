@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- M4.4 deployment: `scripts/deploy.sh` installs versioned releases
+  (`releases/<rel>/bin` + `current` symlink, data outside releases so a rollback can't
+  roll back evidence), with a systemd unit, a launchd plist, and `deploy/RUNBOOK.md`
+  covering install/upgrade/rollback/backup/heartbeat-watching. Exercised end to end:
+  incident open on v1 → upgrade to v2 → still `down` → rollback to v1 → still `down`.
 - M4.3 backup + restore: `Db::backup` runs `VACUUM INTO` (a WAL-consistent online
   snapshot — reads the store, never writes it) behind `POST /api/backup`, which requires
   an absolute path and reports the snapshot's byte size. `scripts/backup-drill.sh`

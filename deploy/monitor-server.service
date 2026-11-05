@@ -1,0 +1,22 @@
+[Unit]
+# The monitor watches other hosts — it must run independently of all of them.
+Description=Service Monitor (monitor-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/smon/env
+ExecStart=/opt/smon/current/bin/monitor-server
+Restart=on-failure
+RestartSec=3s
+# Hard stops consistent with the project's own bounds: the store is byte-capped by
+# SMON_MAX_DB_BYTES, logs by SMON_LOG_MAX_BYTES; the kernel adds its own here.
+LimitNOFILE=4096
+MemoryMax=512M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/smon/data /opt/smon/status
+
+[Install]
+WantedBy=multi-user.target
