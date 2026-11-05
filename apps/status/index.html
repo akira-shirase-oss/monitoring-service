@@ -1,0 +1,66 @@
+<!doctype html>
+<!-- Public status page — a static artifact. Zero runtime dependency on the monitor:
+     copy this file + status.json to any static host. If status.json is missing or past
+     its declared expiry, the honest verdict is "monitoring unavailable", never "all up"
+     and never "everything down". -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="refresh" content="30" />
+<title>Service status</title>
+<style>
+	:root { color-scheme: light dark; font-family: ui-monospace, monospace; }
+	body { max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+	h1 { font-size: 1.25rem; }
+	.banner { border: 1px solid #b45309; background: #fef3c7; color: #78350f;
+		padding: .75rem 1rem; border-radius: .375rem; margin: 1rem 0; }
+	.banner:empty { display: none; }
+	table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+	td, th { text-align: left; padding: .5rem .25rem; border-bottom: 1px solid #9993; font-size: .875rem; }
+	.up { color: #166534; } .down { color: #b91c1c; } .unknown { color: #57534e; }
+	small { color: #78716c; }
+</style>
+</head>
+<body>
+<h1>Service status</h1>
+<div class="banner" id="banner"></div>
+<table><thead><tr><th>service</th><th>status</th><th>since</th></tr></thead>
+<tbody id="services"><tr><td colspan="3"><small>loading…</small></td></tr></tbody></table>
+<p><small id="meta"></small></p>
+<script>
+const verdict = document.getElementById('banner');
+const rows = document.getElementById('services');
+const meta = document.getElementById('meta');
+const age = ts => Math.max(0, Math.round((Date.now() - Date.parse(ts)) / 1000)) + 's ago';
+
+fetch('status.json', { cache: 'no-store' }).then(r => {
+	if (!r.ok) throw new Error('http ' + r.status);
+	return r.json();
+}).then(snap => {
+	const expired = Date.parse(snap.expires_at) < Date.now();
+	meta.textContent = 'snapshot written ' + age(snap.generated_at) +
+		(expired ? ' — expired' : '');
+	if (expired) {
+		// A stale snapshot is a dead heartbeat: the monitor may be down. The only honest
+		// claim is that monitoring is unavailable — the rows below are stale evidence.
+		verdict.textContent = 'Monitoring unavailable — this snapshot is stale. ' +
+			'The service states below were last observed ' + age(snap.generated_at) + '.';
+	}
+	const services = snap.services ?? [];
+	rows.innerHTML = services.length === 0
+		? '<tr><td colspan="3"><small>no services in this snapshot</small></td></tr>'
+		: services.map(s =>
+			'<tr><td>' + s.alias + '</td>' +
+			'<td class="' + s.status + '">' + s.status + '</td>' +
+			'<td><small>' + (s.incident_open_since
+				? 'incident since ' + new Date(s.incident_open_since).toLocaleString()
+				: '—') + '</small></td></tr>').join('');
+}).catch(() => {
+	verdict.textContent = 'Monitoring unavailable — no status snapshot could be read.';
+	rows.innerHTML = '';
+	meta.textContent = '';
+});
+</script>
+</body>
+</html>

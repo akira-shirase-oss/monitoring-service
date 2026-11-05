@@ -7,6 +7,7 @@
 pub mod deliver;
 pub mod probe;
 pub mod schedule;
+pub mod snapshot;
 
 use std::sync::Arc;
 use std::time::Duration;

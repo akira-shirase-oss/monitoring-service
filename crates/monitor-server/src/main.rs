@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Context;
 use monitor_db::SharedStatuses;
@@ -107,6 +108,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("SMON_WEBHOOK_URL unset; alerts accumulate in the outbox");
     }
 
+    let _snapshot_task = spawn_snapshot(&db, &statuses, &shutdown);
+
     let mut app = router(AppState {
         db,
         statuses,
@@ -130,6 +133,33 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal(shutdown))
         .await?;
     Ok(())
+}
+
+/// The public status snapshot — the heartbeat. `SMON_STATUS_DIR` points at wherever the
+/// static status page is hosted; an expired snapshot there reads "monitoring unavailable".
+fn spawn_snapshot(
+    db: &monitor_db::Db,
+    statuses: &SharedStatuses,
+    shutdown: &CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let dir = std::env::var("SMON_STATUS_DIR").unwrap_or_else(|_| "status".into());
+    let env_secs = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    tracing::info!(dir = %dir, "writing status snapshots");
+    monitor_server::snapshot::spawn(
+        db.clone(),
+        Arc::clone(statuses),
+        monitor_server::snapshot::Config {
+            dir: dir.into(),
+            interval: Duration::from_secs(env_secs("SMON_STATUS_INTERVAL_S", 30)),
+            ttl: Duration::from_secs(env_secs("SMON_STATUS_TTL_S", 90)),
+        },
+        shutdown.clone(),
+    )
 }
 
 async fn shutdown_signal(coordinator_stop: CancellationToken) {

@@ -1,6 +1,11 @@
 # Module 07 — Public status + heartbeat (`status` snapshot, renderer, external check)
 
-**Status:** M3. Not started.
+**Status:** built (M3). `monitor-server` writes `status.json` every `SMON_STATUS_INTERVAL_S`
+(default 30 s) into `SMON_STATUS_DIR` — sanitized (sha256-alias, status,
+`incident_open_since` only), atomic (tmp + rename), self-expiring (`SMON_STATUS_TTL_S`,
+default 90 s). `apps/status/index.html` renders it with zero runtime dependency.
+`fixtures/status-check.mjs` is the independent checker: expired/missing snapshot →
+"unavailable", never "targets down".
 
 ## Purpose
 

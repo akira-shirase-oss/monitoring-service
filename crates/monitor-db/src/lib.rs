@@ -7,6 +7,7 @@
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
+use std::collections::HashMap;
 use std::str::FromStr;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -179,6 +180,23 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(exists)
+    }
+
+    /// Every currently-open incident keyed by monitor — the snapshot writer's view of
+    /// "which services are in a recorded outage".
+    pub async fn open_incidents(&self) -> Result<HashMap<MonitorId, OffsetDateTime>, QueryError> {
+        let rows = sqlx::query_as::<_, (String, OffsetDateTime)>(
+            "SELECT monitor_id, opened_at FROM incidents WHERE state = 'open'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, opened_at)| {
+                Uuid::parse_str(&id)
+                    .map(|id| (MonitorId(id), opened_at))
+                    .map_err(|e| QueryError::Corrupt(format!("monitor id: {e}")))
+            })
+            .collect()
     }
 
     /// Incidents, newest first; both filters optional (`None` = unfiltered).

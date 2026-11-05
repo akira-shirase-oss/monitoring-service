@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- M3.2/M3.3 public status + heartbeat: `monitor-server` rewrites `status.json` every
+  `SMON_STATUS_INTERVAL_S` (default 30 s) into `SMON_STATUS_DIR` — allowlisted fields only
+  (sha256 service alias, status, `incident_open_since`; hashing because UUIDv7 prefixes
+  collide for same-millisecond ids), written atomically, self-expiring via
+  `SMON_STATUS_TTL_S` (default 90 s). `apps/status/index.html` is the static renderer —
+  copy the two files to any host; `fixtures/status-check.mjs` is the independent checker.
+  An expired or missing snapshot reports "monitoring unavailable", never "targets down".
+  Verified live: beat → alive, kill → expired beat → unavailable, restart → alive.
 - M3.1 coverage vs success: `GET /api/monitors/{id}/stats` answers "did we look" and
   "what did we see" as separate numbers — `expected` slots from interval over elapsed wall
   clock (bounded `?window_s=`), `observed`/`missed`/`passed` from stored rows, ratios in
