@@ -18,9 +18,13 @@ async fn app() -> anyhow::Result<(
     Arc<RwLock<monitor_domain::Statuses>>,
     Db,
     monitor_db::WriteHealth,
+    tempfile::TempDir,
 )> {
-    // One connection: pooled checkouts of sqlite::memory: would each see a different database.
-    let db = Db::connect("sqlite::memory:", 1).await?;
+    // A file-backed scratch database: `VACUUM INTO` backups can't run on :memory:, and
+    // one pooled connection keeps every test honest anyway.
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("api.db").display());
+    let db = Db::connect(&url, 1).await?;
     db.migrate().await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let write_health: monitor_db::WriteHealth = Arc::default();
@@ -32,7 +36,7 @@ async fn app() -> anyhow::Result<(
         write_health: Arc::clone(&write_health),
         version: "test",
     });
-    Ok((app, statuses, db, write_health))
+    Ok((app, statuses, db, write_health, tmp))
 }
 
 async fn json_body(response: axum::response::Response) -> anyhow::Result<serde_json::Value> {
@@ -42,7 +46,7 @@ async fn json_body(response: axum::response::Response) -> anyhow::Result<serde_j
 
 #[tokio::test]
 async fn livez_and_readyz_answer() {
-    let (app, _statuses, _db, _wh) = app().await.unwrap();
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
     for path in ["/livez", "/readyz"] {
         let response = app
             .clone()
@@ -57,7 +61,7 @@ async fn livez_and_readyz_answer() {
 /// readable store still isn't ready — readiness is a real 503, never a green lie.
 #[tokio::test]
 async fn readyz_reports_unavailable_when_writes_fail() {
-    let (app, _statuses, _db, write_health) = app().await.unwrap();
+    let (app, _statuses, _db, write_health, _tmp) = app().await.unwrap();
     write_health.store(2, std::sync::atomic::Ordering::Relaxed);
     let response = app
         .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
@@ -71,7 +75,7 @@ async fn readyz_reports_unavailable_when_writes_fail() {
 
 #[tokio::test]
 async fn create_then_list_a_monitor() {
-    let (app, _statuses, _db, _wh) = app().await.unwrap();
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
 
     let response = app
         .clone()
@@ -154,7 +158,7 @@ async fn send(
 
 #[tokio::test]
 async fn patch_edits_a_monitor_and_bumps_generation() {
-    let (app, _statuses, _db, _wh) = app().await.unwrap();
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
     let id = create(&app, "before").await.unwrap();
 
     let (status, body) = send(
@@ -195,7 +199,7 @@ async fn patch_edits_a_monitor_and_bumps_generation() {
 
 #[tokio::test]
 async fn patch_revalidates_against_create_rules() {
-    let (app, _statuses, _db, _wh) = app().await.unwrap();
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
     let id = create(&app, "m").await.unwrap();
 
     for payload in [
@@ -218,7 +222,7 @@ async fn patch_revalidates_against_create_rules() {
 
 #[tokio::test]
 async fn patch_and_delete_on_missing_or_malformed_monitors() {
-    let (app, _statuses, _db, _wh) = app().await.unwrap();
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
     let missing = uuid::Uuid::now_v7();
 
     for path in [
@@ -247,7 +251,7 @@ async fn patch_and_delete_on_missing_or_malformed_monitors() {
 
 #[tokio::test]
 async fn delete_removes_a_monitor_without_history() {
-    let (app, _statuses, _db, _wh) = app().await.unwrap();
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
     let id = create(&app, "ephemeral").await.unwrap();
 
     let (status, _body) = send(&app, "DELETE", &format!("/api/monitors/{id}"), None)
@@ -302,7 +306,7 @@ async fn seed_check(
 
 #[tokio::test]
 async fn a_monitor_with_history_cannot_be_deleted() {
-    let (app, statuses, db, _wh) = app().await.unwrap();
+    let (app, statuses, db, _wh, _tmp) = app().await.unwrap();
     let id = create(&app, "keeper").await.unwrap();
     let writer = seed_writer(&db, &statuses);
     seed_check(&db, &writer, &id, monitor_domain::CheckOutcome::Pass)
@@ -324,7 +328,7 @@ async fn a_monitor_with_history_cannot_be_deleted() {
 
 #[tokio::test]
 async fn checks_and_incidents_endpoints_answer() {
-    let (app, statuses, db, _wh) = app().await.unwrap();
+    let (app, statuses, db, _wh, _tmp) = app().await.unwrap();
     let id = create(&app, "watched").await.unwrap();
     let writer = seed_writer(&db, &statuses);
     for _ in 0..3 {
@@ -381,7 +385,7 @@ async fn checks_and_incidents_endpoints_answer() {
 
 #[tokio::test]
 async fn a_stale_observation_after_edit_is_dropped() {
-    let (app, statuses, db, _wh) = app().await.unwrap();
+    let (app, statuses, db, _wh, _tmp) = app().await.unwrap();
     let id = create(&app, "stale-check").await.unwrap();
     let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(&id).unwrap());
 
@@ -417,7 +421,7 @@ async fn a_stale_observation_after_edit_is_dropped() {
 
 #[tokio::test]
 async fn stats_separates_coverage_from_success() {
-    let (app, statuses, db, _wh) = app().await.unwrap();
+    let (app, statuses, db, _wh, _tmp) = app().await.unwrap();
     let id = create(&app, "stats").await.unwrap();
     let writer = seed_writer(&db, &statuses);
     let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(&id).unwrap());
@@ -488,7 +492,7 @@ async fn stats_separates_coverage_from_success() {
 
 #[tokio::test]
 async fn invalid_input_gets_an_error_envelope() {
-    let (app, _statuses, _db, _wh) = app().await.unwrap();
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
     let response = app
         .oneshot(
             Request::post("/api/monitors")
@@ -507,4 +511,44 @@ async fn invalid_input_gets_an_error_envelope() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = json_body(response).await.unwrap();
     assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+/// Backup endpoint (M4.3): absolute paths produce a snapshot file; relative paths are a
+/// bad request — where a backup lands is the operator's explicit choice.
+#[tokio::test]
+async fn backup_writes_a_snapshot_to_an_absolute_path() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let backup = tmp.path().join("snapshot.db");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/backup")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"path": "relative.db"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let response = app
+        .oneshot(
+            Request::post("/api/backup")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"path": backup.to_str().unwrap()}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await.unwrap();
+    assert!(body["bytes"].as_u64().unwrap() > 0);
+    assert!(backup.exists());
 }

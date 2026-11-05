@@ -539,3 +539,47 @@ async fn a_landed_write_clears_the_failure_count() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Restore drill (M4.3): a live `VACUUM INTO` backup, restored as the database file,
+/// keeps an open incident open and the pending outbox event pending — nothing about the
+/// round trip replays or loses committed evidence.
+#[tokio::test]
+async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let live = tmp.path().join("live.db");
+    let db = Db::connect(&format!("sqlite:{}", live.display()), 1).await?;
+    db.migrate().await?;
+    let monitor =
+        NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+
+    let statuses = Arc::new(RwLock::new(HashMap::new()));
+    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
+    // Drive an incident open — check + incident + outbox land in one commit.
+    for _ in 0..3 {
+        handle.record(fail(&monitor)).await?;
+    }
+    assert!(db.open_incident(monitor.id).await?.is_some());
+
+    // Backup while the incident is open, then "restore": open the backup as the store.
+    let backup = tmp.path().join("backup.db");
+    let bytes = db.backup(&backup).await?;
+    assert!(bytes > 0, "a backup must not be empty");
+    drop(handle);
+    drop(db);
+
+    let restored = Db::connect(&format!("sqlite:{}", backup.display()), 1).await?;
+    let open = restored.open_incident(monitor.id).await?;
+    assert!(open.is_some(), "restored open incident stays open");
+    let due = restored.pending_outbox(10, 10).await?;
+    assert_eq!(
+        due.len(),
+        1,
+        "the pending outbox event survives the restore"
+    );
+    // Boot rebuild from the restored store reproduces `down` — not a fresh unknown.
+    let tail = restored.recent_outcomes(monitor.id, 4).await?;
+    let health = Health::rebuild(open.is_some(), &tail);
+    assert_eq!(health.status(), Status::Down);
+    Ok(())
+}

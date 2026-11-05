@@ -38,6 +38,14 @@ pub enum QueryError {
     Corrupt(String),
     #[error("value out of range: {0}")]
     OutOfRange(&'static str),
+    #[error("I/O error: {0}")]
+    Io(String),
+}
+
+impl QueryError {
+    pub(crate) fn io(error: &std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
 }
 
 /// What one `retain` pass did — for logs and tests.
@@ -131,6 +139,23 @@ impl Db {
     pub async fn migrate(&self) -> Result<(), DbError> {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
+    }
+
+    /// Online backup: `VACUUM INTO` writes one consistent snapshot file — the WAL-aware
+    /// way to copy a live database without quiescing it. This reads the store; it does
+    /// not write it, so the single-writer invariant is untouched. Returns the backup's
+    /// size in bytes — a zero-length "backup" is no backup at all.
+    pub async fn backup(&self, path: &std::path::Path) -> Result<u64, QueryError> {
+        // VACUUM INTO takes no bound parameters; the path is quoted as an SQL string
+        // literal with '' escaping — never interpolated raw (AssertSqlSafe audited).
+        let escaped = path.to_string_lossy().replace('\'', "''");
+        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{escaped}'")))
+            .execute(&self.pool)
+            .await?;
+        let bytes = std::fs::metadata(path)
+            .map_err(|error| QueryError::io(&error))?
+            .len();
+        Ok(bytes)
     }
 
     /// A cheap liveness check for `/readyz`.

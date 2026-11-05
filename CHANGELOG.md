@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- M4.3 backup + restore: `Db::backup` runs `VACUUM INTO` (a WAL-consistent online
+  snapshot — reads the store, never writes it) behind `POST /api/backup`, which requires
+  an absolute path and reports the snapshot's byte size. `scripts/backup-drill.sh`
+  rehearses the whole drill: open an incident, back up, destroy, restore, verify the
+  incident and pending outbox are still there.
 - M4.2 disk guardrails: `SMON_MAX_DB_BYTES` (default 2 GiB) caps the database via
   `PRAGMA max_page_count` at connect — writes past the ceiling fail `SQLITE_FULL`, never
   corrupt. The writer counts consecutive commit failures in `WriteHealth`; `/readyz`

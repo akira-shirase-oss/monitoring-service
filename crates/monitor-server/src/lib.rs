@@ -16,7 +16,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -78,7 +78,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/monitors/{id}/checks", get(list_checks))
         .route("/monitors/{id}/stats", get(monitor_stats))
-        .route("/incidents", get(list_incidents));
+        .route("/incidents", get(list_incidents))
+        .route("/backup", post(backup));
 
     Router::new()
         .route("/livez", get(livez))
@@ -433,6 +434,30 @@ async fn list_incidents(
         .await?;
     let incidents: Vec<IncidentView> = incidents.into_iter().map(IncidentView::from).collect();
     Ok(Json(serde_json::json!({ "incidents": incidents })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackupRequest {
+    /// Absolute path the snapshot is written to. Relative paths are rejected — where a
+    /// backup lands is an operator's explicit choice, not a cwd accident.
+    pub path: String,
+}
+
+/// Online snapshot of the store via `VACUUM INTO` (M4.3): the restore drill proves open
+/// incidents and pending outbox rows survive the round trip.
+async fn backup(
+    State(state): State<AppState>,
+    Json(input): Json<BackupRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = std::path::PathBuf::from(&input.path);
+    if !path.is_absolute() {
+        return Err(ApiError::BadId);
+    }
+    let bytes = state.db.backup(&path).await?;
+    Ok(Json(serde_json::json!({
+        "path": input.path,
+        "bytes": bytes,
+    })))
 }
 
 async fn find_monitor(state: &AppState, id: &str) -> Result<MonitorRow, ApiError> {

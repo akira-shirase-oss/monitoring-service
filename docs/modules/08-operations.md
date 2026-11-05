@@ -1,6 +1,9 @@
 # Module 08 — Operations (`scripts/`, deploy, guardrails)
 
-**Status:** dev script only; M4 target.
+**Status:** guardrails + backup live (M4.1–M4.3): `SMON_MAX_DB_BYTES` page ceiling,
+`WriteHealth` → `/readyz` 503 on failed commits, `SMON_LOG_FILE` byte-bounded rotation,
+7-day retention rolling into `check_stats_daily`, `POST /api/backup` (`VACUUM INTO`)
+with `scripts/backup-drill.sh` proving open incidents + outbox survive a restore.
 
 ## Purpose
 
