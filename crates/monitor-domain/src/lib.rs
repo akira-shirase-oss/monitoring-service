@@ -192,6 +192,9 @@ pub enum Effect {
 const FAILURES_TO_OPEN: u8 = 3;
 const PASSES_TO_RECOVER: u8 = 2;
 
+/// Per-monitor statuses as seen by readers, keyed by monitor id.
+pub type Statuses = std::collections::HashMap<MonitorId, Status>;
+
 /// The per-monitor incident state machine: streaks plus whether an incident is open.
 ///
 /// Recovery passes count only while an incident is open — passes before it mean nothing — and a
@@ -220,6 +223,30 @@ impl Health {
             incident_open: true,
             ..Self::default()
         }
+    }
+
+    /// Rebuild after restart from persisted truth: the authoritative open-incident flag plus
+    /// the monitor's most recent stored slot observations, oldest→newest. A few rows are
+    /// enough — streaks never exceed the thresholds.
+    ///
+    /// Replaying the tail through `record` recovers streaks *and* partial recovery progress:
+    /// a stored pass while the incident is open counts toward recovery, because it was fresh
+    /// evidence. At the end the store's flag wins: if replay disagrees with the incident row
+    /// (e.g. the store is inconsistent), `incident_open` is forced back to the stored value.
+    /// Forcing `open` in that case is the conservative direction — recovery waits for fresh
+    /// evidence rather than announcing it early.
+    #[must_use]
+    pub fn rebuild(incident_open: bool, tail: &[SlotObservation]) -> Self {
+        let mut health = if incident_open {
+            Self::with_open_incident()
+        } else {
+            Self::new()
+        };
+        for observation in tail {
+            health.record(*observation);
+        }
+        health.incident_open = incident_open;
+        health
     }
 
     pub fn record(&mut self, observation: SlotObservation) -> Effect {
@@ -380,6 +407,66 @@ mod tests {
         assert_eq!(health.status(), Status::Up);
         health.record(SlotObservation::Missed);
         assert_eq!(health.status(), Status::Unknown);
+    }
+
+    #[test]
+    fn rebuild_recovers_failure_streak() {
+        let tail = [
+            SlotObservation::Probe(CheckOutcome::Pass),
+            SlotObservation::Probe(CheckOutcome::Timeout),
+            SlotObservation::Probe(CheckOutcome::Transport),
+        ];
+        let mut health = Health::rebuild(false, &tail);
+        // One more failure opens the incident — the stored streak was rebuilt.
+        assert_eq!(
+            health.record(SlotObservation::Probe(CheckOutcome::HttpFail {
+                status: 500
+            })),
+            Effect::IncidentOpened
+        );
+    }
+
+    #[test]
+    fn rebuild_counts_stored_passes_toward_recovery() {
+        let tail = [
+            SlotObservation::Probe(CheckOutcome::Timeout),
+            SlotObservation::Probe(CheckOutcome::Pass),
+        ];
+        let mut health = Health::rebuild(true, &tail);
+        // The stored pass counts; one fresh pass completes recovery.
+        assert_eq!(
+            health.record(SlotObservation::Probe(CheckOutcome::Pass)),
+            Effect::IncidentRecovered
+        );
+    }
+
+    #[test]
+    fn rebuild_store_flag_wins_over_replay() {
+        // Store says the incident is open even though the tail ends in two passes —
+        // inconsistent store, so the incident stays open and recovery waits for fresh evidence.
+        let tail = [
+            SlotObservation::Probe(CheckOutcome::Pass),
+            SlotObservation::Probe(CheckOutcome::Pass),
+        ];
+        let health = Health::rebuild(true, &tail);
+        assert!(health.incident_open());
+        assert_eq!(health.status(), Status::Down);
+    }
+
+    #[test]
+    fn rebuild_missed_tail_resets_streaks() {
+        let tail = [
+            SlotObservation::Probe(CheckOutcome::Timeout),
+            SlotObservation::Probe(CheckOutcome::Timeout),
+            SlotObservation::Missed,
+        ];
+        let mut health = Health::rebuild(false, &tail);
+        assert_eq!(health.status(), Status::Unknown);
+        // The miss reset the streak: two more failures do not open an incident.
+        for _ in 0..2 {
+            health.record(SlotObservation::Probe(CheckOutcome::Timeout));
+        }
+        assert!(!health.incident_open());
     }
 
     #[test]

@@ -12,7 +12,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use monitor_domain::{Monitor, MonitorId};
+use monitor_domain::{CheckOutcome, Effect, Monitor, MonitorId, SlotObservation};
+
+pub mod writer;
+pub use writer::{Observation, SharedStatuses, WriteOutcome, WriterError, WriterHandle};
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -108,6 +111,197 @@ impl Db {
         .await?;
         Ok(row)
     }
+
+    /// The monitor's current generation — the writer compares it against the generation an
+    /// observation was claimed under.
+    pub async fn monitor_generation(&self, monitor: MonitorId) -> Result<Option<u64>, QueryError> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT generation FROM monitors WHERE id = ?")
+            .bind(monitor.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|(generation,)| {
+            u64::try_from(generation).map_err(|_| QueryError::Corrupt("negative generation".into()))
+        })
+        .transpose()
+    }
+
+    /// The `limit` most recent slot observations for a monitor, oldest→newest — the tail the
+    /// restart rebuild replays through `Health`.
+    pub async fn recent_outcomes(
+        &self,
+        monitor: MonitorId,
+        limit: i64,
+    ) -> Result<Vec<SlotObservation>, QueryError> {
+        let rows = sqlx::query_as::<_, (String, Option<i64>)>(
+            "SELECT outcome, http_status FROM checks
+             WHERE monitor_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
+        )
+        .bind(monitor.0.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .rev()
+            .map(|(outcome, http_status)| decode_outcome(outcome, *http_status))
+            .collect()
+    }
+
+    /// Check history for a monitor, newest first.
+    pub async fn list_checks(
+        &self,
+        monitor: MonitorId,
+        limit: i64,
+    ) -> Result<Vec<CheckRow>, QueryError> {
+        let rows = sqlx::query_as::<_, CheckRow>(
+            "SELECT id, monitor_id, generation, slot_at, outcome, http_status, latency_ms,
+                    detail, recorded_at
+             FROM checks WHERE monitor_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
+        )
+        .bind(monitor.0.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Outbox rows for a monitor, oldest first — delivery and tests both read this.
+    pub async fn list_outbox(&self, monitor: MonitorId) -> Result<Vec<OutboxRow>, QueryError> {
+        let rows = sqlx::query_as::<_, OutboxRow>(
+            "SELECT id, event_id, monitor_id, incident_id, kind, attempts, next_attempt_at,
+                    delivered_at, created_at
+             FROM notify_outbox WHERE monitor_id = ? ORDER BY id",
+        )
+        .bind(monitor.0.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Commit one slot's observation, its incident transition and the notification outbox row
+    /// in a single transaction — all three or none.
+    pub(crate) async fn commit_observation(
+        &self,
+        observation: &Observation,
+        effect: Effect,
+    ) -> Result<(), QueryError> {
+        let mut tx = self.pool.begin().await?;
+        let (outcome, http_status) = encode_slot(observation.slot, observation.http_status);
+        sqlx::query(
+            "INSERT INTO checks
+                (monitor_id, generation, slot_at, outcome, http_status, latency_ms, detail, recorded_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(observation.monitor_id.0.to_string())
+        .bind(i64::try_from(observation.generation).map_err(|_| QueryError::OutOfRange("generation"))?)
+        .bind(observation.slot_at)
+        .bind(outcome)
+        .bind(http_status)
+        .bind(
+            observation
+                .latency_ms
+                .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+        )
+        .bind(&observation.detail)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&mut *tx)
+        .await?;
+
+        match effect {
+            Effect::Unchanged => {}
+            Effect::IncidentOpened => {
+                let incident_id: i64 = sqlx::query_scalar(
+                    "INSERT INTO incidents (monitor_id, opened_at, state)
+                     VALUES (?, ?, 'open') RETURNING id",
+                )
+                .bind(observation.monitor_id.0.to_string())
+                .bind(observation.slot_at)
+                .fetch_one(&mut *tx)
+                .await?;
+                enqueue_outbox(
+                    &mut tx,
+                    observation.monitor_id,
+                    incident_id,
+                    "incident_opened",
+                )
+                .await?;
+            }
+            Effect::IncidentRecovered => {
+                let incident_id: Option<i64> = sqlx::query_scalar(
+                    "UPDATE incidents SET state = 'resolved', resolved_at = ?
+                     WHERE monitor_id = ? AND state = 'open' RETURNING id",
+                )
+                .bind(observation.slot_at)
+                .bind(observation.monitor_id.0.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(incident_id) = incident_id else {
+                    return Err(QueryError::Corrupt(
+                        "recovery without an open incident".into(),
+                    ));
+                };
+                enqueue_outbox(
+                    &mut tx,
+                    observation.monitor_id,
+                    incident_id,
+                    "incident_recovered",
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+async fn enqueue_outbox(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    monitor: MonitorId,
+    incident_id: i64,
+    kind: &'static str,
+) -> Result<(), QueryError> {
+    sqlx::query(
+        "INSERT INTO notify_outbox (event_id, monitor_id, incident_id, kind, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(monitor.0.to_string())
+    .bind(incident_id)
+    .bind(kind)
+    .bind(OffsetDateTime::now_utc())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Map a slot onto the `checks.outcome` text + status column.
+fn encode_slot(slot: SlotObservation, http_status: Option<u16>) -> (&'static str, Option<i64>) {
+    let status = http_status.map(i64::from);
+    match slot {
+        SlotObservation::Missed => ("missed", None),
+        SlotObservation::Probe(CheckOutcome::Pass) => ("pass", status),
+        SlotObservation::Probe(CheckOutcome::HttpFail { .. }) => ("http_fail", status),
+        SlotObservation::Probe(CheckOutcome::Transport) => ("transport", None),
+        SlotObservation::Probe(CheckOutcome::Timeout) => ("timeout", None),
+    }
+}
+
+/// Rebuild a `SlotObservation` from a stored row; unknown text is corruption, not a default.
+fn decode_outcome(outcome: &str, http_status: Option<i64>) -> Result<SlotObservation, QueryError> {
+    let status = http_status
+        .map(|value| {
+            u16::try_from(value).map_err(|_| QueryError::Corrupt("http_status out of range".into()))
+        })
+        .transpose()?;
+    Ok(match outcome {
+        "missed" => SlotObservation::Missed,
+        "pass" => SlotObservation::Probe(CheckOutcome::Pass),
+        "http_fail" => SlotObservation::Probe(CheckOutcome::HttpFail {
+            status: status.ok_or_else(|| QueryError::Corrupt("http_fail without status".into()))?,
+        }),
+        "transport" => SlotObservation::Probe(CheckOutcome::Transport),
+        "timeout" => SlotObservation::Probe(CheckOutcome::Timeout),
+        other => return Err(QueryError::Corrupt(format!("unknown outcome {other:?}"))),
+    })
 }
 
 /// One `monitors` row, as stored. Converting to `Monitor` validates the stored strings again —
@@ -158,4 +352,30 @@ pub struct IncidentRow {
     pub opened_at: OffsetDateTime,
     pub resolved_at: Option<OffsetDateTime>,
     pub state: String,
+}
+
+#[derive(Debug, FromRow)]
+pub struct CheckRow {
+    pub id: i64,
+    pub monitor_id: String,
+    pub generation: i64,
+    pub slot_at: OffsetDateTime,
+    pub outcome: String,
+    pub http_status: Option<i64>,
+    pub latency_ms: Option<i64>,
+    pub detail: Option<String>,
+    pub recorded_at: OffsetDateTime,
+}
+
+#[derive(Debug, FromRow)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub event_id: String,
+    pub monitor_id: String,
+    pub incident_id: i64,
+    pub kind: String,
+    pub attempts: i64,
+    pub next_attempt_at: Option<OffsetDateTime>,
+    pub delivered_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
 }

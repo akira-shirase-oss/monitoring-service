@@ -23,18 +23,28 @@ and a static SvelteKit dashboard, and never paints missing data green.
 - `apps/dashboard`: static SvelteKit + Tailwind v4 + shadcn-svelte; an unreachable server is
   shown as "cannot see", not as a green board.
 
-Not yet: scheduling/probes, incident writes, notifications, the public status renderer, auth,
-SSRF guards, failure fixtures, load runs. Numbers in docs are targets, not measurements.
+Built: coordinator (one attempt per slot, bounded concurrency, counted misses), the probe
+engine (GET only, deadline + body bounds, classified outcomes, URL-layer target policy), the
+single-writer task (check + incident + outbox in one transaction), restart rebuild, and real
+statuses in the API. `SMON_PROFILE=lab` permits loopback targets for fixtures.
+
+Not yet: notifications delivery, monitor edit/pause routes, incidents API, the public status
+renderer, auth, redirect/DNS-level SSRF guards, failure fixtures, load runs. Numbers in docs
+are targets, not measurements.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `crates/monitor-domain` | Pure domain: types, validation, the incident state machine. No I/O — enforced by `scripts/check-architecture.sh`. |
-| `crates/monitor-db` | SQLite persistence (`sqlx`, WAL + foreign keys). Migrations in `crates/monitor-db/migrations/`. |
-| `crates/monitor-server` | The `monitor-server` binary: Axum management API now, probe coordinator later. |
+| `crates/monitor-db` | SQLite persistence (`sqlx`, WAL + foreign keys) and the single-writer task. Migrations in `crates/monitor-db/migrations/`. |
+| `crates/monitor-server` | The `monitor-server` binary: Axum management API, coordinator + probe workers, alert deliverer. |
 | `crates/monitor-cli` | The `monitor` binary: talks to the HTTP API, same path as the dashboard. |
 | `apps/dashboard` | SvelteKit static app (Tailwind v4, shadcn-svelte). Vite dev on :58600 proxies the API to :58400. |
+| `docs/END_GOAL.md` | What done means; in/out of scope; the ship gate. |
+| `docs/ARCHITECTURE.md` | Sources of truth, process model, data paths, bounds. |
+| `docs/ROADMAP.md` | Milestones M0–M5; every step's outcome/invariant/failure case/acceptance test. |
+| `docs/modules/` | Per-module contracts with testing parameters (01 domain … 09 testing/load). |
 | `docs/DECISIONS.md` | Permanent `D-NNN` decisions, newest first. |
 | `fixtures/`, `perf/` | Failure fixtures and load runs — placeholders until the coordinator exists. |
 

@@ -1,21 +1,31 @@
 //! Black-box tests against the real router on an in-memory database.
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use monitor_db::Db;
 use monitor_server::{AppState, router};
+use tokio::sync::watch;
 use tower::ServiceExt;
 
-async fn app() -> anyhow::Result<Router> {
+/// Builds the router and returns it with the shared pieces tests drive directly.
+async fn app() -> anyhow::Result<(Router, Arc<RwLock<monitor_domain::Statuses>>)> {
     // One connection: pooled checkouts of sqlite::memory: would each see a different database.
     let db = Db::connect("sqlite::memory:", 1).await?;
     db.migrate().await?;
-    Ok(router(AppState {
+    let statuses = Arc::new(RwLock::new(HashMap::new()));
+    let (registry, _rx) = watch::channel(Arc::new(Vec::new()));
+    let app = router(AppState {
         db,
+        statuses: Arc::clone(&statuses),
+        registry,
         version: "test",
-    }))
+    });
+    Ok((app, statuses))
 }
 
 async fn json_body(response: axum::response::Response) -> anyhow::Result<serde_json::Value> {
@@ -25,7 +35,7 @@ async fn json_body(response: axum::response::Response) -> anyhow::Result<serde_j
 
 #[tokio::test]
 async fn livez_and_readyz_answer() {
-    let app = app().await.unwrap();
+    let (app, _statuses) = app().await.unwrap();
     for path in ["/livez", "/readyz"] {
         let response = app
             .clone()
@@ -38,7 +48,7 @@ async fn livez_and_readyz_answer() {
 
 #[tokio::test]
 async fn create_then_list_a_monitor() {
-    let app = app().await.unwrap();
+    let (app, _statuses) = app().await.unwrap();
 
     let response = app
         .clone()
@@ -72,7 +82,7 @@ async fn create_then_list_a_monitor() {
 
 #[tokio::test]
 async fn invalid_input_gets_an_error_envelope() {
-    let app = app().await.unwrap();
+    let (app, _statuses) = app().await.unwrap();
     let response = app
         .oneshot(
             Request::post("/api/monitors")

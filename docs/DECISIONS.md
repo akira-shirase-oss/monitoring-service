@@ -2,6 +2,15 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-007 — Missed slots are stored `checks` rows, not gaps
+
+The scaffold's schema comment said a missed slot would be "visible by the absence of a row."
+That model breaks restart rebuild: the rebuild replays stored outcomes, and two failures
+separated by an unstored miss would replay as consecutive — fabricating an incident that never
+opened. Every slot now produces a row (`outcome = 'missed'` for slots that never ran), so
+coverage, streak rebuild and replay all read the same history. Coverage % = non-missed /
+total rows.
+
 ## D-006 — Ports: 58400 for the server, 58600 for the dashboard's dev server
 
 `SMON_LISTEN` defaults to `127.0.0.1:58400`; vite dev runs on `127.0.0.1:58600` and proxies

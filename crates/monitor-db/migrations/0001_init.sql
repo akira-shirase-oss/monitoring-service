@@ -13,14 +13,16 @@ CREATE TABLE monitors (
     created_at  TEXT NOT NULL
 );
 
--- One row per probe that produced an observation. Missed slots are *not* rows here:
--- they are coverage gaps, visible by the absence of a row for a due slot.
+-- One row per slot — including `missed` slots. A miss is recorded evidence: the streak
+-- rebuild after restart replays this table, and a gap that reset streaks must replay as a
+-- gap (absent rows would count pre-miss and post-miss failures as consecutive, fabricating
+-- an incident that never opened). Coverage = non-missed rows / total rows.
 CREATE TABLE checks (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     monitor_id   TEXT NOT NULL REFERENCES monitors (id),
     generation   INTEGER NOT NULL,            -- monitor generation when the slot was claimed
     slot_at      TEXT NOT NULL,               -- the scheduled slot, not when the row landed
-    outcome      TEXT NOT NULL CHECK (outcome IN ('pass', 'http_fail', 'transport', 'timeout')),
+    outcome      TEXT NOT NULL CHECK (outcome IN ('pass', 'http_fail', 'transport', 'timeout', 'missed')),
     http_status  INTEGER,
     latency_ms   INTEGER,
     detail       TEXT,                        -- classified, sanitized — never tokens or bodies

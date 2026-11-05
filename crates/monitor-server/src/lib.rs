@@ -1,9 +1,13 @@
-//! The management API and, later, the probe coordinator's host.
+//! The management API and the probe coordinator's host.
 //!
-//! Scaffold scope: `/livez`, `/readyz` and `GET|POST /api/monitors`. The probe contract's
-//! scheduling rules (one attempt per slot, bounded everything, SSRF guards) arrive with the
-//! coordinator — nothing here probes yet, so no management route can touch the network.
+//! `/livez`, `/readyz` and `GET|POST /api/monitors` for management; `probe` and `schedule`
+//! carry the observing loop. Statuses served here come only from the committed-evidence map
+//! the writer publishes — never from in-flight probes.
 
+pub mod probe;
+pub mod schedule;
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -14,24 +18,49 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
+use tokio::sync::watch;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use monitor_db::{Db, MonitorRow, QueryError};
-use monitor_domain::{NewMonitor, Status, ValidationError};
+use monitor_db::{Db, MonitorRow, QueryError, SharedStatuses};
+use monitor_domain::{Monitor, NewMonitor, Status, ValidationError};
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
 const BODY_LIMIT: usize = 16 * 1024;
-/// Every handler answers inside this; probes will run on their own deadlines elsewhere.
+/// Every handler answers inside this; probes run on their own deadlines elsewhere.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
+    /// Committed statuses, published by the writer after each commit.
+    pub statuses: SharedStatuses,
+    /// The live monitor set the coordinator schedules against. Management writes re-send it.
+    pub registry: watch::Sender<Arc<Vec<Monitor>>>,
     pub version: &'static str,
+}
+
+/// Re-read the store and publish the monitor set the coordinator schedules against.
+/// No receivers (e.g. a test router without a coordinator) is not an error.
+pub async fn publish_registry(state: &AppState) -> Result<(), ApiError> {
+    let monitors = load_registry(&state.db).await?;
+    if state.registry.send(Arc::new(monitors)).is_err() {
+        tracing::debug!("no coordinator listening for registry updates");
+    }
+    Ok(())
+}
+
+/// The registry is the stored monitor set converted through the domain — corrupt rows are
+/// corruption, not a monitor to skip quietly.
+pub async fn load_registry(db: &Db) -> Result<Vec<Monitor>, QueryError> {
+    db.list_monitors()
+        .await?
+        .into_iter()
+        .map(Monitor::try_from)
+        .collect()
 }
 
 pub fn router(state: AppState) -> Router {
@@ -76,7 +105,8 @@ struct MonitorView {
     timeout_s: u64,
     generation: u64,
     paused: bool,
-    /// No probe history is read yet, so the honest answer is always `unknown`.
+    /// From the committed-evidence map only — a monitor with no committed observations is
+    /// `unknown`, and an unwritten result can never appear here.
     status: Status,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
@@ -86,7 +116,7 @@ async fn list_monitors(State(state): State<AppState>) -> Result<Json<serde_json:
     let rows = state.db.list_monitors().await?;
     let monitors: Vec<MonitorView> = rows
         .into_iter()
-        .map(view_from_row)
+        .map(|row| view_from_row(row, &state.statuses))
         .collect::<Result<_, _>>()?;
     Ok(Json(serde_json::json!({ "monitors": monitors })))
 }
@@ -101,7 +131,7 @@ async fn get_monitor(
         .into_iter()
         .find(|row| row.id == id.to_string())
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(view_from_row(row)?))
+    Ok(Json(view_from_row(row, &state.statuses)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,15 +159,19 @@ async fn create_monitor(
     .map_err(ApiError::Validation)?;
     let monitor = new.into_monitor();
     state.db.insert_monitor(&monitor).await?;
+    publish_registry(&state).await?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": monitor.id.0 })),
     ))
 }
 
-fn view_from_row(row: MonitorRow) -> Result<MonitorView, ApiError> {
+fn view_from_row(row: MonitorRow, statuses: &SharedStatuses) -> Result<MonitorView, ApiError> {
     let created_at = row.created_at;
     let monitor = monitor_domain::Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+    let status = statuses.read().map_or(Status::Unknown, |map| {
+        map.get(&monitor.id).copied().unwrap_or(Status::Unknown)
+    });
     Ok(MonitorView {
         id: monitor.id.0,
         name: monitor.name,
@@ -146,7 +180,7 @@ fn view_from_row(row: MonitorRow) -> Result<MonitorView, ApiError> {
         timeout_s: monitor.timeout.as_secs(),
         generation: monitor.generation,
         paused: monitor.paused,
-        status: Status::Unknown,
+        status,
         created_at,
     })
 }

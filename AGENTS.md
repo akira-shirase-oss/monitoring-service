@@ -4,16 +4,24 @@ The rebuild of the old service monitor, per `Project_Guides/02_Service_Monitor_R
 (read it first — it is the contract). The old code is gone (D-001); the guide plus the
 404human.dev build log are the specification.
 
-**Current state (2026-11-05): scaffold.** Management API (`/livez`, `/readyz`, `GET|POST
-/api/monitors`, `GET /api/monitors/{id}`), SQLite store with migration 0001, the incident state
-machine with tests, the `monitor` CLI, and the dashboard shell. No probes, scheduling, incident
-writes, notifications, auth, or status renderer yet. Next slice: the coordinator (one typed
-check, bounded scheduling, transactional history, restart behavior — guide step 2).
+**Current state (2026-11-05): M1 "check and remember" done.** The observing loop is real:
+coordinator (`schedule.rs`, one attempt per slot, `try_acquire` bounds, counted misses),
+probe engine (`probe.rs`, GET only, deadline + 64 KiB body bound, classified outcomes,
+URL-layer target policy), single-writer task (`monitor-db::writer`, check + incident +
+outbox in one transaction), `Health::rebuild` restart recovery, and statuses in the API that
+only reflect committed evidence. No notification delivery, monitor edit/pause, incidents
+API, auth, DNS-level SSRF guards, or status renderer yet. Next slice: M2 Notify — the outbox
+deliverer, monitor management writes, incidents API, fault fixtures. `SMON_PROFILE=lab`
+permits loopback targets for fixtures.
 
 ## Read first
 
-1. `docs/DECISIONS.md` — permanent decisions (D-001 baseline missing, D-005 provisional status semantics).
-2. `Project_Guides/02_Service_Monitor_Rebuild.docx` — the engineering contract. When code and
+1. `docs/END_GOAL.md` (what done means) → `docs/ARCHITECTURE.md` (sources of truth, process
+   model) → `docs/ROADMAP.md` (milestones; each step carries outcome, invariant, failure case,
+   acceptance test) → the module doc for the area you are touching under `docs/modules/`.
+2. `docs/DECISIONS.md` — permanent decisions (D-001 baseline missing, D-005 provisional status
+   semantics). Record new decisions here.
+3. `Project_Guides/02_Service_Monitor_Rebuild.docx` — the engineering contract. When code and
    guide disagree, the guide wins unless a `D-NNN` says otherwise.
 
 ## What this project optimizes for
