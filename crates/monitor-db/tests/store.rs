@@ -152,6 +152,74 @@ async fn check_stats_counts_window_rows_and_leaves_expected_to_the_caller() -> a
 }
 
 #[tokio::test]
+async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let second =
+        NewMonitor::new("second", url::Url::parse("https://two.example.com")?)?.into_monitor();
+    db.insert_monitor(&second).await?;
+
+    let old = OffsetDateTime::now_utc() - time::Duration::days(9);
+    let aged = |m: &Monitor, outcome: CheckOutcome| {
+        let mut observation = probe(m, outcome);
+        observation.slot_at = old;
+        observation
+    };
+    // Monitor A (no incident): 2 old passes + 1 old failure + 1 old missed → expired.
+    writer.record(aged(&monitor, CheckOutcome::Pass)).await?;
+    writer.record(aged(&monitor, CheckOutcome::Pass)).await?;
+    writer
+        .record(aged(&monitor, CheckOutcome::HttpFail { status: 500 }))
+        .await?;
+    writer
+        .record({
+            let mut observation = missed(&monitor);
+            observation.slot_at = old;
+            observation
+        })
+        .await?;
+    // Monitor B: 3 old failures → an open incident born 9 days ago, still open.
+    for _ in 0..3 {
+        writer
+            .record(aged(&second, CheckOutcome::Transport))
+            .await?;
+    }
+    assert!(db.open_incident(second.id).await?.is_some());
+    // Recent rows for A — inside the window, must stay raw.
+    writer.record(pass(&monitor)).await?;
+
+    let report = writer
+        .retain(OffsetDateTime::now_utc() - time::Duration::days(7))
+        .await?;
+    assert_eq!(report.rows_deleted, 4, "monitor A's four expired rows");
+    assert_eq!(report.days_written, 1, "one monitor-day aggregated");
+
+    // A: raw expired rows are gone, aggregates carry their counts; the recent row is raw.
+    let checks = db.list_checks(monitor.id, 50).await?;
+    assert_eq!(checks.len(), 1);
+    let stats = db
+        .check_stats(
+            monitor.id,
+            OffsetDateTime::now_utc() - time::Duration::days(10),
+        )
+        .await?;
+    assert_eq!((stats.observed, stats.passed, stats.missed), (4, 3, 1));
+
+    // B: open incident → every raw row preserved, nothing aggregated away.
+    assert_eq!(db.list_checks(second.id, 50).await?.len(), 3);
+    let stats_b = db
+        .check_stats(
+            second.id,
+            OffsetDateTime::now_utc() - time::Duration::days(10),
+        )
+        .await?;
+    assert_eq!(stats_b.observed, 3);
+
+    // Outbox is never expired: monitor B's incident_opened event is still there.
+    assert_eq!(db.list_outbox(second.id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn stale_and_unknown_observations_are_dropped() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
 

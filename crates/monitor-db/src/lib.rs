@@ -36,6 +36,15 @@ pub enum QueryError {
     OutOfRange(&'static str),
 }
 
+/// What one `retain` pass did — for logs and tests.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainReport {
+    /// Daily-aggregate rows the pass wrote or merged.
+    pub days_written: u64,
+    /// Raw check rows the pass deleted after aggregating.
+    pub rows_deleted: u64,
+}
+
 /// A handle to the monitor's SQLite store.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -257,17 +266,33 @@ impl Db {
 
     /// Outcome counts for a monitor since `since` — the row half of `CoverageStats`;
     /// the API computes `expected` from the monitor's interval over the elapsed window.
+    /// Unions live rows with the daily aggregates retention writes, so coverage over
+    /// long windows stays honest after raw rows expire.
     pub async fn check_stats(
         &self,
         monitor: MonitorId,
         since: OffsetDateTime,
     ) -> Result<CoverageStats, QueryError> {
+        let day = since.date().to_string();
         let rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT outcome, COUNT(*) FROM checks
-             WHERE monitor_id = ? AND slot_at >= ? GROUP BY outcome",
+            "SELECT outcome, SUM(c) FROM (
+               SELECT outcome, COUNT(*) AS c FROM checks
+                WHERE monitor_id = ?1 AND slot_at >= ?2 GROUP BY outcome
+               UNION ALL SELECT 'pass', pass FROM check_stats_daily
+                WHERE monitor_id = ?1 AND day >= ?3
+               UNION ALL SELECT 'http_fail', http_fail FROM check_stats_daily
+                WHERE monitor_id = ?1 AND day >= ?3
+               UNION ALL SELECT 'transport', transport FROM check_stats_daily
+                WHERE monitor_id = ?1 AND day >= ?3
+               UNION ALL SELECT 'timeout', timeout FROM check_stats_daily
+                WHERE monitor_id = ?1 AND day >= ?3
+               UNION ALL SELECT 'missed', missed FROM check_stats_daily
+                WHERE monitor_id = ?1 AND day >= ?3
+             ) GROUP BY outcome",
         )
         .bind(monitor.0.to_string())
         .bind(since)
+        .bind(day)
         .fetch_all(&self.pool)
         .await?;
         let (mut observed, mut missed, mut passed) = (0_u64, 0_u64, 0_u64);
@@ -288,6 +313,48 @@ impl Db {
             observed,
             missed,
             passed,
+        })
+    }
+
+    /// Retention pass: roll checks older than `cutoff` into `check_stats_daily`, then
+    /// delete the raw rows — one transaction, so a crash can't produce history that is
+    /// neither raw nor aggregated. Monitors with an open incident keep their raw rows:
+    /// an incident's birth evidence never expires while the incident is open.
+    /// Called only by the single writer.
+    pub async fn retain(&self, cutoff: OffsetDateTime) -> Result<RetainReport, QueryError> {
+        let mut tx = self.pool.begin().await?;
+        let aggregated = sqlx::query(
+            "INSERT INTO check_stats_daily
+                (monitor_id, day, pass, http_fail, transport, timeout, missed)
+             SELECT monitor_id, date(slot_at),
+                    SUM(outcome = 'pass'), SUM(outcome = 'http_fail'),
+                    SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
+                    SUM(outcome = 'missed')
+             FROM checks
+             WHERE slot_at < ?1
+               AND monitor_id NOT IN (SELECT monitor_id FROM incidents WHERE state = 'open')
+             GROUP BY monitor_id, date(slot_at)
+             ON CONFLICT (monitor_id, day) DO UPDATE SET
+                pass = check_stats_daily.pass + excluded.pass,
+                http_fail = check_stats_daily.http_fail + excluded.http_fail,
+                transport = check_stats_daily.transport + excluded.transport,
+                timeout = check_stats_daily.timeout + excluded.timeout,
+                missed = check_stats_daily.missed + excluded.missed",
+        )
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query(
+            "DELETE FROM checks WHERE slot_at < ?1
+             AND monitor_id NOT IN (SELECT monitor_id FROM incidents WHERE state = 'open')",
+        )
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(RetainReport {
+            days_written: aggregated.rows_affected(),
+            rows_deleted: deleted.rows_affected(),
         })
     }
 

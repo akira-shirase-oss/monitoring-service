@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 
 use monitor_domain::{Effect, Health, MonitorId, SlotObservation, Statuses};
 
-use crate::{Db, QueryError};
+use crate::{Db, QueryError, RetainReport};
 
 /// The statuses readers see — written only after commits, never from in-flight results.
 pub type SharedStatuses = Arc<RwLock<Statuses>>;
@@ -70,6 +70,12 @@ enum Command {
         delivered_at: Option<OffsetDateTime>,
         reply: oneshot::Sender<Result<(), QueryError>>,
     },
+    /// A retention pass: aggregate + delete expired checks in one transaction. Goes
+    /// through the writer like everything else — the store has one owner.
+    Retain {
+        cutoff: OffsetDateTime,
+        reply: oneshot::Sender<Result<RetainReport, QueryError>>,
+    },
 }
 
 /// Cloneable sender for the single writer.
@@ -117,6 +123,18 @@ impl WriterHandle {
             .map_err(|_| WriterError::Dead)?;
         rx.await.map_err(|_| WriterError::Dead)?.map_err(Into::into)
     }
+
+    /// Run one retention pass: checks older than `cutoff` are rolled into daily
+    /// aggregates and deleted in the same transaction. Open incidents and the outbox
+    /// are never touched.
+    pub async fn retain(&self, cutoff: OffsetDateTime) -> Result<RetainReport, WriterError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Retain { cutoff, reply })
+            .await
+            .map_err(|_| WriterError::Dead)?;
+        rx.await.map_err(|_| WriterError::Dead)?.map_err(Into::into)
+    }
 }
 
 /// Spawn the writer. `health` is the boot-rebuilt map (`Health::rebuild` per monitor); the
@@ -159,6 +177,12 @@ async fn run(
                     .await;
                 if reply.send(outcome).is_err() {
                     debug!("delivery reply channel closed; mark still committed");
+                }
+            }
+            Command::Retain { cutoff, reply } => {
+                let outcome = db.retain(cutoff).await;
+                if reply.send(outcome).is_err() {
+                    debug!("retain reply channel closed; pass still committed");
                 }
             }
         }

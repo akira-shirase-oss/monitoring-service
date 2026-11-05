@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- M4.1 retention: checks older than `SMON_RETENTION_S` (default 7 d) roll into
+  `check_stats_daily` (per-day outcome counts, migration 0002) and delete in the same
+  transaction — one commit, so a crash can't leave history that is neither raw nor summed.
+  The pass runs through the single writer every `SMON_RETENTION_INTERVAL_S` (default 1 h),
+  spares every raw row belonging to a monitor with an open incident, never touches the
+  outbox, and `check_stats` unions both tables so long-window coverage stays honest.
 - M3.4 browser suite: `apps/dashboard/tests/dashboard.spec.ts` driven by `scripts/e2e.sh` —
   Playwright runs the real `monitor-server` (serving the built dashboard on its own origin)
   plus the fault fixture on e2e-only ports. Specs: aborted API renders "cannot see" with no

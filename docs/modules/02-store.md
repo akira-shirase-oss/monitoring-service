@@ -1,6 +1,8 @@
 # Module 02 — Store (`crates/monitor-db`)
 
-**Status:** single-writer task live (M1); retention arrives in M4.
+**Status:** single-writer task live (M1); retention live (M4.1): checks older than
+`SMON_RETENTION_S` (default 7 d) roll into `check_stats_daily` and delete in one transaction;
+monitors with open incidents keep raw rows; `check_stats` unions both tables.
 
 ## Purpose
 

@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             .map(String::into_bytes);
         let _deliverer_task = Deliverer::spawn(
             db.clone(),
-            writer,
+            writer.clone(),
             DelivererConfig {
                 target: Some(target),
                 secret,
@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let _snapshot_task = spawn_snapshot(&db, &statuses, &shutdown);
+    let _retention_task = spawn_retention(&writer, &shutdown);
 
     let mut app = router(AppState {
         db,
@@ -160,6 +161,51 @@ fn spawn_snapshot(
         },
         shutdown.clone(),
     )
+}
+
+/// Retention (M4.1): raw checks live `SMON_RETENTION_S` (default 7 days), then roll into
+/// daily aggregates. Passes go through the single writer, `SMON_RETENTION_INTERVAL_S`
+/// apart (default hourly) — expiry never touches open incidents or the outbox.
+fn spawn_retention(
+    writer: &monitor_db::writer::WriterHandle,
+    shutdown: &CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let env_secs = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let keep = Duration::from_secs(env_secs("SMON_RETENTION_S", 7 * 86_400));
+    let every = Duration::from_secs(env_secs("SMON_RETENTION_INTERVAL_S", 3_600));
+    let writer = writer.clone();
+    let shutdown = shutdown.clone();
+    tracing::info!(
+        keep_s = keep.as_secs(),
+        every_s = every.as_secs(),
+        "retention armed"
+    );
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(every);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => {}
+                () = shutdown.cancelled() => return,
+            }
+            let cutoff = time::OffsetDateTime::now_utc()
+                - time::Duration::try_from(keep).unwrap_or(time::Duration::MAX);
+            match writer.retain(cutoff).await {
+                Ok(report) if report.rows_deleted > 0 => tracing::info!(
+                    days = report.days_written,
+                    rows = report.rows_deleted,
+                    "retention pass"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "retention pass failed"),
+            }
+        }
+    })
 }
 
 async fn shutdown_signal(coordinator_stop: CancellationToken) {

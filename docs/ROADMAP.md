@@ -64,7 +64,7 @@ remembering if a fixture ever counts hits.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 4.1 retention: 7-day raw + aggregates | bounded history | live data never expires | expiry never touches open incidents/open outbox | seeded-retention test |
+| 4.1 retention: 7-day raw + aggregates **(done)** | `check_stats_daily` (migration 0002); `writer.retain` rolls expired rows into per-day outcome counts and deletes them in one transaction; task ticks hourly (`SMON_RETENTION_S`, `SMON_RETENTION_INTERVAL_S`) | live data never expires; `check_stats` unions raw + aggregate so coverage stays honest | expiry never touches open incidents (raw rows spared while `state='open'`) or the outbox | `retention_aggregates_then_deletes_and_spares_open_incidents`; live: 3 expired → aggregate, stats union shows 6 observed |
 | 4.2 disk guardrails + log rotation | ~2 GiB ceiling, bounded logs | pressure → fail-safe, not corruption | full disk → writes fail, status shows unavailable | disk-pressure fixture |
 | 4.3 backup + restore drill | documented restore that works | restored open incidents stay open | restore mid-incident | restore drill script + test |
 | 4.4 deploy off target host | monitor runs independently | separate probe host, status host | upgrade/rollback | deploy runbook exercised |
