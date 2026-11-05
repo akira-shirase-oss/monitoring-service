@@ -1,0 +1,25 @@
+# OS and editor files
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Rust
+/target/
+
+# Node / SvelteKit
+node_modules/
+.svelte-kit/
+build/
+dist/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime data: the SQLite database and its WAL sidecars
+*.db
+*.db-shm
+*.db-wal
+/var/

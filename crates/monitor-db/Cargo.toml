@@ -1,0 +1,20 @@
+[package]
+name = "monitor-db"
+description = "SQLite persistence for Service Monitor: monitors, checks, incidents and the notification outbox."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+monitor-domain.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

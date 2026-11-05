@@ -1,0 +1,17 @@
+{
+  "name": "service-monitor",
+  "private": true,
+  "description": "Service Monitor: the JavaScript workspace (the dashboard and, later, the public status renderer).",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.17"
+  },
+  "scripts": {
+    "check": "npm run check --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  }
+}

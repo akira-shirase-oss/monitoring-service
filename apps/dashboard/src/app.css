@@ -1,0 +1,178 @@
+/*
+ * Service Monitor's design tokens: Tailwind CSS v4 with shadcn-svelte, sharing the portfolio's
+ * look — paper and ink, hairline rules, black pill buttons — with the status colours a monitor
+ * actually speaks: green for up, red for down, amber for pending, grey for unknown/dark.
+ * Dark mode is a warm near-black.
+ */
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import '@fontsource-variable/inter/opsz.css';
+@import '@fontsource-variable/jetbrains-mono';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+	--radius: 0.75rem;
+
+	--background: oklch(0.986 0.003 75);
+	--foreground: oklch(0.19 0.004 60);
+	--card: oklch(1 0 0);
+	--card-foreground: var(--foreground);
+	--popover: oklch(1 0 0);
+	--popover-foreground: var(--foreground);
+	--primary: oklch(0.17 0.003 60);
+	--primary-foreground: oklch(0.99 0.002 75);
+	--secondary: oklch(0.966 0.004 75);
+	--secondary-foreground: var(--foreground);
+	--muted: oklch(0.966 0.004 75);
+	--muted-foreground: oklch(0.49 0.006 60);
+	--accent: oklch(0.955 0.005 75);
+	--accent-foreground: var(--foreground);
+	--destructive: oklch(0.54 0.2 27);
+	--border: oklch(0.925 0.004 75);
+	--input: oklch(0.912 0.004 75);
+	--ring: oklch(0.58 0.17 42);
+
+	--brand: oklch(0.68 0.18 42);
+	--brand-ink: oklch(0.5 0.15 40);
+	--brand-soft: oklch(0.96 0.03 55);
+
+	/* Status: a mark, a soft ground for pills, and an ink that reads on it. */
+	--live: oklch(0.66 0.16 150);
+	--live-soft: oklch(0.965 0.035 150);
+	--live-ink: oklch(0.44 0.11 150);
+	--pending: oklch(0.77 0.15 75);
+	--pending-soft: oklch(0.97 0.045 85);
+	--pending-ink: oklch(0.47 0.1 65);
+	--attention: oklch(0.6 0.2 27);
+	--attention-soft: oklch(0.965 0.025 25);
+	--attention-ink: oklch(0.49 0.17 27);
+	--draft: oklch(0.65 0.005 60);
+	--draft-soft: oklch(0.955 0.003 75);
+	--draft-ink: oklch(0.44 0.006 60);
+
+	--shadow-hairline: 0 1px 2px oklch(0.2 0.01 60 / 0.05);
+	--shadow-soft: 0 1px 2px oklch(0.2 0.01 60 / 0.04), 0 6px 20px -8px oklch(0.2 0.01 60 / 0.1);
+	--shadow-float: 0 1px 2px oklch(0.2 0.01 60 / 0.04), 0 32px 64px -24px oklch(0.35 0.05 40 / 0.28);
+}
+
+.dark {
+	--background: oklch(0.16 0.004 60);
+	--foreground: oklch(0.96 0.003 75);
+	--card: oklch(0.2 0.004 60);
+	--card-foreground: var(--foreground);
+	--popover: oklch(0.21 0.004 60);
+	--popover-foreground: var(--foreground);
+	--primary: oklch(0.97 0.002 75);
+	--primary-foreground: oklch(0.17 0.003 60);
+	--secondary: oklch(0.245 0.004 60);
+	--secondary-foreground: var(--foreground);
+	--muted: oklch(0.245 0.004 60);
+	--muted-foreground: oklch(0.72 0.005 75);
+	--accent: oklch(0.27 0.005 60);
+	--accent-foreground: var(--foreground);
+	--destructive: oklch(0.68 0.18 27);
+	--border: oklch(0.29 0.005 60);
+	--input: oklch(0.33 0.005 60);
+	--ring: oklch(0.72 0.16 45);
+	--brand: oklch(0.72 0.17 45);
+	--brand-ink: oklch(0.78 0.13 50);
+	--brand-soft: oklch(0.27 0.04 45);
+	--live: oklch(0.74 0.15 150);
+	--live-soft: oklch(0.27 0.045 150);
+	--live-ink: oklch(0.86 0.1 150);
+	--pending: oklch(0.82 0.14 80);
+	--pending-soft: oklch(0.29 0.05 75);
+	--pending-ink: oklch(0.89 0.1 85);
+	--attention: oklch(0.7 0.17 27);
+	--attention-soft: oklch(0.28 0.06 27);
+	--attention-ink: oklch(0.87 0.08 27);
+	--draft: oklch(0.65 0.005 75);
+	--draft-soft: oklch(0.26 0.004 60);
+	--draft-ink: oklch(0.85 0.004 75);
+	--shadow-hairline: 0 1px 2px oklch(0 0 0 / 0.3);
+	--shadow-soft: 0 1px 2px oklch(0 0 0 / 0.3), 0 8px 24px -10px oklch(0 0 0 / 0.5);
+	--shadow-float: 0 1px 2px oklch(0 0 0 / 0.3), 0 32px 64px -24px oklch(0 0 0 / 0.7);
+}
+
+@theme inline {
+	--font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+	--font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, monospace;
+
+	/* No text under 14px anywhere. */
+	--text-xs: 0.875rem;
+	--text-xs--line-height: 1.25rem;
+
+	--radius-sm: calc(var(--radius) * 0.5);
+	--radius-md: calc(var(--radius) * 0.75);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) * 1.33);
+
+	--shadow-hairline: var(--shadow-hairline);
+	--shadow-soft: var(--shadow-soft);
+	--shadow-float: var(--shadow-float);
+
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+	--color-brand: var(--brand);
+	--color-brand-ink: var(--brand-ink);
+	--color-brand-soft: var(--brand-soft);
+	--color-live: var(--live);
+	--color-live-soft: var(--live-soft);
+	--color-live-ink: var(--live-ink);
+	--color-pending: var(--pending);
+	--color-pending-soft: var(--pending-soft);
+	--color-pending-ink: var(--pending-ink);
+	--color-attention: var(--attention);
+	--color-attention-soft: var(--attention-soft);
+	--color-attention-ink: var(--attention-ink);
+	--color-draft: var(--draft);
+	--color-draft-soft: var(--draft-soft);
+	--color-draft-ink: var(--draft-ink);
+}
+
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+	}
+	html {
+		@apply bg-background;
+	}
+	body {
+		@apply bg-background font-sans text-foreground antialiased;
+		font-optical-sizing: auto;
+		font-feature-settings: 'cv11', 'ss01';
+	}
+	h1,
+	h2,
+	h3 {
+		text-wrap: balance;
+	}
+	.tabular {
+		font-variant-numeric: tabular-nums;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		*,
+		*::before,
+		*::after {
+			animation-duration: 0.01ms !important;
+			transition-duration: 0.01ms !important;
+		}
+	}
+}

@@ -1,0 +1,67 @@
+# Service Monitor
+
+Tell the truth about availability — including when the monitor itself cannot see.
+
+The deliberate rebuild described in the Akira Shirase OSS project guides
+(`Project_Guides/02_Service_Monitor_Rebuild.docx`): a Rust engine that probes a small number of
+authorized HTTP services on a schedule, stores evidence in local SQLite, reports through a CLI
+and a static SvelteKit dashboard, and never paints missing data green.
+
+## Status
+
+**Scaffold.** What exists today:
+
+- Workspace, toolchain pin (Rust 1.99.1), lint/architecture gates and check scripts.
+- `monitor-domain`: monitor types, the check-outcome model and the incident state machine
+  (three failures open, two fresh passes recover, missed slots reset streaks to `unknown`,
+  incidents survive restarts) with unit tests.
+- `monitor-db`: SQLite store (WAL, foreign keys) with migration `0001` — monitors, checks,
+  incidents, notify outbox.
+- `monitor-server`: `/livez`, `/readyz`, `GET|POST /api/monitors`, `GET /api/monitors/{id}`;
+  serves `apps/dashboard/build` on the same origin when built. No probing yet.
+- `monitor` CLI: `ping`, `monitors list`, `monitors add`.
+- `apps/dashboard`: static SvelteKit + Tailwind v4 + shadcn-svelte; an unreachable server is
+  shown as "cannot see", not as a green board.
+
+Not yet: scheduling/probes, incident writes, notifications, the public status renderer, auth,
+SSRF guards, failure fixtures, load runs. Numbers in docs are targets, not measurements.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `crates/monitor-domain` | Pure domain: types, validation, the incident state machine. No I/O — enforced by `scripts/check-architecture.sh`. |
+| `crates/monitor-db` | SQLite persistence (`sqlx`, WAL + foreign keys). Migrations in `crates/monitor-db/migrations/`. |
+| `crates/monitor-server` | The `monitor-server` binary: Axum management API now, probe coordinator later. |
+| `crates/monitor-cli` | The `monitor` binary: talks to the HTTP API, same path as the dashboard. |
+| `apps/dashboard` | SvelteKit static app (Tailwind v4, shadcn-svelte). Vite dev on :58600 proxies the API to :58400. |
+| `docs/DECISIONS.md` | Permanent `D-NNN` decisions, newest first. |
+| `fixtures/`, `perf/` | Failure fixtures and load runs — placeholders until the coordinator exists. |
+
+## Quickstart
+
+```bash
+# Toolchain: Homebrew's cargo ignores rust-toolchain.toml — use rustup's proxies.
+export PATH="$(brew --prefix rustup)/bin:$PATH"
+
+npm install                 # once
+cargo build                 # once (generates Cargo.lock)
+scripts/dev.sh              # serves the API on 127.0.0.1:58400 (+ dashboard if built)
+
+# in another shell
+monitor() { cargo run -q -p monitor-cli -- "$@"; }
+monitor ping
+monitor monitors add example https://example.com/health
+monitor monitors list
+
+# dashboard dev server (hot reload, proxies /api to 58400)
+npm run dev --workspace @service-monitor/dashboard   # http://127.0.0.1:58600
+
+# or build it once and let monitor-server serve it at 127.0.0.1:58400
+npm run build --workspace @service-monitor/dashboard
+```
+
+## Verify
+
+`scripts/check.sh` — toolchain check, `cargo fmt --check`, `cargo clippy -- -D warnings`,
+`cargo test`, the architecture rule, `svelte-check` and a dashboard build.

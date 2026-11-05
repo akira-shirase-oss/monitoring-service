@@ -1,0 +1,7 @@
+# Production code may not unwrap or expect; tests may, so they stay readable.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+
+# Proper names, not code: "OpenID" (Connect), "SvelteKit", "SemVer". ".." keeps Clippy's default list.
+doc-valid-idents = ["OpenID", "SvelteKit", "SemVer", "SQLite", ".."]
