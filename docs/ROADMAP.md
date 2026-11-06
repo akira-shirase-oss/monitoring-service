@@ -76,7 +76,23 @@ remembering if a fixture ever counts hits.
 | 5.1 management auth **(done)** | `SMON_ADMIN_TOKEN` → `Bearer` required on every `/api/**` (sha256-digest compare); `/livez` `/readyz` statics stay open; dashboard TokenGate + CLI `--token` | unauthenticated = denied — once enabled, no bypass | credential failure → 401; tokenless non-loopback bind refuses to boot | `auth_denies_without_a_valid_bearer_token` (5 deny shapes + accept + open health); live: 401/401/200, CLI denied/allowed, boot refused |
 | 5.2 SSRF complete **(done)** | `PolicyResolver` validates every DNS answer inside reqwest's resolver (dialer only sees validated addrs — no TOCTOU gap); redirects followed ≤5 hops, each revalidated; DNS refusal classifies `rejected_local` | a single local address in an answer fails the whole resolution | public name → private IP refused; refused/looping redirect leaves the 3xx as `http_fail` | unit: `is_local` full-range matrix incl. v4-mapped v6, `validate_addrs` mixed answer, real `localhost` refusal; live: `localhost` target → `transport`/`rejected_local`, redirect chain → `pass`, loop → `http_fail/302` |
 | 5.3 load runs **(done)** | `perf/lab-profile.mjs` baseline: 100 monitors @ 15 s phase-locked (built-in 6.7× burst/wave), 10 fixture origins, 10 min — 4000/4000 slots, 0 missed, commit-lag p95 4.9 s, 107/107 alerts first-attempt, RSS flat | bounded pools hold under a 22.5% error rate; misses counted, never hidden | wave drain is the whole lag story; per-origin bound correctly throttles a single-origin run to a trickle (first run proved it) | `perf/results/2026-11-06T01-18-54.904Z-33656f5.json`; 24 h soak not yet run — documented, not claimed |
-| 5.4 release | installable artifact + docs | honest claims only | n/a | fresh-machine install by another dev |
+| 5.4 release **(done)** | installable artifact + docs; fresh-prefix install drill passed (migrations → livez/readyz/`/version` → dashboard → auth) | honest claims only | n/a | e2e gate fixed (config-less playwright run); 4/4 specs + install drill |
 
 **Ship gate:** another developer installs it, gets a useful alert, and distinguishes a target
 outage from missing monitoring data.
+
+## M6 — Parity + UI (gap log: `docs/GAPS.md`)
+
+| Step | Outcome | Invariant | Failure case | Acceptance test |
+|---|---|---|---|---|
+| 6.1 TLS classification **(done)** | `transport` detail: `cert_expired` / `cert_not_yet_valid` / `cert_name_mismatch` / `cert_untrusted` / `tls`; `ClientConfig` on `webpki-roots` + `ProbePolicy.extra_roots` (D-010) | a cert failure never reads as `connect`; committed detail is a fixed string, never raw error text | platform verifier flattens cert errors (macOS Security.framework) → bypassed by deterministic trust | 5 rcgen/tokio-rustls fixture tests; live: `expired.badssl.com` → `cert_expired`, `wrong.host.badssl.com` → `cert_name_mismatch` |
+| 6.2 per-monitor thresholds | `fail_threshold` / `recover_threshold` on the monitor, validated, honored by the incident machine | optional; defaults keep 3/2 | invalid values rejected at create/edit | threshold matrix tests + live flappy monitor |
+| 6.3 incident four times | `first_fail_at` / `last_fail_at` / `opened_at` / `resolved_at` tracked separately | start-of-failure ≠ time-of-notice | backfilled rows stay honest (NULL ≠ fabricated) | migration + incident test asserts all four |
+| 6.4 dashboard mutations | add/edit/pause/delete in the UI behind the token | UI never bypasses the API contract | 401 → token gate, not silent failure | Playwright mutation spec |
+| 6.5 charts | uptime timeline/sparkline from real check rows | chart renders `unknown`/no-data honestly | sparse data shows gaps, not interpolated green | component test + spec |
+| 6.6 auto-refresh | poll list/detail without losing honest states | refresh never flashes a stale green | API down mid-poll → unreachable state | spec with route abort |
+| 6.7 public status view | render sanitized `status.json` inside the dashboard | public viewers never touch management APIs | expired heartbeat → "monitoring unavailable" | spec + drift check vs schema |
+| 6.8 guide page | plain-English status/word reference | drift-checked against real enums | a new outcome not in the guide fails the check | drift test |
+| 6.9 CLI exit codes | contract audit + pinned tests | scripts can trust `$?` | every failure mode maps to a documented code | exit-code matrix tests |
+| 6.10 mutation testing | cargo-mutants on the domain crate | tests must kill mutants, not just pass | survivors triaged: fix or justify | mutants run logged |
+| 6.11 maintenance windows | schedule-scoped suppression: checks record, incidents don't open during a window | suppression is explicit, time-bounded, never silent | window expiry resumes normal alerting | window matrix tests + live drill |

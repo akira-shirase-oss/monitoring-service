@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- M6.1 TLS/certificate classification: `transport` checks now carry a stable `detail`
+  drawn from rustls `CertificateError` — `cert_expired`, `cert_not_yet_valid`,
+  `cert_name_mismatch`, `cert_untrusted`, `tls` — instead of flattening to `connect`.
+  The client builds its own `ClientConfig` on `webpki-roots` (D-010): identical trust
+  on every OS, no silent reliance on the operator's keychain; internal PKI opts in
+  through `ProbePolicy.extra_roots`. Committed details are fixed strings — never cert
+  contents, URLs, or raw error text. Proven with real rcgen/tokio-rustls handshakes
+  (5 fixtures) and live against `expired.badssl.com` → `cert_expired`,
+  `wrong.host.badssl.com` → `cert_name_mismatch`.
 - M5.3 load baseline: `perf/lab-profile.mjs` runs the monitor's own scheduler as the
   load generator — 100 monitors at the minimum 15 s interval registered in one wave,
   so every wave is a phase-locked burst on the 20 global slots across 10 fixture

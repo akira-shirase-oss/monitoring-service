@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let probes = ProbeClient::new(
         ProbePolicy {
             allow_local_targets: lab,
+            extra_roots: Vec::new(),
         },
         64 * 1024,
     )

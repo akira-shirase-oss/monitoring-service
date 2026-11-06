@@ -2,6 +2,19 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-010 — Certificate trust is deterministic: webpki-roots, never the local store
+
+A monitor should report what a *public* client sees. Reqwest's default on macOS delegates
+verification to `rustls-platform-verifier` → Security.framework, which flattens every
+certificate failure into an opaque OSStatus and silently trusts whatever roots are in the
+operator's keychain — meaning a corp-rooted laptop can report "down" or "up" for reasons no
+visitor shares. The probe client instead builds its own `rustls::ClientConfig` on
+`webpki-roots` (same root program Firefox ships) via `tls_backend_preconfigured`: rich
+`CertificateError` variants survive into `classify`, behavior is identical on every OS, and
+the answer means the same thing to every reader. Operators with internal PKI opt in
+explicitly through `ProbePolicy.extra_roots` — a configured root is a stated assumption,
+not an accident of where the monitor happens to run.
+
 ## D-009 — Edit and invalidation are one write: `generation` bumps atomically
 
 Every management write (`PATCH`, pause/unpause) revalidates the merged monitor through the

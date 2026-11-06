@@ -1,7 +1,8 @@
 # Module 03 — Coordinator + probes (`crates/monitor-server`, `probe`/`schedule`)
 
 **Status:** built (M1); SSRF complete (M5.2): redirects followed with per-hop revalidation,
-DNS answers checked inside the resolver.
+DNS answers checked inside the resolver; TLS/certificate classification complete (M6.1):
+deterministic webpki-roots trust (D-010) + committed cert detail taxonomy.
 
 ## Purpose
 
@@ -21,7 +22,11 @@ it to the writer — without ever letting a slow target stall the schedule.
   `missed`, not a queue.
 - **Classification:** `Pass` = acceptable status (2xx in v1; assertions later);
   `HttpFail{status}` = any other status incl. exhausted redirects; `Transport` = connect/DNS/
-  TLS/body failure; `Timeout` = deadline exceeded. Never infer.
+  TLS/body failure; `Timeout` = deadline exceeded. Never infer. `Transport` carries a stable
+  `detail`: `rejected_local` (SSRF), `cert_expired`, `cert_not_yet_valid`,
+  `cert_name_mismatch`, `cert_untrusted`, `tls`, `connect`, `body`, `request`, or none.
+  Certificate classes map from rustls `CertificateError` under webpki-roots trust (D-010);
+  details are fixed strings — no cert contents, URLs, or raw error text are committed.
 - **Generation invalidation:** probe carries `generation`; the writer drops results whose
   generation no longer matches the stored monitor.
 - **Target policy (SSRF, complete in M5.2):** two layers, both live. URL layer — scheme
@@ -45,6 +50,10 @@ it to the writer — without ever letting a slow target stall the schedule.
 | Redirect to refused target | hop stopped; the 3xx stands as `http_fail` |
 | Redirect loop past 5 hops | last 3xx stands as `http_fail` |
 | Name resolves to a local address | `transport` + `rejected_local` (DNS-layer refusal) |
+| Expired / not-yet-valid cert | `transport` + `cert_expired` / `cert_not_yet_valid` |
+| Trusted cert, wrong hostname | `transport` + `cert_name_mismatch` |
+| Self-signed / untrusted chain | `transport` + `cert_untrusted` |
+| Other TLS handshake failure | `transport` + `tls` |
 
 ## Testing parameters
 
@@ -55,6 +64,11 @@ it to the writer — without ever letting a slow target stall the schedule.
 - **Integration (ephemeral fixtures):** 200 → `pass`; 500 → `http_fail`; silent socket →
   `timeout` under a 200 ms test deadline; refused port → `transport`; chunked 1 MiB body →
   pass with ≤64 KiB read.
+- **TLS fixtures (rcgen + tokio-rustls, real handshakes):** expired leaf → `cert_expired`;
+  not-yet-valid → `cert_not_yet_valid`; self-signed → `cert_untrusted`; CA-signed leaf with
+  wrong SAN trusted via `extra_roots` → `cert_name_mismatch`; CA-signed correct leaf →
+  `pass`. Live drill: `expired.badssl.com` → `cert_expired`, `wrong.host.badssl.com` →
+  `cert_name_mismatch` (committed rows, 2026-11-06).
 - **Scheduler test (paused clock / short intervals):** 50 ms interval monitor produces
   ordered slots; two monitors never probe the same origin >2 concurrently; a 200 ms-hung
   target at 100 ms interval yields `missed` slots, never overlap.

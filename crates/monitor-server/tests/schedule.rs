@@ -69,6 +69,7 @@ fn rig(
     let probes = ProbeClient::new(
         ProbePolicy {
             allow_local_targets: true,
+            extra_roots: Vec::new(),
         },
         64 * 1024,
     )?;

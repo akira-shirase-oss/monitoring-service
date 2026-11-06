@@ -20,10 +20,13 @@ const MAX_REDIRECT_HOPS: usize = 5;
 ///  * URL layer — scheme and IP literals, checked at registration and per redirect hop;
 ///  * DNS layer — every address a name resolves to must pass `is_local` too, enforced by
 ///    `PolicyResolver` so reqwest only ever dials validated addresses.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProbePolicy {
     /// `lab` profile permits loopback/private literal targets for local fixtures.
     pub allow_local_targets: bool,
+    /// Additional trust anchors beyond the public webpki bundle — an internal CA
+    /// for operators monitoring inside their own PKI. Empty in the default profile.
+    pub extra_roots: Vec<rustls_pki_types::CertificateDer<'static>>,
 }
 
 /// Why a target was refused before a socket was opened.
@@ -154,11 +157,26 @@ pub struct ProbeClient {
 
 impl ProbeClient {
     pub fn new(policy: ProbePolicy, max_body: usize) -> Result<Self, reqwest::Error> {
+        // TLS truth (D-010): a preconfigured rustls client on the webpki-roots bundle.
+        // The platform verifier (Security.framework / schannel) flattens certificate
+        // failures into opaque OS errors — the detail taxonomy below is only possible
+        // because webpki reports rich variants. A monitor should also see what a public
+        // client sees: local enterprise roots must not mask a real trust failure.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for cert in &policy.extra_roots {
+            let _ = roots.add(cert.clone());
+        }
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let redirect_policy = policy.clone();
         let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
             .redirect(redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= MAX_REDIRECT_HOPS {
                     attempt.stop()
-                } else if policy.check(attempt.url()).is_err() {
+                } else if redirect_policy.check(attempt.url()).is_err() {
                     // A hop the policy refuses is evidence, not a path: keep the 3xx.
                     attempt.stop()
                 } else {
@@ -267,15 +285,51 @@ enum Attempt {
     Answered(reqwest::StatusCode),
 }
 
-/// A short stable classification — the stored `detail` must stay free of URLs and headers,
-/// so reqwest's Display is never stored.
+/// A TLS failure gets its own committed detail — "couldn't connect" is the least useful
+/// thing a monitor can say about a broken certificate. Names mirror the operator's
+/// remediation: renew, wait, fix the CA chain, fix the name.
+fn classify_tls(error: &rustls::Error) -> &'static str {
+    use rustls::CertificateError as C;
+    match error {
+        rustls::Error::InvalidCertificate(inner) => match inner {
+            C::Expired | C::ExpiredContext { .. } => "cert_expired",
+            C::NotValidYet | C::NotValidYetContext { .. } => "cert_not_yet_valid",
+            C::NotValidForName | C::NotValidForNameContext { .. } => "cert_name_mismatch",
+            C::Revoked => "cert_revoked",
+            _ => "cert_untrusted",
+        },
+        _ => "tls",
+    }
+}
+
+/// Find the rustls error inside a cause-chain node — reqwest/hyper wrap it inside
+/// `io::Error` inner refs, sometimes nested (observed: io → io → rustls).
+fn find_tls<'a>(mut node: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    loop {
+        if let Some(tls) = node.downcast_ref::<rustls::Error>() {
+            return Some(tls);
+        }
+        node = node
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())?;
+    }
+}
+
+/// A short stable classification — the stored `detail` must stay free of URLs and
+/// headers, so reqwest's Display is never stored.
 fn classify(error: &reqwest::Error) -> &'static str {
     // A DNS refusal from PolicyResolver rides inside reqwest's connect error — walk the
-    // cause chain so it reports `rejected_local`, not an ambiguous `connect`.
+    // cause chain so it reports `rejected_local`, not an ambiguous `connect`. TLS
+    // failures ride the same chain — catch them on the way down.
     let mut cause: Option<&dyn std::error::Error> = std::error::Error::source(error);
     while let Some(e) = cause {
         if e.is::<ResolvedLocal>() {
             return "rejected_local";
+        }
+        // TLS errors ride the connect chain, wrapped one or more levels inside
+        // io::Error inner refs — recurse until the error or the wrap chain ends.
+        if let Some(tls) = find_tls(e) {
+            return classify_tls(tls);
         }
         cause = e.source();
     }
