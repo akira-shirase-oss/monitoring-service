@@ -94,6 +94,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
+        .route("/version", get(version))
         .nest("/api", api)
         .with_state(state)
         // Order matters: request id first, then tracing, panic catch, timeout, body limit.
@@ -110,6 +111,12 @@ pub fn router(state: AppState) -> Router {
 
 async fn livez() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "alive" }))
+}
+
+/// Which build answers — an operator checks this after an upgrade or rollback, so it
+/// reports the binary's own version, never a configured string.
+async fn version(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "version": state.version }))
 }
 
 /// Readiness means the store answers *and* the write path has landed commits. A read can

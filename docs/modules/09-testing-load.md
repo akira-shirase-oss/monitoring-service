@@ -31,16 +31,29 @@ failure demo must be repeatable.
 - **Disk:** read-only/full data dir → `/readyz` 503, no authoritative updates.
 - **Monitor death:** heartbeat expiry → "monitoring unavailable" (module 07).
 
-## Load plan (guide lab profile — proposed targets, not measured)
+## Load plan — first measured baseline (M5.3)
 
-- **Shape:** 100 monitors @ 60 s, 20 global slots, 2 per origin; healthy/slow/failing mix;
-  24 h; plus a 5× short burst.
+- **Harness:** `perf/lab-profile.mjs`. The monitor generates its own load (an external
+  driver would only exercise the API), so the harness orchestrates: N fixture origins,
+  one monitor-server in `lab` profile, 100 monitors registered inside ~130 ms — all at
+  the minimum 15 s interval so every wave is a phase-locked 100-slot burst on the 20
+  global slots (the "5× burst" is built in, every 15 s, for the whole run).
+- **Mix:** 50 `/ok`, 20 `/flaky` (varied patterns so phases decorrelate), 15 `/slow` (2 s
+  inside a 3 s deadline), 10 `/status/500` (permanent), 5 `/hang` (timeout every slot).
+- **Measured** (`perf/results/2026-11-06T01-18-54.904Z-33656f5.json`, Darwin arm64,
+  10 min): 4000 checks = 100 × 40 slots exactly — zero missed, zero extras; 22.5%
+  non-pass rate held (699 http_fail + exactly-200 timeouts = all hung slots); commit lag
+  (recorded_at − slot_at − probe latency, an upper bound on dispatch lag) p50 2.9 s /
+  p95 4.9 s — under the 5 s grace but with ~2% headroom, the wave-drain queue is the
+  whole story; 62 incidents → 107 outbox events = 45 resolved×2 + 17 open, all 107
+  delivered on attempt 1, sink hits match exactly (no dupes); RSS 27→21 MB flat; DB
+  840 KB.
 - **Targets:** p95 dispatch lag < 5 s; no unexplained steady memory growth; missed checks
   counted and reported, never hidden; storage inside the ~2 GiB guardrail.
+- **Not yet run:** the 24 h soak — the bounded run above is the baseline; a long soak is
+  the remaining evidence, and nothing here claims it.
 - **Comparisons:** identical fixtures, recorded commit + machine; laptop numbers are
   development observations, never public claims.
-- **Scenario files:** `perf/k6/` as they land; results committed to `perf/results/` with
-  machine and commit (module 05/02/03 assertions fold into the soak).
 
 ## Testing parameters for this module itself
 

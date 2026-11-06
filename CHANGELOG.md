@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- M5.3 load baseline: `perf/lab-profile.mjs` runs the monitor's own scheduler as the
+  load generator — 100 monitors at the minimum 15 s interval registered in one wave,
+  so every wave is a phase-locked burst on the 20 global slots across 10 fixture
+  origins (the mix: 50 ok / 20 flaky / 15 slow / 10 dead / 5 hung). Measured on
+  Darwin arm64 for 10 min: 4000/4000 slots accounted (zero missed), commit-lag p95
+  4.9 s vs the 5 s grace, 62 incidents → 107 outbox events all delivered
+  first-attempt (sink hits match exactly), RSS flat at ~27 MB, DB 840 KB. The guide's
+  24 h soak is documented as not yet run — the bounded baseline is the evidence that
+  exists. `GET /version` now reports the binary's own version for upgrade checks.
 - M5.2 SSRF complete: `PolicyResolver` runs inside reqwest's DNS resolution — every
   address in the OS answer must be public (unless `SMON_PROFILE=lab`), and reqwest only
   ever dials the validated set, so there is no validate-then-re-resolve gap; one local
