@@ -28,6 +28,35 @@ enum Command {
         #[command(subcommand)]
         action: Monitors,
     },
+    /// Manage maintenance windows — schedule-scoped alert suppression. Checks still
+    /// record; an incident that would open inside a window is suppressed, and the first
+    /// failure after the window ends opens it if the target is still broken.
+    Maintenance {
+        #[command(subcommand)]
+        action: Maintenance,
+    },
+}
+
+#[derive(Subcommand)]
+enum Maintenance {
+    /// Register a suppression window. `--from` accepts `now` or RFC 3339; `--to` is RFC 3339.
+    Add {
+        /// The monitor's id (`monitor monitors list`).
+        id: String,
+        /// Window start: `now` or an RFC 3339 timestamp like `2026-11-07T02:00:00Z`.
+        #[arg(long)]
+        from: String,
+        /// Window end, RFC 3339. Must be after the start.
+        #[arg(long)]
+        to: String,
+        /// Why the window exists — shown to anyone asking why the page never fired.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List a monitor's windows, soonest-ending first.
+    List { id: String },
+    /// Cancel a window by id. Cancelling an active window resumes alerting on the next slot.
+    Rm { window: i64 },
 }
 
 #[derive(Subcommand)]
@@ -166,8 +195,114 @@ async fn run() -> Result<()> {
             println!("live and ready");
         }
         Command::Monitors { action } => monitors(&client, base, action).await?,
+        Command::Maintenance { action } => maintenance(&client, base, action).await?,
     }
     Ok(())
+}
+
+async fn maintenance(client: &reqwest::Client, base: &str, action: Maintenance) -> Result<()> {
+    match action {
+        Maintenance::Add {
+            id,
+            from,
+            to,
+            reason,
+        } => {
+            let starts_at = parse_from(&from)?;
+            let ends_at = parse_rfc3339(&to, "--to")?;
+            let mut payload = serde_json::json!({
+                "starts_at": starts_at,
+                "ends_at": ends_at,
+            });
+            if let Some(reason) = reason {
+                payload["reason"] = reason.into();
+            }
+            let response = send(
+                client
+                    .post(format!("{base}/api/monitors/{id}/maintenance"))
+                    .json(&payload),
+            )
+            .await?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                explain_error(status.as_u16(), &body)?;
+            }
+            print_window(&serde_json::from_str(&body)?);
+        }
+        Maintenance::List { id } => {
+            let body = get(client, &format!("{base}/api/monitors/{id}/maintenance")).await?;
+            let parsed: serde_json::Value = serde_json::from_str(&body)?;
+            let windows = parsed["windows"].as_array().map_or(&[][..], Vec::as_slice);
+            if windows.is_empty() {
+                println!("no maintenance windows");
+            }
+            for window in windows {
+                print_window(&serde_json::from_value(window.clone())?);
+            }
+        }
+        Maintenance::Rm { window } => {
+            let response = send(client.delete(format!("{base}/api/maintenance/{window}"))).await?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                explain_error(status.as_u16(), &body)?;
+            }
+            println!("deleted window {window}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct WindowView {
+    id: i64,
+    starts_at: String,
+    ends_at: String,
+    reason: String,
+    active: bool,
+}
+
+fn print_window(window: &WindowView) {
+    println!(
+        "{}\t{}\t{} → {}{}{}",
+        window.id,
+        if window.active { "active" } else { "set" },
+        window.starts_at,
+        window.ends_at,
+        if window.reason.is_empty() {
+            String::new()
+        } else {
+            format!("\t{}", window.reason)
+        },
+        if window.active { "\tsuppressing" } else { "" },
+    );
+}
+
+/// `--from` accepts `now` (the common case: suppress starting this slot) or RFC 3339.
+fn parse_from(value: &str) -> Result<String> {
+    if value == "now" {
+        return time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("format current time");
+    }
+    parse_rfc3339(value, "--from")
+}
+
+/// A timestamp the server will reject anyway — but a usage error should be caught
+/// client-side (exit 2), not round-tripped into a 422 (exit 1).
+fn parse_rfc3339(value: &str, flag: &str) -> Result<String> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(
+        |_| {
+            anyhow::Error::new(CliFailure {
+                code: EXIT_USAGE,
+                message: format!(
+                    "{flag} must be RFC 3339, e.g. 2026-11-07T02:00:00Z (got `{value}`)"
+                ),
+            })
+        },
+    )?;
+    Ok(value.to_owned())
 }
 
 async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Result<()> {

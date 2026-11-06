@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- M6.11 maintenance windows: schedule-scoped suppression (`maintenance_windows`,
+  migration 0005) read inside the observation gate — a `failures_to_open` crossing in
+  an active window commits the check row but yields `IncidentSuppressed` (no incident,
+  no outbox). The streak keeps counting, so the first post-expiry failure opens the
+  incident immediately; `first_fail_at` honestly lands inside the window. Recovery of
+  a pre-existing incident is never suppressed. API `GET|POST
+  /api/monitors/{id}/maintenance` + `DELETE /api/maintenance/{id}`; CLI `monitor
+  maintenance add|list|rm` with `--from now`. Live drill: 4 failing checks suppressed,
+  window deleted → incident opened on the next slot.
 - M6.10 mutation testing: `cargo mutants -p monitor-domain` — 48 mutants,
   42 caught, 6 unviable (`Default::default()` on non-Default types), **0 missed**
   after adding three boundary tests the first run exposed as survivors:

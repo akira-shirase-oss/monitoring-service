@@ -345,6 +345,11 @@ pub enum Effect {
     Unchanged,
     IncidentOpened,
     IncidentRecovered,
+    /// The streak crossed `failures_to_open` inside a maintenance window: the check row is
+    /// still committed evidence, but no incident opens and no alert fires. The streak is
+    /// *not* reset — a target still broken when the window ends opens on the next failing
+    /// check, not a fresh streak later.
+    IncidentSuppressed,
 }
 
 /// Per-monitor statuses as seen by readers, keyed by monitor id.
@@ -400,7 +405,7 @@ impl Health {
             Self::new()
         };
         for observation in tail {
-            health.record(*observation, thresholds);
+            health.record(*observation, thresholds, false);
         }
         health.incident_open = incident_open;
         health
@@ -408,8 +413,16 @@ impl Health {
 
     /// Advance the machine on one slot observation. `thresholds` comes from the monitor row
     /// read at commit time — never cached — so an edit that bumps generation takes effect on
-    /// the same observation that confirms the new generation.
-    pub fn record(&mut self, observation: SlotObservation, thresholds: Thresholds) -> Effect {
+    /// the same observation that confirms the new generation. `suppress_open` is the
+    /// maintenance window the same committed read saw: when it is set, a threshold crossing
+    /// yields `IncidentSuppressed` — the streak keeps counting (a still-broken target opens
+    /// on the first check after expiry) but no incident and no alert.
+    pub fn record(
+        &mut self,
+        observation: SlotObservation,
+        thresholds: Thresholds,
+        suppress_open: bool,
+    ) -> Effect {
         match observation {
             SlotObservation::Missed => {
                 // No evidence: streaks reset and the display goes back to `Unknown` unless an
@@ -441,6 +454,11 @@ impl Health {
                 } else {
                     self.consecutive_failures += 1;
                     if self.consecutive_failures >= thresholds.failures_to_open {
+                        if suppress_open {
+                            // Suppression silences the page, not the evidence: keep
+                            // counting so expiry opens on the next failure.
+                            return Effect::IncidentSuppressed;
+                        }
                         self.incident_open = true;
                         self.consecutive_failures = 0;
                         return Effect::IncidentOpened;
@@ -475,7 +493,12 @@ mod tests {
     impl Health {
         /// `record` under the default 3/2 thresholds — the contract's baseline behavior.
         fn rec(&mut self, observation: SlotObservation) -> Effect {
-            self.record(observation, Thresholds::default())
+            self.record(observation, Thresholds::default(), false)
+        }
+
+        /// `record` with suppression active — a slot inside a maintenance window.
+        fn rec_windowed(&mut self, observation: SlotObservation) -> Effect {
+            self.record(observation, Thresholds::default(), true)
         }
     }
 
@@ -679,7 +702,11 @@ mod tests {
         let thresholds = Thresholds::new(1, 2).expect("valid");
         let mut health = Health::new();
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Timeout), thresholds),
+            health.record(
+                SlotObservation::Probe(CheckOutcome::Timeout),
+                thresholds,
+                false
+            ),
             Effect::IncidentOpened
         );
     }
@@ -690,17 +717,29 @@ mod tests {
         let mut health = Health::new();
         for _ in 0..4 {
             assert_eq!(
-                health.record(SlotObservation::Probe(CheckOutcome::Transport), thresholds),
+                health.record(
+                    SlotObservation::Probe(CheckOutcome::Transport),
+                    thresholds,
+                    false
+                ),
                 Effect::Unchanged
             );
         }
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Transport), thresholds),
+            health.record(
+                SlotObservation::Probe(CheckOutcome::Transport),
+                thresholds,
+                false
+            ),
             Effect::IncidentOpened
         );
         // passes_to_recover = 1: a single fresh pass closes it.
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Pass), thresholds),
+            health.record(
+                SlotObservation::Probe(CheckOutcome::Pass),
+                thresholds,
+                false
+            ),
             Effect::IncidentRecovered
         );
     }
@@ -733,12 +772,84 @@ mod tests {
         let lenient = Thresholds::new(5, 2).expect("valid");
         let mut health = Health::rebuild(false, &tail, lenient);
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Timeout), lenient),
+            health.record(
+                SlotObservation::Probe(CheckOutcome::Timeout),
+                lenient,
+                false
+            ),
             Effect::IncidentOpened
         );
         // Under the default 3 the same tail opens mid-replay — but the committed flag
         // still wins: the store says closed, so the machine stays closed.
         let health = Health::rebuild(false, &tail, Thresholds::default());
+        assert!(!health.incident_open());
+    }
+
+    #[test]
+    fn a_windowed_crossing_suppresses_the_open_but_keeps_the_streak() {
+        let mut health = Health::new();
+        // Three failures inside a window: each reports suppressed, none opens an incident.
+        for _ in 0..3 {
+            health.rec_windowed(SlotObservation::Probe(CheckOutcome::Timeout));
+        }
+        assert!(!health.incident_open());
+        assert_eq!(health.status(), Status::Up);
+        // Two more while windowed — still suppressed, streak now deep past threshold.
+        health.rec_windowed(SlotObservation::Probe(CheckOutcome::Timeout));
+        assert_eq!(
+            health.rec_windowed(SlotObservation::Probe(CheckOutcome::Timeout)),
+            Effect::IncidentSuppressed
+        );
+        // Window expired: the very next failure opens immediately — no fresh streak needed.
+        assert_eq!(
+            health.rec(SlotObservation::Probe(CheckOutcome::Timeout)),
+            Effect::IncidentOpened
+        );
+        assert!(health.incident_open());
+    }
+
+    #[test]
+    fn a_windowed_pass_still_resets_the_streak() {
+        let mut health = Health::new();
+        for _ in 0..2 {
+            health.rec_windowed(SlotObservation::Probe(CheckOutcome::Timeout));
+        }
+        // A pass inside the window is real evidence — the streak restarts.
+        health.rec_windowed(SlotObservation::Probe(CheckOutcome::Pass));
+        for _ in 0..2 {
+            health.rec_windowed(SlotObservation::Probe(CheckOutcome::Timeout));
+        }
+        assert!(!health.incident_open());
+        assert_eq!(
+            health.rec(SlotObservation::Probe(CheckOutcome::Timeout)),
+            Effect::IncidentOpened
+        );
+    }
+
+    #[test]
+    fn a_missed_slot_in_a_window_still_resets_streaks() {
+        // Suppression never upgrades "no observation" into tolerated failure.
+        let mut health = Health::new();
+        for _ in 0..4 {
+            health.rec_windowed(SlotObservation::Probe(CheckOutcome::Timeout));
+        }
+        health.rec_windowed(SlotObservation::Missed);
+        for _ in 0..2 {
+            health.rec(SlotObservation::Probe(CheckOutcome::Timeout));
+        }
+        assert!(!health.incident_open());
+    }
+
+    #[test]
+    fn an_open_incident_still_recovers_during_a_window() {
+        // Suppression blocks *opening*, never healing: an incident that predates the
+        // window closes on fresh passes so the paged human gets their resolve.
+        let mut health = Health::with_open_incident();
+        health.rec_windowed(SlotObservation::Probe(CheckOutcome::Pass));
+        assert_eq!(
+            health.rec_windowed(SlotObservation::Probe(CheckOutcome::Pass)),
+            Effect::IncidentRecovered
+        );
         assert!(!health.incident_open());
     }
 

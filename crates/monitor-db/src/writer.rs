@@ -246,7 +246,7 @@ async fn record(
         .get(&observation.monitor_id)
         .cloned()
         .unwrap_or_default();
-    let effect = next.record(observation.slot, gate.thresholds);
+    let effect = next.record(observation.slot, gate.thresholds, gate.maintenance);
     db.commit_observation(&observation, effect, next.incident_open())
         .await?;
     let status = next.status();

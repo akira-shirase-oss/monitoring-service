@@ -108,6 +108,73 @@ async fn per_monitor_thresholds_drive_the_incident_machine() -> anyhow::Result<(
     Ok(())
 }
 
+/// M6.11: an active window suppresses the incident open *and* its outbox event while
+/// every check row still commits — suppression silences the page, never the evidence.
+/// The streak keeps counting through the window, so the first post-expiry failure
+/// opens the incident immediately rather than needing a fresh streak.
+#[tokio::test]
+async fn a_maintenance_window_suppresses_opens_but_not_evidence() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let now = OffsetDateTime::now_utc();
+    let window = db
+        .create_window(
+            monitor.id,
+            now - time::Duration::seconds(10),
+            now + time::Duration::seconds(600),
+            "kernel rebuild",
+        )
+        .await?;
+    assert_eq!(window.reason, "kernel rebuild");
+    assert!(
+        db.monitor_gate(monitor.id)
+            .await?
+            .expect("gate")
+            .maintenance,
+        "an enclosing window must show active in the gate"
+    );
+    let listed = db.list_windows(monitor.id).await?;
+    assert_eq!(listed.len(), 1);
+
+    // Three failures inside the window — every check commits as evidence, none opens
+    // an incident and none queues an alert. The first two are still below threshold
+    // (Unchanged); the crossing itself is what's suppressed.
+    for _ in 0..2 {
+        assert_eq!(
+            writer.record(fail(&monitor)).await?,
+            WriteOutcome::Committed(Effect::Unchanged)
+        );
+    }
+    assert_eq!(
+        writer.record(fail(&monitor)).await?,
+        WriteOutcome::Committed(Effect::IncidentSuppressed)
+    );
+    assert!(db.open_incident(monitor.id).await?.is_none());
+    assert_eq!(db.list_checks(monitor.id, 10).await?.len(), 3);
+    assert!(db.list_outbox(monitor.id).await?.is_empty());
+
+    // Deleting the window early stands in for expiry — it's the same gate flag. The
+    // very next failure opens immediately: the streak counted through the window.
+    assert!(db.delete_window(window.id).await?);
+    assert!(
+        !db.delete_window(window.id).await?,
+        "second delete is 404-truth"
+    );
+    assert!(
+        !db.monitor_gate(monitor.id)
+            .await?
+            .expect("gate")
+            .maintenance,
+        "a deleted window must stop suppressing at the next gate read"
+    );
+    assert_eq!(
+        writer.record(fail(&monitor)).await?,
+        WriteOutcome::Committed(Effect::IncidentOpened)
+    );
+    assert!(db.open_incident(monitor.id).await?.is_some());
+    assert_eq!(db.list_outbox(monitor.id).await?.len(), 1);
+    Ok(())
+}
+
 /// M6.3: the four incident times are tracked separately and honestly — `first_fail_at` is
 /// the streak's first failing slot, `opened_at` when the threshold was crossed,
 /// `last_fail_at` the latest failing slot while open, `resolved_at` on recovery.
@@ -574,7 +641,8 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
     assert_eq!(
         health.record(
             SlotObservation::Probe(CheckOutcome::Timeout),
-            monitor.thresholds
+            monitor.thresholds,
+            false
         ),
         Effect::IncidentOpened
     );
@@ -593,11 +661,13 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
     health.record(
         SlotObservation::Probe(CheckOutcome::Pass),
         monitor.thresholds,
+        false,
     );
     assert_eq!(
         health.record(
             SlotObservation::Probe(CheckOutcome::Pass),
-            monitor.thresholds
+            monitor.thresholds,
+            false
         ),
         Effect::IncidentRecovered
     );

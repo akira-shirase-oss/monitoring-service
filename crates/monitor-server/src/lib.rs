@@ -17,7 +17,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,7 +29,9 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use monitor_db::{CheckRow, Db, IncidentRow, MonitorRow, QueryError, SharedStatuses, WriteHealth};
+use monitor_db::{
+    CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses, WriteHealth,
+};
 use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError};
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
@@ -82,6 +84,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/monitors/{id}/checks", get(list_checks))
         .route("/monitors/{id}/stats", get(monitor_stats))
+        .route(
+            "/monitors/{id}/maintenance",
+            get(list_windows).post(create_window),
+        )
+        .route("/maintenance/{id}", delete(delete_window))
         .route("/incidents", get(list_incidents))
         .route("/backup", post(backup))
         // Auth wraps the whole API: /livez, /readyz and static files stay open —
@@ -450,6 +457,112 @@ impl From<IncidentRow> for IncidentView {
     }
 }
 
+/// A maintenance window as the API reports it. `active` is computed server-side against
+/// the same clock the gate uses — clients never re-derive "is this suppressing now".
+#[derive(Debug, Serialize)]
+struct MaintenanceView {
+    id: i64,
+    monitor_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    ends_at: OffsetDateTime,
+    reason: String,
+    active: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+impl MaintenanceView {
+    fn from_row(row: MaintenanceRow, now: OffsetDateTime) -> Self {
+        Self {
+            id: row.id,
+            monitor_id: row.monitor_id,
+            active: row.starts_at <= now && row.ends_at > now,
+            starts_at: row.starts_at,
+            ends_at: row.ends_at,
+            reason: row.reason,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateWindow {
+    /// RFC 3339 timestamps. A window wholly in the past is accepted — it documents why
+    /// checks failed without paging, the same reason resolved incidents are kept.
+    #[serde(with = "time::serde::rfc3339")]
+    pub starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ends_at: OffsetDateTime,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Register suppression for a monitor. The gate reads windows per committed observation,
+/// so a new window suppresses starting with the *next* slot — never retroactively.
+async fn create_window(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<CreateWindow>,
+) -> Result<(StatusCode, Json<MaintenanceView>), ApiError> {
+    let row = find_monitor(&state, &id).await?;
+    let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+    if input.ends_at <= input.starts_at {
+        return Err(ApiError::Invalid("ends_at must be after starts_at".into()));
+    }
+    let created = state
+        .db
+        .create_window(
+            monitor.id,
+            input.starts_at,
+            input.ends_at,
+            input.reason.as_deref().unwrap_or(""),
+        )
+        .await
+        .map_err(|e| match e {
+            QueryError::Invalid(msg) => ApiError::Invalid(msg),
+            other => ApiError::Db(other),
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(MaintenanceView::from_row(
+            created,
+            OffsetDateTime::now_utc(),
+        )),
+    ))
+}
+
+async fn list_windows(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row = find_monitor(&state, &id).await?;
+    let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+    let now = OffsetDateTime::now_utc();
+    let windows: Vec<MaintenanceView> = state
+        .db
+        .list_windows(monitor.id)
+        .await?
+        .into_iter()
+        .map(|row| MaintenanceView::from_row(row, now))
+        .collect();
+    Ok(Json(serde_json::json!({ "windows": windows })))
+}
+
+/// Cancel a window. An active one resumes alerting on the next slot; deleting a
+/// nonexistent window is a 404, not a silent success.
+async fn delete_window(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id: i64 = id.parse().map_err(|_| ApiError::NotFound)?;
+    if !state.db.delete_window(id).await? {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The incident timeline — open and resolved. `?monitor_id=` and `?state=open|resolved`
 /// filter; a bogus state value is a bad request, not silently "all".
 async fn list_incidents(
@@ -546,6 +659,8 @@ pub enum ApiError {
     #[error("`url` must be a valid absolute URL")]
     BadUrl,
     #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
     Conflict(String),
     #[error(transparent)]
     Validation(#[from] ValidationError),
@@ -559,7 +674,9 @@ impl ApiError {
     fn code(&self) -> &'static str {
         match self {
             Self::NotFound => "not_found",
-            Self::BadId | Self::BadUrl | Self::Validation(_) => "invalid_request",
+            Self::BadId | Self::BadUrl | Self::Validation(_) | Self::Invalid(_) => {
+                "invalid_request"
+            }
             Self::Conflict(_) => "conflict",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
@@ -569,7 +686,9 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadId | Self::BadUrl | Self::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::BadId | Self::BadUrl | Self::Validation(_) | Self::Invalid(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

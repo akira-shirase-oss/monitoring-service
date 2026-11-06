@@ -35,15 +35,26 @@ export type StatsView = {
 	success_bps: number | null;
 };
 
+export type WindowView = {
+	id: number;
+	monitor_id: string;
+	starts_at: string;
+	ends_at: string;
+	reason: string;
+	active: boolean;
+	created_at: string;
+};
+
 // Four honest states: the monitor row, "the server cannot see", "there is no such
 // monitor", and "the server wants a credential" — a 401 is not a fetch failure either.
 export const load: PageLoad = async ({ fetch, params }) => {
 	try {
-		const [monitor, checks, incidents, stats] = await Promise.all([
+		const [monitor, checks, incidents, stats, windows] = await Promise.all([
 			apiFetch(`/api/monitors/${params.id}`, undefined, fetch),
 			apiFetch(`/api/monitors/${params.id}/checks?limit=50`, undefined, fetch),
 			apiFetch(`/api/incidents?monitor_id=${params.id}&limit=50`, undefined, fetch),
-			apiFetch(`/api/monitors/${params.id}/stats`, undefined, fetch)
+			apiFetch(`/api/monitors/${params.id}/stats`, undefined, fetch),
+			apiFetch(`/api/monitors/${params.id}/maintenance`, undefined, fetch)
 		]);
 		if (monitor.status === 401) {
 			return { state: 'needsAuth' as const };
@@ -51,7 +62,7 @@ export const load: PageLoad = async ({ fetch, params }) => {
 		if (monitor.status === 404) {
 			return { state: 'missing' as const };
 		}
-		if (!monitor.ok || !checks.ok || !incidents.ok || !stats.ok) {
+		if (!monitor.ok || !checks.ok || !incidents.ok || !stats.ok || !windows.ok) {
 			return { state: 'unreachable' as const };
 		}
 		return {
@@ -59,7 +70,8 @@ export const load: PageLoad = async ({ fetch, params }) => {
 			monitor: (await monitor.json()) as MonitorView,
 			checks: ((await checks.json()) as { checks?: CheckView[] }).checks ?? [],
 			incidents: ((await incidents.json()) as { incidents?: IncidentView[] }).incidents ?? [],
-			stats: (await stats.json()) as StatsView
+			stats: (await stats.json()) as StatsView,
+			windows: ((await windows.json()) as { windows?: WindowView[] }).windows ?? []
 		};
 	} catch {
 		return { state: 'unreachable' as const };

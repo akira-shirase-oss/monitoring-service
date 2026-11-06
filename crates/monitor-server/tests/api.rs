@@ -172,6 +172,121 @@ async fn thresholds_are_validated_on_create_and_patch() {
     assert_eq!(view["passes_to_recover"], 4);
 }
 
+/// M6.11: windows CRUD through the real router — `active` is computed server-side,
+/// backwards windows are `invalid_request`, and deleting tells 204 from 404 honestly.
+#[tokio::test]
+async fn maintenance_windows_create_list_and_cancel() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let id = create(&app, "windowed").await.unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let rfc = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+
+    // Backwards window → invalid_request, never stored.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/api/monitors/{id}/maintenance"),
+        Some(serde_json::json!({
+            "starts_at": rfc(now + time::Duration::hours(2)),
+            "ends_at": rfc(now),
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "invalid_request");
+
+    // An active window round-trips with `active: true`.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/api/monitors/{id}/maintenance"),
+        Some(serde_json::json!({
+            "starts_at": rfc(now - time::Duration::minutes(1)),
+            "ends_at": rfc(now + time::Duration::hours(2)),
+            "reason": "kernel rebuild",
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["active"], true);
+    assert_eq!(body["reason"], "kernel rebuild");
+    let window_id = body["id"].as_i64().unwrap();
+
+    // A past window lists with `active: false` — records are kept, not hidden.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/monitors/{id}/maintenance"),
+        Some(serde_json::json!({
+            "starts_at": rfc(now - time::Duration::hours(3)),
+            "ends_at": rfc(now - time::Duration::hours(1)),
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/api/monitors/{id}/maintenance"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let windows = body["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 2);
+    let actives: Vec<bool> = windows
+        .iter()
+        .map(|w| w["active"].as_bool().unwrap())
+        .collect();
+    assert!(actives.contains(&true) && actives.contains(&false));
+
+    // Windows on an unknown monitor are 404, as is deleting a nonexistent window.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/monitors/00000000-0000-0000-0000-000000000000/maintenance",
+        Some(serde_json::json!({
+            "starts_at": rfc(now),
+            "ends_at": rfc(now + time::Duration::hours(1)),
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&app, "DELETE", "/api/maintenance/99999", None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Cancel the active window: 204, and the list shows it gone.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/maintenance/{window_id}"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = send(
+        &app,
+        "GET",
+        &format!("/api/monitors/{id}/maintenance"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(body["windows"].as_array().unwrap().len(), 1);
+}
+
 /// Create a monitor and return its id.
 async fn create(app: &Router, name: &str) -> anyhow::Result<String> {
     let response = app

@@ -203,6 +203,41 @@
 			</p>
 		</div>
 
+		{#if data.windows.length > 0}
+			<div>
+				<h2 class="text-sm font-medium text-muted-foreground">Maintenance windows</h2>
+				<div class="mt-2 flex flex-col gap-1.5">
+					{#each data.windows as window (window.id)}
+						<div
+							class="flex items-center justify-between gap-4 rounded-md border px-3 py-2 text-sm {window.active
+								? 'border-attention/40 bg-attention-soft'
+								: ''}"
+						>
+							<span class="tabular text-muted-foreground">
+								{new Date(window.starts_at).toLocaleString()} → {new Date(
+									window.ends_at
+								).toLocaleString()}
+								{#if window.reason}
+									<span class="block text-xs">{window.reason}</span>
+								{/if}
+							</span>
+							<Badge variant={window.active ? 'down' : 'secondary'}>
+								{window.active
+									? 'suppressing now'
+									: new Date(window.ends_at) < new Date()
+										? 'ended'
+										: 'scheduled'}
+							</Badge>
+						</div>
+					{/each}
+				</div>
+				<p class="mt-2 text-xs text-muted-foreground">
+					Checks still record during a window; an incident that would open is suppressed, and a
+					target still broken at expiry opens on the next failing check.
+				</p>
+			</div>
+		{/if}
+
 		<div>
 			<h2 class="text-sm font-medium text-muted-foreground">Recent checks</h2>
 			<div class="mt-2">

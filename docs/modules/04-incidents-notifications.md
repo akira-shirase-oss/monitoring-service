@@ -48,3 +48,22 @@ at-least-once to a receiver — without alerting ever being able to stall observ
 - **Process-kill:** kill between commit and delivery → exactly-once *logical* event on restart.
 - **Load:** incident storms — 20 monitors failing together enqueue 20 events; delivery drains
   with receivers at 200 ms latency without blocking probes (soak assertion).
+
+## Maintenance windows (M6.11)
+
+Schedule-scoped suppression so planned work doesn't page. A `maintenance_windows` row
+(`starts_at`, `ends_at`, `reason`) is read **inside the observation gate** — the same
+committed read that returns generation and thresholds — so creating or deleting a window
+takes effect on the next slot, never cached.
+
+- **Suppression silences the page, never the evidence.** A `failures_to_open` crossing
+  inside an active window yields `Effect::IncidentSuppressed`: the check row commits, no
+  incident row, no outbox event. The domain keeps counting the streak — a target still
+  broken at expiry opens on the *next* failing check, not a fresh streak later.
+- **Windows never block healing.** An incident open before the window still recovers on
+  fresh passes inside it — the paged human gets their resolve.
+- **`active` is computed server-side** in `MaintenanceView` and at the gate — no client
+  re-derives "is this suppressing now".
+- **Management surface:** `POST|GET /api/monitors/{id}/maintenance`,
+  `DELETE /api/maintenance/{id}` (204 vs 404 honestly); CLI `monitor maintenance
+  add|list|rm` (`--from now` for the common case).

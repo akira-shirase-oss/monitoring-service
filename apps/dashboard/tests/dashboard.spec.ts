@@ -306,6 +306,25 @@ test('a mutation 401 surfaces the token error, never silent', async ({ page }) =
 	await expect(page.getByText('The server rejected the token')).toBeVisible();
 });
 
+test('an active maintenance window is visible, never silent', async ({ page, request }) => {
+	const name = `e2e-window-${Date.now()}`;
+	const id = await addMonitor(request, name, `http://127.0.0.1:${FAULT}/fail`);
+	const now = Date.now();
+	const response = await request.post(`/api/monitors/${id}/maintenance`, {
+		data: {
+			starts_at: new Date(now - 60_000).toISOString(),
+			ends_at: new Date(now + 3_600_000).toISOString(),
+			reason: 'e2e deploy rehearsal'
+		}
+	});
+	expect(response.status()).toBe(201);
+
+	await page.goto(`/monitors/${id}`);
+	await expect(page.getByText('Maintenance windows')).toBeVisible();
+	await expect(page.getByText('suppressing now')).toBeVisible();
+	await expect(page.getByText('e2e deploy rehearsal')).toBeVisible();
+});
+
 test('keyboard navigation reaches the detail page', async ({ page, request }) => {
 	const name = `e2e-kbd-${Date.now()}`;
 	const id = await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);

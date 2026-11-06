@@ -40,6 +40,8 @@ pub enum QueryError {
     Corrupt(String),
     #[error("value out of range: {0}")]
     OutOfRange(&'static str),
+    #[error("invalid input: {0}")]
+    Invalid(String),
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -331,17 +333,25 @@ impl Db {
     }
 
     /// What the writer needs to admit one observation: the committed generation (a claimed
-    /// older generation is stale) and the committed thresholds (the incident machine runs on
+    /// older generation is stale), the committed thresholds (the incident machine runs on
     /// current config, so an edit takes effect on the same observation that confirms its
-    /// generation bump). One row read, never cached — the gate is always fresh.
+    /// generation bump), and whether a maintenance window is active *now* (created or
+    /// deleted windows take effect on the next slot). One row read, never cached — the
+    /// gate is always fresh.
     pub async fn monitor_gate(&self, monitor: MonitorId) -> Result<Option<Gate>, QueryError> {
-        let row: Option<(i64, i64, i64)> = sqlx::query_as(
-            "SELECT generation, fail_threshold, recover_threshold FROM monitors WHERE id = ?",
+        let row: Option<(i64, i64, i64, bool)> = sqlx::query_as(
+            "SELECT generation, fail_threshold, recover_threshold,
+                    EXISTS(SELECT 1 FROM maintenance_windows w
+                           WHERE w.monitor_id = monitors.id
+                             AND w.starts_at <= ? AND w.ends_at > ?)
+             FROM monitors WHERE id = ?",
         )
+        .bind(OffsetDateTime::now_utc())
+        .bind(OffsetDateTime::now_utc())
         .bind(monitor.0.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(generation, fail, recover)| {
+        row.map(|(generation, fail, recover, maintenance)| {
             let generation = u64::try_from(generation)
                 .map_err(|_| QueryError::Corrupt("negative generation".into()))?;
             let thresholds = Thresholds::new(
@@ -353,6 +363,7 @@ impl Db {
             Ok(Gate {
                 generation,
                 thresholds,
+                maintenance,
             })
         })
         .transpose()
@@ -365,6 +376,71 @@ impl Db {
             .monitor_gate(monitor)
             .await?
             .map(|gate| gate.generation))
+    }
+
+    /// Register a maintenance window. `starts_at < ends_at` is enforced by the table's
+    /// CHECK; a wholly-past window is accepted — it is a record explaining evidence, not
+    /// dead config (the same reason resolved incidents are kept).
+    pub async fn create_window(
+        &self,
+        monitor: MonitorId,
+        starts_at: OffsetDateTime,
+        ends_at: OffsetDateTime,
+        reason: &str,
+    ) -> Result<MaintenanceRow, QueryError> {
+        let row = sqlx::query_as::<_, MaintenanceRow>(
+            "INSERT INTO maintenance_windows (monitor_id, starts_at, ends_at, reason, created_at)
+             VALUES (?, ?, ?, ?, ?)
+             RETURNING id, monitor_id, starts_at, ends_at, reason, created_at",
+        )
+        .bind(monitor.0.to_string())
+        .bind(starts_at)
+        .bind(ends_at)
+        .bind(reason)
+        .bind(OffsetDateTime::now_utc())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db) = &e {
+                if db.is_check_violation() {
+                    return QueryError::Invalid("window ends_at must be after starts_at".into());
+                }
+                if db.is_foreign_key_violation() {
+                    return QueryError::Invalid("unknown monitor".into());
+                }
+            }
+            QueryError::Sql(e)
+        })?;
+        Ok(row)
+    }
+
+    /// All windows for a monitor, soonest-ending first — upcoming suppression is the
+    /// operationally interesting sort, history is kept after it.
+    pub async fn list_windows(
+        &self,
+        monitor: MonitorId,
+    ) -> Result<Vec<MaintenanceRow>, QueryError> {
+        sqlx::query_as::<_, MaintenanceRow>(
+            "SELECT id, monitor_id, starts_at, ends_at, reason, created_at
+             FROM maintenance_windows WHERE monitor_id = ?
+             ORDER BY ends_at ASC, id ASC",
+        )
+        .bind(monitor.0.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Cancel a window. Deleting an *active* window resumes normal alerting on the next
+    /// slot; deleting a future or past one just removes the record. Returns whether a row
+    /// was deleted so the API can distinguish 204 from 404.
+    pub async fn delete_window(&self, window_id: i64) -> Result<bool, QueryError> {
+        let deleted = sqlx::query("DELETE FROM maintenance_windows WHERE id = ?")
+            .bind(window_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(deleted > 0)
     }
 
     /// The `limit` most recent slot observations for a monitor, oldest→newest — the tail the
@@ -599,7 +675,11 @@ impl Db {
         .await?;
 
         match effect {
-            Effect::Unchanged => {}
+            Effect::Unchanged | Effect::IncidentSuppressed => {
+                // Suppressed: the check row above is the whole commit — no incident row,
+                // no outbox event. The window itself is the explanation for the withheld
+                // page; the machine's streak still counted it.
+            }
             Effect::IncidentOpened => {
                 // first_fail_at = the streak's start: the oldest consecutive failing
                 // slot since the last pass/missed — derived from committed rows, so it
@@ -729,10 +809,25 @@ fn decode_outcome(outcome: &str, http_status: Option<i64>) -> Result<SlotObserva
     })
 }
 
-/// The admission gate for one observation — generation plus the committed thresholds.
+/// The admission gate for one observation — generation, committed thresholds, and whether
+/// a maintenance window is active at commit time (suppression is a committed-read fact,
+/// never a cached flag).
 pub struct Gate {
     pub generation: u64,
     pub thresholds: monitor_domain::Thresholds,
+    pub maintenance: bool,
+}
+
+/// One `maintenance_windows` row — schedule-scoped suppression. `active` is computed at
+/// read time so the API never has to re-derive it.
+#[derive(Debug, FromRow)]
+pub struct MaintenanceRow {
+    pub id: i64,
+    pub monitor_id: String,
+    pub starts_at: OffsetDateTime,
+    pub ends_at: OffsetDateTime,
+    pub reason: String,
+    pub created_at: OffsetDateTime,
 }
 
 /// One `monitors` row, as stored. Converting to `Monitor` validates the stored strings again —

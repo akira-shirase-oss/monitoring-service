@@ -13,7 +13,12 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 
 - **Routes:** `/livez`, `/readyz`; `GET|POST /api/monitors`,
   `GET|PATCH|DELETE /api/monitors/{id}`; `GET /api/monitors/{id}/checks`,
-  `GET /api/monitors/{id}/stats` (coverage/success, `?window_s=` bounded), `GET /api/incidents`
+  `GET /api/monitors/{id}/stats` (coverage/success, `?window_s=` bounded), `GET /api/incidents`;
+  `GET|POST /api/monitors/{id}/maintenance`, `DELETE /api/maintenance/{id}` (M6.11 —
+  server-computed `active` flag, `starts_at < ends_at` enforced, past windows kept as
+  records). CLI: `monitor maintenance add <id> --from now|<rfc3339> --to <rfc3339>
+  [--reason s]`, `maintenance list <id>`, `maintenance rm <window-id>` — a bad timestamp
+  is a usage error (exit 2), not a round-tripped 422.
   (`?monitor_id=`, `?state=`, `?limit=`). Still to come: `GET /api/status` (M3.2 public
   snapshot). Incidents are system-created evidence — there is deliberately no `POST`.
   `IncidentView` carries all four times (M6.3): `first_fail_at`, `opened_at`,
