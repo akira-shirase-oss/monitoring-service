@@ -34,7 +34,7 @@ enum Command {
 enum Monitors {
     /// List registered monitors.
     List,
-    /// Register a monitor (defaults: 60-second interval, 5-second deadline).
+    /// Register a monitor (defaults: 60-second interval, 5-second deadline, 3-fail / 2-pass).
     Add {
         name: String,
         url: String,
@@ -42,6 +42,12 @@ enum Monitors {
         interval_s: Option<u64>,
         #[arg(long)]
         timeout_s: Option<u64>,
+        /// Consecutive failures that open an incident (1-10, default 3).
+        #[arg(long)]
+        failures_to_open: Option<u8>,
+        /// Fresh passes while open that confirm recovery (1-10, default 2).
+        #[arg(long)]
+        passes_to_recover: Option<u8>,
     },
     /// Show one monitor with its recent checks and incidents.
     Show { id: String },
@@ -58,6 +64,12 @@ enum Monitors {
         interval_s: Option<u64>,
         #[arg(long)]
         timeout_s: Option<u64>,
+        /// Consecutive failures that open an incident (1-10).
+        #[arg(long)]
+        failures_to_open: Option<u8>,
+        /// Fresh passes while open that confirm recovery (1-10).
+        #[arg(long)]
+        passes_to_recover: Option<u8>,
     },
     /// Stop scheduling checks. The monitor's record stays; nothing is checked until `unpause`.
     Pause { id: String },
@@ -74,6 +86,8 @@ struct MonitorView {
     name: String,
     url: String,
     interval_s: u64,
+    failures_to_open: u8,
+    passes_to_recover: u8,
     generation: u64,
     paused: bool,
     status: String,
@@ -149,27 +163,18 @@ async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Res
             url,
             interval_s,
             timeout_s,
+            failures_to_open,
+            passes_to_recover,
         } => {
             let mut payload = serde_json::json!({ "name": name, "url": url });
-            if let Some(interval) = interval_s {
-                payload["interval_s"] = interval.into();
-            }
-            if let Some(timeout) = timeout_s {
-                payload["timeout_s"] = timeout.into();
-            }
-            let response = client
-                .post(format!("{base}/api/monitors"))
-                .json(&payload)
-                .send()
-                .await
-                .context("server unreachable")?;
-            let status = response.status();
-            let body = response.text().await?;
-            if !status.is_success() {
-                explain_error(&body)?;
-            }
-            let created: serde_json::Value = serde_json::from_str(&body)?;
-            println!("created {}", created["id"].as_str().unwrap_or("(no id)"));
+            fill_fields(
+                &mut payload,
+                interval_s,
+                timeout_s,
+                failures_to_open,
+                passes_to_recover,
+            );
+            add(client, base, &payload).await?;
         }
         Monitors::Show { id } => show(client, base, &id).await?,
         Monitors::Edit {
@@ -178,6 +183,8 @@ async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Res
             url,
             interval_s,
             timeout_s,
+            failures_to_open,
+            passes_to_recover,
         } => {
             let mut payload = serde_json::json!({});
             if let Some(name) = name {
@@ -186,19 +193,14 @@ async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Res
             if let Some(url) = url {
                 payload["url"] = url.into();
             }
-            if let Some(interval) = interval_s {
-                payload["interval_s"] = interval.into();
-            }
-            if let Some(timeout) = timeout_s {
-                payload["timeout_s"] = timeout.into();
-            }
-            if payload.as_object().is_none_or(serde_json::Map::is_empty) {
-                anyhow::bail!(
-                    "nothing to change — pass at least one of --name/--url/--interval-s/--timeout-s"
-                );
-            }
-            let body = patch(client, &format!("{base}/api/monitors/{id}"), &payload).await?;
-            print_monitor(&serde_json::from_str(&body)?);
+            fill_fields(
+                &mut payload,
+                interval_s,
+                timeout_s,
+                failures_to_open,
+                passes_to_recover,
+            );
+            edit(client, base, &id, payload).await?;
         }
         Monitors::Pause { id } => set_paused(client, base, &id, true).await?,
         Monitors::Unpause { id } => set_paused(client, base, &id, false).await?,
@@ -217,6 +219,68 @@ async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Res
         }
     }
     Ok(())
+}
+
+/// POST a create payload and print the created id.
+async fn add(client: &reqwest::Client, base: &str, payload: &serde_json::Value) -> Result<()> {
+    let response = client
+        .post(format!("{base}/api/monitors"))
+        .json(payload)
+        .send()
+        .await
+        .context("server unreachable")?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        explain_error(&body)?;
+    }
+    let created: serde_json::Value = serde_json::from_str(&body)?;
+    println!("created {}", created["id"].as_str().unwrap_or("(no id)"));
+    Ok(())
+}
+
+/// PATCH an edit payload — rejecting an empty one, which would be a no-op call.
+async fn edit(
+    client: &reqwest::Client,
+    base: &str,
+    id: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    if payload.as_object().is_none_or(serde_json::Map::is_empty) {
+        anyhow::bail!(
+            "nothing to change — pass at least one of --name/--url/--interval-s/--timeout-s/--failures-to-open/--passes-to-recover"
+        );
+    }
+    let body = patch(client, &format!("{base}/api/monitors/{id}"), &payload).await?;
+    print_monitor(&serde_json::from_str(&body)?);
+    Ok(())
+}
+
+/// Copy the optional schedule/threshold fields into a create or edit payload — `None`
+/// means "don't send", which is what keeps a patch partial.
+fn fill_fields(
+    payload: &mut serde_json::Value,
+    interval_s: Option<u64>,
+    timeout_s: Option<u64>,
+    failures_to_open: Option<u8>,
+    passes_to_recover: Option<u8>,
+) {
+    for (key, value) in [
+        ("interval_s", interval_s.map(serde_json::Value::from)),
+        ("timeout_s", timeout_s.map(serde_json::Value::from)),
+        (
+            "failures_to_open",
+            failures_to_open.map(serde_json::Value::from),
+        ),
+        (
+            "passes_to_recover",
+            passes_to_recover.map(serde_json::Value::from),
+        ),
+    ] {
+        if let Some(value) = value {
+            payload[key] = value;
+        }
+    }
 }
 
 /// One monitor plus its recent evidence: checks first, then incidents.
@@ -273,11 +337,13 @@ async fn set_paused(client: &reqwest::Client, base: &str, id: &str, paused: bool
 
 fn print_monitor(monitor: &MonitorView) {
     println!(
-        "{}\t{}\t{}\tevery {}s\tgeneration {}\t{}",
+        "{}\t{}\t{}\tevery {}s\t{}f/{}r\tgeneration {}\t{}",
         monitor.id,
         monitor.status,
         monitor.name,
         monitor.interval_s,
+        monitor.failures_to_open,
+        monitor.passes_to_recover,
         monitor.generation,
         if monitor.paused {
             format!("paused\t{}", monitor.url)

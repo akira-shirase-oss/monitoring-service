@@ -148,6 +148,8 @@ struct MonitorView {
     url: String,
     interval_s: u64,
     timeout_s: u64,
+    failures_to_open: u8,
+    passes_to_recover: u8,
     generation: u64,
     paused: bool,
     /// From the committed-evidence map only — a monitor with no committed observations is
@@ -180,6 +182,9 @@ pub struct CreateMonitor {
     pub url: String,
     pub interval_s: Option<u64>,
     pub timeout_s: Option<u64>,
+    /// Optional incident sensitivity — both fall back to the contract's 3/2 when absent.
+    pub failures_to_open: Option<u8>,
+    pub passes_to_recover: Option<u8>,
 }
 
 async fn create_monitor(
@@ -197,6 +202,15 @@ async fn create_monitor(
         ),
     }
     .map_err(ApiError::Validation)?;
+    let new = match (input.failures_to_open, input.passes_to_recover) {
+        (None, None) => new,
+        (fail, recover) => new
+            .with_thresholds(
+                fail.unwrap_or(monitor_domain::DEFAULT_FAILURES_TO_OPEN),
+                recover.unwrap_or(monitor_domain::DEFAULT_PASSES_TO_RECOVER),
+            )
+            .map_err(ApiError::Validation)?,
+    };
     let monitor = new.into_monitor();
     state.db.insert_monitor(&monitor).await?;
     publish_registry(&state).await?;
@@ -212,6 +226,8 @@ pub struct PatchMonitor {
     pub url: Option<String>,
     pub interval_s: Option<u64>,
     pub timeout_s: Option<u64>,
+    pub failures_to_open: Option<u8>,
+    pub passes_to_recover: Option<u8>,
     pub paused: Option<bool>,
     /// Optional optimistic-concurrency guard: when present and stale, the write is a
     /// conflict rather than a blind last-writer-wins.
@@ -245,6 +261,8 @@ async fn patch_monitor(
             .map_err(|_| ApiError::BadUrl)?,
         interval: input.interval_s.map(Duration::from_secs),
         timeout: input.timeout_s.map(Duration::from_secs),
+        failures_to_open: input.failures_to_open,
+        passes_to_recover: input.passes_to_recover,
         paused: input.paused,
     };
     let merged = patch.apply(&monitor).map_err(ApiError::Validation)?;
@@ -500,6 +518,8 @@ fn view_from_row(row: MonitorRow, statuses: &SharedStatuses) -> Result<MonitorVi
         url: monitor.url.to_string(),
         interval_s: monitor.interval.as_secs(),
         timeout_s: monitor.timeout.as_secs(),
+        failures_to_open: monitor.thresholds.failures_to_open,
+        passes_to_recover: monitor.thresholds.passes_to_recover,
         generation: monitor.generation,
         paused: monitor.paused,
         status,

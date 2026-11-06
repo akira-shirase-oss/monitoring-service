@@ -226,26 +226,27 @@ async fn record(
     health: &mut HashMap<MonitorId, Health>,
     observation: Observation,
 ) -> Result<WriteOutcome, QueryError> {
-    let Some(stored) = db.monitor_generation(observation.monitor_id).await? else {
+    let Some(gate) = db.monitor_gate(observation.monitor_id).await? else {
         warn!(monitor = %observation.monitor_id.0, "dropping observation for unknown monitor");
         return Ok(WriteOutcome::DroppedUnknownMonitor);
     };
-    if stored != observation.generation {
+    if gate.generation != observation.generation {
         debug!(
             monitor = %observation.monitor_id.0,
-            stored, claimed = observation.generation,
+            stored = gate.generation, claimed = observation.generation,
             "dropping stale-generation observation"
         );
         return Ok(WriteOutcome::DroppedStaleGeneration);
     }
 
     // The state machine only advances on a clone: if the commit fails, `health` keeps the
-    // last committed state, so memory can never be ahead of the store.
+    // last committed state, so memory can never be ahead of the store. Thresholds come from
+    // the same committed read as the generation — an edit takes effect here atomically.
     let mut next = health
         .get(&observation.monitor_id)
         .cloned()
         .unwrap_or_default();
-    let effect = next.record(observation.slot);
+    let effect = next.record(observation.slot, gate.thresholds);
     db.commit_observation(&observation, effect).await?;
     let status = next.status();
     health.insert(observation.monitor_id, next);

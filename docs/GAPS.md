@@ -29,7 +29,7 @@ rebuild log ships), mined before its removal from `minimal-portfolio`.
 | Gap | Old evidence | M6 step | Decision rationale |
 |---|---|---|---|
 | ~~TLS/certificate classification~~ | 2.8 | **M6.1 done** | `cert_expired` / `cert_not_yet_valid` / `cert_name_mismatch` / `cert_untrusted` / `tls` committed via deterministic webpki-roots trust (D-010) + `extra_roots`; rcgen fixtures + badssl live drill |
-| Per-monitor alarm sensitivity | 2.3 | M6.2 | One noisy target shouldn't share the global 3/2 rule; stays optional, defaults keep current behavior |
+| ~~Per-monitor alarm sensitivity~~ | 2.3 | **M6.2 done** | `failures_to_open`/`passes_to_recover` per monitor (`1..=10`, default 3/2), read from the committed gate row so edits apply atomically |
 | Incident four times kept apart | 2.4: opened / first-fail / last-fail / resolved | M6.3 | Cheap columns, real forensic value — when did it *start* failing vs when did we *notice* |
 | Dashboard mutations | old M4 "adding/editing from the dashboard" | M6.4 | The token gate exists; the API contract exists; the UI can hold write authority behind the same credential now |
 | Charts / uptime timeline | (dashboard richer than rows) | M6.5 | The check rows already carry everything a sparkline needs |

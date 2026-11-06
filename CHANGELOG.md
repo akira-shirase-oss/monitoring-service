@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- M6.2 per-monitor incident thresholds: `failures_to_open` / `passes_to_recover`
+  (`1..=10`, default 3/2) on `POST`/`PATCH /api/monitors` and `monitor add|edit`.
+  `Health::record` takes thresholds per call from `monitor_gate` — the same committed
+  row read as the generation — so a threshold edit takes effect atomically with the
+  generation bump that invalidates in-flight probes; no stale-config streaks. Boot
+  rebuild replays under current thresholds (`Thresholds::rebuild_tail` sizes the tail).
+  Live proof: `failures_to_open=1` monitor opened its incident on the first check while
+  a default monitor waited for three.
 - M6.1 TLS/certificate classification: `transport` checks now carry a stable `detail`
   drawn from rustls `CertificateError` — `cert_expired`, `cert_not_yet_valid`,
   `cert_name_mismatch`, `cert_untrusted`, `tls` — instead of flattening to `connect`.

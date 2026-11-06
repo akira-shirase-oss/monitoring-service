@@ -25,8 +25,6 @@ const DEFAULT_DATABASE: &str = "sqlite:monitor.db";
 /// Writer channel depth: the coordinator parks behind a full queue instead of dropping
 /// evidence — a bounded queue is the honest backpressure point.
 const WRITER_BOUND: usize = 64;
-/// Stored observations replayed per monitor on boot; streaks never exceed the thresholds.
-const REBUILD_TAIL: i64 = 4;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -63,18 +61,8 @@ async fn main() -> anyhow::Result<()> {
     let monitors = load_registry(&db)
         .await
         .context("loading the monitor registry")?;
-    let mut health = HashMap::with_capacity(monitors.len());
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::new()));
-    for monitor in &monitors {
-        let open = db.open_incident(monitor.id).await?.is_some();
-        let tail = db.recent_outcomes(monitor.id, REBUILD_TAIL).await?;
-        let rebuilt = Health::rebuild(open, &tail);
-        statuses
-            .write()
-            .map_err(|_| anyhow::anyhow!("status map poisoned at boot"))?
-            .insert(monitor.id, rebuilt.status());
-        health.insert(monitor.id, rebuilt);
-    }
+    let health = rebuild_health(&db, &monitors, &statuses).await?;
 
     let write_health: monitor_db::WriteHealth = Arc::default();
     let (writer, _writer_task) = monitor_db::writer::spawn(
@@ -152,6 +140,30 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal(shutdown))
         .await?;
     Ok(())
+}
+
+/// Boot rebuild: replay each monitor's stored tail through `Health` under its *current*
+/// thresholds, seed the status map, and hand the machines to the writer. The rebuild tail
+/// is sized from the monitor's own thresholds — a streak can never exceed them.
+async fn rebuild_health(
+    db: &monitor_db::Db,
+    monitors: &[monitor_domain::Monitor],
+    statuses: &SharedStatuses,
+) -> anyhow::Result<HashMap<monitor_domain::MonitorId, Health>> {
+    let mut health = HashMap::with_capacity(monitors.len());
+    for monitor in monitors {
+        let open = db.open_incident(monitor.id).await?.is_some();
+        let tail = db
+            .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
+            .await?;
+        let rebuilt = Health::rebuild(open, &tail, monitor.thresholds);
+        statuses
+            .write()
+            .map_err(|_| anyhow::anyhow!("status map poisoned at boot"))?
+            .insert(monitor.id, rebuilt.status());
+        health.insert(monitor.id, rebuilt);
+    }
+    Ok(health)
 }
 
 /// The management credential: configured → required on every /api call; unset → dev mode,

@@ -108,6 +108,70 @@ async fn create_then_list_a_monitor() {
     assert_eq!(monitors[0]["status"], "unknown");
 }
 
+/// M6.2: thresholds ride the same create/patch contract — defaults are 3/2, explicit values
+/// are validated, and an invalid threshold is a `validation` error, never a stored monitor.
+#[tokio::test]
+async fn thresholds_are_validated_on_create_and_patch() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+
+    // Explicit thresholds on create round-trip through the view.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "strict", "url": "https://example.com/health",
+            "failures_to_open": 1, "passes_to_recover": 4
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    let id = body["id"].as_str().unwrap().to_owned();
+    let (status, view) = send(&app, "GET", &format!("/api/monitors/{id}"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["failures_to_open"], 1);
+    assert_eq!(view["passes_to_recover"], 4);
+
+    // Defaults stay 3/2.
+    let id2 = create(&app, "defaulted").await.unwrap();
+    let (_, view) = send(&app, "GET", &format!("/api/monitors/{id2}"), None)
+        .await
+        .unwrap();
+    assert_eq!(view["failures_to_open"], 3);
+    assert_eq!(view["passes_to_recover"], 2);
+
+    // Out-of-range values are rejected on both create and patch.
+    for (method, path) in [
+        ("POST", "/api/monitors".to_owned()),
+        ("PATCH", format!("/api/monitors/{id}")),
+    ] {
+        let payload = if method == "POST" {
+            serde_json::json!({"name": "bad", "url": "https://x.example.com", "failures_to_open": 0})
+        } else {
+            serde_json::json!({"passes_to_recover": 0})
+        };
+        let (status, body) = send(&app, method, &path, Some(payload)).await.unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{method} {path}");
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    // A valid patch merges: change one threshold, keep the other.
+    let (status, view) = send(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{id}"),
+        Some(serde_json::json!({"failures_to_open": 2})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["failures_to_open"], 2);
+    assert_eq!(view["passes_to_recover"], 4);
+}
+
 /// Create a monitor and return its id.
 async fn create(app: &Router, name: &str) -> anyhow::Result<String> {
     let response = app

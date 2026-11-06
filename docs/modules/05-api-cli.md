@@ -22,7 +22,9 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   $SMON_ADMIN_TOKEN` (sha256-digest compare). `/livez`, `/readyz` and static files stay
   open. Token unset = dev mode on loopback only; a tokenless public bind refuses to boot.
   Denied means denied — no unauthenticated path once enabled.
-- **Writes bump generation** on any schedule/target/paused change (module 01 invariant).
+- **Writes bump generation** on any schedule/target/threshold/paused change (module 01
+  invariant). `failures_to_open` / `passes_to_recover` (`1..=10`, default 3/2) are settable
+  on create and patch; out-of-range → `invalid_request`.
 - **CLI parity:** `monitor ping`, `monitors list|add|edit|pause|delete`, `checks`,
   `incidents`, `status` — everything the API can do, nothing more.
 - **Truthful readiness:** `/readyz` fails when the store doesn't answer (module 02 failure

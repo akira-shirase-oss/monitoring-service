@@ -14,10 +14,16 @@ deterministically without a database, a network or a clock.
 - `CheckOutcome`: `Pass | HttpFail{status} | Transport | Timeout` — an HTTP failure, a timeout
   and a missed observation are different things and are never collapsed.
 - `SlotObservation::Missed` is not an outcome — the slot produced no evidence.
-- `Health`: 3 consecutive failures open an incident; 2 *fresh* passes confirm recovery; a
+- `Health`: consecutive failures open an incident; *fresh* passes confirm recovery; a
   missed slot resets both streaks and returns the display to `unknown` (unless an incident is
   open); an open incident persists across restarts until evidence resolves it (D-005,
   provisional: open + missed currently displays `down` — revisit when the status page lands).
+- `Thresholds` (M6.2): `failures_to_open` / `passes_to_recover`, each `1..=10`, default 3/2.
+  Thresholds are *config on the monitor row* — `Health::record` takes them per call from the
+  same committed `monitor_gate` read as the generation, so an edit applies atomically with
+  its generation bump and the machine never runs on stale config. Boot rebuild replays the
+  tail under current thresholds, sized by `Thresholds::rebuild_tail`; the committed incident
+  flag still wins over replay disagreement.
 - `Monitor.generation`: bumped on edit/pause; stale-generation results are invalid.
 
 ## Failure cases it must express

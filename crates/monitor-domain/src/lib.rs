@@ -44,6 +44,59 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// The default total deadline for one probe; the whole attempt must fit in it.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default streak lengths from the contract: three consecutive failures open an incident,
+/// two fresh passes confirm recovery.
+pub const DEFAULT_FAILURES_TO_OPEN: u8 = 3;
+pub const DEFAULT_PASSES_TO_RECOVER: u8 = 2;
+/// Ceiling on either threshold — past ten consecutive observations a "monitor" isn't
+/// monitoring, it's a scheduled log. Bounds catch config mistakes, not real needs.
+pub const MAX_THRESHOLD: u8 = 10;
+
+/// How sensitive one monitor's incident machine is — per-monitor, because one noisy target
+/// shouldn't share the global 3/2 rule. Thresholds are *config*: they ride on the monitor row
+/// and reach `Health::record` per observation, so an edit takes effect with the same
+/// generation bump that invalidates in-flight probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thresholds {
+    /// Consecutive failures that open an incident (`1..=MAX_THRESHOLD`).
+    pub failures_to_open: u8,
+    /// Fresh passes, while an incident is open, that confirm recovery (`1..=MAX_THRESHOLD`).
+    pub passes_to_recover: u8,
+}
+
+impl Thresholds {
+    pub fn new(failures_to_open: u8, passes_to_recover: u8) -> Result<Self, ValidationError> {
+        for (field, value) in [
+            ("failures_to_open", failures_to_open),
+            ("passes_to_recover", passes_to_recover),
+        ] {
+            if value == 0 || value > MAX_THRESHOLD {
+                return Err(ValidationError::ThresholdOutOfRange { field, value });
+            }
+        }
+        Ok(Self {
+            failures_to_open,
+            passes_to_recover,
+        })
+    }
+
+    /// How many stored tail rows a rebuild needs to recover a streak — a streak can never
+    /// exceed its threshold, so the larger one bounds the window.
+    #[must_use]
+    pub fn rebuild_tail(self) -> i64 {
+        i64::from(self.failures_to_open.max(self.passes_to_recover))
+    }
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            failures_to_open: DEFAULT_FAILURES_TO_OPEN,
+            passes_to_recover: DEFAULT_PASSES_TO_RECOVER,
+        }
+    }
+}
+
 /// A registered target to probe.
 #[derive(Debug, Clone)]
 pub struct Monitor {
@@ -54,6 +107,8 @@ pub struct Monitor {
     pub interval: Duration,
     /// Total deadline for one probe, always `<= interval`.
     pub timeout: Duration,
+    /// Incident sensitivity — read by the writer per committed observation.
+    pub thresholds: Thresholds,
     /// Bumped on every edit or pause; a probe result carrying an older generation is stale and
     /// must not update current status (the "edit/pause during a probe" failure case).
     pub generation: u64,
@@ -69,6 +124,7 @@ pub struct NewMonitor {
     pub url: Url,
     pub interval: Duration,
     pub timeout: Duration,
+    pub thresholds: Thresholds,
 }
 
 #[derive(Debug, Error)]
@@ -84,6 +140,8 @@ pub enum ValidationError {
         timeout: Duration,
         interval: Duration,
     },
+    #[error("{field} {value} is outside 1..={MAX_THRESHOLD}")]
+    ThresholdOutOfRange { field: &'static str, value: u8 },
 }
 
 fn validate_fields(
@@ -128,7 +186,18 @@ impl NewMonitor {
             url,
             interval,
             timeout,
+            thresholds: Thresholds::default(),
         })
+    }
+
+    /// Override the default 3-fail / 2-pass sensitivity for this monitor.
+    pub fn with_thresholds(
+        mut self,
+        failures_to_open: u8,
+        passes_to_recover: u8,
+    ) -> Result<Self, ValidationError> {
+        self.thresholds = Thresholds::new(failures_to_open, passes_to_recover)?;
+        Ok(self)
     }
 
     #[must_use]
@@ -139,6 +208,7 @@ impl NewMonitor {
             url: self.url,
             interval: self.interval,
             timeout: self.timeout,
+            thresholds: self.thresholds,
             generation: 1,
             paused: false,
         }
@@ -155,6 +225,8 @@ pub struct MonitorPatch {
     pub url: Option<Url>,
     pub interval: Option<Duration>,
     pub timeout: Option<Duration>,
+    pub failures_to_open: Option<u8>,
+    pub passes_to_recover: Option<u8>,
     pub paused: Option<bool>,
 }
 
@@ -167,6 +239,12 @@ impl MonitorPatch {
             url: self.url.clone().unwrap_or_else(|| monitor.url.clone()),
             interval: self.interval.unwrap_or(monitor.interval),
             timeout: self.timeout.unwrap_or(monitor.timeout),
+            thresholds: Thresholds::new(
+                self.failures_to_open
+                    .unwrap_or(monitor.thresholds.failures_to_open),
+                self.passes_to_recover
+                    .unwrap_or(monitor.thresholds.passes_to_recover),
+            )?,
             generation: monitor.generation,
             paused: self.paused.unwrap_or(monitor.paused),
         };
@@ -269,10 +347,6 @@ pub enum Effect {
     IncidentRecovered,
 }
 
-/// Failure and recovery thresholds from the contract.
-const FAILURES_TO_OPEN: u8 = 3;
-const PASSES_TO_RECOVER: u8 = 2;
-
 /// Per-monitor statuses as seen by readers, keyed by monitor id.
 pub type Statuses = std::collections::HashMap<MonitorId, Status>;
 
@@ -307,30 +381,35 @@ impl Health {
     }
 
     /// Rebuild after restart from persisted truth: the authoritative open-incident flag plus
-    /// the monitor's most recent stored slot observations, oldest→newest. A few rows are
-    /// enough — streaks never exceed the thresholds.
+    /// the monitor's most recent stored slot observations, oldest→newest. `Thresholds::rebuild_tail`
+    /// rows are enough — streaks never exceed the thresholds.
     ///
     /// Replaying the tail through `record` recovers streaks *and* partial recovery progress:
     /// a stored pass while the incident is open counts toward recovery, because it was fresh
-    /// evidence. At the end the store's flag wins: if replay disagrees with the incident row
-    /// (e.g. the store is inconsistent), `incident_open` is forced back to the stored value.
-    /// Forcing `open` in that case is the conservative direction — recovery waits for fresh
-    /// evidence rather than announcing it early.
+    /// evidence. Replay uses the monitor's *current* thresholds — the committed config — not
+    /// whatever was configured when the old rows were written. At the end the store's flag
+    /// wins: if replay disagrees with the incident row (e.g. the store is inconsistent),
+    /// `incident_open` is forced back to the stored value. Forcing `open` in that case is the
+    /// conservative direction — recovery waits for fresh evidence rather than announcing it
+    /// early.
     #[must_use]
-    pub fn rebuild(incident_open: bool, tail: &[SlotObservation]) -> Self {
+    pub fn rebuild(incident_open: bool, tail: &[SlotObservation], thresholds: Thresholds) -> Self {
         let mut health = if incident_open {
             Self::with_open_incident()
         } else {
             Self::new()
         };
         for observation in tail {
-            health.record(*observation);
+            health.record(*observation, thresholds);
         }
         health.incident_open = incident_open;
         health
     }
 
-    pub fn record(&mut self, observation: SlotObservation) -> Effect {
+    /// Advance the machine on one slot observation. `thresholds` comes from the monitor row
+    /// read at commit time — never cached — so an edit that bumps generation takes effect on
+    /// the same observation that confirms the new generation.
+    pub fn record(&mut self, observation: SlotObservation, thresholds: Thresholds) -> Effect {
         match observation {
             SlotObservation::Missed => {
                 // No evidence: streaks reset and the display goes back to `Unknown` unless an
@@ -345,7 +424,7 @@ impl Health {
                 if self.incident_open {
                     if outcome.is_pass() {
                         self.recovery_passes += 1;
-                        if self.recovery_passes >= PASSES_TO_RECOVER {
+                        if self.recovery_passes >= thresholds.passes_to_recover {
                             self.incident_open = false;
                             self.consecutive_failures = 0;
                             self.recovery_passes = 0;
@@ -361,7 +440,7 @@ impl Health {
                     Effect::Unchanged
                 } else {
                     self.consecutive_failures += 1;
-                    if self.consecutive_failures >= FAILURES_TO_OPEN {
+                    if self.consecutive_failures >= thresholds.failures_to_open {
                         self.incident_open = true;
                         self.consecutive_failures = 0;
                         return Effect::IncidentOpened;
@@ -393,6 +472,13 @@ impl Health {
 mod tests {
     use super::*;
 
+    impl Health {
+        /// `record` under the default 3/2 thresholds — the contract's baseline behavior.
+        fn rec(&mut self, observation: SlotObservation) -> Effect {
+            self.record(observation, Thresholds::default())
+        }
+    }
+
     fn url() -> Url {
         Url::parse("https://example.com/health").expect("test URL parses")
     }
@@ -419,12 +505,12 @@ mod tests {
         let mut health = Health::new();
         for _ in 0..2 {
             assert_eq!(
-                health.record(SlotObservation::Probe(CheckOutcome::Timeout)),
+                health.rec(SlotObservation::Probe(CheckOutcome::Timeout)),
                 Effect::Unchanged
             );
         }
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Transport)),
+            health.rec(SlotObservation::Probe(CheckOutcome::Transport)),
             Effect::IncidentOpened
         );
         assert_eq!(health.status(), Status::Down);
@@ -434,14 +520,14 @@ mod tests {
     fn a_missed_slot_resets_the_failure_streak() {
         let mut health = Health::new();
         for _ in 0..2 {
-            health.record(SlotObservation::Probe(CheckOutcome::HttpFail {
+            health.rec(SlotObservation::Probe(CheckOutcome::HttpFail {
                 status: 500,
             }));
         }
-        health.record(SlotObservation::Missed);
+        health.rec(SlotObservation::Missed);
         // The next failure is the first of a new streak, not the third.
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Timeout)),
+            health.rec(SlotObservation::Probe(CheckOutcome::Timeout)),
             Effect::Unchanged
         );
         assert!(!health.incident_open());
@@ -451,10 +537,10 @@ mod tests {
     fn a_missed_slot_does_not_close_an_open_incident() {
         let mut health = Health::new();
         for _ in 0..3 {
-            health.record(SlotObservation::Probe(CheckOutcome::Transport));
+            health.rec(SlotObservation::Probe(CheckOutcome::Transport));
         }
         assert!(health.incident_open());
-        health.record(SlotObservation::Missed);
+        health.rec(SlotObservation::Missed);
         assert!(health.incident_open());
         assert_eq!(health.status(), Status::Down);
     }
@@ -463,18 +549,18 @@ mod tests {
     fn two_fresh_passes_confirm_recovery() {
         let mut health = Health::new();
         for _ in 0..3 {
-            health.record(SlotObservation::Probe(CheckOutcome::Timeout));
+            health.rec(SlotObservation::Probe(CheckOutcome::Timeout));
         }
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Pass)),
+            health.rec(SlotObservation::Probe(CheckOutcome::Pass)),
             Effect::Unchanged
         );
         assert!(health.incident_open());
         // A failure between passes resets the recovery streak.
-        health.record(SlotObservation::Probe(CheckOutcome::Transport));
-        health.record(SlotObservation::Probe(CheckOutcome::Pass));
+        health.rec(SlotObservation::Probe(CheckOutcome::Transport));
+        health.rec(SlotObservation::Probe(CheckOutcome::Pass));
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Pass)),
+            health.rec(SlotObservation::Probe(CheckOutcome::Pass)),
             Effect::IncidentRecovered
         );
         assert_eq!(health.status(), Status::Up);
@@ -484,9 +570,9 @@ mod tests {
     fn missing_checks_display_unknown() {
         let mut health = Health::new();
         assert_eq!(health.status(), Status::Unknown);
-        health.record(SlotObservation::Probe(CheckOutcome::Pass));
+        health.rec(SlotObservation::Probe(CheckOutcome::Pass));
         assert_eq!(health.status(), Status::Up);
-        health.record(SlotObservation::Missed);
+        health.rec(SlotObservation::Missed);
         assert_eq!(health.status(), Status::Unknown);
     }
 
@@ -497,10 +583,10 @@ mod tests {
             SlotObservation::Probe(CheckOutcome::Timeout),
             SlotObservation::Probe(CheckOutcome::Transport),
         ];
-        let mut health = Health::rebuild(false, &tail);
+        let mut health = Health::rebuild(false, &tail, Thresholds::default());
         // One more failure opens the incident — the stored streak was rebuilt.
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::HttpFail {
+            health.rec(SlotObservation::Probe(CheckOutcome::HttpFail {
                 status: 500
             })),
             Effect::IncidentOpened
@@ -513,10 +599,10 @@ mod tests {
             SlotObservation::Probe(CheckOutcome::Timeout),
             SlotObservation::Probe(CheckOutcome::Pass),
         ];
-        let mut health = Health::rebuild(true, &tail);
+        let mut health = Health::rebuild(true, &tail, Thresholds::default());
         // The stored pass counts; one fresh pass completes recovery.
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Pass)),
+            health.rec(SlotObservation::Probe(CheckOutcome::Pass)),
             Effect::IncidentRecovered
         );
     }
@@ -529,7 +615,7 @@ mod tests {
             SlotObservation::Probe(CheckOutcome::Pass),
             SlotObservation::Probe(CheckOutcome::Pass),
         ];
-        let health = Health::rebuild(true, &tail);
+        let health = Health::rebuild(true, &tail, Thresholds::default());
         assert!(health.incident_open());
         assert_eq!(health.status(), Status::Down);
     }
@@ -541,13 +627,101 @@ mod tests {
             SlotObservation::Probe(CheckOutcome::Timeout),
             SlotObservation::Missed,
         ];
-        let mut health = Health::rebuild(false, &tail);
+        let mut health = Health::rebuild(false, &tail, Thresholds::default());
         assert_eq!(health.status(), Status::Unknown);
         // The miss reset the streak: two more failures do not open an incident.
         for _ in 0..2 {
-            health.record(SlotObservation::Probe(CheckOutcome::Timeout));
+            health.rec(SlotObservation::Probe(CheckOutcome::Timeout));
         }
         assert!(!health.incident_open());
+    }
+
+    #[test]
+    fn one_failure_opens_when_threshold_is_one() {
+        let thresholds = Thresholds::new(1, 2).expect("valid");
+        let mut health = Health::new();
+        assert_eq!(
+            health.record(SlotObservation::Probe(CheckOutcome::Timeout), thresholds),
+            Effect::IncidentOpened
+        );
+    }
+
+    #[test]
+    fn five_failures_open_only_at_the_fifth() {
+        let thresholds = Thresholds::new(5, 1).expect("valid");
+        let mut health = Health::new();
+        for _ in 0..4 {
+            assert_eq!(
+                health.record(SlotObservation::Probe(CheckOutcome::Transport), thresholds),
+                Effect::Unchanged
+            );
+        }
+        assert_eq!(
+            health.record(SlotObservation::Probe(CheckOutcome::Transport), thresholds),
+            Effect::IncidentOpened
+        );
+        // passes_to_recover = 1: a single fresh pass closes it.
+        assert_eq!(
+            health.record(SlotObservation::Probe(CheckOutcome::Pass), thresholds),
+            Effect::IncidentRecovered
+        );
+    }
+
+    #[test]
+    fn thresholds_reject_zero_and_overflow() {
+        assert!(matches!(
+            Thresholds::new(0, 2),
+            Err(ValidationError::ThresholdOutOfRange {
+                field: "failures_to_open",
+                value: 0
+            })
+        ));
+        assert!(matches!(
+            Thresholds::new(3, 11),
+            Err(ValidationError::ThresholdOutOfRange {
+                field: "passes_to_recover",
+                value: 11
+            })
+        ));
+        assert!(Thresholds::new(MAX_THRESHOLD, MAX_THRESHOLD).is_ok());
+    }
+
+    #[test]
+    fn rebuild_replays_under_current_thresholds() {
+        // Under fail=5, a four-failure tail means the *next* failure opens the incident —
+        // the rebuilt streak is measured against the monitor's current threshold, not the
+        // one in force when the rows were written.
+        let tail = [SlotObservation::Probe(CheckOutcome::Timeout); 4];
+        let lenient = Thresholds::new(5, 2).expect("valid");
+        let mut health = Health::rebuild(false, &tail, lenient);
+        assert_eq!(
+            health.record(SlotObservation::Probe(CheckOutcome::Timeout), lenient),
+            Effect::IncidentOpened
+        );
+        // Under the default 3 the same tail opens mid-replay — but the committed flag
+        // still wins: the store says closed, so the machine stays closed.
+        let health = Health::rebuild(false, &tail, Thresholds::default());
+        assert!(!health.incident_open());
+    }
+
+    #[test]
+    fn patch_validates_thresholds() {
+        let monitor = monitor();
+        let merged = MonitorPatch {
+            failures_to_open: Some(1),
+            ..MonitorPatch::default()
+        }
+        .apply(&monitor)
+        .expect("valid patch");
+        assert_eq!(merged.thresholds.failures_to_open, 1);
+        assert_eq!(merged.thresholds.passes_to_recover, 2);
+        let err = MonitorPatch {
+            passes_to_recover: Some(0),
+            ..MonitorPatch::default()
+        }
+        .apply(&monitor)
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::ThresholdOutOfRange { .. }));
     }
 
     fn monitor() -> Monitor {
@@ -666,10 +840,10 @@ mod tests {
         // Rebuilt from the persisted incident: still down until two fresh passes land.
         let mut health = Health::with_open_incident();
         assert_eq!(health.status(), Status::Down);
-        health.record(SlotObservation::Probe(CheckOutcome::Pass));
+        health.rec(SlotObservation::Probe(CheckOutcome::Pass));
         assert_eq!(health.status(), Status::Down);
         assert_eq!(
-            health.record(SlotObservation::Probe(CheckOutcome::Pass)),
+            health.rec(SlotObservation::Probe(CheckOutcome::Pass)),
             Effect::IncidentRecovered
         );
     }

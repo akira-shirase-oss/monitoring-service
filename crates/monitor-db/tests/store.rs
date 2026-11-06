@@ -54,6 +54,56 @@ fn missed(monitor: &Monitor) -> Observation {
     }
 }
 
+/// M6.2: the incident machine reads thresholds from the same committed gate row as the
+/// generation — a strict monitor opens on its first failure while a default one waits
+/// for three, and an edit takes effect on the next observation.
+#[tokio::test]
+async fn per_monitor_thresholds_drive_the_incident_machine() -> anyhow::Result<()> {
+    let (db, _monitor, writer) = store().await?;
+    let strict = NewMonitor::new("strict", url::Url::parse("https://strict.example.com")?)?
+        .with_thresholds(1, 1)?
+        .into_monitor();
+    db.insert_monitor(&strict).await?;
+
+    // One failure on the strict monitor opens its incident immediately.
+    let outcome = writer.record(fail(&strict)).await?;
+    assert_eq!(outcome, WriteOutcome::Committed(Effect::IncidentOpened));
+    assert!(db.open_incident(strict.id).await?.is_some());
+    // And its single fresh pass recovers it (passes_to_recover = 1).
+    let outcome = writer.record(pass(&strict)).await?;
+    assert_eq!(outcome, WriteOutcome::Committed(Effect::IncidentRecovered));
+
+    // An edit to the stored thresholds takes effect on the next committed observation:
+    // bump passes_to_recover to 3, re-open, then prove two passes are not enough.
+    let mut edited = strict.clone();
+    edited.thresholds = monitor_domain::Thresholds::new(1, 3)?;
+    db.update_monitor(&edited, strict.generation).await?;
+    let gate = db.monitor_gate(strict.id).await?.expect("gate");
+    assert_eq!(gate.thresholds.passes_to_recover, 3);
+    let at_gen = |outcome| Observation {
+        monitor_id: strict.id,
+        generation: gate.generation,
+        slot_at: OffsetDateTime::now_utc(),
+        slot: SlotObservation::Probe(outcome),
+        http_status: Some(500),
+        latency_ms: Some(42),
+        detail: None,
+    };
+    writer.record(at_gen(CheckOutcome::Transport)).await?;
+    for _ in 0..2 {
+        assert_eq!(
+            writer.record(at_gen(CheckOutcome::Pass)).await?,
+            WriteOutcome::Committed(Effect::Unchanged),
+            "edited recover threshold of 3 must not close on the second pass"
+        );
+    }
+    assert_eq!(
+        writer.record(at_gen(CheckOutcome::Pass)).await?,
+        WriteOutcome::Committed(Effect::IncidentRecovered)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn three_failures_commit_check_incident_and_outbox_together() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
@@ -453,10 +503,13 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
 
     let open = db.open_incident(monitor.id).await?.is_some();
     let tail = db.recent_outcomes(monitor.id, 4).await?;
-    let mut health = Health::rebuild(open, &tail);
+    let mut health = Health::rebuild(open, &tail, monitor.thresholds);
     // Two stored failures + one fresh failure must open the incident — streaks survived.
     assert_eq!(
-        health.record(SlotObservation::Probe(CheckOutcome::Timeout)),
+        health.record(
+            SlotObservation::Probe(CheckOutcome::Timeout),
+            monitor.thresholds
+        ),
         Effect::IncidentOpened
     );
 
@@ -468,12 +521,18 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
     drop(writer);
     let open = db.open_incident(monitor.id).await?.is_some();
     let tail = db.recent_outcomes(monitor.id, 4).await?;
-    let mut health = Health::rebuild(open, &tail);
+    let mut health = Health::rebuild(open, &tail, monitor.thresholds);
     assert_eq!(health.status(), Status::Down);
     // One pass is not enough; the second fresh pass recovers.
-    health.record(SlotObservation::Probe(CheckOutcome::Pass));
+    health.record(
+        SlotObservation::Probe(CheckOutcome::Pass),
+        monitor.thresholds,
+    );
     assert_eq!(
-        health.record(SlotObservation::Probe(CheckOutcome::Pass)),
+        health.record(
+            SlotObservation::Probe(CheckOutcome::Pass),
+            monitor.thresholds
+        ),
         Effect::IncidentRecovered
     );
     Ok(())
@@ -504,12 +563,17 @@ async fn writes_past_the_page_ceiling_fail_and_flag_unhealthy() -> anyhow::Resul
         8,
     );
 
-    // Free pages absorb a few rows; keep writing until the ceiling bites. Every write
-    // either commits or fails — the counter only counts the failures.
+    // Free pages absorb a few rows; keep writing until the ceiling bites. The counter
+    // tracks *trailing consecutive* failures — a landed write resets it — so count both
+    // totals and the trailing run, and compare against the run.
     let mut failures = 0;
+    let mut trailing = 0;
     for _ in 0..400 {
         if handle.record(pass(&monitor)).await.is_err() {
             failures += 1;
+            trailing += 1;
+        } else {
+            trailing = 0;
         }
     }
     assert!(
@@ -518,8 +582,8 @@ async fn writes_past_the_page_ceiling_fail_and_flag_unhealthy() -> anyhow::Resul
     );
     assert_eq!(
         write_health.load(std::sync::atomic::Ordering::Relaxed),
-        failures,
-        "consecutive failures counted by the writer, not guessed"
+        trailing,
+        "the counter tracks consecutive failures; a landed write resets it"
     );
     Ok(())
 }
@@ -579,7 +643,7 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
     );
     // Boot rebuild from the restored store reproduces `down` — not a fresh unknown.
     let tail = restored.recent_outcomes(monitor.id, 4).await?;
-    let health = Health::rebuild(open.is_some(), &tail);
+    let health = Health::rebuild(open.is_some(), &tail, monitor.thresholds);
     assert_eq!(health.status(), Status::Down);
     Ok(())
 }

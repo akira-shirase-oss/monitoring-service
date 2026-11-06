@@ -13,7 +13,9 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use monitor_domain::{CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation};
+use monitor_domain::{
+    CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation, Thresholds,
+};
 
 pub mod writer;
 pub use writer::{
@@ -166,14 +168,23 @@ impl Db {
 
     pub async fn insert_monitor(&self, monitor: &Monitor) -> Result<(), QueryError> {
         sqlx::query(
-            "INSERT INTO monitors (id, name, url, interval_s, timeout_s, generation, paused, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            "INSERT INTO monitors (id, name, url, interval_s, timeout_s, fail_threshold,
+                                  recover_threshold, generation, paused, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
         )
         .bind(monitor.id.0.to_string())
         .bind(&monitor.name)
         .bind(monitor.url.as_str())
-        .bind(i64::try_from(monitor.interval.as_secs()).map_err(|_| QueryError::OutOfRange("interval"))?)
-        .bind(i64::try_from(monitor.timeout.as_secs()).map_err(|_| QueryError::OutOfRange("timeout"))?)
+        .bind(
+            i64::try_from(monitor.interval.as_secs())
+                .map_err(|_| QueryError::OutOfRange("interval"))?,
+        )
+        .bind(
+            i64::try_from(monitor.timeout.as_secs())
+                .map_err(|_| QueryError::OutOfRange("timeout"))?,
+        )
+        .bind(i64::from(monitor.thresholds.failures_to_open))
+        .bind(i64::from(monitor.thresholds.passes_to_recover))
         .bind(i64::try_from(monitor.generation).map_err(|_| QueryError::OutOfRange("generation"))?)
         .bind(OffsetDateTime::now_utc())
         .execute(&self.pool)
@@ -183,7 +194,8 @@ impl Db {
 
     pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
         let rows = sqlx::query_as::<_, MonitorRow>(
-            "SELECT id, name, url, interval_s, timeout_s, generation, paused, created_at
+            "SELECT id, name, url, interval_s, timeout_s, fail_threshold, recover_threshold,
+                    generation, paused, created_at
              FROM monitors ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -218,6 +230,7 @@ impl Db {
         let result = sqlx::query(
             "UPDATE monitors
              SET name = ?, url = ?, interval_s = ?, timeout_s = ?, paused = ?,
+                 fail_threshold = ?, recover_threshold = ?,
                  generation = generation + 1
              WHERE id = ? AND generation = ?",
         )
@@ -232,6 +245,8 @@ impl Db {
                 .map_err(|_| QueryError::OutOfRange("timeout"))?,
         )
         .bind(monitor.paused)
+        .bind(i64::from(monitor.thresholds.failures_to_open))
+        .bind(i64::from(monitor.thresholds.passes_to_recover))
         .bind(monitor.id.0.to_string())
         .bind(i64::try_from(expected_generation).map_err(|_| QueryError::OutOfRange("generation"))?)
         .execute(&self.pool)
@@ -315,17 +330,41 @@ impl Db {
         Ok(rows)
     }
 
+    /// What the writer needs to admit one observation: the committed generation (a claimed
+    /// older generation is stale) and the committed thresholds (the incident machine runs on
+    /// current config, so an edit takes effect on the same observation that confirms its
+    /// generation bump). One row read, never cached — the gate is always fresh.
+    pub async fn monitor_gate(&self, monitor: MonitorId) -> Result<Option<Gate>, QueryError> {
+        let row: Option<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT generation, fail_threshold, recover_threshold FROM monitors WHERE id = ?",
+        )
+        .bind(monitor.0.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(generation, fail, recover)| {
+            let generation = u64::try_from(generation)
+                .map_err(|_| QueryError::Corrupt("negative generation".into()))?;
+            let thresholds = Thresholds::new(
+                u8::try_from(fail).map_err(|_| QueryError::Corrupt("fail_threshold".into()))?,
+                u8::try_from(recover)
+                    .map_err(|_| QueryError::Corrupt("recover_threshold".into()))?,
+            )
+            .map_err(|_| QueryError::Corrupt("thresholds out of range".into()))?;
+            Ok(Gate {
+                generation,
+                thresholds,
+            })
+        })
+        .transpose()
+    }
+
     /// The monitor's current generation — the writer compares it against the generation an
     /// observation was claimed under.
     pub async fn monitor_generation(&self, monitor: MonitorId) -> Result<Option<u64>, QueryError> {
-        let row: Option<(i64,)> = sqlx::query_as("SELECT generation FROM monitors WHERE id = ?")
-            .bind(monitor.0.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|(generation,)| {
-            u64::try_from(generation).map_err(|_| QueryError::Corrupt("negative generation".into()))
-        })
-        .transpose()
+        Ok(self
+            .monitor_gate(monitor)
+            .await?
+            .map(|gate| gate.generation))
     }
 
     /// The `limit` most recent slot observations for a monitor, oldest→newest — the tail the
@@ -651,6 +690,12 @@ fn decode_outcome(outcome: &str, http_status: Option<i64>) -> Result<SlotObserva
     })
 }
 
+/// The admission gate for one observation — generation plus the committed thresholds.
+pub struct Gate {
+    pub generation: u64,
+    pub thresholds: monitor_domain::Thresholds,
+}
+
 /// One `monitors` row, as stored. Converting to `Monitor` validates the stored strings again —
 /// the database is local but the domain contract still holds ("parse, don't validate" works at
 /// every boundary, including our own store).
@@ -661,6 +706,8 @@ pub struct MonitorRow {
     pub url: String,
     pub interval_s: i64,
     pub timeout_s: i64,
+    pub fail_threshold: i64,
+    pub recover_threshold: i64,
     pub generation: i64,
     pub paused: bool,
     pub created_at: OffsetDateTime,
@@ -680,12 +727,20 @@ impl TryFrom<MonitorRow> for Monitor {
             .map_err(|_| QueryError::Corrupt("negative timeout".into()))?;
         let generation = u64::try_from(row.generation)
             .map_err(|_| QueryError::Corrupt("negative generation".into()))?;
+        let thresholds = Thresholds::new(
+            u8::try_from(row.fail_threshold)
+                .map_err(|_| QueryError::Corrupt("fail_threshold".into()))?,
+            u8::try_from(row.recover_threshold)
+                .map_err(|_| QueryError::Corrupt("recover_threshold".into()))?,
+        )
+        .map_err(|_| QueryError::Corrupt("thresholds out of range".into()))?;
         Ok(Self {
             id: MonitorId(id),
             name: row.name,
             url,
             interval: std::time::Duration::from_secs(interval),
             timeout: std::time::Duration::from_secs(timeout),
+            thresholds,
             generation,
             paused: row.paused,
         })
