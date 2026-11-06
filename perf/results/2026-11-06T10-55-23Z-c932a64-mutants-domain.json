@@ -1,0 +1,13 @@
+{
+ "tool": "cargo-mutants (Homebrew)",
+ "command": "cargo mutants -p monitor-domain",
+ "commit": "c932a64",
+ "machine": "Darwin arm64",
+ "outcome_counts": {
+  "Success": 1,
+  "CaughtMutant": 42,
+  "Unviable": 6
+ },
+ "missed_after_fix": [],
+ "note": "Baseline + mutants. Missed=0. Unviable mutants are Default::default() replacements that cannot compile (types lack Default). The initial run missed 5; three boundary tests (minimum-interval equality, timeout==interval, rebuild_tail sizing) killed all of them."
+}

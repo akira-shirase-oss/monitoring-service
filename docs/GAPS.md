@@ -37,7 +37,7 @@ rebuild log ships), mined before its removal from `minimal-portfolio`.
 | ~~Public status view in-app~~ | old M5 "status page somewhere else" | **M6.7 done** | `/status.json` serves the sanitized artifact unmodified (outside /api, no token); `/status` page renders it — stale/missing → "monitoring unavailable", never "all down" |
 | ~~Guide page~~ | 2.2: plain-English status/word reference, drift-checked | **M6.8 done** | `/guide` from one glossary; `guide_drift.rs` pins every wire word both directions — a new enum variant/word without a guide entry fails the build |
 | ~~CLI exit codes~~ | 0.6 | **M6.9 done** | 0 ok · 1 API/app error · 2 usage · 3 unreachable · 4 unauthorized — pinned by `tests/exit_codes.rs` against the real binary |
-| Mutation testing | 0.7 | M6.10 | 88 hand-written tests have never been attacked; cargo-mutants on the domain |
+| ~~Mutation testing~~ | 0.7 | **M6.10 done** | 48 mutants: 42 caught, 6 unviable, 0 missed — first run exposed 5 boundary survivors (comparison-edge + rebuild_tail sizing); tests added, re-run clean; evidence in `perf/results/` |
 | Maintenance windows | old M4 planned | M6.11 | Real feature: suppression schedule so planned work doesn't page; scoped as "no new incidents during window, checks still record" |
 
 ## Defer — documented, not claimed

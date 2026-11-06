@@ -501,6 +501,44 @@ mod tests {
     }
 
     #[test]
+    fn the_minimum_interval_itself_is_accepted() {
+        // Mutation bait: `interval < MIN` and `interval <= MIN` differ only here.
+        assert!(
+            NewMonitor::with_schedule("x", url(), MIN_INTERVAL, Duration::from_secs(1)).is_ok()
+        );
+        assert!(matches!(
+            NewMonitor::with_schedule(
+                "x",
+                url(),
+                MIN_INTERVAL.checked_sub(Duration::from_secs(1)).unwrap(),
+                Duration::from_secs(1)
+            )
+            .unwrap_err(),
+            ValidationError::IntervalBelowMinimum { .. }
+        ));
+    }
+
+    #[test]
+    fn a_timeout_equal_to_the_interval_is_accepted() {
+        // Same shape: `timeout > interval` and `timeout >= interval` differ only at equality.
+        assert!(
+            NewMonitor::with_schedule("x", url(), Duration::from_secs(30), Duration::from_secs(30))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rebuild_tail_sizes_to_the_larger_threshold() {
+        // A streak can never exceed its threshold, so the tail needs the larger of the two —
+        // returning anything else silently truncates a rebuild.
+        let fail_led = Thresholds::new(7, 2).unwrap();
+        assert_eq!(fail_led.rebuild_tail(), 7);
+        let recover_led = Thresholds::new(1, 9).unwrap();
+        assert_eq!(recover_led.rebuild_tail(), 9);
+        assert_eq!(Thresholds::default().rebuild_tail(), 3);
+    }
+
+    #[test]
     fn three_consecutive_failures_open_an_incident() {
         let mut health = Health::new();
         for _ in 0..2 {

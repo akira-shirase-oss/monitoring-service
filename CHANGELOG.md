@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- M6.10 mutation testing: `cargo mutants -p monitor-domain` — 48 mutants,
+  42 caught, 6 unviable (`Default::default()` on non-Default types), **0 missed**
+  after adding three boundary tests the first run exposed as survivors:
+  `interval == MIN_INTERVAL` accepted, `timeout == interval` accepted, and
+  `rebuild_tail` returning the larger threshold. Evidence committed to
+  `perf/results/`.
+
 - M6.9 CLI exit-code contract: the `monitor` binary now distinguishes failure classes a
   script can branch on — `0` success, `1` API/application error (envelope errors),
   `2` usage error (clap rejections and an empty `monitors edit`), `3` server
