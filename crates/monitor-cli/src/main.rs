@@ -104,8 +104,44 @@ struct ErrorBody {
     message: String,
 }
 
+/// Exit-code contract (docs/modules/05-api-cli.md). Scripts can branch on these:
+/// 0 success · 1 API/application error · 2 usage error · 3 server unreachable ·
+/// 4 unauthorized (the token is missing or wrong).
+const EXIT_ERROR: u8 = 1;
+const EXIT_USAGE: u8 = 2;
+const EXIT_UNREACHABLE: u8 = 3;
+const EXIT_UNAUTHORIZED: u8 = 4;
+
+#[derive(Debug)]
+struct CliFailure {
+    code: u8,
+    message: String,
+}
+
+impl std::fmt::Display for CliFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliFailure {}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error:#}");
+            let code = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<CliFailure>())
+                .map_or(EXIT_ERROR, |failure| failure.code);
+            std::process::ExitCode::from(code)
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(token) = &cli.token {
@@ -205,15 +241,11 @@ async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Res
         Monitors::Pause { id } => set_paused(client, base, &id, true).await?,
         Monitors::Unpause { id } => set_paused(client, base, &id, false).await?,
         Monitors::Delete { id } => {
-            let response = client
-                .delete(format!("{base}/api/monitors/{id}"))
-                .send()
-                .await
-                .context("server unreachable")?;
+            let response = send(client.delete(format!("{base}/api/monitors/{id}"))).await?;
             let status = response.status();
             let body = response.text().await?;
             if !status.is_success() {
-                explain_error(&body)?;
+                explain_error(status.as_u16(), &body)?;
             }
             println!("deleted {id}");
         }
@@ -223,16 +255,11 @@ async fn monitors(client: &reqwest::Client, base: &str, action: Monitors) -> Res
 
 /// POST a create payload and print the created id.
 async fn add(client: &reqwest::Client, base: &str, payload: &serde_json::Value) -> Result<()> {
-    let response = client
-        .post(format!("{base}/api/monitors"))
-        .json(payload)
-        .send()
-        .await
-        .context("server unreachable")?;
+    let response = send(client.post(format!("{base}/api/monitors")).json(payload)).await?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
-        explain_error(&body)?;
+        explain_error(status.as_u16(), &body)?;
     }
     let created: serde_json::Value = serde_json::from_str(&body)?;
     println!("created {}", created["id"].as_str().unwrap_or("(no id)"));
@@ -247,9 +274,11 @@ async fn edit(
     payload: serde_json::Value,
 ) -> Result<()> {
     if payload.as_object().is_none_or(serde_json::Map::is_empty) {
-        anyhow::bail!(
-            "nothing to change — pass at least one of --name/--url/--interval-s/--timeout-s/--failures-to-open/--passes-to-recover"
-        );
+        return Err(CliFailure {
+            code: EXIT_USAGE,
+            message: "nothing to change — pass at least one of --name/--url/--interval-s/--timeout-s/--failures-to-open/--passes-to-recover".into(),
+        }
+        .into());
     }
     let body = patch(client, &format!("{base}/api/monitors/{id}"), &payload).await?;
     print_monitor(&serde_json::from_str(&body)?);
@@ -360,33 +389,47 @@ fn print_monitor(monitor: &MonitorView) {
 }
 
 async fn get(client: &reqwest::Client, url: &str) -> Result<String> {
-    let response = client.get(url).send().await.context("server unreachable")?;
+    let response = send(client.get(url)).await?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
-        explain_error(&body)?;
+        explain_error(status.as_u16(), &body)?;
     }
     Ok(body)
 }
 
 async fn patch(client: &reqwest::Client, url: &str, payload: &serde_json::Value) -> Result<String> {
-    let response = client
-        .patch(url)
-        .json(payload)
-        .send()
-        .await
-        .context("server unreachable")?;
+    let response = send(client.patch(url).json(payload)).await?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
-        explain_error(&body)?;
+        explain_error(status.as_u16(), &body)?;
     }
     Ok(body)
 }
 
-fn explain_error(body: &str) -> Result<()> {
-    match serde_json::from_str::<ErrorEnvelope>(body) {
-        Ok(envelope) => anyhow::bail!("{}: {}", envelope.error.code, envelope.error.message),
-        Err(_) => anyhow::bail!("request failed: {body}"),
-    }
+/// A request that never got a response is a different failure class than one the
+/// server answered and rejected — scripts need to tell "server is down" apart from
+/// "the server refused".
+async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    request.send().await.map_err(|error| {
+        CliFailure {
+            code: EXIT_UNREACHABLE,
+            message: format!("server unreachable: {error}"),
+        }
+        .into()
+    })
+}
+
+fn explain_error(status: u16, body: &str) -> Result<()> {
+    let message = match serde_json::from_str::<ErrorEnvelope>(body) {
+        Ok(envelope) => format!("{}: {}", envelope.error.code, envelope.error.message),
+        Err(_) => format!("request failed: {body}"),
+    };
+    let code = if status == 401 || status == 403 {
+        EXIT_UNAUTHORIZED
+    } else {
+        EXIT_ERROR
+    };
+    Err(CliFailure { code, message }.into())
 }

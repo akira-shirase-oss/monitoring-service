@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- M6.9 CLI exit-code contract: the `monitor` binary now distinguishes failure classes a
+  script can branch on — `0` success, `1` API/application error (envelope errors),
+  `2` usage error (clap rejections and an empty `monitors edit`), `3` server
+  unreachable (no HTTP answer), `4` unauthorized (401/403). Errors go to stderr,
+  results to stdout. Pinned by `crates/monitor-cli/tests/exit_codes.rs`, which runs
+  the real binary against a stub std HTTP server for all seven cases.
 - M6.8 guide page: `/guide` renders one glossary (`lib/vocabulary.ts`) — monitor
   statuses, check outcomes, the transport detail taxonomy, incident fields and states,
   plus concepts (coverage vs success, generation, "cannot see", "monitoring

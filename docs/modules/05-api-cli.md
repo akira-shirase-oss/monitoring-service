@@ -29,6 +29,11 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   on create and patch; out-of-range → `invalid_request`.
 - **CLI parity:** `monitor ping`, `monitors list|add|edit|pause|delete`, `checks`,
   `incidents`, `status` — everything the API can do, nothing more.
+- **CLI exit codes (M6.9, pinned by `tests/exit_codes.rs`):** `0` success; `1` an API or
+  application error (envelope errors like `not_found`/`conflict`/`invalid_request`, or an
+  unexpected response); `2` usage error (clap rejects, empty `edit`); `3` server
+  unreachable (connect refused, DNS, timeout — no HTTP answer at all); `4` unauthorized
+  (401/403 — the token is missing or wrong). Errors print to stderr, results to stdout.
 - **Truthful readiness:** `/readyz` fails when the store doesn't answer (module 02 failure
   case: disk write fails → unready, not green).
 
