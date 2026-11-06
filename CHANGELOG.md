@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- M5.2 SSRF complete: `PolicyResolver` runs inside reqwest's DNS resolution — every
+  address in the OS answer must be public (unless `SMON_PROFILE=lab`), and reqwest only
+  ever dials the validated set, so there is no validate-then-re-resolve gap; one local
+  address fails the whole answer. Redirects are now followed (≤5 hops) with every hop
+  revalidated through the same URL-layer policy — a refused or looping hop leaves the
+  last 3xx as `http_fail` evidence. DNS-layer refusal classifies `rejected_local` via a
+  cause-chain walk instead of an ambiguous `connect`.
 - M5.1 management auth: `SMON_ADMIN_TOKEN` requires `Authorization: Bearer` on every
   `/api/**` route, compared on SHA-256 digests (fixed-length, no timing leak). Unset is
   dev mode — allowed on loopback with a loud warning, refused on any public bind before

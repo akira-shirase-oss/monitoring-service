@@ -76,6 +76,12 @@ const server = http.createServer((request, response) => {
 		// Never answer. Keep the socket open so a probe that forgot its deadline hangs forever.
 		return;
 	}
+	if (url.pathname === '/redirect') {
+		// ?to=/path 302s there; no param 302s to itself — a loop for hop-limit proof.
+		const to = url.searchParams.get('to') ?? url.pathname + url.search;
+		response.writeHead(302, { location: to }).end(`redirect -> ${to}`);
+		return;
+	}
 	if (url.pathname === '/ok') {
 		response.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
 		return;

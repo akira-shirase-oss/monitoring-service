@@ -74,7 +74,7 @@ remembering if a fixture ever counts hits.
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
 | 5.1 management auth **(done)** | `SMON_ADMIN_TOKEN` → `Bearer` required on every `/api/**` (sha256-digest compare); `/livez` `/readyz` statics stay open; dashboard TokenGate + CLI `--token` | unauthenticated = denied — once enabled, no bypass | credential failure → 401; tokenless non-loopback bind refuses to boot | `auth_denies_without_a_valid_bearer_token` (5 deny shapes + accept + open health); live: 401/401/200, CLI denied/allowed, boot refused |
-| 5.2 SSRF complete (module 03) | redirect revalidation, DNS-level private-IP checks, lab profile | localhost only in lab profile | public name → private IP refused | SSRF fixture suite |
+| 5.2 SSRF complete **(done)** | `PolicyResolver` validates every DNS answer inside reqwest's resolver (dialer only sees validated addrs — no TOCTOU gap); redirects followed ≤5 hops, each revalidated; DNS refusal classifies `rejected_local` | a single local address in an answer fails the whole resolution | public name → private IP refused; refused/looping redirect leaves the 3xx as `http_fail` | unit: `is_local` full-range matrix incl. v4-mapped v6, `validate_addrs` mixed answer, real `localhost` refusal; live: `localhost` target → `transport`/`rejected_local`, redirect chain → `pass`, loop → `http_fail/302` |
 | 5.3 load runs (module 09) | measured lab profile | thresholds frozen from baseline | p95 dispatch lag < 5 s target, 24 h soak | k6 results committed |
 | 5.4 release | installable artifact + docs | honest claims only | n/a | fresh-machine install by another dev |
 

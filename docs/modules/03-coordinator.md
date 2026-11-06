@@ -1,7 +1,7 @@
 # Module 03 — Coordinator + probes (`crates/monitor-server`, `probe`/`schedule`)
 
-**Status:** built (M1). SSRF staging: URL-layer policy (scheme + IP literals) now; redirect
-following and DNS-resolution checks in M5.
+**Status:** built (M1); SSRF complete (M5.2): redirects followed with per-hop revalidation,
+DNS answers checked inside the resolver.
 
 ## Purpose
 
@@ -24,10 +24,16 @@ it to the writer — without ever letting a slow target stall the schedule.
   TLS/body failure; `Timeout` = deadline exceeded. Never infer.
 - **Generation invalidation:** probe carries `generation`; the writer drops results whose
   generation no longer matches the stored monitor.
-- **Target policy (SSRF, M1 minimal → M5 full):** scheme `http`/`https` only (validated at
-  registration); no redirect following in v1 (a redirect is `HttpFail{3xx}`); host as an IP
-  literal: loopback/private/link-local rejected unless `--profile lab`. Deferred to M5:
-  redirect-following with per-hop revalidation and DNS-resolution IP checks (rebinding).
+- **Target policy (SSRF, complete in M5.2):** two layers, both live. URL layer — scheme
+  `http`/`https` only (checked at probe time and at every redirect hop); host as an IP
+  literal: loopback/private/link-local/unspecified/broadcast/multicast rejected unless
+  `SMON_PROFILE=lab`. DNS layer — `PolicyResolver` validates every address the OS answer
+  contains *inside* reqwest's resolver, so the dialer only ever sees validated addresses
+  (no validate-then-re-resolve gap); one local address fails the whole resolution —
+  round-robin DNS makes "usually public" not a defense. Redirects: followed up to 5 hops,
+  each hop revalidated through the same URL check; a refused hop leaves the 3xx as
+  `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk), so
+  it never masquerades as a plain `connect` error.
 
 ## Failure cases
 
@@ -36,12 +42,16 @@ it to the writer — without ever letting a slow target stall the schedule.
 | Target hangs | `timeout` at deadline; worker freed |
 | Workers saturated / probe in flight | slot `missed`, counted, `unknown` semantics apply |
 | Edit/pause mid-probe | generation bump; late result dropped at writer |
-| Redirect | `http_fail` with the 3xx status (v1) |
+| Redirect to refused target | hop stopped; the 3xx stands as `http_fail` |
+| Redirect loop past 5 hops | last 3xx stands as `http_fail` |
+| Name resolves to a local address | `transport` + `rejected_local` (DNS-layer refusal) |
 
 ## Testing parameters
 
 - **Unit:** classify each reqwest error kind; policy accept/reject matrix (schemes, IP
-  literals, lab vs normal profile).
+  literals, lab vs normal profile); `is_local` over every non-public range incl.
+  v4-mapped v6; `validate_addrs` mixed-answer refusal; the resolver refusing a real
+  `localhost` lookup under the strict profile.
 - **Integration (ephemeral fixtures):** 200 → `pass`; 500 → `http_fail`; silent socket →
   `timeout` under a 200 ms test deadline; refused port → `transport`; chunked 1 MiB body →
   pass with ≤64 KiB read.

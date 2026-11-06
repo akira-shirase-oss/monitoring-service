@@ -122,3 +122,45 @@ async fn policy_rejects_non_http_schemes() -> anyhow::Result<()> {
     assert_eq!(result.detail, Some("rejected_scheme"));
     Ok(())
 }
+
+/// Redirects (M5.2): a public hop chain is followed to its final answer — the redirect
+/// itself is not the evidence, what it leads to is.
+#[tokio::test]
+async fn a_redirect_chain_is_followed_to_the_final_answer() -> anyhow::Result<()> {
+    let url = fixture(
+        Router::new()
+            .route(
+                "/go",
+                get(|| async { (StatusCode::FOUND, [("location", "/mid")]) }),
+            )
+            .route(
+                "/mid",
+                get(|| async { (StatusCode::MOVED_PERMANENTLY, [("location", "/ok")]) }),
+            )
+            .route("/ok", get(|| async { "landed" })),
+    )
+    .await?;
+    let result = lab_client(64 * 1024)?
+        .probe(&url.join("go")?, Duration::from_secs(2))
+        .await;
+    assert_eq!(result.outcome, CheckOutcome::Pass);
+    assert_eq!(result.http_status, Some(200));
+    Ok(())
+}
+
+/// Past the hop limit, the last 3xx stands as evidence — a redirect loop is `http_fail`,
+/// never a hang or a pass.
+#[tokio::test]
+async fn a_redirect_loop_is_http_fail_after_the_hop_limit() -> anyhow::Result<()> {
+    let url = fixture(Router::new().route(
+        "/loop",
+        get(|| async { (StatusCode::FOUND, [("location", "/loop")]) }),
+    ))
+    .await?;
+    let result = lab_client(64 * 1024)?
+        .probe(&url.join("loop")?, Duration::from_secs(2))
+        .await;
+    assert_eq!(result.outcome, CheckOutcome::HttpFail { status: 302 });
+    assert_eq!(result.http_status, Some(302));
+    Ok(())
+}

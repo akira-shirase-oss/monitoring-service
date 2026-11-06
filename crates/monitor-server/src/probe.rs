@@ -2,19 +2,24 @@
 //! honestly. A redirect, a refused connection and a hung socket are different evidence and
 //! never collapse into each other.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use tokio::time::Instant;
 use url::{Host, Url};
 
 use monitor_domain::CheckOutcome;
 
-/// Targets the monitor refuses to contact. The v1 guard lives at the URL layer: scheme plus
-/// IP-literal checks. DNS-level checks (a public name resolving to a private address) and
-/// redirect following with per-hop revalidation are M5 work — until then redirects are
-/// simply `http_fail` evidence, never followed.
+/// Redirects followed per hop, each revalidated — a hop limit, never a free pass.
+const MAX_REDIRECT_HOPS: usize = 5;
+
+/// Targets the monitor refuses to contact. Two layers, both M5-complete:
+///  * URL layer — scheme and IP literals, checked at registration and per redirect hop;
+///  * DNS layer — every address a name resolves to must pass `is_local` too, enforced by
+///    `PolicyResolver` so reqwest only ever dials validated addresses.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbePolicy {
     /// `lab` profile permits loopback/private literal targets for local fixtures.
@@ -26,6 +31,55 @@ pub struct ProbePolicy {
 pub enum Rejected {
     SchemeNotAllowed,
     LocalAddressForbidden,
+}
+
+/// A DNS answer containing a local address — the whole resolution is refused, because
+/// answering "we found 10.0.0.1" to a dialer that might pick it is a rebinding hole.
+#[derive(Debug)]
+struct ResolvedLocal;
+
+impl std::fmt::Display for ResolvedLocal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("target resolves to a local address")
+    }
+}
+
+impl std::error::Error for ResolvedLocal {}
+
+/// reqwest's resolver with the policy inside: names resolve through the OS, then every
+/// returned address must be public (unless `lab`). reqwest receives only the validated
+/// set — the check is the resolution itself, so there is no validate-then-re-resolve gap.
+#[derive(Debug, Clone, Copy)]
+struct PolicyResolver {
+    allow_local_targets: bool,
+}
+
+impl Resolve for PolicyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let allow = self.allow_local_targets;
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Every resolved address must be public (unless `lab`): a single local address fails the
+/// whole resolution — round-robin DNS means "usually public" is not a defense.
+fn validate_addrs(
+    addrs: impl IntoIterator<Item = IpAddr>,
+    allow_local_targets: bool,
+) -> Result<(), ResolvedLocal> {
+    if allow_local_targets {
+        return Ok(());
+    }
+    if addrs.into_iter().any(is_local) {
+        return Err(ResolvedLocal);
+    }
+    Ok(())
 }
 
 impl ProbePolicy {
@@ -87,7 +141,9 @@ pub struct ProbeResult {
     pub detail: Option<&'static str>,
 }
 
-/// One reqwest client shared by every probe: connection reuse, no redirect following.
+/// One reqwest client shared by every probe: connection reuse, policy-checked DNS, and
+/// redirects followed up to a bound with every hop revalidated — a redirect is a target
+/// the target chose, so it must clear the same policy as the original.
 #[derive(Debug, Clone)]
 pub struct ProbeClient {
     client: reqwest::Client,
@@ -99,7 +155,19 @@ pub struct ProbeClient {
 impl ProbeClient {
     pub fn new(policy: ProbePolicy, max_body: usize) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
-            .redirect(redirect::Policy::none())
+            .redirect(redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= MAX_REDIRECT_HOPS {
+                    attempt.stop()
+                } else if policy.check(attempt.url()).is_err() {
+                    // A hop the policy refuses is evidence, not a path: keep the 3xx.
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
+            .dns_resolver(Arc::new(PolicyResolver {
+                allow_local_targets: policy.allow_local_targets,
+            }))
             .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
@@ -202,6 +270,15 @@ enum Attempt {
 /// A short stable classification — the stored `detail` must stay free of URLs and headers,
 /// so reqwest's Display is never stored.
 fn classify(error: &reqwest::Error) -> &'static str {
+    // A DNS refusal from PolicyResolver rides inside reqwest's connect error — walk the
+    // cause chain so it reports `rejected_local`, not an ambiguous `connect`.
+    let mut cause: Option<&dyn std::error::Error> = std::error::Error::source(error);
+    while let Some(e) = cause {
+        if e.is::<ResolvedLocal>() {
+            return "rejected_local";
+        }
+        cause = e.source();
+    }
     if error.is_connect() {
         "connect"
     } else if error.is_body() || error.is_decode() {
@@ -210,5 +287,67 @@ fn classify(error: &reqwest::Error) -> &'static str {
         "request"
     } else {
         "transport"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+
+    #[test]
+    fn is_local_catches_every_non_public_range() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), // link-local cloud metadata
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6("fd00::1".parse().expect("fc00::/7")),
+            IpAddr::V6("fe80::1".parse().expect("link-local")),
+            IpAddr::V6("::ffff:127.0.0.1".parse().expect("v4-mapped loopback")),
+            IpAddr::V6("::ffff:10.0.0.1".parse().expect("v4-mapped private")),
+        ] {
+            assert!(is_local(ip), "{ip} must be refused");
+        }
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V6("2606:4700:4700::1111".parse().expect("public v6")),
+            IpAddr::V6("::ffff:8.8.8.8".parse().expect("v4-mapped public")),
+        ] {
+            assert!(!is_local(ip), "{ip} must be allowed");
+        }
+    }
+
+    #[test]
+    fn validate_addrs_refuses_when_any_answer_is_local() {
+        let mixed = [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+        ];
+        assert!(validate_addrs(mixed, false).is_err());
+        assert!(validate_addrs(mixed, true).is_ok());
+        let public = [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))];
+        assert!(validate_addrs(public, false).is_ok());
+        assert!(validate_addrs([], false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_resolver_itself_refuses_a_name_that_resolves_local() {
+        let resolver = PolicyResolver {
+            allow_local_targets: false,
+        };
+        let name = Name::from_str("localhost").expect("name");
+        assert!(
+            resolver.resolve(name).await.is_err(),
+            "localhost must not resolve under the strict profile"
+        );
     }
 }
