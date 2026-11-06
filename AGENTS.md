@@ -70,7 +70,10 @@ tested.
 
 Every feature ships with regression tests in the same branch: Rust unit tests (domain logic),
 in-process API tests (`crates/monitor-server/tests/`), and later black-box fixtures in
-`fixtures/` plus a load scenario in `perf/k6/`. Every fixed bug gets a test that fails without
+`fixtures/` plus a load scenario in `perf/k6/`. Load runs are aggressive per the workspace
+rule: full scenarios send at least 1,000,000 requests (or the equivalent unit — probe
+checks — where requests don't apply), with thresholds and results committed under
+`perf/results/` with machine + commit. Every fixed bug gets a test that fails without
 the fix. Report exactly what ran and what passed; never claim verified/benchmarked without an
 executed run.
 
