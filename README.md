@@ -10,17 +10,22 @@ pass?) are separate numbers everywhere.
 
 ## Status
 
-**M0–M5 built and verified.** Every milestone landed with a live drill or a measured
+**M0–M7 built and verified.** Every milestone landed with a live drill or a measured
 run; what exists is what the commits show. Highlights:
 
 - **Observing loop:** one attempt per scheduled slot, bounded global + per-origin
   concurrency, counted `missed` slots, generation invalidation (edits kill stale
   in-flight probes), restart rebuild from committed evidence.
 - **Honest classification:** pass / http_fail / transport / timeout / missed — a
-  redirect, a refused socket and a hung target never collapse into each other.
-- **Incidents + alerts:** three failures open, two fresh passes recover; signed
-  webhooks (`x-smon-event`, HMAC-SHA256 `x-smon-signature`) with finite jittered
-  retries — the outbox survives restarts and restores.
+  redirect, a refused socket and a hung target never collapse into each other; TLS
+  failures classify deterministically (`cert_expired`, `cert_name_mismatch`, …) on
+  webpki-roots rather than the platform verifier.
+- **Incidents + alerts:** per-monitor thresholds (1–10 to open / to recover, default
+  3/2) and all four honest times (`first_fail_at`, `last_fail_at`, `opened_at`,
+  `resolved_at`); maintenance windows suppress the page, never the evidence. Signed
+  webhooks (`x-smon-event`, HMAC-SHA256 `x-smon-signature`) and SMTP email through
+  the same outbox, with finite jittered retries — the outbox survives restarts and
+  restores.
 - **SSRF guard:** `http`/`https` only; private/loopback/link-local/multicast/v4-mapped
   IP literals refused; DNS answers validated inside the resolver (a public name
   resolving to a private address is refused — `rejected_local`); redirects followed
@@ -35,12 +40,18 @@ run; what exists is what the commits show. Highlights:
   expiry, `SMON_SESSION_TTL_S`; `Origin` must match `Host`, mandatory on
   cookie-authed writes). Tokenless loopback is dev mode, tokenless public bind
   refuses to boot.
+- **Dashboard:** add/edit/pause/delete without leaving the UI, an uptime strip that
+  renders unobserved slots as gaps (never interpolated green), a 15 s auto-refresh
+  with atomic swaps, the public status rendered in-app, and a guide page whose
+  words are drift-checked against the real wire vocabulary in both directions.
 - **Public status:** self-expiring `status.json` heartbeat + static renderer +
   independent checker — an expired snapshot reads "monitoring unavailable," never
   "all down."
-- **Evidence:** 90+ Rust tests, a Playwright suite against the real server, a measured
-  load baseline (`perf/results/`, 4000 checks, zero missed, p95 commit lag 4.9 s) —
-  and the guide's 24 h soak is documented as *not yet run* rather than claimed.
+- **Evidence:** 90+ Rust tests, a Playwright suite against the real server, a
+  mutation-tested domain (48 mutants → 42 caught, 0 missed), pinned CLI exit codes,
+  a measured load baseline and a 3.84M-request real-app drill (`perf/results/`,
+  0 missed slots, honest incident times, both alert channels delivered) — and the
+  guide's 24 h soak is still documented as *not yet run* rather than claimed.
 
 ## Layout
 
@@ -54,7 +65,7 @@ run; what exists is what the commits show. Highlights:
 | `apps/status` | Static status-page renderer for the public snapshot. |
 | `docs/END_GOAL.md` | What done means; in/out of scope; the ship gate. |
 | `docs/ARCHITECTURE.md` | Sources of truth, process model, data paths, bounds. |
-| `docs/ROADMAP.md` | Milestones M0–M5; every step's outcome/invariant/failure case/acceptance test. |
+| `docs/ROADMAP.md` | Milestones M0–M7; every step's outcome/invariant/failure case/acceptance test. |
 | `docs/modules/` | Per-module contracts with testing parameters (01 domain … 09 testing/load). |
 | `docs/DECISIONS.md` | Permanent `D-NNN` decisions, newest first. |
 | `fixtures/`, `perf/` | Deterministic fault fixtures, the lab-profile load harness, committed results. |

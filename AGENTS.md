@@ -4,15 +4,22 @@ The rebuild of the old service monitor, per `Project_Guides/02_Service_Monitor_R
 (read it first — it is the contract). The old code is gone (D-001); the guide plus the
 404human.dev build log are the specification.
 
-**Current state (2026-11-05): M1 "check and remember" done.** The observing loop is real:
-coordinator (`schedule.rs`, one attempt per slot, `try_acquire` bounds, counted misses),
-probe engine (`probe.rs`, GET only, deadline + 64 KiB body bound, classified outcomes,
-URL-layer target policy), single-writer task (`monitor-db::writer`, check + incident +
-outbox in one transaction), `Health::rebuild` restart recovery, and statuses in the API that
-only reflect committed evidence. No notification delivery, monitor edit/pause, incidents
-API, auth, DNS-level SSRF guards, or status renderer yet. Next slice: M2 Notify — the outbox
-deliverer, monitor management writes, incidents API, fault fixtures. `SMON_PROFILE=lab`
-permits loopback targets for fixtures.
+**Current state (2026-11-06): the rebuild roadmap is complete — M0–M7 are built and
+verified.** The observing loop (one attempt per slot, `try_acquire` bounds, counted
+misses, generation invalidation, restart rebuild from committed evidence), the
+incident machine (three failures open, two fresh passes close — per-monitor
+thresholds, all four honest times, maintenance windows that suppress the page and
+never the evidence), the signed-webhook and SMTP-email outbox, the complete SSRF
+guard (DNS answers validated inside the resolver, ≤5 revalidated redirects),
+management auth (`SMON_ADMIN_TOKEN` bearer for the CLI; `POST /api/login` session
+cookie for the dashboard, Origin-checked), monitor edit/pause/delete, the incidents
+API, the self-expiring public `status.json` plus independent checker, retention
+aggregates, `VACUUM INTO` backups and release/symlink deploys all exist and are
+covered in `docs/ROADMAP.md`. The domain survived cargo-mutants 42/48 with 0 missed;
+the real-app load drill committed 3.84M requests against the app's own ground truth.
+**Still owed: the guide's 24-hour soak** — `perf/results/soak-24h-20261106.log` is an
+empty placeholder committed 2026-11-06; the run itself has not happened.
+`SMON_PROFILE=lab` permits loopback targets for fixtures.
 
 ## Read first
 
