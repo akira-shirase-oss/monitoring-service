@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- M6.5 dashboard uptime strip: `CheckStrip` above the detail-page check rows — one cell
+  per committed check (live/attention/draft status tokens, tooltips carry the outcome,
+  HTTP status and latency), plus dashed `missing` gap cells where the slot grid shows
+  unobserved time (`buildStripCells` measures whole-interval distance, 1.5× tolerance for
+  commit lag; a long hole compresses to chunked cells with the true slot count in the
+  tooltip). A hole in evidence renders as a hole, never interpolated green. Playwright:
+  pass/http_fail cells on the up/down specs; the pause-gap spec pauses a monitor for two
+  slots, resumes, and asserts the `data-outcome="missing"` cell — real unobserved time,
+  not a mock.
 - M6.4 dashboard mutations: the UI now holds write authority behind the existing token
   — "Add monitor" on the list page (shared `MonitorForm` component), and pause/resume,
   edit (interval/timeout/thresholds sent with the `generation` optimistic-concurrency

@@ -7,7 +7,9 @@ Mutations (M6.4): create via the shared `MonitorForm`, detail-page pause/resume,
 (interval/timeout/thresholds, sent with the `generation` guard), delete behind a two-click
 confirm — every write goes through the same API contract, and the server's envelope error
 is shown verbatim (stale-generation `conflict`, delete-with-history refusal, 401 → token
-hint).
+hint). Charts (M6.5): `CheckStrip` uptime strip above the check rows — one cell per
+committed check (live/attention/draft tokens), plus dashed gap cells where the slot grid
+shows unobserved time; a hole in evidence renders as a hole.
 
 ## Purpose
 
@@ -43,6 +45,8 @@ evidence, check history and incident timelines — a client of the API, never of
   page (checks strip, "still open", coverage-vs-success line), full mutation spec
   (UI create → pause (API-verified) → edit (generation bumps once per write) → delete),
   delete-with-history refusal surfacing the server message, mutation-401 token hint,
-  keyboard navigation. `scripts/e2e.sh` builds the server + dashboard and runs it.
+  uptime-strip cells for pass/http_fail outcomes, and the pause-gap spec — pause mid-run
+  so slots skip, resume, and `data-outcome="missing"` cells mark the unobserved window.
+  `scripts/e2e.sh` builds the server + dashboard and runs it.
 - **Load:** not a target — a local operator tool; page weight budget recorded per release
   (module 09).

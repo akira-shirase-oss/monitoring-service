@@ -43,6 +43,10 @@ test('a monitor registers, probes land, and the badge turns up', async ({
 		.toBe('up');
 	await page.reload();
 	await expect(page.getByRole('link', { name })).toBeVisible();
+
+	// The uptime strip renders a live cell per committed check.
+	await page.getByRole('link', { name }).click();
+	await expect(page.locator('.check-strip [data-outcome="pass"]').first()).toBeVisible();
 });
 
 test('three failures open an incident and the detail page tells the truth', async ({
@@ -74,6 +78,8 @@ test('three failures open an incident and the detail page tells the truth', asyn
 	await expect(page.getByText('still open').first()).toBeVisible();
 	// Coverage vs success are separate claims — success reads 0%, coverage is a number.
 	await expect(page.getByText(/coverage \d+\.\d%[\s\S]*success 0\.0%/)).toBeVisible();
+	// The strip shows the failing run as down cells — count tracks committed rows.
+	await expect(page.locator('.check-strip [data-outcome="http_fail"]').first()).toBeVisible();
 });
 
 test('mutations through the real API: create in UI, pause, edit, delete', async ({
@@ -143,6 +149,30 @@ test('delete refusal on a monitor with history shows the server error', async ({
 	// The server's own conflict message is shown — not a silent no-op, not a spin.
 	await expect(page.getByText(/recorded history|pause it instead/)).toBeVisible();
 	await expect(page.getByRole('heading', { name })).toBeVisible();
+});
+
+test('a paused window renders as missing slots, never interpolated green', async ({
+	page,
+	request
+}) => {
+	const name = `e2e-gap-${Date.now()}`;
+	const id = await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);
+	const checkCount = async () => {
+		const r = await request.get(`/api/monitors/${id}/checks?limit=50`);
+		return (await r.json()).checks.length;
+	};
+	// One check lands, then pause for ~2 slots, then resume — the pause window is
+	// unobserved time: no rows at all, so the strip must show a gap, not cells.
+	await expect.poll(checkCount, { timeout: 40_000 }).toBeGreaterThan(0);
+	await request.patch(`/api/monitors/${id}`, { data: { paused: true } });
+	await new Promise((resolve) => setTimeout(resolve, 35_000));
+	await request.patch(`/api/monitors/${id}`, { data: { paused: false } });
+	const after = await checkCount();
+	await expect.poll(checkCount, { timeout: 40_000 }).toBeGreaterThan(after);
+
+	await page.goto(`/monitors/${id}`);
+	await expect(page.locator('.check-strip [data-outcome="missing"]').first()).toBeVisible();
+	await expect(page.locator('.check-strip [data-outcome="pass"]').first()).toBeVisible();
 });
 
 test('a mutation 401 surfaces the token error, never silent', async ({ page }) => {

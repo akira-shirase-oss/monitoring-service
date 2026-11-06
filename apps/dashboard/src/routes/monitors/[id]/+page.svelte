@@ -5,6 +5,7 @@
 	import { goto, invalidateAll } from '$app/navigation';
 	import TokenGate from '#lib/components/TokenGate.svelte';
 	import MonitorForm from '#lib/components/MonitorForm.svelte';
+	import CheckStrip from '#lib/components/CheckStrip.svelte';
 	import { apiFetch } from '#lib/auth.js';
 	import { readEnvelope } from '#lib/api.js';
 	import type { MonitorPayload } from '#lib/monitor-form.js';
@@ -194,6 +195,9 @@
 
 		<div>
 			<h2 class="text-sm font-medium text-muted-foreground">Recent checks</h2>
+			<div class="mt-2">
+				<CheckStrip checks={data.checks} intervalS={data.monitor.interval_s} />
+			</div>
 			{#if data.checks.length === 0}
 				<p class="mt-2 text-sm text-muted-foreground">Nothing observed yet.</p>
 			{:else}
