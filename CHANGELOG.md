@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- M6.8 guide page: `/guide` renders one glossary (`lib/vocabulary.ts`) — monitor
+  statuses, check outcomes, the transport detail taxonomy, incident fields and states,
+  plus concepts (coverage vs success, generation, "cannot see", "monitoring
+  unavailable", the strip's gap cells, thresholds). Drift-checked both directions by
+  `tests/guide_drift.rs`: every serialized `Status`, every `SlotObservation` outcome
+  through the store's own `encode_slot`, the detail taxonomy, and the incident words
+  must be in the guide — and no guide word may exist that the API can't emit. A new
+  enum variant or word without a guide entry now fails the build.
 - M6.7 public status view in-app: `monitor-server` now serves the sanitized snapshot
   unmodified at `GET /status.json` — outside `/api`, no token, so public viewers never
   touch the management surface. The dashboard gains `/status`: service rows with hashed

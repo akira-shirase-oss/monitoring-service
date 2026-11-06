@@ -262,6 +262,26 @@ test('no readable snapshot is "monitoring unavailable", never fabricated rows', 
 	await expect(page.locator('span.font-mono')).toHaveCount(0);
 });
 
+test('the guide page documents every wire word in plain English', async ({
+	page
+}) => {
+	await page.goto('/guide');
+	await expect(page.getByRole('heading', { name: 'Guide' })).toBeVisible();
+	for (const section of [
+		'Monitor status',
+		'Check outcomes',
+		'Failure detail',
+		'Incident vocabulary',
+		'Concepts'
+	]) {
+		await expect(page.getByRole('heading', { name: section })).toBeVisible();
+	}
+	// Spot-check the words a user actually sees — wire strings rendered as code.
+	for (const word of ['up', 'unknown', 'http_fail', 'missed', 'cert_expired', 'first_fail_at']) {
+		await expect(page.locator('code').getByText(word, { exact: true })).toBeVisible();
+	}
+});
+
 test('a mutation 401 surfaces the token error, never silent', async ({ page }) => {
 	await page.route('**/api/monitors', (route) => {
 		if (route.request().method() === 'POST') {

@@ -35,7 +35,7 @@ rebuild log ships), mined before its removal from `minimal-portfolio`.
 | ~~Charts / uptime timeline~~ | (dashboard richer than rows) | **M6.5 done** | `CheckStrip` — one cell per committed check + dashed gap cells for unobserved slots; pause-gap spec proves a hole renders as a hole |
 | ~~Auto-refresh~~ | — | **M6.6 done** | `invalidateAll()` on the 15 s tick; atomic data swap — mid-poll outage resolves to "cannot see", new data appears without reload |
 | ~~Public status view in-app~~ | old M5 "status page somewhere else" | **M6.7 done** | `/status.json` serves the sanitized artifact unmodified (outside /api, no token); `/status` page renders it — stale/missing → "monitoring unavailable", never "all down" |
-| Guide page | 2.2: plain-English status/word reference, drift-checked | M6.8 | Cheap; the honesty vocabulary needs explaining |
+| ~~Guide page~~ | 2.2: plain-English status/word reference, drift-checked | **M6.8 done** | `/guide` from one glossary; `guide_drift.rs` pins every wire word both directions — a new enum variant/word without a guide entry fails the build |
 | CLI exit codes | 0.6 | M6.9 | Contract audit + pinned tests |
 | Mutation testing | 0.7 | M6.10 | 88 hand-written tests have never been attacked; cargo-mutants on the domain |
 | Maintenance windows | old M4 planned | M6.11 | Real feature: suppression schedule so planned work doesn't page; scoped as "no new incidents during window, checks still record" |

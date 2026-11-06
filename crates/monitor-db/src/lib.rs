@@ -696,8 +696,10 @@ async fn enqueue_outbox(
     Ok(())
 }
 
-/// Map a slot onto the `checks.outcome` text + status column.
-fn encode_slot(slot: SlotObservation, http_status: Option<u16>) -> (&'static str, Option<i64>) {
+/// Map a slot onto the `checks.outcome` text + status column. `pub` for the guide drift
+/// test — the wire vocabulary is this function, so the guide's word list is checked
+/// against what the store actually writes.
+pub fn encode_slot(slot: SlotObservation, http_status: Option<u16>) -> (&'static str, Option<i64>) {
     let status = http_status.map(i64::from);
     match slot {
         SlotObservation::Missed => ("missed", None),

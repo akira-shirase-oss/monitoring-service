@@ -12,7 +12,11 @@ committed check (live/attention/draft tokens), plus dashed gap cells where the s
 shows unobserved time; a hole in evidence renders as a hole. Auto-refresh (M6.6): both
 pages `invalidateAll()` on the 15 s minimum-interval tick — SvelteKit holds the last data
 until the reload resolves so the swap is atomic (no stale-green flash); an API outage
-mid-poll resolves to "cannot see"; hidden tabs skip the tick.
+mid-poll resolves to "cannot see"; hidden tabs skip the tick. Guide (M6.8): `/guide`
+renders one glossary (`lib/vocabulary.ts`) — statuses, outcomes, the transport detail
+taxonomy, incident fields, plus concepts (coverage≠success, generation, "cannot see");
+a Rust drift test (`tests/guide_drift.rs`) pins every wire string against the real
+enums and the store's own `encode_slot`.
 
 ## Purpose
 
@@ -51,6 +55,11 @@ evidence, check history and incident timelines — a client of the API, never of
   uptime-strip cells for pass/http_fail outcomes, the pause-gap spec (pause ~2 slots →
   resume → `data-outcome="missing"` cells), and the auto-refresh pair — a new monitor
   surfaces on the poll tick without navigation; an API abort mid-poll resolves to
-  "cannot see". `scripts/e2e.sh` builds the server + dashboard and runs it.
+  "cannot see"; the status-view trio (live/stale/missing snapshot); the guide-page spec.
+  `scripts/e2e.sh` builds the server + dashboard and runs it.
+- **Rust drift check (M6.8):** `tests/guide_drift.rs` reads `lib/vocabulary.ts` and pins
+  every `word` against `Status`/`SlotObservation` serialization through the store's own
+  `encode_slot`, the transport detail taxonomy, and the incident field/state set — plus
+  the reverse (no stale guide words).
 - **Load:** not a target — a local operator tool; page weight budget recorded per release
   (module 09).
