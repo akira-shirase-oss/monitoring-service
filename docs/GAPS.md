@@ -45,7 +45,7 @@ rebuild log ships), mined before its removal from `minimal-portfolio`.
 | Point | Why deferred |
 |---|---|
 | ~~Email alerts (old M3.4)~~ | **M7.1 done** — `notify_outbox.channel`; one transition enqueues one row per configured channel (webhook always, email when `SMON_SMTP_*` set); lettre/rustls `Sink::Email` on the same retry/deadline path; partial SMTP config is a boot error |
-| Dashboard management login UX (old M4 "logging in") | Token gate exists; a session/login system is M7.2 |
+| ~~Dashboard management login UX (old M4 "logging in")~~ | **M7.2 done** — `POST /api/login` → HttpOnly session cookie (migration 0007, `SMON_SESSION_TTL_S`); logout deletes the row; Origin must match Host for any credential and is mandatory on cookie-authed writes; bearer kept for CLI; e2e runs the real auth path |
 | 24-hour soak | Owed evidence, not a feature — `perf/lab-profile.mjs --duration-s 86400` (running) |
 | Real-app load watch (old 1.1) | The lab-profile harness covers bounded evidence; a real-Node-app rising-load run is M7.3 |
 

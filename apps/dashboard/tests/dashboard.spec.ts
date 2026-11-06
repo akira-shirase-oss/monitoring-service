@@ -1,6 +1,19 @@
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type BrowserContext, type Page } from '@playwright/test';
 
 const FAULT = process.env['SMON_E2E_FAULT_PORT'] ?? '58710';
+const TOKEN = 'e2e-token';
+// Direct API calls use the CLI contract: Bearer, no Origin needed.
+const AUTH = { authorization: `Bearer ${TOKEN}` };
+
+// The dashboard earns its session the way a browser does: POST /api/login once,
+// the HttpOnly cookie moves into the page's jar. API-side `request` calls carry
+// the same cookie for reads; writes take the bearer path above.
+test.beforeEach(async ({ request, context }) => {
+	const response = await request.post('/api/login', { data: { token: TOKEN } });
+	expect(response.status()).toBe(204);
+	const state = await request.storageState();
+	await context.addCookies(state.cookies);
+});
 
 async function addMonitor(
 	request: APIRequestContext,
@@ -8,7 +21,8 @@ async function addMonitor(
 	url: string
 ): Promise<string> {
 	const response = await request.post('/api/monitors', {
-		data: { name, url, interval_s: 15, timeout_s: 5 }
+		data: { name, url, interval_s: 15, timeout_s: 5 },
+		headers: AUTH
 	});
 	expect(response.status()).toBe(201);
 	return (await response.json()).id as string;
@@ -164,9 +178,9 @@ test('a paused window renders as missing slots, never interpolated green', async
 	// One check lands, then pause for ~2 slots, then resume — the pause window is
 	// unobserved time: no rows at all, so the strip must show a gap, not cells.
 	await expect.poll(checkCount, { timeout: 40_000 }).toBeGreaterThan(0);
-	await request.patch(`/api/monitors/${id}`, { data: { paused: true } });
+	await request.patch(`/api/monitors/${id}`, { data: { paused: true }, headers: AUTH });
 	await new Promise((resolve) => setTimeout(resolve, 35_000));
-	await request.patch(`/api/monitors/${id}`, { data: { paused: false } });
+	await request.patch(`/api/monitors/${id}`, { data: { paused: false }, headers: AUTH });
 	const after = await checkCount();
 	await expect.poll(checkCount, { timeout: 40_000 }).toBeGreaterThan(after);
 
@@ -315,7 +329,8 @@ test('an active maintenance window is visible, never silent', async ({ page, req
 			starts_at: new Date(now - 60_000).toISOString(),
 			ends_at: new Date(now + 3_600_000).toISOString(),
 			reason: 'e2e deploy rehearsal'
-		}
+		},
+		headers: AUTH
 	});
 	expect(response.status()).toBe(201);
 
@@ -336,4 +351,41 @@ test('keyboard navigation reaches the detail page', async ({ page, request }) =>
 	await page.keyboard.press('Enter');
 	await expect(page).toHaveURL(new RegExp(`/monitors/${id}`));
 	await expect(page.getByRole('heading', { name })).toBeVisible();
+});
+
+test('sign-in: wrong token refused, right token earns the session, sign-out ends it', async ({
+	page,
+	context
+}) => {
+	// The shared beforeEach already logged this context in — start truly signed out.
+	await context.clearCookies();
+	await page.goto('/');
+	await expect(page.getByText('Sign in to manage monitors.')).toBeVisible();
+
+	// A wrong token is refused with an honest error, no cookie.
+	await page.getByPlaceholder('admin token').fill('wrong-token');
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	await expect(page.getByText('That token was refused.')).toBeVisible();
+	await expect(page.getByText('Sign in to manage monitors.')).toBeVisible();
+
+	// The right token → 204 + cookie → reload → the real board, not a stored token.
+	await page.getByPlaceholder('admin token').fill(TOKEN);
+	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+	await expect(page.getByText('Sign in to manage monitors.')).not.toBeVisible({
+		timeout: 10_000
+	});
+	// The session cookie is HttpOnly — document.cookie can never see it.
+	const cookies = await context.cookies();
+	const session = cookies.find((c) => c.name === 'smon_session');
+	expect(session, 'the login sets the session cookie').toBeTruthy();
+	expect(session?.httpOnly).toBe(true);
+	expect(session?.sameSite).toBe('Strict');
+
+	// Sign out deletes the row server-side and expires the cookie — the gate returns.
+	await page.getByRole('button', { name: 'Sign out' }).click();
+	await expect(page.getByText('Sign in to manage monitors.')).toBeVisible({
+		timeout: 10_000
+	});
+	const after = await context.cookies();
+	expect(after.find((c) => c.name === 'smon_session')?.value ?? '').toBe('');
 });

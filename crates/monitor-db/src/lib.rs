@@ -378,6 +378,63 @@ impl Db {
             .map(|gate| gate.generation))
     }
 
+    /// Register a dashboard session (M7.2). The cookie carries only the id — the store
+    /// decides validity, so a session survives a restart and dies on its own `expires_at`.
+    pub async fn create_session(
+        &self,
+        id: &str,
+        expires_at: OffsetDateTime,
+    ) -> Result<(), QueryError> {
+        sqlx::query("INSERT INTO sessions (id, created_at, expires_at) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(OffsetDateTime::now_utc())
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A session authorizes only while `expires_at` is in the future. An expired row is
+    /// deleted on sight — the sweep in retention is the sweeper, this is the guard.
+    pub async fn session_valid(&self, id: &str) -> Result<bool, QueryError> {
+        let now = OffsetDateTime::now_utc();
+        let row: Option<(OffsetDateTime,)> =
+            sqlx::query_as("SELECT expires_at FROM sessions WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            Some((expires,)) if expires > now => Ok(true),
+            Some(_) => {
+                sqlx::query("DELETE FROM sessions WHERE id = ?")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(false)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Logout deletes the row — an idempotent no-op on an already-gone session.
+    pub async fn delete_session(&self, id: &str) -> Result<(), QueryError> {
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete every session past its expiry — the retention tick's housekeeping so
+    /// forgotten rows can't accumulate forever.
+    pub async fn sweep_expired_sessions(&self) -> Result<u64, QueryError> {
+        let done = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
+            .bind(OffsetDateTime::now_utc())
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Register a maintenance window. `starts_at < ends_at` is enforced by the table's
     /// CHECK; a wholly-past window is accepted — it is a record explaining evidence, not
     /// dead config (the same reason resolved incidents are kept).

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- M7.2 dashboard login UX: `POST /api/login` exchanges `SMON_ADMIN_TOKEN` for a
+  `sessions` row (migration 0007) + `smon_session` cookie — HttpOnly,
+  SameSite=Strict, `SMON_SESSION_TTL_S` (default 12 h). Store-side `expires_at` is
+  the authority; `POST /api/logout` deletes the row and expires the cookie
+  (idempotent). CSRF contract: `Origin` must match `Host` for any credential and is
+  mandatory on cookie-authed writes; bearer needs none (CLI unchanged). A wrong
+  token gets a fixed delay + 401; a session-store failure answers 503 rather than
+  a false 401. Dashboard: `TokenGate`→`LoginGate` (real POST + server-verbatim
+  errors), nav Sign out, `apiFetch` carries the cookie — no token in browser
+  storage. Tests: store lifecycle, 7 API session tests (cookie flags, Origin
+  matrix, logout, ttl=0 expiry), Playwright sign-in spec — all 16 e2e specs now
+  run the real auth path. Live drill: full 401→204+cookie→403/403/201→logout→401
+  matrix on the wire.
 - M7.1 email alerts: `notify_outbox.channel` (migration 0006) — one incident
   transition enqueues one row per configured channel (webhook always; email when
   `SMON_SMTP_DSN`/`SMON_SMTP_FROM`/`SMON_SMTP_TO` are all set). `Sink::Email` is a

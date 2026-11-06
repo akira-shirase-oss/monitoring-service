@@ -106,14 +106,19 @@ async fn main() -> anyhow::Result<()> {
 
     let status_dir = std::env::var("SMON_STATUS_DIR").unwrap_or_else(|_| "status".into());
     let _snapshot_task = spawn_snapshot(&db, &statuses, &status_dir, &shutdown);
-    let _retention_task = spawn_retention(&writer, &shutdown);
+    let _retention_task = spawn_retention(&db, &writer, &shutdown);
 
+    let session_ttl = std::env::var("SMON_SESSION_TTL_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(Duration::from_hours(12), Duration::from_secs);
     let mut app = router(AppState {
         db,
         statuses,
         registry: registry_tx,
         write_health,
         admin_token,
+        session_ttl,
         version: env!("CARGO_PKG_VERSION"),
     });
 
@@ -243,6 +248,7 @@ fn spawn_snapshot(
 /// daily aggregates. Passes go through the single writer, `SMON_RETENTION_INTERVAL_S`
 /// apart (default hourly) — expiry never touches open incidents or the outbox.
 fn spawn_retention(
+    db: &monitor_db::Db,
     writer: &monitor_db::writer::WriterHandle,
     shutdown: &CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -254,6 +260,7 @@ fn spawn_retention(
     };
     let keep = Duration::from_secs(env_secs("SMON_RETENTION_S", 7 * 86_400));
     let every = Duration::from_secs(env_secs("SMON_RETENTION_INTERVAL_S", 3_600));
+    let db = db.clone();
     let writer = writer.clone();
     let shutdown = shutdown.clone();
     tracing::info!(
@@ -279,6 +286,13 @@ fn spawn_retention(
                 ),
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "retention pass failed"),
+            }
+            // Expired dashboard sessions are the same class of garbage: honest expiry
+            // needs no lazy-lookup to be correct, it just keeps the table small.
+            match db.sweep_expired_sessions().await {
+                Ok(n) if n > 0 => tracing::debug!(sessions = n, "swept expired sessions"),
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "session sweep failed"),
             }
         }
     })

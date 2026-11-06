@@ -25,10 +25,26 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `last_fail_at`, `resolved_at` — RFC3339, nullable for pre-M6.3 rows.
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
-- **Auth (M5.1, live):** every `/api/**` route requires `Authorization: Bearer
-  $SMON_ADMIN_TOKEN` (sha256-digest compare). `/livez`, `/readyz` and static files stay
-  open. Token unset = dev mode on loopback only; a tokenless public bind refuses to boot.
-  Denied means denied — no unauthenticated path once enabled.
+- **Auth (M5.1 + M7.2, live):** every `/api/**` route requires a credential —
+  `Authorization: Bearer $SMON_ADMIN_TOKEN` (sha256-digest compare) for CLI/scripts,
+  or the HttpOnly `smon_session` cookie for the dashboard. `/livez`, `/readyz` and
+  static files stay open. Token unset = dev mode on loopback only; a tokenless
+  public bind refuses to boot. Denied means denied — no unauthenticated path once
+  enabled.
+- **Session login (M7.2):** `POST /api/login {token}` exchanges the admin token for a
+  `sessions` row (migration 0007) + `Set-Cookie: smon_session=<id>; HttpOnly;
+  SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>`. Store-side
+  `expires_at` is the authority — the cookie's Max-Age is a browser hint. The token
+  itself never lands in browser storage; it can be rotated without stranding copies.
+  `POST /api/logout` deletes the row and expires the cookie — idempotent. A wrong
+  token gets a fixed ~300 ms delay + 401 (no lockout state to game); a session-store
+  failure answers 503, never a false 401. With no admin token configured, login
+  answers 404 `auth_disabled` — dev mode has no credential to exchange.
+- **CSRF contract:** an `Origin` header that doesn't match `Host` (host:port —
+  browsers state the exact authority they dialed) is rejected for *any* credential;
+  a **cookie-authed mutation must send Origin** (browsers always do on writes —
+  its absence means the request isn't a browser). Bearer requests need no Origin —
+  curl and the CLI don't send one.
 - **Writes bump generation** on any schedule/target/threshold/paused change (module 01
   invariant). `failures_to_open` / `passes_to_recover` (`1..=10`, default 3/2) are settable
   on create and patch; out-of-range → `invalid_request`.

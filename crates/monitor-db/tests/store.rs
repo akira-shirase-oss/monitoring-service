@@ -849,3 +849,36 @@ async fn an_incident_enqueues_one_row_per_configured_channel() -> anyhow::Result
     );
     Ok(())
 }
+
+/// M7.2: session rows are the cookie's authority — create, validate, expire, sweep.
+#[tokio::test]
+async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let now = time::OffsetDateTime::now_utc();
+
+    db.create_session("live", now + time::Duration::hours(1))
+        .await?;
+    db.create_session("dead", now - time::Duration::seconds(1))
+        .await?;
+    assert!(db.session_valid("live").await?);
+    assert!(!db.session_valid("missing").await?);
+    // An expired row is denied and deleted on sight — one lookup is the whole contract.
+    assert!(!db.session_valid("dead").await?);
+
+    db.create_session("gone-soon", now - time::Duration::seconds(1))
+        .await?;
+    // `dead` was already deleted by the lazy guard above — the sweep takes what's left.
+    assert_eq!(
+        db.sweep_expired_sessions().await?,
+        1,
+        "the untouched expired row swept"
+    );
+    assert!(
+        db.session_valid("live").await?,
+        "the live session survives the sweep"
+    );
+    db.delete_session("live").await?;
+    assert!(!db.session_valid("live").await?);
+    Ok(())
+}

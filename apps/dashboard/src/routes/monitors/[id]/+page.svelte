@@ -4,7 +4,7 @@
 	import { ArrowLeft, TriangleAlert } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { goto, invalidateAll } from '$app/navigation';
-	import TokenGate from '#lib/components/TokenGate.svelte';
+	import LoginGate from '#lib/components/LoginGate.svelte';
 	import MonitorForm from '#lib/components/MonitorForm.svelte';
 	import CheckStrip from '#lib/components/CheckStrip.svelte';
 	import { apiFetch } from '#lib/auth.js';
@@ -115,7 +115,7 @@
 	</a>
 
 	{#if data.state === 'needsAuth'}
-		<TokenGate />
+		<LoginGate />
 	{:else if data.state === 'missing'}
 		<Card.Root class="border-dashed">
 			<Card.Content class="p-10 text-center">

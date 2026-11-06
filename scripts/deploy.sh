@@ -47,6 +47,7 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_SMTP_DSN=smtps://user:pass@smtp.example.com:465   # or smtp://host:587?tls=required
 # SMON_SMTP_FROM=alerts@example.com
 # SMON_SMTP_TO=oncall@example.com,backup@example.com
+# SMON_SESSION_TTL_S=43200   # dashboard session lifetime (default 12h)
 ENV
 
 if [ -d apps/dashboard/build ]; then

@@ -30,8 +30,11 @@ run; what exists is what the commits show. Highlights:
   keep raw evidence); `SMON_MAX_DB_BYTES` caps the store and `/readyz` goes 503 when
   the write path fails; `SMON_LOG_FILE` bounds logs to two generations; `VACUUM INTO`
   backups behind `POST /api/backup`; versioned releases + rollback by repoint.
-- **Auth:** `SMON_ADMIN_TOKEN` → `Bearer` on every `/api/**` route (digest-compared);
-  tokenless loopback is dev mode, tokenless public bind refuses to boot.
+- **Auth:** `SMON_ADMIN_TOKEN` → `Bearer` for CLI/scripts, or the HttpOnly
+  `smon_session` cookie the dashboard earns at `POST /api/login` (store-side
+  expiry, `SMON_SESSION_TTL_S`; `Origin` must match `Host`, mandatory on
+  cookie-authed writes). Tokenless loopback is dev mode, tokenless public bind
+  refuses to boot.
 - **Public status:** self-expiring `status.json` heartbeat + static renderer +
   independent checker — an expired snapshot reads "monitoring unavailable," never
   "all down."
@@ -108,6 +111,7 @@ All via `SMON_*` env vars (defaults in `deploy.sh`'s generated `env` file):
 `SMON_WEBHOOK_URL` `SMON_WEBHOOK_SECRET`
 `SMON_SMTP_DSN` `SMON_SMTP_FROM` `SMON_SMTP_TO` — all three required together for the
 email channel; a partial set fails the boot.
+`SMON_SESSION_TTL_S` — dashboard session lifetime in seconds (default 43200).
 
 ## Verify
 

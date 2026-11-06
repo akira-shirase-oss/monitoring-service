@@ -1,7 +1,15 @@
 <script lang="ts">
 	import '../app.css';
+	import { logout } from '#lib/auth.js';
 
 	let { children } = $props();
+
+	// Sign-out is idempotent: no session → the POST is a no-op and the reload
+	// just lands back here; a session → the row dies server-side, not just in the tab.
+	async function signOut() {
+		await logout();
+		location.reload();
+	}
 </script>
 
 <div class="flex min-h-dvh flex-col">
@@ -11,8 +19,9 @@
 				<span class="size-2.5 rounded-full bg-brand"></span>
 				Service Monitor
 			</a>
-			<nav class="text-sm text-muted-foreground">
+			<nav class="flex items-center gap-4 text-sm text-muted-foreground">
 				<a href="/" class="hover:text-foreground">Monitors</a>
+				<button onclick={signOut} class="hover:text-foreground">Sign out</button>
 			</nav>
 		</div>
 	</header>

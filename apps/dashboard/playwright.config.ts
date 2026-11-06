@@ -37,7 +37,10 @@ export default defineConfig({
 				SMON_LISTEN: `127.0.0.1:${SERVER_PORT}`,
 				SMON_PROFILE: 'lab',
 				SMON_DASHBOARD_DIR: `${repo}apps/dashboard/build`,
-				SMON_STATUS_DIR: `/tmp/smon-e2e-status-${process.pid}`
+				SMON_STATUS_DIR: `/tmp/smon-e2e-status-${process.pid}`,
+				// M7.2: e2e runs the real auth path — the dashboard earns its session
+				// cookie exactly like a deployed instance.
+				SMON_ADMIN_TOKEN: 'e2e-token'
 			},
 			url: `http://127.0.0.1:${SERVER_PORT}/livez`,
 			reuseExistingServer: false,

@@ -4,7 +4,7 @@
 	import { TriangleAlert } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
-	import TokenGate from '#lib/components/TokenGate.svelte';
+	import LoginGate from '#lib/components/LoginGate.svelte';
 	import MonitorForm from '#lib/components/MonitorForm.svelte';
 	import { apiFetch } from '#lib/auth.js';
 	import { readEnvelope } from '#lib/api.js';
@@ -95,7 +95,7 @@
 	</div>
 
 	{#if data.needsAuth}
-		<TokenGate />
+		<LoginGate />
 	{:else if !data.reachable}
 		<Card.Root class="border-attention/40 bg-attention-soft">
 			<Card.Content class="flex items-start gap-3 p-4">

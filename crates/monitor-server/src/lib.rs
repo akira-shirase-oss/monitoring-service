@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,10 @@ pub struct AppState {
     /// The management credential (M5.1). `None` only on a loopback listen — boot refuses
     /// a tokenless public listen.
     pub admin_token: auth::AdminToken,
+    /// Dashboard session lifetime (M7.2) — the `expires_at` stamped on each new
+    /// `sessions` row and the cookie's `Max-Age`. Store-side expiry is the authority;
+    /// the cookie's copy is a convenience for the browser.
+    pub session_ttl: Duration,
     pub version: &'static str,
 }
 
@@ -102,6 +106,10 @@ pub fn router(state: AppState) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/version", get(version))
+        // Login/logout live outside the auth layer: a credential can't be required
+        // to earn a credential. Both enforce their own rules inside the handlers.
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
         .nest("/api", api)
         .with_state(state)
         // Order matters: request id first, then tracing, panic catch, timeout, body limit.
@@ -124,6 +132,103 @@ async fn livez() -> Json<serde_json::Value> {
 /// reports the binary's own version, never a configured string.
 async fn version(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": state.version }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginBody {
+    pub token: String,
+}
+
+/// Turn the admin token into a session: the browser presents the token once, the
+/// server answers with an `HttpOnly` cookie whose id is a `sessions` row. The token
+/// itself never touches the dashboard's storage — it can be rotated or forgotten
+/// without a stray copy in localStorage.
+async fn login(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    // Same CSRF rule as the middleware: Origin, when sent, must match the Host.
+    let authority = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN)
+        && !auth::origin_matches_host(origin, authority)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": { "code": "origin_mismatch", "message": "Origin does not match Host" }
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(admin) = &state.admin_token else {
+        // Tokenless dev mode has no credential to exchange — say so plainly.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "code": "auth_disabled",
+                           "message": "management auth is not enabled (no SMON_ADMIN_TOKEN)" }
+            })),
+        )
+            .into_response();
+    };
+    if !auth::digests_match(body.token.as_bytes(), admin.as_bytes()) {
+        // A small fixed delay blunts online guessing without needing lockout state —
+        // the digest compare itself already runs in constant time.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": { "code": "unauthenticated", "message": "invalid token" }
+            })),
+        )
+            .into_response();
+    }
+
+    let id = Uuid::new_v4().simple().to_string();
+    let expires = OffsetDateTime::now_utc()
+        + time::Duration::seconds(i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX));
+    if let Err(error) = state.db.create_session(&id, expires).await {
+        tracing::error!(%error, "session insert failed");
+        return ApiError::Db(error).into_response();
+    }
+    (
+        StatusCode::NO_CONTENT,
+        [(
+            axum::http::header::SET_COOKIE,
+            format!(
+                "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                auth::SESSION_COOKIE,
+                state.session_ttl.as_secs()
+            ),
+        )],
+    )
+        .into_response()
+}
+
+/// Delete the session row and expire the cookie. Idempotent — clearing an already-gone
+/// session answers the same way, so a browser can always reset its own state.
+async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(id) = auth::session_cookie(headers.get(axum::http::header::COOKIE))
+        && let Err(error) = state.db.delete_session(id).await
+    {
+        tracing::error!(%error, "session delete failed");
+        return ApiError::Db(error).into_response();
+    }
+    (
+        StatusCode::NO_CONTENT,
+        [(
+            axum::http::header::SET_COOKIE,
+            format!(
+                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                auth::SESSION_COOKIE
+            ),
+        )],
+    )
+        .into_response()
 }
 
 /// Readiness means the store answers *and* the write path has landed commits. A read can

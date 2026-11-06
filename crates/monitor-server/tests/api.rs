@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -35,6 +36,7 @@ async fn app() -> anyhow::Result<(
         registry,
         write_health: Arc::clone(&write_health),
         admin_token: None,
+        session_ttl: Duration::from_hours(12),
         version: "test",
     });
     Ok((app, statuses, db, write_health, tmp))
@@ -753,6 +755,7 @@ async fn auth_denies_without_a_valid_bearer_token() {
         registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
         write_health,
         admin_token: Some(Arc::from("s3cret")),
+        session_ttl: Duration::from_hours(12),
         version: "test",
     };
     let app = monitor_server::router(state);
@@ -797,4 +800,285 @@ async fn auth_denies_without_a_valid_bearer_token() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
+}
+
+/// Builds an authed router (admin token + configurable session ttl) on a scratch store —
+/// the M7.2 session tests all share this rig.
+async fn authed(token: &str, ttl: Duration) -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("auth.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let state = monitor_server::AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
+        write_health: Arc::default(),
+        admin_token: Some(Arc::from(token)),
+        session_ttl: ttl,
+        version: "test",
+    };
+    Ok((monitor_server::router(state), db, tmp))
+}
+
+/// The Set-Cookie value from a login response — the assertions all key off it.
+fn session_cookie_from(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next().map(str::trim).map(str::to_owned))
+        .unwrap_or_else(|| panic!("login must set the session cookie"))
+}
+
+/// M7.2: a correct token earns an `HttpOnly` session cookie; the cookie alone authorizes
+/// reads. The token itself never leaves the login request.
+#[tokio::test]
+async fn login_issues_an_http_only_cookie_and_the_cookie_authorizes() {
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .header("host", "127.0.0.1:58400")
+                .header("origin", "http://127.0.0.1:58400")
+                .body(Body::from(r#"{"token":"s3cret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
+    assert!(set_cookie.contains("Max-Age=3600"), "{set_cookie}");
+    assert!(set_cookie.contains("Path=/"), "{set_cookie}");
+
+    let cookie = session_cookie_from(&response);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/monitors")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the session cookie authorizes a read"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_token_gets_401_and_no_cookie() {
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get("set-cookie").is_none());
+    let body = json_body(response).await.unwrap();
+    assert_eq!(body["error"]["code"], "unauthenticated");
+}
+
+#[tokio::test]
+async fn login_with_auth_disabled_says_so() {
+    let (app, _s, _d, _w, _tmp) = app().await.unwrap(); // dev-mode: no admin token
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"anything"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = json_body(response).await.unwrap();
+    assert_eq!(body["error"]["code"], "auth_disabled");
+}
+
+/// Cookie-authed mutations are CSRF-guarded: no Origin → 403, wrong Origin → 403,
+/// matching Origin → the write lands. Bearer carries the same power with no Origin —
+/// that is the CLI contract.
+#[tokio::test]
+async fn a_cookie_authed_mutation_needs_a_matching_origin() {
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
+    let login = app
+        .clone()
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"s3cret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = session_cookie_from(&login);
+
+    let create = |origin: Option<&str>| {
+        let mut request = Request::post("/api/monitors")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("host", "127.0.0.1:58400");
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        request
+            .body(Body::from(r#"{"name":"m","url":"https://example.com/"}"#))
+            .unwrap()
+    };
+
+    // No Origin at all — a browser always sends one on writes, so this is not a browser.
+    let response = app.clone().oneshot(create(None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await.unwrap();
+    assert_eq!(body["error"]["code"], "origin_required");
+
+    // A cross-site Origin is rejected before the credential matters.
+    let response = app
+        .clone()
+        .oneshot(create(Some("https://evil.example.com")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await.unwrap();
+    assert_eq!(body["error"]["code"], "origin_mismatch");
+
+    // Same-authority Origin — the real browser shape.
+    let response = app
+        .clone()
+        .oneshot(create(Some("http://127.0.0.1:58400")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Bearer never needs Origin — curl and the CLI don't send one.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/monitors")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::from(r#"{"name":"m2","url":"https://example.org/"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// And a mismatched Origin is rejected even on a valid bearer request — the header is
+/// a cross-site marker no matter the credential.
+#[tokio::test]
+async fn a_mismatched_origin_is_rejected_for_any_credential() {
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/monitors")
+                .header("authorization", "Bearer s3cret")
+                .header("host", "127.0.0.1:58400")
+                .header("origin", "https://evil.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn logout_expires_the_session() {
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
+    let login = app
+        .clone()
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"s3cret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = session_cookie_from(&login);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/logout")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let cleared = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+
+    // The same cookie now denies — the row is gone, not just the browser's copy.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/monitors")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Store-side expiry is the authority: a zero-ttl session is dead the moment it exists.
+#[tokio::test]
+async fn an_expired_session_is_denied() {
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(0)).await.unwrap();
+    let login = app
+        .clone()
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"s3cret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::NO_CONTENT);
+    let cookie = session_cookie_from(&login);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/monitors")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
