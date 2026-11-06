@@ -1,0 +1,167 @@
+{
+  "run": "real-app rising-load drill (M7.3)",
+  "commit": "825110a",
+  "started_at": "2026-11-06T14:03:29.168Z",
+  "duration_s": 440,
+  "machine": "Darwin arm64",
+  "phases": [
+    {
+      "phase": "ramp",
+      "at": "2026-11-06T14:03:29.466Z"
+    },
+    {
+      "phase": "degrade",
+      "at": "2026-11-06T14:06:59.475Z"
+    },
+    {
+      "phase": "recover",
+      "at": "2026-11-06T14:08:59.486Z"
+    }
+  ],
+  "load": {
+    "requests_sent": 3837352,
+    "client_errors": 0,
+    "latency_p50_ms": 3,
+    "latency_p95_ms": 7,
+    "peak_concurrency": 40
+  },
+  "monitor": {
+    "rss_kb": {
+      "start": 18400,
+      "end": 15728,
+      "max": 18720
+    },
+    "db_bytes": 4096,
+    "checks_committed": {
+      "app-items": 30,
+      "app-health": 30
+    },
+    "missed_slots": 0,
+    "commit_lag_ms": {
+      "p50": 787,
+      "p95": 842,
+      "max": 862
+    },
+    "incidents": [
+      {
+        "first_fail_at": "2026-11-06T14:07:00.461166Z",
+        "id": 1,
+        "last_fail_at": "2026-11-06T14:08:45.461166Z",
+        "monitor_id": "01a1b12b-f134-74bb-8d24-af18b71b78ed",
+        "opened_at": "2026-11-06T14:07:15.461166Z",
+        "resolved_at": "2026-11-06T14:09:00.461166Z",
+        "state": "resolved"
+      }
+    ],
+    "delivered_events": [
+      {
+        "kind": "incident_opened",
+        "event_id": "01a1b12f-6715-7008-97d9-aeed0e33a95f"
+      },
+      {
+        "kind": "incident_recovered",
+        "event_id": "01a1b131-014c-7106-ae52-51eb30a2158e"
+      }
+    ]
+  },
+  "app_truth": {
+    "routes": {
+      "GET /api/items": {
+        "n": 2687372,
+        "errors": 777060,
+        "p50": 0.065542,
+        "p95": 0.075625,
+        "p99": 0.082583
+      },
+      "POST /api/echo": {
+        "n": 1150010,
+        "errors": 332595,
+        "p50": 0.006167,
+        "p95": 0.009084,
+        "p99": 0.022959
+      },
+      "GET /health": {
+        "n": 30,
+        "errors": 0,
+        "p50": 0.003084,
+        "p95": 0.021542,
+        "p99": 0.214
+      },
+      "POST /__ctl": {
+        "n": 3,
+        "errors": 0,
+        "p50": 0.024583,
+        "p95": 0.307042,
+        "p99": 0.307042
+      }
+    },
+    "loop_lag_p95_ms": 4.336084,
+    "ctl": {
+      "degrade": 0,
+      "slow_ms": 0
+    }
+  },
+  "assertions": [
+    {
+      "name": "app served real traffic",
+      "pass": true,
+      "detail": "2687372 GET /api/items"
+    },
+    {
+      "name": "committed evidence ≈ slots",
+      "pass": true,
+      "detail": "30 rows"
+    },
+    {
+      "name": "no missed slots",
+      "pass": true,
+      "detail": "0"
+    },
+    {
+      "name": "degrade read as http_fail",
+      "pass": true,
+      "detail": "100% of degrade-window checks failed"
+    },
+    {
+      "name": "incident opened in the window",
+      "pass": true,
+      "detail": "2026-11-06T14:07:15.461166Z"
+    },
+    {
+      "name": "every incident healed once the app did",
+      "pass": true,
+      "detail": "0 still open"
+    },
+    {
+      "name": "control monitor stayed quiet",
+      "pass": true,
+      "detail": "no health incidents"
+    },
+    {
+      "name": "open alert delivered",
+      "pass": true,
+      "detail": "1"
+    },
+    {
+      "name": "resolve alert delivered",
+      "pass": true,
+      "detail": "1"
+    },
+    {
+      "name": "app recorded the outage in its own stats",
+      "pass": true,
+      "detail": "app 5xx rate 28.9% over 2687372 requests"
+    },
+    {
+      "name": "probe latency bounded under load",
+      "pass": true,
+      "detail": "monitor-observed ramp p95 61ms"
+    },
+    {
+      "name": "commit lag p95 < 15s",
+      "pass": true,
+      "detail": "842ms"
+    }
+  ],
+  "passed": true
+}

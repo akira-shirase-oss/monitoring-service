@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- M7.3 real-app load drill: `perf/real-app.mjs` — a dependency-free Node app doing
+  genuine work per request (`/api/items` filters+aggregates, `/api/echo`,
+  `/health`), ground-truth route/error/latency stats at `GET /__stats`, and
+  `POST /__ctl`-driven degradation that fails *after* the real work runs.
+  `perf/real-app-load.mjs` orchestrates the run: closed-loop load ramp 2→40
+  workers, monitors on the busy route and the quiet control, 85% degrade then a
+  45 s hard-outage tail, heal, then 12 assertions gathered through the real API
+  (checks, incidents, sink events, app truth). Harness failures are evidence —
+  a mid-window heal at partial degradation is the domain being honest, not a
+  flake, so assertions check invariants (opened in-window, every incident
+  healed, alerts delivered) rather than a scripted flap pattern. Committed
+  result: `perf/results/real-app-2026-11-06T14-03-29.168Z-825110a.json` —
+  3.84 M requests, 0 missed slots, incident first_fail→opened→last_fail→resolved
+  all honest, both alerts delivered, control quiet, lag p95 842 ms.
 - M7.2 dashboard login UX: `POST /api/login` exchanges `SMON_ADMIN_TOKEN` for a
   `sessions` row (migration 0007) + `smon_session` cookie — HttpOnly,
   SameSite=Strict, `SMON_SESSION_TTL_S` (default 12 h). Store-side `expires_at` is

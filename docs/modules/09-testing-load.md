@@ -55,6 +55,45 @@ failure demo must be repeatable.
 - **Comparisons:** identical fixtures, recorded commit + machine; laptop numbers are
   development observations, never public claims.
 
+## Real-app rising-load drill (M7.3)
+
+The lab profile proves the monitor keeps bounded evidence under its own generated load;
+it does **not** prove the readings reflect a real application. The real-app drill closes
+that gap: `perf/real-app.mjs` is a dependency-free Node app that does genuine work per
+request (`GET /api/items` scans a filtered row set and aggregates; `POST /api/echo`
+round-trips a bounded body; `GET /health` is the control target), records its own
+ground-truth route/error/latency stats at `GET /__stats`, and takes a degradation
+fraction through `POST /__ctl` — failures happen *after* the real work runs, so the
+monitor sees honest slow failures, not refused connections.
+
+`perf/real-app-load.mjs` orchestrates: a closed-loop load generator ramps 2 → 40
+concurrent workers (~7.5 min), the monitor watches `/api/items` (15 s interval,
+fail-open 2, pass-recover 1) and `/health` (the control — never paged), the app is
+degraded at 85% for the bulk of the window then 100% for the last 45 s (so a stable-open
+incident always reaches the recovery phase — at 85%, a single lucky pass resolves the
+incident mid-window, which is the domain being honest, not a flake), then heals.
+Everything the drill asserts is gathered through the real API: committed check rows,
+incidents, webhook events at a real sink, and the app's own `__stats` as ground truth.
+
+- **Measured** (`perf/results/real-app-2026-11-06T14-03-29.168Z-825110a.json`,
+  Darwin arm64, 440 s): 3,837,352 requests sent, 0 client errors, client p95 7 ms;
+  app truth on `/api/items` — 2,687,372 requests, 777,060 errors (28.9% across the full
+  run, concentrated in the degrade window as designed). Monitor: 30+30 committed rows,
+  **0 missed**, commit lag p50 787 ms / p95 842 ms, RSS flat at ~18 MB. One incident:
+  `first_fail_at` 14:07:00 → `opened_at` 14:07:15 (2-fail threshold) → `last_fail_at`
+  14:08:45 → `resolved_at` 14:09:00 (first pass after heal) — all four times honest.
+  Both alerts delivered (open + recovered, 1 event each at the sink). The `/health`
+  control monitor committed 30 checks and never paged. Probe-observed ramp p95 latency
+  61 ms while the app served ~9k req/s.
+- **Assertions (12/12):** real traffic committed; evidence ≈ expected slots; zero
+  missed; degrade window read as `http_fail`; incident opened in-window; **every**
+  incident healed once the app did; control quiet; open + recover alerts delivered; app
+  recorded the outage in its own stats; probe latency bounded under load; commit lag
+  p95 < 15 s.
+- **Rule:** harness failures are evidence — a failed assertion documents a real behavior
+  difference (the mid-window-recovery semantics above were found this way), not a reason
+  to rerun until green.
+
 ## Testing parameters for this module itself
 
 - Fixtures start deterministically and reset state; each fault test asserts the *monitor's*
