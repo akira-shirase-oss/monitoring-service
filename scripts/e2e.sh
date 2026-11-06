@@ -8,4 +8,5 @@ export PATH="$(brew --prefix rustup)/bin:$PATH"
 
 cargo build -p monitor-server
 npm --prefix apps/dashboard run build
-npm --prefix apps/dashboard exec -- playwright test "$@"
+# Run from apps/dashboard — playwright resolves its config (baseURL + webServers) by cwd.
+(cd apps/dashboard && npx playwright test "$@")

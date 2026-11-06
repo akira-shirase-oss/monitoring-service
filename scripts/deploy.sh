@@ -33,6 +33,7 @@ cp target/release/monitor-server target/release/monitor "$DEST/bin/"
 ln -sfn "$DEST" "$PREFIX/current"
 
 [ -f "$PREFIX/env" ] || cat > "$PREFIX/env" <<'ENV'
+# SMON_ADMIN_TOKEN=   # REQUIRED on any non-loopback SMON_LISTEN — boot refuses without it
 # SMON_DATABASE_URL=sqlite:/opt/smon/data/monitor.db
 # SMON_LISTEN=127.0.0.1:58400
 # SMON_STATUS_DIR=/opt/smon/status

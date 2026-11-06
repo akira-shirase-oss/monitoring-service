@@ -36,7 +36,8 @@ sudo cp deploy/com.shirase.smon.plist /Library/LaunchDaemons/
 sudo launchctl load /Library/LaunchDaemons/com.shirase.smon.plist
 ```
 
-Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}`. If it answers
+Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
+`curl -sf $SMON_LISTEN/version` → the expected release. If readyz answers
 `unavailable` with a failure count, the store's write path is failing (disk, perms) —
 readiness is honest, fix the cause rather than restart-looping.
 
@@ -45,7 +46,7 @@ readiness is honest, fix the cause rather than restart-looping.
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # new release dir, repoints current
 sudo systemctl restart monitor-server           # or: launchctl kickstart -k system/com.shirase.smon
-curl -sf .../readyz
+curl -sf .../readyz && curl -sf .../version     # the version must match the new release
 ```
 
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
