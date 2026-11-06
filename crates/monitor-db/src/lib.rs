@@ -210,7 +210,7 @@ impl Db {
         monitor: MonitorId,
     ) -> Result<Option<IncidentRow>, QueryError> {
         let row = sqlx::query_as::<_, IncidentRow>(
-            "SELECT id, monitor_id, opened_at, resolved_at, state
+            "SELECT id, monitor_id, opened_at, first_fail_at, last_fail_at, resolved_at, state
              FROM incidents WHERE monitor_id = ? AND state = 'open'",
         )
         .bind(monitor.0.to_string())
@@ -318,7 +318,7 @@ impl Db {
         let monitor_id = monitor.map(|id| id.0.to_string());
         let state = state.map(str::to_owned);
         let rows = sqlx::query_as::<_, IncidentRow>(
-            "SELECT id, monitor_id, opened_at, resolved_at, state FROM incidents
+            "SELECT id, monitor_id, opened_at, first_fail_at, last_fail_at, resolved_at, state FROM incidents
              WHERE (?1 IS NULL OR monitor_id = ?1) AND (?2 IS NULL OR state = ?2)
              ORDER BY opened_at DESC, id DESC LIMIT ?3",
         )
@@ -524,7 +524,8 @@ impl Db {
         let rows = sqlx::query_as::<_, DeliveryRow>(
             "SELECT o.event_id, o.kind, o.attempts, o.created_at,
                     m.id AS monitor_id, m.name AS monitor_name, m.url AS monitor_url,
-                    i.id AS incident_id, i.opened_at, i.resolved_at
+                    i.id AS incident_id, i.opened_at, i.first_fail_at, i.last_fail_at,
+                    i.resolved_at
              FROM notify_outbox o
              JOIN monitors m ON m.id = o.monitor_id
              JOIN incidents i ON i.id = o.incident_id
@@ -564,11 +565,16 @@ impl Db {
     }
 
     /// Commit one slot's observation, its incident transition and the notification outbox row
-    /// in a single transaction — all three or none.
+    /// in a single transaction — all three or none. `open_after` is the machine's post-record
+    /// incident flag: a failing probe committed under an open incident also stamps
+    /// `last_fail_at`, so the four incident times stay distinct (`first_fail_at` = streak
+    /// start, `opened_at` = when the monitor noticed, `last_fail_at` = latest evidence,
+    /// `resolved_at` = confirmed recovery).
     pub(crate) async fn commit_observation(
         &self,
         observation: &Observation,
         effect: Effect,
+        open_after: bool,
     ) -> Result<(), QueryError> {
         let mut tx = self.pool.begin().await?;
         let (outcome, http_status) = encode_slot(observation.slot, observation.http_status);
@@ -595,11 +601,29 @@ impl Db {
         match effect {
             Effect::Unchanged => {}
             Effect::IncidentOpened => {
-                let incident_id: i64 = sqlx::query_scalar(
-                    "INSERT INTO incidents (monitor_id, opened_at, state)
-                     VALUES (?, ?, 'open') RETURNING id",
+                // first_fail_at = the streak's start: the oldest consecutive failing
+                // slot since the last pass/missed — derived from committed rows, so it
+                // is right no matter when the machine was last in memory.
+                let first_fail_at: Option<OffsetDateTime> = sqlx::query_scalar(
+                    "SELECT MIN(slot_at) FROM checks
+                     WHERE monitor_id = ?1
+                       AND outcome IN ('http_fail', 'transport', 'timeout')
+                       AND slot_at > COALESCE(
+                             (SELECT MAX(slot_at) FROM checks
+                              WHERE monitor_id = ?1
+                                AND outcome IN ('pass', 'missed')),
+                             '')",
                 )
                 .bind(observation.monitor_id.0.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+                let incident_id: i64 = sqlx::query_scalar(
+                    "INSERT INTO incidents (monitor_id, opened_at, first_fail_at, last_fail_at, state)
+                     VALUES (?, ?, ?, ?, 'open') RETURNING id",
+                )
+                .bind(observation.monitor_id.0.to_string())
+                .bind(observation.slot_at)
+                .bind(first_fail_at.unwrap_or(observation.slot_at))
                 .bind(observation.slot_at)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -633,6 +657,19 @@ impl Db {
                 )
                 .await?;
             }
+        }
+
+        // A failing probe under an open incident is fresh evidence about *how long* the
+        // target has been failing — stamp it on the same commit (no-op when closed).
+        if open_after && matches!(observation.slot, SlotObservation::Probe(o) if !o.is_pass()) {
+            sqlx::query(
+                "UPDATE incidents SET last_fail_at = ?
+                 WHERE monitor_id = ? AND state = 'open'",
+            )
+            .bind(observation.slot_at)
+            .bind(observation.monitor_id.0.to_string())
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -752,6 +789,11 @@ pub struct IncidentRow {
     pub id: i64,
     pub monitor_id: String,
     pub opened_at: OffsetDateTime,
+    /// The streak's first failing slot — when the target *started* failing (the monitor
+    /// noticed at `opened_at`). `NULL` on rows opened before M6.3.
+    pub first_fail_at: Option<OffsetDateTime>,
+    /// The latest failing slot while the incident was open — how long the failure lasted.
+    pub last_fail_at: Option<OffsetDateTime>,
     pub resolved_at: Option<OffsetDateTime>,
     pub state: String,
 }
@@ -794,5 +836,7 @@ pub struct DeliveryRow {
     pub monitor_url: String,
     pub incident_id: i64,
     pub opened_at: OffsetDateTime,
+    pub first_fail_at: Option<OffsetDateTime>,
+    pub last_fail_at: Option<OffsetDateTime>,
     pub resolved_at: Option<OffsetDateTime>,
 }

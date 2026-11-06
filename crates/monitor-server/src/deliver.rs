@@ -85,6 +85,9 @@ struct MonitorRef<'a> {
 struct IncidentRef<'a> {
     id: i64,
     opened_at: &'a OffsetDateTime,
+    /// When the streak started — "failing since" is the fact a receiver acts on first.
+    first_fail_at: Option<&'a OffsetDateTime>,
+    last_fail_at: Option<&'a OffsetDateTime>,
     resolved_at: Option<&'a OffsetDateTime>,
 }
 
@@ -102,6 +105,8 @@ impl<'a> From<&'a DeliveryRow> for Payload<'a> {
             incident: IncidentRef {
                 id: row.incident_id,
                 opened_at: &row.opened_at,
+                first_fail_at: row.first_fail_at.as_ref(),
+                last_fail_at: row.last_fail_at.as_ref(),
                 resolved_at: row.resolved_at.as_ref(),
             },
         }
@@ -344,6 +349,8 @@ mod tests {
             monitor_url: "https://example.com/health".to_owned(),
             incident_id: 7,
             opened_at: now,
+            first_fail_at: Some(now),
+            last_fail_at: Some(now),
             resolved_at: None,
         }
     }

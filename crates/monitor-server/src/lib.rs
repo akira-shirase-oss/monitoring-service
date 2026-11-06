@@ -425,6 +425,12 @@ struct IncidentView {
     monitor_id: String,
     #[serde(with = "time::serde::rfc3339")]
     opened_at: OffsetDateTime,
+    /// When the streak started — `null` on incidents opened before M6.3.
+    #[serde(with = "time::serde::rfc3339::option")]
+    first_fail_at: Option<OffsetDateTime>,
+    /// Latest failing slot while open — `null` on incidents opened before M6.3.
+    #[serde(with = "time::serde::rfc3339::option")]
+    last_fail_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     resolved_at: Option<OffsetDateTime>,
     state: String,
@@ -436,6 +442,8 @@ impl From<IncidentRow> for IncidentView {
             id: row.id,
             monitor_id: row.monitor_id,
             opened_at: row.opened_at,
+            first_fail_at: row.first_fail_at,
+            last_fail_at: row.last_fail_at,
             resolved_at: row.resolved_at,
             state: row.state,
         }

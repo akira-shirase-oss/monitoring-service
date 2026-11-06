@@ -247,7 +247,8 @@ async fn record(
         .cloned()
         .unwrap_or_default();
     let effect = next.record(observation.slot, gate.thresholds);
-    db.commit_observation(&observation, effect).await?;
+    db.commit_observation(&observation, effect, next.incident_open())
+        .await?;
     let status = next.status();
     health.insert(observation.monitor_id, next);
     if let Ok(mut map) = statuses.write() {

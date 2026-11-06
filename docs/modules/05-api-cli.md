@@ -16,6 +16,8 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `GET /api/monitors/{id}/stats` (coverage/success, `?window_s=` bounded), `GET /api/incidents`
   (`?monitor_id=`, `?state=`, `?limit=`). Still to come: `GET /api/status` (M3.2 public
   snapshot). Incidents are system-created evidence — there is deliberately no `POST`.
+  `IncidentView` carries all four times (M6.3): `first_fail_at`, `opened_at`,
+  `last_fail_at`, `resolved_at` — RFC3339, nullable for pre-M6.3 rows.
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
 - **Auth (M5.1, live):** every `/api/**` route requires `Authorization: Bearer

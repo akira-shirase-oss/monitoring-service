@@ -31,10 +31,14 @@ fn fail(monitor: &Monitor) -> Observation {
 }
 
 fn probe(monitor: &Monitor, outcome: CheckOutcome) -> Observation {
+    probe_at(monitor, outcome, OffsetDateTime::now_utc())
+}
+
+fn probe_at(monitor: &Monitor, outcome: CheckOutcome, at: OffsetDateTime) -> Observation {
     Observation {
         monitor_id: monitor.id,
         generation: monitor.generation,
-        slot_at: OffsetDateTime::now_utc(),
+        slot_at: at,
         slot: SlotObservation::Probe(outcome),
         http_status: Some(500),
         latency_ms: Some(42),
@@ -100,6 +104,68 @@ async fn per_monitor_thresholds_drive_the_incident_machine() -> anyhow::Result<(
     assert_eq!(
         writer.record(at_gen(CheckOutcome::Pass)).await?,
         WriteOutcome::Committed(Effect::IncidentRecovered)
+    );
+    Ok(())
+}
+
+/// M6.3: the four incident times are tracked separately and honestly — `first_fail_at` is
+/// the streak's first failing slot, `opened_at` when the threshold was crossed,
+/// `last_fail_at` the latest failing slot while open, `resolved_at` on recovery.
+#[tokio::test]
+async fn incident_tracks_first_fail_open_last_fail_and_resolve_separately() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    // Streak begins at slot 1, threshold crossed at slot 3 — the notice is two slots
+    // after the failure started, and that difference is the whole point.
+    let base = OffsetDateTime::now_utc();
+    let slot = |offset_s: i64| base + time::Duration::seconds(offset_s);
+    for offset in 1..=5 {
+        writer
+            .record(probe_at(&monitor, CheckOutcome::Transport, slot(offset)))
+            .await?;
+    }
+
+    let incident = db
+        .open_incident(monitor.id)
+        .await?
+        .expect("incident open after 5 failures");
+    assert_eq!(
+        incident.first_fail_at.map(OffsetDateTime::unix_timestamp),
+        Some(slot(1).unix_timestamp()),
+        "streak began at slot 1"
+    );
+    assert_eq!(
+        incident.opened_at.unix_timestamp(),
+        slot(3).unix_timestamp(),
+        "noticed when the third landed"
+    );
+    assert_eq!(
+        incident.last_fail_at.map(OffsetDateTime::unix_timestamp),
+        Some(slot(5).unix_timestamp()),
+        "latest failure while open"
+    );
+    assert!(incident.resolved_at.is_none());
+
+    // Recovery stamps resolved_at and freezes the other three.
+    for offset in 6..=7 {
+        writer
+            .record(probe_at(&monitor, CheckOutcome::Pass, slot(offset)))
+            .await?;
+    }
+    let incidents = db
+        .list_incidents(Some(monitor.id), Some("resolved"), 5)
+        .await?;
+    let resolved = &incidents[0];
+    assert_eq!(
+        resolved.first_fail_at.map(OffsetDateTime::unix_timestamp),
+        Some(slot(1).unix_timestamp())
+    );
+    assert_eq!(
+        resolved.last_fail_at.map(OffsetDateTime::unix_timestamp),
+        Some(slot(5).unix_timestamp())
+    );
+    assert_eq!(
+        resolved.resolved_at.map(OffsetDateTime::unix_timestamp),
+        Some(slot(7).unix_timestamp())
     );
     Ok(())
 }

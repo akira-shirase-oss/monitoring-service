@@ -13,6 +13,13 @@ at-least-once to a receiver — without alerting ever being able to stall observ
 
 - **Enqueue in the same commit** as the check row and incident transition — an undelivered
   alert is durable work, not a log line.
+- **Four incident times, committed separately (M6.3):** `first_fail_at` (start of the
+  failing streak — derived inside the commit transaction from committed check rows, the
+  oldest consecutive failure since the last `pass`/`missed`), `opened_at` (the slot that
+  crossed `failures_to_open`), `last_fail_at` (re-stamped on every failing check while
+  open), `resolved_at` (recovery). Start-of-failure ≠ time-of-notice is the forensic
+  point; pre-M6.3 rows keep NULL rather than fabricated history. All four ride the API
+  `IncidentView` and the webhook `incident` reference.
 - **Stable `event_id`** (uuid v7) per logical event; dedup/idempotency key on delivery.
 - **Separate delivery pool:** deliverer task(s) read the outbox; probes never wait on them.
   A hung receiver occupies a delivery slot with its own deadline, nothing else.

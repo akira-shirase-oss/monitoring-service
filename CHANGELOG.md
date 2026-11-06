@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- M6.3 incident four times: `first_fail_at`, `opened_at`, `last_fail_at`, `resolved_at`
+  are now committed separately (migration 0004). `first_fail_at` is derived inside the
+  commit transaction from committed check rows — the oldest consecutive failure since
+  the last `pass`/`missed` — so it survives restarts without trusting memory; the
+  writer passes the post-transition open flag so the streak lookup runs on the same
+  read. `last_fail_at` re-stamps on every failing check while the incident is open.
+  All four are exposed in `GET /api/incidents`, the webhook `incident` reference, and
+  `monitor … show`; pre-M6.3 rows keep NULL rather than fabricated history. Live proof:
+  a refused-port monitor shows `first_fail_at` 30 s before `opened_at`, `last_fail_at`
+  still advancing while open.
 - M6.2 per-monitor incident thresholds: `failures_to_open` / `passes_to_recover`
   (`1..=10`, default 3/2) on `POST`/`PATCH /api/monitors` and `monitor add|edit`.
   `Health::record` takes thresholds per call from `monitor_gate` — the same committed

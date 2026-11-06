@@ -315,10 +315,16 @@ async fn show(client: &reqwest::Client, base: &str, id: &str) -> Result<()> {
         .map_or(&[][..], Vec::as_slice)
     {
         println!(
-            "  {}  {}  opened {}",
+            "  {}  {}  opened {}{}{}",
             incident["state"].as_str().unwrap_or("?"),
             incident["id"].as_i64().unwrap_or(0),
             incident["opened_at"].as_str().unwrap_or("?"),
+            incident["first_fail_at"]
+                .as_str()
+                .map_or_else(String::new, |t| format!("  failing since {t}")),
+            incident["last_fail_at"]
+                .as_str()
+                .map_or_else(String::new, |t| format!("  last fail {t}")),
         );
     }
     Ok(())
