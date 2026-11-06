@@ -113,7 +113,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("SMON_WEBHOOK_URL unset; alerts accumulate in the outbox");
     }
 
-    let _snapshot_task = spawn_snapshot(&db, &statuses, &shutdown);
+    let status_dir = std::env::var("SMON_STATUS_DIR").unwrap_or_else(|_| "status".into());
+    let _snapshot_task = spawn_snapshot(&db, &statuses, &status_dir, &shutdown);
     let _retention_task = spawn_retention(&writer, &shutdown);
 
     let mut app = router(AppState {
@@ -124,6 +125,13 @@ async fn main() -> anyhow::Result<()> {
         admin_token,
         version: env!("CARGO_PKG_VERSION"),
     });
+
+    // The public snapshot served unmodified at /status.json — outside /api, so public
+    // viewers never touch the management surface; expiry is the file's own claim.
+    app = app.route_service(
+        "/status.json",
+        ServeFile::new(Path::new(&status_dir).join("status.json")),
+    );
 
     if Path::new(&dashboard_dir).is_dir() {
         let index = ServeFile::new(format!("{dashboard_dir}/200.html"));
@@ -218,9 +226,9 @@ fn init_logging() -> anyhow::Result<()> {
 fn spawn_snapshot(
     db: &monitor_db::Db,
     statuses: &SharedStatuses,
+    dir: &str,
     shutdown: &CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    let dir = std::env::var("SMON_STATUS_DIR").unwrap_or_else(|_| "status".into());
     let env_secs = |name: &str, default: u64| {
         std::env::var(name)
             .ok()

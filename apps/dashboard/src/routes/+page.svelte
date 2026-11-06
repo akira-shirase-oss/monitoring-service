@@ -70,14 +70,22 @@
 				Authorized HTTP targets, checked on a schedule. Status here is evidence, not hope.
 			</p>
 		</div>
-		{#if data.reachable && !data.needsAuth && !adding}
-			<button
-				onclick={() => (adding = true)}
-				class="shrink-0 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
+		<div class="flex shrink-0 items-center gap-2">
+			<a
+				href="/status"
+				class="rounded-md border border-input px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
 			>
-				Add monitor
-			</button>
-		{/if}
+				Status
+			</a>
+			{#if data.reachable && !data.needsAuth && !adding}
+				<button
+					onclick={() => (adding = true)}
+					class="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
+				>
+					Add monitor
+				</button>
+			{/if}
+		</div>
 	</div>
 
 	{#if data.needsAuth}

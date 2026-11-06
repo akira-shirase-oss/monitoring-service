@@ -1,9 +1,12 @@
 # Module 07 — Public status + heartbeat (`status` snapshot, renderer, external check)
 
-**Status:** built (M3). `monitor-server` writes `status.json` every `SMON_STATUS_INTERVAL_S`
+**Status:** built (M3, M6.7). `monitor-server` writes `status.json` every `SMON_STATUS_INTERVAL_S`
 (default 30 s) into `SMON_STATUS_DIR` — sanitized (sha256-alias, status,
 `incident_open_since` only), atomic (tmp + rename), self-expiring (`SMON_STATUS_TTL_S`,
-default 90 s). `apps/status/index.html` renders it with zero runtime dependency.
+default 90 s). `apps/status/index.html` renders it with zero runtime dependency — the
+canonical independently-hosted page. The server also serves the same file unmodified at
+`GET /status.json` (outside `/api`, no token), and the dashboard's `/status` route renders
+it in-app (M6.7) — identical artifact, identical expiry semantics.
 `fixtures/status-check.mjs` is the independent checker: expired/missing snapshot →
 "unavailable", never "targets down".
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- M6.7 public status view in-app: `monitor-server` now serves the sanitized snapshot
+  unmodified at `GET /status.json` — outside `/api`, no token, so public viewers never
+  touch the management surface. The dashboard gains `/status`: service rows with hashed
+  aliases + status badges + `incident since` times and a "snapshot written Xs ago" meta,
+  polled on the writer cadence. A stale `expires_at` reads "Monitoring unavailable —
+  this snapshot is stale" with rows kept as stale evidence; a missing snapshot is the
+  same verdict with no rows — never "all targets down" and never fabricated green.
+  Playwright: live-snapshot, stale-doctor and 404 specs.
 - M6.6 dashboard auto-refresh: both pages call `invalidateAll()` on the 15 s minimum
   interval tick — SvelteKit keeps the previous data until the reload resolves, so the
   swap is atomic and a commit mid-poll flips a badge exactly once; an API outage

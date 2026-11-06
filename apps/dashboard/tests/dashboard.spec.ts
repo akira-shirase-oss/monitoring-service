@@ -200,6 +200,68 @@ test('an API outage mid-poll resolves to "cannot see", not a frozen board', asyn
 	).toBeVisible({ timeout: 25_000 });
 });
 
+test('the in-app status view renders the public snapshot', async ({
+	page,
+	request
+}) => {
+	const name = `e2e-status-${Date.now()}`;
+	await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);
+	// The snapshot writer beats every 30s — wait for the new service to appear in the
+	// public artifact, not the management API.
+	await expect
+		.poll(
+			async () => {
+				const r = await request.get('/status.json');
+				if (!r.ok()) return 0;
+				return ((await r.json()).services ?? []).length;
+			},
+			{ timeout: 45_000 }
+		)
+		.toBeGreaterThan(0);
+
+	await page.goto('/status');
+	await expect(page.getByRole('heading', { name: 'Service status' })).toBeVisible();
+	// Every schema field lands: hashed alias, status badge, snapshot meta line.
+	await expect(page.locator('span.font-mono').first()).toBeVisible();
+	await expect(page.getByText(/snapshot written \d+s ago/)).toBeVisible();
+	await expect(page.getByText(/^(up|down|unknown)$/).first()).toBeVisible();
+});
+
+test('a stale snapshot reads "monitoring unavailable", rows stay stale evidence', async ({
+	page
+}) => {
+	const stale = {
+		generated_at: new Date(Date.now() - 120_000).toISOString(),
+		expires_at: new Date(Date.now() - 30_000).toISOString(),
+		services: [{ alias: 'deadbeef0123', status: 'down', incident_open_since: null }]
+	};
+	await page.route('**/status.json', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(stale)
+		})
+	);
+	await page.goto('/status');
+	await expect(
+		page.getByText('Monitoring unavailable — this snapshot is stale.')
+	).toBeVisible();
+	await expect(page.getByText('deadbeef0123')).toBeVisible();
+	await expect(page.getByText('down').first()).toBeVisible();
+});
+
+test('no readable snapshot is "monitoring unavailable", never fabricated rows', async ({
+	page
+}) => {
+	await page.route('**/status.json', (route) =>
+		route.fulfill({ status: 404, body: 'not found' })
+	);
+	await page.goto('/status');
+	await expect(page.getByText('Monitoring unavailable.')).toBeVisible();
+	// No service rows are fabricated — the only "status" on screen is the page title.
+	await expect(page.locator('span.font-mono')).toHaveCount(0);
+});
+
 test('a mutation 401 surfaces the token error, never silent', async ({ page }) => {
 	await page.route('**/api/monitors', (route) => {
 		if (route.request().method() === 'POST') {
