@@ -458,6 +458,7 @@ fn seed_writer(
         HashMap::new(),
         Arc::default(),
         8,
+        false,
     );
     // The JoinHandle detaches on drop; the writer lives as long as the handle is used.
     writer
@@ -581,8 +582,14 @@ async fn a_stale_observation_after_edit_is_dropped() {
     assert_eq!(status, StatusCode::OK);
 
     // An observation claimed under generation 1 arrives late: the writer must drop it.
-    let (writer, _task) =
-        monitor_db::writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
+    let (writer, _task) = monitor_db::writer::spawn(
+        db.clone(),
+        statuses,
+        HashMap::new(),
+        Arc::default(),
+        8,
+        false,
+    );
     let outcome = writer
         .record(monitor_db::Observation {
             monitor_id,

@@ -8,9 +8,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Context;
+use lettre::Tokio1Executor;
+use lettre::message::Mailbox;
+use lettre::transport::smtp::AsyncSmtpTransport;
 use monitor_db::SharedStatuses;
 use monitor_domain::Health;
-use monitor_server::deliver::{Config as DelivererConfig, Deliverer};
+use monitor_server::deliver::{Config as DelivererConfig, Deliverer, Sink};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config as CoordinatorConfig, Coordinator};
 use monitor_server::{AppState, load_registry, router};
@@ -64,6 +67,10 @@ async fn main() -> anyhow::Result<()> {
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::new()));
     let health = rebuild_health(&db, &monitors, &statuses).await?;
 
+    // Resolve alert channels up front: email rows only enter the outbox when SMTP is
+    // configured, so the writer needs the answer before it starts committing.
+    let smtp = smtp_sink()?;
+
     let write_health: monitor_db::WriteHealth = Arc::default();
     let (writer, _writer_task) = monitor_db::writer::spawn(
         db.clone(),
@@ -71,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         health,
         Arc::clone(&write_health),
         WRITER_BOUND,
+        smtp.is_some(),
     );
     let (registry_tx, registry_rx) = watch::channel(Arc::new(monitors));
 
@@ -94,24 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Alerts only run when a receiver is configured; without one, outbox events stay pending
     // in the table — visible, never silently dropped.
-    if let Ok(target) = std::env::var("SMON_WEBHOOK_URL") {
-        let target = url::Url::parse(&target).context("SMON_WEBHOOK_URL must be a URL")?;
-        let secret = std::env::var("SMON_WEBHOOK_SECRET")
-            .ok()
-            .map(String::into_bytes);
-        let _deliverer_task = Deliverer::spawn(
-            db.clone(),
-            writer.clone(),
-            DelivererConfig {
-                target: Some(target),
-                secret,
-                ..DelivererConfig::default()
-            },
-            shutdown.clone(),
-        );
-    } else {
-        tracing::info!("SMON_WEBHOOK_URL unset; alerts accumulate in the outbox");
-    }
+    spawn_deliverers(&db, &writer, smtp, &shutdown)?;
 
     let status_dir = std::env::var("SMON_STATUS_DIR").unwrap_or_else(|_| "status".into());
     let _snapshot_task = spawn_snapshot(&db, &statuses, &status_dir, &shutdown);
@@ -306,4 +297,73 @@ async fn shutdown_signal(coordinator_stop: CancellationToken) {
 /// one day carry a credential.
 fn redact_sqlite(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+/// Spawn one deliverer per configured channel. Webhook rows are always enqueued — pending
+/// rows are the visible "no receiver" signal — while email rows only exist when SMTP is
+/// configured, so an unconfigured channel is never a dead plan.
+fn spawn_deliverers(
+    db: &monitor_db::Db,
+    writer: &monitor_db::writer::WriterHandle,
+    smtp: Option<Sink>,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    if let Ok(target) = std::env::var("SMON_WEBHOOK_URL") {
+        let target = url::Url::parse(&target).context("SMON_WEBHOOK_URL must be a URL")?;
+        let secret = std::env::var("SMON_WEBHOOK_SECRET")
+            .ok()
+            .map(String::into_bytes);
+        let _webhook_deliverer = Deliverer::spawn(
+            db.clone(),
+            writer.clone(),
+            DelivererConfig::default(),
+            Sink::Webhook { target, secret },
+            shutdown.clone(),
+        );
+    } else {
+        tracing::info!("SMON_WEBHOOK_URL unset; alerts accumulate in the outbox");
+    }
+    if let Some(sink) = smtp {
+        let _email_deliverer = Deliverer::spawn(
+            db.clone(),
+            writer.clone(),
+            DelivererConfig::default(),
+            sink,
+            shutdown.clone(),
+        );
+    }
+    Ok(())
+}
+
+/// The email alert channel (M7.1): `SMON_SMTP_DSN` selects the relay
+/// (`smtps://user:pass@host[:465]`, `smtp://user:pass@host[:587]?tls=required` for mandatory
+/// STARTTLS, or a bare `smtp://` for an explicitly plaintext local relay), `SMON_SMTP_FROM`
+/// is the sender mailbox, `SMON_SMTP_TO` a comma-separated recipient list. All three are
+/// required together; a partial configuration is a boot error, not a half-live channel.
+fn smtp_sink() -> anyhow::Result<Option<Sink>> {
+    let Ok(dsn) = std::env::var("SMON_SMTP_DSN") else {
+        return Ok(None);
+    };
+    let mailer = AsyncSmtpTransport::<Tokio1Executor>::from_url(&dsn)
+        .context("SMON_SMTP_DSN must be smtp:// or smtps://")?
+        .build();
+    let parse_mailbox = |raw: &str, var: &str| -> anyhow::Result<Mailbox> {
+        raw.trim()
+            .parse::<Mailbox>()
+            .with_context(|| format!("{var} contains an invalid mailbox: {raw:?}"))
+    };
+    let from = std::env::var("SMON_SMTP_FROM")
+        .context("SMON_SMTP_FROM is required when SMON_SMTP_DSN is set")
+        .and_then(|raw| parse_mailbox(&raw, "SMON_SMTP_FROM"))?;
+    let recipients = std::env::var("SMON_SMTP_TO")
+        .context("SMON_SMTP_TO is required when SMON_SMTP_DSN is set")?;
+    let to: Vec<Mailbox> = recipients
+        .split(',')
+        .map(|raw| parse_mailbox(raw, "SMON_SMTP_TO"))
+        .collect::<anyhow::Result<_>>()?;
+    anyhow::ensure!(
+        !to.is_empty(),
+        "SMON_SMTP_TO must name at least one recipient"
+    );
+    Ok(Some(Sink::Email { mailer, from, to }))
 }

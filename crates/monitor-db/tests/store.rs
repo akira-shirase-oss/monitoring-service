@@ -18,7 +18,14 @@ async fn store() -> anyhow::Result<(Db, Monitor, writer::WriterHandle)> {
         NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
     db.insert_monitor(&monitor).await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
-    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
+    let (handle, _task) = writer::spawn(
+        db.clone(),
+        statuses,
+        HashMap::new(),
+        Arc::default(),
+        8,
+        false,
+    );
     Ok((db, monitor, handle))
 }
 
@@ -437,6 +444,7 @@ async fn statuses_only_move_on_commits() -> anyhow::Result<()> {
         HashMap::new(),
         Arc::default(),
         8,
+        false,
     );
 
     assert_eq!(
@@ -522,7 +530,7 @@ async fn outbox_lifecycle_pending_retry_exhausted_delivered() -> anyhow::Result<
     let event_id = outbox[0].event_id.clone();
 
     // Fresh event: due immediately.
-    let pending = db.pending_outbox(3, 10).await?;
+    let pending = db.pending_outbox("webhook", 3, 10).await?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].event_id, event_id);
     assert_eq!(pending[0].monitor_name, "fixture");
@@ -533,17 +541,17 @@ async fn outbox_lifecycle_pending_retry_exhausted_delivered() -> anyhow::Result<
     writer
         .mark_delivery(&event_id, 1, Some(later), None)
         .await?;
-    assert!(db.pending_outbox(3, 10).await?.is_empty());
+    assert!(db.pending_outbox("webhook", 3, 10).await?.is_empty());
 
     // Past the retry time it is due again — simulate by scheduling in the past.
     let past = OffsetDateTime::now_utc() - time::Duration::seconds(1);
     writer.mark_delivery(&event_id, 2, Some(past), None).await?;
-    assert_eq!(db.pending_outbox(3, 10).await?.len(), 1);
+    assert_eq!(db.pending_outbox("webhook", 3, 10).await?.len(), 1);
 
     // Exhausted (attempts = max, no next attempt) is terminal: never pending again, but the
     // row stays in the table.
     writer.mark_delivery(&event_id, 3, None, None).await?;
-    assert!(db.pending_outbox(3, 10).await?.is_empty());
+    assert!(db.pending_outbox("webhook", 3, 10).await?.is_empty());
     assert_eq!(db.list_outbox(monitor.id).await?.len(), 1);
     Ok(())
 }
@@ -568,7 +576,7 @@ async fn a_delivered_event_cannot_be_rewritten() -> anyhow::Result<()> {
     assert_eq!(row.attempts, 1);
     assert!(row.delivered_at.is_some());
     assert!(row.next_attempt_at.is_none());
-    assert!(db.pending_outbox(8, 10).await?.is_empty());
+    assert!(db.pending_outbox("webhook", 8, 10).await?.is_empty());
     Ok(())
 }
 
@@ -697,6 +705,7 @@ async fn writes_past_the_page_ceiling_fail_and_flag_unhealthy() -> anyhow::Resul
         HashMap::new(),
         Arc::clone(&write_health),
         8,
+        false,
     );
 
     // Free pages absorb a few rows; keep writing until the ceiling bites. The counter
@@ -730,7 +739,14 @@ async fn a_landed_write_clears_the_failure_count() -> anyhow::Result<()> {
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let write_health: WriteHealth = Arc::default();
     write_health.store(3, std::sync::atomic::Ordering::Relaxed);
-    let (handle, _task) = writer::spawn(db, statuses, HashMap::new(), Arc::clone(&write_health), 8);
+    let (handle, _task) = writer::spawn(
+        db,
+        statuses,
+        HashMap::new(),
+        Arc::clone(&write_health),
+        8,
+        false,
+    );
     handle.record(pass(&monitor)).await?;
     assert_eq!(
         write_health.load(std::sync::atomic::Ordering::Relaxed),
@@ -754,7 +770,14 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
     db.insert_monitor(&monitor).await?;
 
     let statuses = Arc::new(RwLock::new(HashMap::new()));
-    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
+    let (handle, _task) = writer::spawn(
+        db.clone(),
+        statuses,
+        HashMap::new(),
+        Arc::default(),
+        8,
+        false,
+    );
     // Drive an incident open — check + incident + outbox land in one commit.
     for _ in 0..3 {
         handle.record(fail(&monitor)).await?;
@@ -771,7 +794,7 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
     let restored = Db::connect(&format!("sqlite:{}", backup.display()), 1).await?;
     let open = restored.open_incident(monitor.id).await?;
     assert!(open.is_some(), "restored open incident stays open");
-    let due = restored.pending_outbox(10, 10).await?;
+    let due = restored.pending_outbox("webhook", 10, 10).await?;
     assert_eq!(
         due.len(),
         1,
@@ -781,5 +804,48 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
     let tail = restored.recent_outcomes(monitor.id, 4).await?;
     let health = Health::rebuild(open.is_some(), &tail, monitor.thresholds);
     assert_eq!(health.status(), Status::Down);
+    Ok(())
+}
+
+/// M7.1: with the email channel configured, an incident transition enqueues one outbox row
+/// per channel — same event, independent delivery bookkeeping.
+#[tokio::test]
+async fn an_incident_enqueues_one_row_per_configured_channel() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let monitor =
+        NewMonitor::new("fixture", url::Url::parse("https://example.com")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+    let statuses = Arc::new(RwLock::new(HashMap::new()));
+    // The email channel is what production gets when SMON_SMTP_DSN is set.
+    let (handle, _task) = writer::spawn(
+        db.clone(),
+        statuses,
+        HashMap::new(),
+        Arc::default(),
+        8,
+        true,
+    );
+
+    for _ in 0..3 {
+        handle.record(fail(&monitor)).await?;
+    }
+
+    let rows = db.list_outbox(monitor.id).await?;
+    assert_eq!(rows.len(), 2, "one outbox row per configured channel");
+    let mut channels: Vec<&str> = rows.iter().map(|row| row.channel.as_str()).collect();
+    channels.sort_unstable();
+    assert_eq!(channels, ["email", "webhook"]);
+    assert_eq!(rows[0].incident_id, rows[1].incident_id);
+    assert_eq!(rows[0].kind, rows[1].kind);
+    assert_ne!(
+        rows[0].event_id, rows[1].event_id,
+        "each channel tracks its own delivery"
+    );
+    assert_eq!(
+        db.pending_outbox("email", 8, 10).await?.len(),
+        1,
+        "the email row is pending on its own channel"
+    );
     Ok(())
 }

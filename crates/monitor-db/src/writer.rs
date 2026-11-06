@@ -147,13 +147,16 @@ impl WriterHandle {
 
 /// Spawn the writer. `health` is the boot-rebuilt map (`Health::rebuild` per monitor); the
 /// writer owns it from here. `write_health` is bumped on every failed commit and reset on
-/// every landed one. The task exits when every handle is dropped.
+/// every landed one. `queue_email` mirrors the alert config: when SMTP is configured,
+/// incident transitions enqueue an `email` outbox row alongside the webhook one. The task
+/// exits when every handle is dropped.
 pub fn spawn(
     db: Db,
     statuses: SharedStatuses,
     health: impl IntoIterator<Item = (MonitorId, Health)>,
     write_health: WriteHealth,
     channel_bound: usize,
+    queue_email: bool,
 ) -> (WriterHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(channel_bound);
     let handle = WriterHandle { tx };
@@ -162,6 +165,7 @@ pub fn spawn(
         statuses,
         health.into_iter().collect(),
         write_health,
+        queue_email,
         rx,
     ));
     (handle, task)
@@ -172,12 +176,13 @@ async fn run(
     statuses: SharedStatuses,
     mut health: HashMap<MonitorId, Health>,
     write_health: WriteHealth,
+    queue_email: bool,
     mut rx: mpsc::Receiver<Command>,
 ) {
     while let Some(command) = rx.recv().await {
         match command {
             Command::Record { observation, reply } => {
-                let outcome = record(&db, &statuses, &mut health, *observation).await;
+                let outcome = record(&db, &statuses, &mut health, queue_email, *observation).await;
                 track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("observation reply channel closed; result still committed");
@@ -224,6 +229,7 @@ async fn record(
     db: &Db,
     statuses: &SharedStatuses,
     health: &mut HashMap<MonitorId, Health>,
+    queue_email: bool,
     observation: Observation,
 ) -> Result<WriteOutcome, QueryError> {
     let Some(gate) = db.monitor_gate(observation.monitor_id).await? else {
@@ -247,7 +253,7 @@ async fn record(
         .cloned()
         .unwrap_or_default();
     let effect = next.record(observation.slot, gate.thresholds, gate.maintenance);
-    db.commit_observation(&observation, effect, next.incident_open())
+    db.commit_observation(&observation, effect, next.incident_open(), queue_email)
         .await?;
     let status = next.status();
     health.insert(observation.monitor_id, next);

@@ -28,13 +28,28 @@ at-least-once to a receiver — without alerting ever being able to stall observ
   never silently dropped.
 - **Uncertainty is explicit:** a timed-out delivery is `uncertain` — retried under the same
   `event_id`, so a receiver may see a duplicate but never a second *logical* event.
-- **Channels:** webhook first (HMAC-signed body, bounded); email later behind an adapter.
+- **Channels (M7.1):** `notify_outbox.channel` selects the transport — `webhook` always,
+  `email` when SMTP is configured. One transition enqueues one row *per configured
+  channel* (same incident/kind, distinct `event_id`s — each channel owns its delivery
+  bookkeeping). Each deliverer polls only its own channel, so a dead SMTP relay can never
+  stall webhooks or vice versa. No configured channel ⇒ no dead-plan rows.
+- **Email sink:** `Sink::Email` — lettre `AsyncSmtpTransport` on rustls+tokio
+  (`SMON_SMTP_DSN`: `smtps://user:pass@host[:465]`, `smtp://…?tls=required` for mandatory
+  STARTTLS, bare `smtp://` only for an explicitly plaintext local relay),
+  `SMON_SMTP_FROM`, `SMON_SMTP_TO` (comma-separated). All three required together —
+  partial config is a boot error, not a half-live channel. Subject carries
+  `[service-monitor] <monitor>: <kind>` with CR/LF stripped (header injection never
+  reaches the wire); `Message-ID: <event_id@service-monitor>` threads retries. A positive
+  2xx/354-close reply is success; anything else is the same deterministic retry/exhaustion
+  path as webhooks. Credentials live in env only and are never logged — `Sink::describe`
+  reports the recipient count, not addresses.
 
 ## Failure cases
 
 | Trigger | Required result |
 |---|---|
 | Receiver hangs | deadline; retry later; probes unaffected |
+| One channel's relay down | other channel's rows still drain; failing channel retries under its own event_id |
 | Crash after commit before delivery | outbox row survives; delivered on restart |
 | Receiver 500s / flaps | bounded retries, then visible `undelivered` |
 | Deliverer dies | probes + incidents continue; backlog drains on restart |

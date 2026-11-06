@@ -64,7 +64,14 @@ fn rig(
     monitors: Vec<Monitor>,
 ) -> anyhow::Result<(watch::Sender<Arc<Vec<Monitor>>>, CancellationToken)> {
     let statuses = Arc::new(RwLock::new(HashMap::new()));
-    let (handle, _writer) = writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 32);
+    let (handle, _writer) = writer::spawn(
+        db.clone(),
+        statuses,
+        HashMap::new(),
+        Arc::default(),
+        32,
+        false,
+    );
     let (registry_tx, registry_rx) = watch::channel(Arc::new(monitors));
     let probes = ProbeClient::new(
         ProbePolicy {

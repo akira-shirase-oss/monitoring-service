@@ -43,6 +43,10 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_LOG_FILE=/opt/smon/data/monitor.log
 # SMON_WEBHOOK_URL=
 # SMON_WEBHOOK_SECRET=
+# Email channel — set all three or none (partial config refuses to boot):
+# SMON_SMTP_DSN=smtps://user:pass@smtp.example.com:465   # or smtp://host:587?tls=required
+# SMON_SMTP_FROM=alerts@example.com
+# SMON_SMTP_TO=oncall@example.com,backup@example.com
 ENV
 
 if [ -d apps/dashboard/build ]; then

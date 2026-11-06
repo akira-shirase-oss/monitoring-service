@@ -17,6 +17,7 @@ monitor-db.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 hmac.workspace = true
+lettre.workspace = true
 reqwest.workspace = true
 rustls = "0.23"
 rustls-pki-types = "1"

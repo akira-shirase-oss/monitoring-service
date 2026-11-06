@@ -15,7 +15,7 @@ use axum::routing::post;
 use hmac::{Hmac, Mac};
 use monitor_db::{Db, Observation, OutboxRow, writer};
 use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation};
-use monitor_server::deliver::{Config, Deliverer};
+use monitor_server::deliver::{Config, Deliverer, Sink};
 use sha2::Sha256;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
@@ -82,7 +82,14 @@ async fn rig() -> anyhow::Result<(Db, writer::WriterHandle)> {
     let db = Db::connect("sqlite::memory:", 1).await?;
     db.migrate().await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
-    let (handle, _task) = writer::spawn(db.clone(), statuses, HashMap::new(), Arc::default(), 8);
+    let (handle, _task) = writer::spawn(
+        db.clone(),
+        statuses,
+        HashMap::new(),
+        Arc::default(),
+        8,
+        false,
+    );
     Ok((db, handle))
 }
 
@@ -116,10 +123,8 @@ async fn monitor_with_event(
     Ok((monitor, row))
 }
 
-fn fast_config(target: url::Url, secret: Option<&[u8]>) -> Config {
+fn fast_config() -> Config {
     Config {
-        target: Some(target),
-        secret: secret.map(<[u8]>::to_vec),
         poll_tick: Duration::from_millis(30),
         attempt_deadline: Duration::from_millis(400),
         max_attempts: 3,
@@ -128,6 +133,13 @@ fn fast_config(target: url::Url, secret: Option<&[u8]>) -> Config {
         concurrency: 4,
         batch: 8,
     }
+}
+
+fn webhook_sink(target: &str, secret: Option<&[u8]>) -> anyhow::Result<Sink> {
+    Ok(Sink::Webhook {
+        target: url::Url::parse(target)?,
+        secret: secret.map(<[u8]>::to_vec),
+    })
 }
 
 /// Poll the outbox row until `pred` holds or the deadline passes. The stub reports a hit
@@ -161,7 +173,8 @@ async fn a_pending_event_is_delivered_and_marked() -> anyhow::Result<()> {
     let task = Deliverer::spawn(
         db.clone(),
         writer,
-        fast_config(url::Url::parse(&target)?, Some(b"the-secret")),
+        fast_config(),
+        webhook_sink(&target, Some(b"the-secret"))?,
         shutdown.clone(),
     );
 
@@ -205,7 +218,8 @@ async fn a_failed_attempt_is_retried_then_delivered() -> anyhow::Result<()> {
     let task = Deliverer::spawn(
         db.clone(),
         writer,
-        fast_config(url::Url::parse(&target)?, None),
+        fast_config(),
+        webhook_sink(&target, None)?,
         shutdown.clone(),
     );
 
@@ -227,10 +241,16 @@ async fn a_hanging_receiver_is_a_slow_retry_not_a_stalled_pool() -> anyhow::Resu
     let (bad, _bad_event) = monitor_with_event(&db, &writer, "bad").await?;
     let (good, _good_event) = monitor_with_event(&db, &writer, "good").await?;
     let (target, mut hits) = stub(0, vec![bad.id.0.to_string()]).await?;
-    let mut config = fast_config(url::Url::parse(&target)?, None);
+    let mut config = fast_config();
     config.attempt_deadline = Duration::from_millis(150);
     let shutdown = CancellationToken::new();
-    let task = Deliverer::spawn(db.clone(), writer, config, shutdown.clone());
+    let task = Deliverer::spawn(
+        db.clone(),
+        writer,
+        config,
+        webhook_sink(&target, None)?,
+        shutdown.clone(),
+    );
 
     // The healthy event still delivers while the hanging one occupies its retry deadline.
     let mut good_delivered = false;
@@ -261,10 +281,16 @@ async fn exhaustion_is_terminal_and_the_row_stays_visible() -> anyhow::Result<()
     let (db, writer) = rig().await?;
     let (monitor, event) = monitor_with_event(&db, &writer, "fixture").await?;
     let (target, mut hits) = stub(10, vec![]).await?; // always 500
-    let mut config = fast_config(url::Url::parse(&target)?, None);
+    let mut config = fast_config();
     config.max_attempts = 2;
     let shutdown = CancellationToken::new();
-    let task = Deliverer::spawn(db.clone(), writer, config, shutdown.clone());
+    let task = Deliverer::spawn(
+        db.clone(),
+        writer,
+        config,
+        webhook_sink(&target, None)?,
+        shutdown.clone(),
+    );
 
     for _ in 0..2 {
         let _ = tokio::time::timeout(Duration::from_secs(5), hits.recv())
@@ -285,7 +311,7 @@ async fn exhaustion_is_terminal_and_the_row_stays_visible() -> anyhow::Result<()
     assert_eq!(row.event_id, event.event_id);
     assert!(row.delivered_at.is_none());
     assert!(row.next_attempt_at.is_none());
-    assert!(db.pending_outbox(2, 10).await?.is_empty());
+    assert!(db.pending_outbox("webhook", 2, 10).await?.is_empty());
     // But it stays in the table — visible, not silently dropped.
     assert_eq!(db.list_outbox(monitor.id).await?.len(), 1);
     shutdown.cancel();
@@ -297,11 +323,9 @@ async fn exhaustion_is_terminal_and_the_row_stays_visible() -> anyhow::Result<()
 async fn no_target_means_pending_not_dropped() -> anyhow::Result<()> {
     let (db, writer) = rig().await?;
     let (monitor, _event) = monitor_with_event(&db, &writer, "fixture").await?;
-    let shutdown = CancellationToken::new();
-    let mut config = fast_config(url::Url::parse("http://127.0.0.1:1/")?, None);
-    config.target = None;
-    let task = Deliverer::spawn(db.clone(), writer, config, shutdown.clone());
-    task.await?; // no target: the loop returns after logging
+    // With no sink configured the deliverer is simply never spawned — the pending row is
+    // the visible "no receiver" signal, so nothing is attempted and nothing is dropped.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let row = &db.list_outbox(monitor.id).await?[0];
     assert!(row.delivered_at.is_none());
     assert_eq!(row.attempts, 0, "nothing was attempted");
@@ -317,9 +341,15 @@ async fn pending_events_survive_a_deliverer_restart() -> anyhow::Result<()> {
     let (monitor, _event) = monitor_with_event(&db, &writer, "fixture").await?;
 
     let shutdown_a = CancellationToken::new();
-    let mut dead = fast_config(url::Url::parse("http://127.0.0.1:1/")?, None);
+    let mut dead = fast_config();
     dead.attempt_deadline = Duration::from_millis(200);
-    let task_a = Deliverer::spawn(db.clone(), writer.clone(), dead, shutdown_a.clone());
+    let task_a = Deliverer::spawn(
+        db.clone(),
+        writer.clone(),
+        dead,
+        webhook_sink("http://127.0.0.1:1/", None)?,
+        shutdown_a.clone(),
+    );
     let row = wait_row(&db, &monitor, |row| row.attempts >= 1).await?;
     assert_eq!(
         row.attempts, 1,
@@ -334,7 +364,8 @@ async fn pending_events_survive_a_deliverer_restart() -> anyhow::Result<()> {
     let task_b = Deliverer::spawn(
         db.clone(),
         writer,
-        fast_config(url::Url::parse(&target)?, None),
+        fast_config(),
+        webhook_sink(&target, None)?,
         shutdown_b.clone(),
     );
     let (_headers, _body) = tokio::time::timeout(Duration::from_secs(5), hits.recv())

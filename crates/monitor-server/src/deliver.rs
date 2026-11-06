@@ -1,16 +1,19 @@
-//! The notification deliverer: turns committed outbox rows into at-least-once webhook
-//! delivery, on its own pool and its own deadlines — a hung or failing receiver can occupy a
-//! delivery slot, never a probe slot.
+//! The notification deliverer: turns committed outbox rows into at-least-once delivery on
+//! their channel — webhook POST or email — on its own pool and its own deadlines, so a hung
+//! or failing receiver can occupy a delivery slot, never a probe slot.
 //!
 //! Writes still go through the single writer (`mark_delivery`): the deliverer computes the
-//! schedule, the store records it. Every logical event keeps one stable `event_id`, so a
-//! retried delivery may arrive twice at the receiver but is never a second *logical* event.
+//! schedule, the store records it. Every outbox row keeps one stable `event_id`, so a retried
+//! delivery may arrive twice at the receiver but is never a second *logical* event.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
+use lettre::message::{Mailbox, header};
+use lettre::transport::smtp::AsyncSmtpTransport;
+use lettre::{AsyncTransport, Message, Tokio1Executor};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Serialize;
 use sha2::Sha256;
@@ -25,13 +28,41 @@ use monitor_db::{Db, DeliveryRow, WriterHandle};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// One channel's delivery endpoint — where an outbox row goes. `Sink::channel` is the
+/// `notify_outbox.channel` filter, so a deliverer can only ever claim its own rows.
+pub enum Sink {
+    /// `POST` the JSON payload, optionally HMAC-signed.
+    Webhook {
+        target: Url,
+        secret: Option<Vec<u8>>,
+    },
+    /// A plaintext message per event through an SMTP relay.
+    Email {
+        mailer: AsyncSmtpTransport<Tokio1Executor>,
+        from: Mailbox,
+        to: Vec<Mailbox>,
+    },
+}
+
+impl Sink {
+    fn channel(&self) -> &'static str {
+        match self {
+            Self::Webhook { .. } => "webhook",
+            Self::Email { .. } => "email",
+        }
+    }
+
+    /// What the logs may say — never credentials or full recipient lists.
+    fn describe(&self) -> String {
+        match self {
+            Self::Webhook { target, .. } => redact(target),
+            Self::Email { to, .. } => format!("smtp relay → {} recipient(s)", to.len()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Where events are `POST`ed. `None` means "no receiver configured": events stay pending in
-    /// the outbox — visible, never delivered to nowhere.
-    pub target: Option<Url>,
-    /// HMAC key for the `x-smon-signature` header; unsigned when unset.
-    pub secret: Option<Vec<u8>>,
     /// How often the outbox is polled for due events.
     pub poll_tick: Duration,
     /// Per-attempt deadline: a hanging receiver is a slow retry, not a stalled pool.
@@ -50,8 +81,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            target: None,
-            secret: None,
             poll_tick: Duration::from_secs(5),
             attempt_deadline: Duration::from_secs(5),
             max_attempts: 8,
@@ -116,15 +145,16 @@ impl<'a> From<&'a DeliveryRow> for Payload<'a> {
 pub struct Deliverer;
 
 impl Deliverer {
-    /// Spawn the delivery loop. With `config.target = None` it still runs: pending rows are
-    /// counted and logged, so "nothing is notifying" is visible rather than silent.
+    /// Spawn the delivery loop for one channel. Callers spawn it only when the channel is
+    /// configured; rows for an unconfigured channel simply never exist to claim.
     pub fn spawn(
         db: Db,
         writer: WriterHandle,
         config: Config,
+        sink: Sink,
         shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(run(db, writer, config, shutdown))
+        tokio::spawn(run(db, writer, config, sink, shutdown))
     }
 }
 
@@ -143,21 +173,51 @@ fn retry_delay(event_id: &str, attempt: i64, base: Duration, cap: Duration) -> D
     Duration::from_millis(u64::try_from(jittered_ms).unwrap_or(u64::MAX))
 }
 
-async fn run(db: Db, writer: WriterHandle, config: Config, shutdown: CancellationToken) {
-    let Some(target) = config.target.clone() else {
-        info!("no webhook target configured; outbox events will stay pending");
-        return;
-    };
-    let client = match reqwest::Client::builder()
-        .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            warn!(%error, "deliverer could not build an HTTP client; not delivering");
-            return;
+/// A sink with its one-time construction done — the webhook client is built once and reused
+/// so delivery attempts share its pool.
+enum Prepared {
+    Webhook {
+        client: reqwest::Client,
+        target: Url,
+        secret: Option<Vec<u8>>,
+    },
+    Email {
+        mailer: AsyncSmtpTransport<Tokio1Executor>,
+        from: Mailbox,
+        to: Vec<Mailbox>,
+    },
+}
+
+async fn run(
+    db: Db,
+    writer: WriterHandle,
+    config: Config,
+    sink: Sink,
+    shutdown: CancellationToken,
+) {
+    let channel = sink.channel();
+    let endpoint = sink.describe();
+    let prepared = match sink {
+        Sink::Webhook { target, secret } => {
+            let client = match reqwest::Client::builder()
+                .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
+                .build()
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    warn!(%error, "webhook deliverer could not build an HTTP client; not delivering");
+                    return;
+                }
+            };
+            Prepared::Webhook {
+                client,
+                target,
+                secret,
+            }
         }
+        Sink::Email { mailer, from, to } => Prepared::Email { mailer, from, to },
     };
+    let prepared = Arc::new(prepared);
 
     let permits = Arc::new(Semaphore::new(config.concurrency));
     let tracker = TaskTracker::new();
@@ -167,12 +227,12 @@ async fn run(db: Db, writer: WriterHandle, config: Config, shutdown: Cancellatio
     let mut in_flight: HashSet<String> = HashSet::new();
     let mut ticker = tokio::time::interval(config.poll_tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    info!(target = %redact(&target), "deliverer running");
+    info!(channel, endpoint, "deliverer running");
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                match db.pending_outbox(config.max_attempts, config.batch).await {
+                match db.pending_outbox(channel, config.max_attempts, config.batch).await {
                     Ok(rows) => {
                         for row in rows {
                             if in_flight.contains(&row.event_id) {
@@ -184,9 +244,8 @@ async fn run(db: Db, writer: WriterHandle, config: Config, shutdown: Cancellatio
                             };
                             in_flight.insert(row.event_id.clone());
                             tracker.spawn(attempt(
-                                client.clone(),
+                                prepared.clone(),
                                 writer.clone(),
-                                target.clone(),
                                 config.clone(),
                                 row,
                                 permit,
@@ -194,7 +253,7 @@ async fn run(db: Db, writer: WriterHandle, config: Config, shutdown: Cancellatio
                             ));
                         }
                     }
-                    Err(error) => warn!(%error, "outbox poll failed; retrying next tick"),
+                    Err(error) => warn!(%error, channel, "outbox poll failed; retrying next tick"),
                 }
             }
             done = done_rx.recv() => {
@@ -219,67 +278,32 @@ async fn run(db: Db, writer: WriterHandle, config: Config, shutdown: Cancellatio
     info!("deliverer stopped");
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "task boundary gathers owned clones"
-)]
 async fn attempt(
-    client: reqwest::Client,
+    sink: Arc<Prepared>,
     writer: WriterHandle,
-    target: Url,
     config: Config,
     row: DeliveryRow,
     _permit: tokio::sync::OwnedSemaphorePermit,
     done: tokio::sync::mpsc::Sender<String>,
 ) {
     let event_id = row.event_id.clone();
-    deliver(&client, &writer, &target, &config, &row).await;
+    deliver(&sink, &writer, &config, &row).await;
     if done.send(event_id).await.is_err() {
         debug!("deliverer loop gone; completion not reported");
     }
 }
 
-async fn deliver(
-    client: &reqwest::Client,
-    writer: &WriterHandle,
-    target: &Url,
-    config: &Config,
-    row: &DeliveryRow,
-) {
-    let body = match serde_json::to_vec(&Payload::from(row)) {
-        Ok(body) => body,
-        Err(error) => {
-            warn!(%error, event = %row.event_id, "payload serialize failed; event stays pending");
-            return;
-        }
+async fn deliver(sink: &Prepared, writer: &WriterHandle, config: &Config, row: &DeliveryRow) {
+    let delivered = match sink {
+        Prepared::Webhook {
+            client,
+            target,
+            secret,
+        } => deliver_webhook(client, target, secret.as_deref(), config, row).await,
+        Prepared::Email { mailer, from, to } => deliver_email(mailer, from, to, config, row).await,
     };
 
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Ok(id) = HeaderValue::from_str(&row.event_id) {
-        headers.insert("x-smon-event", id);
-    }
-    if let Some(secret) = &config.secret
-        && let Ok(mut mac) = HmacSha256::new_from_slice(secret)
-    {
-        mac.update(&body);
-        let signature = hex_lower(&mac.finalize().into_bytes());
-        if let Ok(value) = HeaderValue::from_str(&format!("sha256={signature}")) {
-            headers.insert("x-smon-signature", value);
-        }
-    }
-
-    let send = client
-        .post(target.clone())
-        .headers(headers)
-        .body(body)
-        .send();
     let attempts = row.attempts + 1;
-    let delivered = matches!(
-        tokio::time::timeout(config.attempt_deadline, send).await,
-        Ok(Ok(response)) if response.status().is_success()
-    );
-
     if delivered {
         if let Err(error) = writer
             .mark_delivery(
@@ -316,6 +340,106 @@ async fn deliver(
     }
 }
 
+async fn deliver_webhook(
+    client: &reqwest::Client,
+    target: &Url,
+    secret: Option<&[u8]>,
+    config: &Config,
+    row: &DeliveryRow,
+) -> bool {
+    let body = match serde_json::to_vec(&Payload::from(row)) {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(%error, event = %row.event_id, "payload serialize failed; event stays pending");
+            return false;
+        }
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(id) = HeaderValue::from_str(&row.event_id) {
+        headers.insert("x-smon-event", id);
+    }
+    if let Some(secret) = secret
+        && let Ok(mut mac) = HmacSha256::new_from_slice(secret)
+    {
+        mac.update(&body);
+        let signature = hex_lower(&mac.finalize().into_bytes());
+        if let Ok(value) = HeaderValue::from_str(&format!("sha256={signature}")) {
+            headers.insert("x-smon-signature", value);
+        }
+    }
+
+    let send = client
+        .post(target.clone())
+        .headers(headers)
+        .body(body)
+        .send();
+    matches!(
+        tokio::time::timeout(config.attempt_deadline, send).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
+}
+
+/// One plaintext message per event. The subject is sanitized of CR/LF so a monitor name can
+/// never inject a header line; `Message-ID` carries the `event_id` so a retry threads onto
+/// the same logical event at the receiver.
+async fn deliver_email(
+    mailer: &AsyncSmtpTransport<Tokio1Executor>,
+    from: &Mailbox,
+    to: &[Mailbox],
+    config: &Config,
+    row: &DeliveryRow,
+) -> bool {
+    let mut message = Message::builder().from(from.clone());
+    for recipient in to {
+        message = message.to(recipient.clone());
+    }
+    let kind = row.kind.replace('_', " ");
+    let subject = format!(
+        "[service-monitor] {}: {kind}",
+        row.monitor_name.replace(['\r', '\n'], " ")
+    );
+    let body = email_body(row, &kind);
+    let message = match message
+        .subject(subject)
+        .header(header::MessageId::from(format!(
+            "<{}@service-monitor>",
+            row.event_id
+        )))
+        .body(body)
+    {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(%error, event = %row.event_id, "email build failed; event stays pending");
+            return false;
+        }
+    };
+    matches!(
+        tokio::time::timeout(config.attempt_deadline, mailer.send(message)).await,
+        Ok(Ok(response)) if response.is_positive()
+    )
+}
+
+fn email_body(row: &DeliveryRow, kind: &str) -> String {
+    use std::fmt::Write;
+    let mut body = format!(
+        "Service Monitor: {kind}\n\nEvent:    {}\nMonitor:  {} <{}>\nIncident: #{}\nOpened:   {}",
+        row.event_id, row.monitor_name, row.monitor_url, row.incident_id, row.opened_at
+    );
+    if let Some(first_fail) = row.first_fail_at {
+        let _ = write!(body, "\nFailing since: {first_fail}");
+    }
+    if let Some(last_fail) = row.last_fail_at {
+        let _ = write!(body, "\nLast failure:  {last_fail}");
+    }
+    if let Some(resolved) = row.resolved_at {
+        let _ = write!(body, "\nResolved:      {resolved}");
+    }
+    let _ = write!(body, "\nOccurred: {}\n", row.created_at);
+    body
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
@@ -342,6 +466,7 @@ mod tests {
         DeliveryRow {
             event_id: "evt_01".to_owned(),
             kind: "incident_opened".to_owned(),
+            channel: "webhook".to_owned(),
             attempts: 0,
             created_at: now,
             monitor_id: "mon_1".to_owned(),

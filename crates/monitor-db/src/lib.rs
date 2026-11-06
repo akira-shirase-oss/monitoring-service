@@ -579,7 +579,7 @@ impl Db {
     /// Outbox rows for a monitor, oldest first — delivery and tests both read this.
     pub async fn list_outbox(&self, monitor: MonitorId) -> Result<Vec<OutboxRow>, QueryError> {
         let rows = sqlx::query_as::<_, OutboxRow>(
-            "SELECT id, event_id, monitor_id, incident_id, kind, attempts, next_attempt_at,
+            "SELECT id, event_id, monitor_id, incident_id, kind, channel, attempts, next_attempt_at,
                     delivered_at, created_at
              FROM notify_outbox WHERE monitor_id = ? ORDER BY id",
         )
@@ -594,21 +594,24 @@ impl Db {
     /// config — the store just records what the deliverer asked it to.
     pub async fn pending_outbox(
         &self,
+        channel: &str,
         max_attempts: i64,
         limit: i64,
     ) -> Result<Vec<DeliveryRow>, QueryError> {
         let rows = sqlx::query_as::<_, DeliveryRow>(
-            "SELECT o.event_id, o.kind, o.attempts, o.created_at,
+            "SELECT o.event_id, o.kind, o.attempts, o.created_at, o.channel,
                     m.id AS monitor_id, m.name AS monitor_name, m.url AS monitor_url,
                     i.id AS incident_id, i.opened_at, i.first_fail_at, i.last_fail_at,
                     i.resolved_at
              FROM notify_outbox o
              JOIN monitors m ON m.id = o.monitor_id
              JOIN incidents i ON i.id = o.incident_id
-             WHERE o.delivered_at IS NULL AND o.attempts < ?
+             WHERE o.channel = ?
+               AND o.delivered_at IS NULL AND o.attempts < ?
                AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
              ORDER BY o.id LIMIT ?",
         )
+        .bind(channel)
         .bind(max_attempts)
         .bind(OffsetDateTime::now_utc())
         .bind(limit)
@@ -651,6 +654,7 @@ impl Db {
         observation: &Observation,
         effect: Effect,
         open_after: bool,
+        queue_email: bool,
     ) -> Result<(), QueryError> {
         let mut tx = self.pool.begin().await?;
         let (outcome, http_status) = encode_slot(observation.slot, observation.http_status);
@@ -712,6 +716,7 @@ impl Db {
                     observation.monitor_id,
                     incident_id,
                     "incident_opened",
+                    queue_email,
                 )
                 .await?;
             }
@@ -734,6 +739,7 @@ impl Db {
                     observation.monitor_id,
                     incident_id,
                     "incident_recovered",
+                    queue_email,
                 )
                 .await?;
             }
@@ -761,18 +767,30 @@ async fn enqueue_outbox(
     monitor: MonitorId,
     incident_id: i64,
     kind: &'static str,
+    queue_email: bool,
 ) -> Result<(), QueryError> {
-    sqlx::query(
-        "INSERT INTO notify_outbox (event_id, monitor_id, incident_id, kind, created_at)
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(Uuid::now_v7().to_string())
-    .bind(monitor.0.to_string())
-    .bind(incident_id)
-    .bind(kind)
-    .bind(OffsetDateTime::now_utc())
-    .execute(&mut **tx)
-    .await?;
+    // One row per delivery channel: webhook is always planned (pending rows are the
+    // visible "no receiver" signal); email rows only exist when SMTP is configured —
+    // an unconfigured channel is no plan, not a pending one.
+    let channels: &[&str] = if queue_email {
+        &["webhook", "email"]
+    } else {
+        &["webhook"]
+    };
+    for channel in channels {
+        sqlx::query(
+            "INSERT INTO notify_outbox (event_id, monitor_id, incident_id, kind, channel, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(monitor.0.to_string())
+        .bind(incident_id)
+        .bind(kind)
+        .bind(*channel)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -915,6 +933,7 @@ pub struct OutboxRow {
     pub monitor_id: String,
     pub incident_id: i64,
     pub kind: String,
+    pub channel: String,
     pub attempts: i64,
     pub next_attempt_at: Option<OffsetDateTime>,
     pub delivered_at: Option<OffsetDateTime>,
@@ -926,6 +945,7 @@ pub struct OutboxRow {
 pub struct DeliveryRow {
     pub event_id: String,
     pub kind: String,
+    pub channel: String,
     pub attempts: i64,
     pub created_at: OffsetDateTime,
     pub monitor_id: String,

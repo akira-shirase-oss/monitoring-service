@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- M7.1 email alerts: `notify_outbox.channel` (migration 0006) — one incident
+  transition enqueues one row per configured channel (webhook always; email when
+  `SMON_SMTP_DSN`/`SMON_SMTP_FROM`/`SMON_SMTP_TO` are all set). `Sink::Email` is a
+  lettre `AsyncSmtpTransport` on rustls+tokio (`aws_lc_rs`, webpki-roots) driving the
+  same bounded pool, per-attempt deadline, deterministic backoff and writer
+  bookkeeping as webhooks — a dead SMTP relay can never stall webhook delivery.
+  Partial SMTP config is a boot error; subjects are CR/LF-sanitized; `Message-ID`
+  carries the event id so SMTP retries thread one logical message. Store test: one
+  row per channel; integration: a loopback SMTP stub proves deliver+mark,
+  550-refusal→retry→deliver (attempts=2), and channel isolation.
 - M6.11 maintenance windows: schedule-scoped suppression (`maintenance_windows`,
   migration 0005) read inside the observation gate — a `failures_to_open` crossing in
   an active window commits the check row but yields `IncidentSuppressed` (no incident,

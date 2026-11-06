@@ -44,10 +44,10 @@ rebuild log ships), mined before its removal from `minimal-portfolio`.
 
 | Point | Why deferred |
 |---|---|
-| Email alerts (old M3.4) | Webhook is the v1 channel; an SMTP adapter is a separate milestone with its own auth surface |
-| Dashboard management login UX (old M4 "logging in") | Token gate exists; a session/login system is out of scope |
-| 24-hour soak | Owed evidence, not a feature — `perf/lab-profile.mjs --duration-s 86400` |
-| Real-app load watch (old 1.1) | The lab-profile harness covers bounded evidence; a real-Node-app rising-load run is a separate drill |
+| ~~Email alerts (old M3.4)~~ | **M7.1 done** — `notify_outbox.channel`; one transition enqueues one row per configured channel (webhook always, email when `SMON_SMTP_*` set); lettre/rustls `Sink::Email` on the same retry/deadline path; partial SMTP config is a boot error |
+| Dashboard management login UX (old M4 "logging in") | Token gate exists; a session/login system is M7.2 |
+| 24-hour soak | Owed evidence, not a feature — `perf/lab-profile.mjs --duration-s 86400` (running) |
+| Real-app load watch (old 1.1) | The lab-profile harness covers bounded evidence; a real-Node-app rising-load run is M7.3 |
 
 ## Rejected — not rebuilding
 

@@ -113,6 +113,7 @@ async fn the_writer_beats_a_real_file_with_committed_evidence() {
         HashMap::new(),
         Arc::default(),
         8,
+        false,
     );
     // One committed pass → the snapshot's status comes from the committed map.
     writer

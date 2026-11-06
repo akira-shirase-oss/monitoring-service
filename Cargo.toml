@@ -22,6 +22,11 @@ axum = "0.8.9"
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
 hmac = "0.12.1"
 http-body-util = "0.1.5"
+# SMTP for the email alert channel — rustls + tokio only, matching the single-TLS-stack rule.
+# `tokio1-rustls` + `webpki-roots` + `aws-lc-rs` gives the rustls connector and Mozilla
+# roots with the workspace's existing provider; lettre's `rustls-tls` bundle would force
+# `ring` on top and rustls refuses an ambiguous process provider.
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1-rustls", "webpki-roots", "aws-lc-rs"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
 sha2 = "0.10.9"
 serde = { version = "1.0.229", features = ["derive"] }

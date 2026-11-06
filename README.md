@@ -94,8 +94,8 @@ Upgrade = rerun `deploy.sh` + restart. Rollback = repoint `current` + restart �
 data lives in `$PREFIX/data`, outside releases, so evidence survives both.
 `deploy/RUNBOOK.md` covers install/upgrade/rollback/backup/heartbeat-watching end
 to end. Supported platforms: anything Rust + Node build on; the unit files target
-systemd (Linux) and launchd (macOS). v1 alerts are webhooks only — no email, no
-PagerDuty.
+systemd (Linux) and launchd (macOS). v1 alerts are webhooks and SMTP email through the
+same outbox — no PagerDuty.
 
 ## Configuration
 
@@ -106,6 +106,8 @@ All via `SMON_*` env vars (defaults in `deploy.sh`'s generated `env` file):
 `SMON_RETENTION_S` `SMON_RETENTION_INTERVAL_S` `SMON_STATUS_DIR`
 `SMON_STATUS_INTERVAL_S` `SMON_STATUS_TTL_S` `SMON_LOG_FILE` `SMON_LOG_MAX_BYTES`
 `SMON_WEBHOOK_URL` `SMON_WEBHOOK_SECRET`
+`SMON_SMTP_DSN` `SMON_SMTP_FROM` `SMON_SMTP_TO` — all three required together for the
+email channel; a partial set fails the boot.
 
 ## Verify
 
