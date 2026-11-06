@@ -175,6 +175,31 @@ test('a paused window renders as missing slots, never interpolated green', async
 	await expect(page.locator('.check-strip [data-outcome="pass"]').first()).toBeVisible();
 });
 
+test('auto-refresh picks up new monitors without a reload', async ({
+	page,
+	request
+}) => {
+	await page.goto('/');
+	await expect(page.getByRole('heading', { name: 'Monitors' })).toBeVisible();
+	const name = `e2e-refresh-${Date.now()}`;
+	await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);
+	// The next poll tick (~15s) must surface it — no navigation, no reload.
+	await expect(page.getByRole('link', { name })).toBeVisible({ timeout: 25_000 });
+});
+
+test('an API outage mid-poll resolves to "cannot see", not a frozen board', async ({
+	page
+}) => {
+	await page.goto('/');
+	await expect(page.getByRole('heading', { name: 'Monitors' })).toBeVisible();
+	// Kill the API after the page loaded; the next poll tick must resolve to the
+	// honest unreachable state — data swaps atomically, never a stale green.
+	await page.route('**/api/**', (route) => route.abort());
+	await expect(
+		page.getByText('The monitor server is unreachable.')
+	).toBeVisible({ timeout: 25_000 });
+});
+
 test('a mutation 401 surfaces the token error, never silent', async ({ page }) => {
 	await page.route('**/api/monitors', (route) => {
 		if (route.request().method() === 'POST') {

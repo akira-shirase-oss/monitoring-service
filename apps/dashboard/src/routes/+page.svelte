@@ -2,6 +2,7 @@
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
 	import { TriangleAlert } from '@lucide/svelte';
+	import { onMount } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
 	import TokenGate from '#lib/components/TokenGate.svelte';
 	import MonitorForm from '#lib/components/MonitorForm.svelte';
@@ -12,6 +13,16 @@
 	import type { MonitorView } from './+page';
 
 	let { data }: { data: PageData } = $props();
+
+	// Poll on the minimum check interval — SvelteKit holds the previous data until the
+	// reload resolves, so the swap is atomic: a commit mid-poll flips the badge once,
+	// an API outage mid-poll resolves to "cannot see", and nothing ever flashes stale.
+	onMount(() => {
+		const timer = setInterval(() => {
+			if (document.visibilityState === 'visible') invalidateAll();
+		}, 15_000);
+		return () => clearInterval(timer);
+	});
 
 	let adding = $state(false);
 	let addError = $state<string | null>(null);

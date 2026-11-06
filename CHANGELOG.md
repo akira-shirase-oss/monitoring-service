@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- M6.6 dashboard auto-refresh: both pages call `invalidateAll()` on the 15 s minimum
+  interval tick — SvelteKit keeps the previous data until the reload resolves, so the
+  swap is atomic and a commit mid-poll flips a badge exactly once; an API outage
+  mid-poll resolves to "cannot see" through the same load path; hidden tabs skip the
+  tick. Playwright: a new monitor surfaces on the next tick without reload/navigation,
+  and a route-abort mid-poll yields the unreachable banner (both specs ≈15.6 s, one
+  tick).
 - M6.5 dashboard uptime strip: `CheckStrip` above the detail-page check rows — one cell
   per committed check (live/attention/draft status tokens, tooltips carry the outcome,
   HTTP status and latency), plus dashed `missing` gap cells where the slot grid shows

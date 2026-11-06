@@ -33,7 +33,7 @@ rebuild log ships), mined before its removal from `minimal-portfolio`.
 | ~~Incident four times kept apart~~ | 2.4: opened / first-fail / last-fail / resolved | **M6.3 done** | `first_fail_at` derived from committed check rows inside the commit transaction (restart-safe), `last_fail_at` re-stamps per failing check, `resolved_at` on recovery; NULL for pre-M6.3 rows — no fabricated history; surfaced in API + webhook payload |
 | ~~Dashboard mutations~~ | old M4 "adding/editing from the dashboard" | **M6.4 done** | create/pause/edit/delete through the real API contract with envelope-error surfacing; delete-with-history refusal and 401 shown, never silent |
 | ~~Charts / uptime timeline~~ | (dashboard richer than rows) | **M6.5 done** | `CheckStrip` — one cell per committed check + dashed gap cells for unobserved slots; pause-gap spec proves a hole renders as a hole |
-| Auto-refresh | — | M6.6 | A monitor page you must reload is weaker than its data |
+| ~~Auto-refresh~~ | — | **M6.6 done** | `invalidateAll()` on the 15 s tick; atomic data swap — mid-poll outage resolves to "cannot see", new data appears without reload |
 | Public status view in-app | old M5 "status page somewhere else" | M6.7 | Render the *sanitized* status.json inside the dashboard — public viewers still never reach management APIs |
 | Guide page | 2.2: plain-English status/word reference, drift-checked | M6.8 | Cheap; the honesty vocabulary needs explaining |
 | CLI exit codes | 0.6 | M6.9 | Contract audit + pinned tests |

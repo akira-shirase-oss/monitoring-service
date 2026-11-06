@@ -2,6 +2,7 @@
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
 	import { ArrowLeft, TriangleAlert } from '@lucide/svelte';
+	import { onMount } from 'svelte';
 	import { goto, invalidateAll } from '$app/navigation';
 	import TokenGate from '#lib/components/TokenGate.svelte';
 	import MonitorForm from '#lib/components/MonitorForm.svelte';
@@ -13,6 +14,15 @@
 	import type { CheckView } from './+page';
 
 	let { data }: { data: PageData } = $props();
+
+	// Same honest poll as the list: atomic data swap, API outage -> unreachable,
+	// hidden tabs don't poll.
+	onMount(() => {
+		const timer = setInterval(() => {
+			if (document.visibilityState === 'visible') invalidateAll();
+		}, 15_000);
+		return () => clearInterval(timer);
+	});
 
 	let editing = $state(false);
 	let confirmingDelete = $state(false);
