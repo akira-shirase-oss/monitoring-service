@@ -76,6 +76,99 @@ test('three failures open an incident and the detail page tells the truth', asyn
 	await expect(page.getByText(/coverage \d+\.\d%[\s\S]*success 0\.0%/)).toBeVisible();
 });
 
+test('mutations through the real API: create in UI, pause, edit, delete', async ({
+	page,
+	request
+}) => {
+	// Create through the form — the API contract validates and the list shows the row.
+	await page.goto('/');
+	await page.getByRole('button', { name: 'Add monitor' }).click();
+	const name = `e2e-mut-${Date.now()}`;
+	await page.getByPlaceholder('billing-api').fill(name);
+	await page
+		.getByPlaceholder('https://example.com/healthz')
+		.fill(`http://127.0.0.1:${FAULT}/ok`);
+	await page.getByRole('button', { name: 'Create monitor' }).click();
+	await expect(page.getByRole('link', { name })).toBeVisible();
+
+	// Detail → pause: badge + API agree (the write went through, not just the view).
+	await page.getByRole('link', { name }).click();
+	await expect(page.getByRole('heading', { name })).toBeVisible();
+	await page.getByRole('button', { name: 'Pause' }).click();
+	await expect(page.getByText('paused').first()).toBeVisible();
+	await expect
+		.poll(async () => {
+			const r = await request.get('/api/monitors');
+			return (await r.json()).monitors.find(
+				(m: { name: string }) => m.name === name
+			)?.paused;
+		})
+		.toBe(true);
+
+	// Edit: the form seeds current values; every management write bumps generation
+	// once — create(1) → pause(2) → edit(3).
+	await page.getByRole('button', { name: 'Edit' }).click();
+	await page.getByPlaceholder('60').fill('30');
+	await page.getByRole('button', { name: 'Save changes' }).click();
+	await expect(page.getByText(/every 30s/)).toBeVisible();
+	await expect(page.getByText(/generation 3/)).toBeVisible();
+
+	// Delete needs the two-click confirm; a paused, checkless monitor deletes clean.
+	await page.getByRole('button', { name: 'Delete' }).click();
+	await page.getByRole('button', { name: 'Confirm delete' }).click();
+	await expect(page).toHaveURL(/\/$/);
+	await expect(page.getByRole('link', { name })).not.toBeVisible();
+});
+
+test('delete refusal on a monitor with history shows the server error', async ({
+	page,
+	request
+}) => {
+	const name = `e2e-del-${Date.now()}`;
+	const id = await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);
+	// Wait for committed evidence — delete must then refuse (evidence isn't erasable).
+	await expect
+		.poll(
+			async () => {
+				const r = await request.get(`/api/monitors/${id}/checks?limit=1`);
+				return (await r.json()).checks.length;
+			},
+			{ timeout: 40_000 }
+		)
+		.toBeGreaterThan(0);
+
+	await page.goto(`/monitors/${id}`);
+	await page.getByRole('button', { name: 'Delete' }).click();
+	await page.getByRole('button', { name: 'Confirm delete' }).click();
+	// The server's own conflict message is shown — not a silent no-op, not a spin.
+	await expect(page.getByText(/recorded history|pause it instead/)).toBeVisible();
+	await expect(page.getByRole('heading', { name })).toBeVisible();
+});
+
+test('a mutation 401 surfaces the token error, never silent', async ({ page }) => {
+	await page.route('**/api/monitors', (route) => {
+		if (route.request().method() === 'POST') {
+			route.fulfill({
+				status: 401,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					error: { code: 'unauthorized', message: 'missing credential' }
+				})
+			});
+		} else {
+			route.continue();
+		}
+	});
+	await page.goto('/');
+	await page.getByRole('button', { name: 'Add monitor' }).click();
+	await page.getByPlaceholder('billing-api').fill('e2e-401');
+	await page
+		.getByPlaceholder('https://example.com/healthz')
+		.fill('http://127.0.0.1/healthz');
+	await page.getByRole('button', { name: 'Create monitor' }).click();
+	await expect(page.getByText('The server rejected the token')).toBeVisible();
+});
+
 test('keyboard navigation reaches the detail page', async ({ page, request }) => {
 	const name = `e2e-kbd-${Date.now()}`;
 	const id = await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);

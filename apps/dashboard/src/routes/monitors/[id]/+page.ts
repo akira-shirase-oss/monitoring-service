@@ -19,6 +19,8 @@ export type IncidentView = {
 	id: number;
 	monitor_id: string;
 	opened_at: string;
+	first_fail_at: string | null;
+	last_fail_at: string | null;
 	resolved_at: string | null;
 	state: 'open' | 'resolved';
 };

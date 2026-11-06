@@ -1,8 +1,13 @@
 # Module 06 — Dashboard (`apps/dashboard`)
 
-**Status:** live (M2–M3): list with real status + monitor detail page — recent checks incl.
-`missed`, incident timeline, coverage-vs-success line from `GET …/stats` (nulls render as
-"no data"), unreachable vs missing vs ok states.
+**Status:** live (M2–M3, M6.4): list with real status + monitor detail page — recent checks
+incl. `missed`, incident timeline (first-fail vs opened vs resolved), coverage-vs-success
+line from `GET …/stats` (nulls render as "no data"), unreachable vs missing vs ok states.
+Mutations (M6.4): create via the shared `MonitorForm`, detail-page pause/resume, edit
+(interval/timeout/thresholds, sent with the `generation` guard), delete behind a two-click
+confirm — every write goes through the same API contract, and the server's envelope error
+is shown verbatim (stale-generation `conflict`, delete-with-history refusal, 401 → token
+hint).
 
 ## Purpose
 
@@ -33,9 +38,11 @@ evidence, check history and incident timelines — a client of the API, never of
 ## Testing parameters
 
 - **Unit/component:** badge variant mapping; reachable/unreachable branches.
-- **Playwright (M3.4, done):** `tests/dashboard.spec.ts` — API-abort banner (no fabricated
+- **Playwright (M3.4, M6.4):** `tests/dashboard.spec.ts` — API-abort banner (no fabricated
   rows), monitor → `up` badge on committed evidence, real 3-failure incident on the detail
-  page (checks strip, "still open", coverage-vs-success line), keyboard navigation.
-  `scripts/e2e.sh` builds the server + dashboard and runs it.
+  page (checks strip, "still open", coverage-vs-success line), full mutation spec
+  (UI create → pause (API-verified) → edit (generation bumps once per write) → delete),
+  delete-with-history refusal surfacing the server message, mutation-401 token hint,
+  keyboard navigation. `scripts/e2e.sh` builds the server + dashboard and runs it.
 - **Load:** not a target — a local operator tool; page weight budget recorded per release
   (module 09).

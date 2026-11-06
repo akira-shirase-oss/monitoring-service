@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- M6.4 dashboard mutations: the UI now holds write authority behind the existing token
+  — "Add monitor" on the list page (shared `MonitorForm` component), and pause/resume,
+  edit (interval/timeout/thresholds sent with the `generation` optimistic-concurrency
+  guard), and delete behind a two-click confirm on the detail page. Server envelope
+  errors are shown verbatim: a stale-generation `conflict`, the delete-with-history
+  refusal ("pause it instead"), and a 401 token hint — no silent failures. Incident rows
+  now show `first_fail_at` ("failing since") alongside opened/resolved (M6.3 surface).
+  Playwright: full mutation spec (create → pause API-verified → edit, generation 1→2→3
+  per write → delete), history-refusal message, and a mutation-401 spec.
 - M6.3 incident four times: `first_fail_at`, `opened_at`, `last_fail_at`, `resolved_at`
   are now committed separately (migration 0004). `first_fail_at` is derived inside the
   commit transaction from committed check rows — the oldest consecutive failure since

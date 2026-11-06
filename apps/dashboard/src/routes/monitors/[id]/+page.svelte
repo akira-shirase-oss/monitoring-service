@@ -2,11 +2,69 @@
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
 	import { ArrowLeft, TriangleAlert } from '@lucide/svelte';
+	import { goto, invalidateAll } from '$app/navigation';
 	import TokenGate from '#lib/components/TokenGate.svelte';
+	import MonitorForm from '#lib/components/MonitorForm.svelte';
+	import { apiFetch } from '#lib/auth.js';
+	import { readEnvelope } from '#lib/api.js';
+	import type { MonitorPayload } from '#lib/monitor-form.js';
 	import type { PageData } from './$types';
 	import type { CheckView } from './+page';
 
 	let { data }: { data: PageData } = $props();
+
+	let editing = $state(false);
+	let confirmingDelete = $state(false);
+	let actionError = $state<string | null>(null);
+	let actionBusy = $state(false);
+
+	// Every management write shows the server's own error — a 409 conflict is real
+	// information (stale read, or the monitor has history), never something to swallow.
+	async function mutate(id: string, init: RequestInit): Promise<boolean> {
+		actionBusy = true;
+		try {
+			const response = await apiFetch(`/api/monitors/${id}`, init, fetch);
+			const failure = await readEnvelope(response);
+			if (failure) {
+				actionError = failure.message;
+				return false;
+			}
+			actionError = null;
+			return true;
+		} catch {
+			actionError = 'The monitor server is unreachable.';
+			return false;
+		} finally {
+			actionBusy = false;
+		}
+	}
+
+	async function togglePaused(id: string, paused: boolean) {
+		if (await mutate(id, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ paused })
+		})) await invalidateAll();
+	}
+
+	async function saveEdit(id: string, generation: number, payload: MonitorPayload) {
+		if (await mutate(id, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ ...payload, generation })
+		})) {
+			editing = false;
+			await invalidateAll();
+		}
+	}
+
+	async function remove(id: string) {
+		if (!confirmingDelete) {
+			confirmingDelete = true;
+			return;
+		}
+		if (await mutate(id, { method: 'DELETE' })) await goto('/');
+	}
 
 	function variantFor(outcome: CheckView['outcome']): BadgeVariant {
 		switch (outcome) {
@@ -76,9 +134,56 @@
 			</div>
 			<p class="mt-1 truncate font-mono text-sm text-muted-foreground">{data.monitor.url}</p>
 			<p class="mt-0.5 text-sm text-muted-foreground">
-				every {data.monitor.interval_s}s · deadline {data.monitor.timeout_s}s · generation {data
-					.monitor.generation}
+				every {data.monitor.interval_s}s · deadline {data.monitor.timeout_s}s · opens after {data
+					.monitor.failures_to_open} fails · recovers after {data.monitor.passes_to_recover} passes
+				· generation {data.monitor.generation}
 			</p>
+			<div class="mt-3 flex flex-wrap items-center gap-2">
+				<button
+					onclick={() => togglePaused(data.monitor.id, !data.monitor.paused)}
+					disabled={actionBusy}
+					class="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-50"
+				>
+					{data.monitor.paused ? 'Resume' : 'Pause'}
+				</button>
+				<button
+					onclick={() => {
+						editing = !editing;
+						actionError = null;
+					}}
+					disabled={actionBusy}
+					class="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-50"
+				>
+					{editing ? 'Close edit' : 'Edit'}
+				</button>
+				<button
+					onclick={() => remove(data.monitor.id)}
+					disabled={actionBusy}
+					class="rounded-md border border-down/40 px-3 py-1.5 text-sm text-down disabled:opacity-50"
+				>
+					{confirmingDelete ? 'Confirm delete' : 'Delete'}
+				</button>
+			</div>
+			{#if actionError}
+				<p class="mt-2 text-sm text-attention-ink">{actionError}</p>
+			{/if}
+			{#if editing}
+				<Card.Root class="mt-3">
+					<Card.Content class="p-4">
+						<MonitorForm
+							initial={{
+								interval_s: data.monitor.interval_s,
+								timeout_s: data.monitor.timeout_s,
+								failures_to_open: data.monitor.failures_to_open,
+								passes_to_recover: data.monitor.passes_to_recover
+							}}
+							submitLabel="Save changes"
+							onSubmit={(payload) => saveEdit(data.monitor.id, data.monitor.generation, payload)}
+							onCancel={() => (editing = false)}
+						/>
+					</Card.Content>
+				</Card.Root>
+			{/if}
 			<p class="mt-0.5 text-sm text-muted-foreground">
 				last {Math.round(data.stats.window_s / 3600)}h · coverage {pct(data.stats.coverage_bps)}
 				({data.stats.observed}/{data.stats.expected} slots{data.stats.missed > 0
@@ -124,6 +229,11 @@
 						>
 							<span class="tabular text-muted-foreground">
 								{new Date(incident.opened_at).toLocaleString()}
+								{#if incident.first_fail_at}
+									<span class="block text-xs">
+										failing since {new Date(incident.first_fail_at).toLocaleTimeString()}
+									</span>
+								{/if}
 							</span>
 							<span class="text-muted-foreground">
 								{incident.resolved_at
