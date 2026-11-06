@@ -1,5 +1,6 @@
 import type { PageLoad } from './$types';
 import type { MonitorView } from '../../+page';
+import { apiFetch } from '#lib/auth.js';
 
 // Client-side only: the route's id comes from the URL at runtime; the static build's
 // 200.html fallback serves the page and the load runs in the browser.
@@ -32,16 +33,19 @@ export type StatsView = {
 	success_bps: number | null;
 };
 
-// Three honest states: the monitor row, "the server cannot see", and "there is no such
-// monitor" — a 404 is not a fetch failure and must not be rendered as one.
+// Four honest states: the monitor row, "the server cannot see", "there is no such
+// monitor", and "the server wants a credential" — a 401 is not a fetch failure either.
 export const load: PageLoad = async ({ fetch, params }) => {
 	try {
 		const [monitor, checks, incidents, stats] = await Promise.all([
-			fetch(`/api/monitors/${params.id}`),
-			fetch(`/api/monitors/${params.id}/checks?limit=50`),
-			fetch(`/api/incidents?monitor_id=${params.id}&limit=50`),
-			fetch(`/api/monitors/${params.id}/stats`)
+			apiFetch(`/api/monitors/${params.id}`, undefined, fetch),
+			apiFetch(`/api/monitors/${params.id}/checks?limit=50`, undefined, fetch),
+			apiFetch(`/api/incidents?monitor_id=${params.id}&limit=50`, undefined, fetch),
+			apiFetch(`/api/monitors/${params.id}/stats`, undefined, fetch)
 		]);
+		if (monitor.status === 401) {
+			return { state: 'needsAuth' as const };
+		}
 		if (monitor.status === 404) {
 			return { state: 'missing' as const };
 		}

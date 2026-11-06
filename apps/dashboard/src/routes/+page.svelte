@@ -2,6 +2,7 @@
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
 	import { TriangleAlert } from '@lucide/svelte';
+	import TokenGate from '#lib/components/TokenGate.svelte';
 	import type { PageData } from './$types';
 	import type { MonitorView } from './+page';
 
@@ -30,7 +31,9 @@
 		</p>
 	</div>
 
-	{#if !data.reachable}
+	{#if data.needsAuth}
+		<TokenGate />
+	{:else if !data.reachable}
 		<Card.Root class="border-attention/40 bg-attention-soft">
 			<Card.Content class="flex items-start gap-3 p-4">
 				<TriangleAlert class="mt-0.5 size-4 shrink-0 text-attention-ink" />

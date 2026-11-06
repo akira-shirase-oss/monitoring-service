@@ -50,6 +50,12 @@ async fn main() -> anyhow::Result<()> {
     // `SMON_PROFILE=lab` permits loopback/private literal targets for local fixtures.
     let lab = std::env::var("SMON_PROFILE").is_ok_and(|profile| profile == "lab");
 
+    // Management auth (M5.1): a token guards /api. Without one the server is dev-mode —
+    // allowed on loopback only, and loudly, never quietly on a public bind. Resolved
+    // before anything spawns: a refused configuration starts no work.
+    let addr: SocketAddr = listen.parse().context("SMON_LISTEN must be host:port")?;
+    let admin_token = resolve_admin_token(&addr)?;
+
     let db = monitor_db::Db::connect_opts(&database_url, 4, Some(max_db_bytes)).await?;
     db.migrate().await?;
 
@@ -126,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         statuses,
         registry: registry_tx,
         write_health,
+        admin_token,
         version: env!("CARGO_PKG_VERSION"),
     });
 
@@ -137,7 +144,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(dir = %dashboard_dir, "dashboard not built; API only");
     }
 
-    let addr: SocketAddr = listen.parse().context("SMON_LISTEN must be host:port")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, database = %redact_sqlite(&database_url), lab, "monitor-server listening");
 
@@ -145,6 +151,24 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal(shutdown))
         .await?;
     Ok(())
+}
+
+/// The management credential: configured → required on every /api call; unset → dev mode,
+/// which is only honest on loopback. A tokenless public bind refuses to boot rather than
+/// leave the store open.
+fn resolve_admin_token(addr: &SocketAddr) -> anyhow::Result<monitor_server::auth::AdminToken> {
+    let token: monitor_server::auth::AdminToken = std::env::var("SMON_ADMIN_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(Arc::from);
+    if token.is_none() {
+        if addr.ip().is_loopback() {
+            tracing::warn!("SMON_ADMIN_TOKEN unset: /api is unauthenticated (loopback dev mode)");
+        } else {
+            anyhow::bail!("SMON_ADMIN_TOKEN is required when listening on {addr}");
+        }
+    }
+    Ok(token)
 }
 
 /// Logging goes to stdout by default. `SMON_LOG_FILE` switches to a byte-bounded file

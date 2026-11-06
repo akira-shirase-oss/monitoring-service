@@ -18,9 +18,10 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   snapshot). Incidents are system-created evidence — there is deliberately no `POST`.
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
-- **Auth (M5):** management routes require a credential; read-only status endpoints are
-  separately scoped. Denied means denied — there is no "convenient" unauthenticated mode once
-  enabled.
+- **Auth (M5.1, live):** every `/api/**` route requires `Authorization: Bearer
+  $SMON_ADMIN_TOKEN` (sha256-digest compare). `/livez`, `/readyz` and static files stay
+  open. Token unset = dev mode on loopback only; a tokenless public bind refuses to boot.
+  Denied means denied — no unauthenticated path once enabled.
 - **Writes bump generation** on any schedule/target/paused change (module 01 invariant).
 - **CLI parity:** `monitor ping`, `monitors list|add|edit|pause|delete`, `checks`,
   `incidents`, `status` — everything the API can do, nothing more.

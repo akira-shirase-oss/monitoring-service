@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- M5.1 management auth: `SMON_ADMIN_TOKEN` requires `Authorization: Bearer` on every
+  `/api/**` route, compared on SHA-256 digests (fixed-length, no timing leak). Unset is
+  dev mode — allowed on loopback with a loud warning, refused on any public bind before
+  a single task spawns. `/livez`, `/readyz` and static files stay open; the dashboard
+  shows a token gate on 401 (stored in localStorage), and the CLI sends the token from
+  `--token`/`SMON_ADMIN_TOKEN`.
 - M4.4 deployment: `scripts/deploy.sh` installs versioned releases
   (`releases/<rel>/bin` + `current` symlink, data outside releases so a rollback can't
   roll back evidence), with a systemd unit, a launchd plist, and `deploy/RUNBOOK.md`

@@ -12,6 +12,9 @@ struct Cli {
     /// The monitor-server base URL.
     #[arg(long, env = "SMON_SERVER", default_value = "http://127.0.0.1:58400")]
     server: String,
+    /// Management credential — sent as `Authorization: Bearer` when the server requires it.
+    #[arg(long, env = "SMON_ADMIN_TOKEN")]
+    token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -90,9 +93,19 @@ struct ErrorBody {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &cli.token {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}")
+                .parse()
+                .context("SMON_ADMIN_TOKEN must be a valid header value")?,
+        );
+    }
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(10))
+        .default_headers(headers)
         .build()?;
     let base = cli.server.trim_end_matches('/');
 

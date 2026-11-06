@@ -34,6 +34,7 @@ async fn app() -> anyhow::Result<(
         statuses: Arc::clone(&statuses),
         registry,
         write_health: Arc::clone(&write_health),
+        admin_token: None,
         version: "test",
     });
     Ok((app, statuses, db, write_health, tmp))
@@ -551,4 +552,63 @@ async fn backup_writes_a_snapshot_to_an_absolute_path() {
     let body = json_body(response).await.unwrap();
     assert!(body["bytes"].as_u64().unwrap() > 0);
     assert!(backup.exists());
+}
+
+/// Management auth (M5.1): with a token configured, every /api route denies a missing,
+/// wrong, or malformed credential — and accepts exactly `Bearer <token>`. /livez and
+/// /readyz stay open: readiness is not a secret.
+#[tokio::test]
+async fn auth_denies_without_a_valid_bearer_token() {
+    let (_app, statuses, db, write_health, _tmp) = app().await.unwrap();
+    // Rebuild the router with a token configured — `app()` runs the dev (None) path.
+    let state = monitor_server::AppState {
+        db,
+        statuses,
+        registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
+        write_health,
+        admin_token: Some(Arc::from("s3cret")),
+        version: "test",
+    };
+    let app = monitor_server::router(state);
+
+    for headers in [
+        vec![],
+        vec![("authorization", "Bearer wrong")],
+        vec![("authorization", "Bearer s3cret-extra")],
+        vec![("authorization", "bearer s3cret")],
+        vec![("authorization", "s3cret")],
+    ] {
+        let mut request = Request::get("/api/monitors");
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/monitors")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Health stays open — probes and orchestrators don't carry admin credentials.
+    for path in ["/livez", "/readyz"] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
 }

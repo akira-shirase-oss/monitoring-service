@@ -4,6 +4,7 @@
 //! carry the observing loop. Statuses served here come only from the committed-evidence map
 //! the writer publishes — never from in-flight probes.
 
+pub mod auth;
 pub mod deliver;
 pub mod logfile;
 pub mod probe;
@@ -46,6 +47,9 @@ pub struct AppState {
     /// Consecutive store-write failures from the writer — nonzero means the write path is
     /// broken (disk full, I/O error) and readiness must say so.
     pub write_health: WriteHealth,
+    /// The management credential (M5.1). `None` only on a loopback listen — boot refuses
+    /// a tokenless public listen.
+    pub admin_token: auth::AdminToken,
     pub version: &'static str,
 }
 
@@ -79,7 +83,13 @@ pub fn router(state: AppState) -> Router {
         .route("/monitors/{id}/checks", get(list_checks))
         .route("/monitors/{id}/stats", get(monitor_stats))
         .route("/incidents", get(list_incidents))
-        .route("/backup", post(backup));
+        .route("/backup", post(backup))
+        // Auth wraps the whole API: /livez, /readyz and static files stay open —
+        // the dashboard must load to *hold* a token, and readiness is not a secret.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
 
     Router::new()
         .route("/livez", get(livez))

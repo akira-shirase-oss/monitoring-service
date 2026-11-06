@@ -2,6 +2,7 @@
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
 	import { ArrowLeft, TriangleAlert } from '@lucide/svelte';
+	import TokenGate from '#lib/components/TokenGate.svelte';
 	import type { PageData } from './$types';
 	import type { CheckView } from './+page';
 
@@ -44,7 +45,9 @@
 		<ArrowLeft class="size-4" /> Monitors
 	</a>
 
-	{#if data.state === 'missing'}
+	{#if data.state === 'needsAuth'}
+		<TokenGate />
+	{:else if data.state === 'missing'}
 		<Card.Root class="border-dashed">
 			<Card.Content class="p-10 text-center">
 				<p class="font-medium">No monitor with that id.</p>

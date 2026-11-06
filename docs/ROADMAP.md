@@ -73,7 +73,7 @@ remembering if a fixture ever counts hits.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 5.1 management auth | management routes require it | unauthenticated = denied | credential failure → locked out, never open | auth tests |
+| 5.1 management auth **(done)** | `SMON_ADMIN_TOKEN` → `Bearer` required on every `/api/**` (sha256-digest compare); `/livez` `/readyz` statics stay open; dashboard TokenGate + CLI `--token` | unauthenticated = denied — once enabled, no bypass | credential failure → 401; tokenless non-loopback bind refuses to boot | `auth_denies_without_a_valid_bearer_token` (5 deny shapes + accept + open health); live: 401/401/200, CLI denied/allowed, boot refused |
 | 5.2 SSRF complete (module 03) | redirect revalidation, DNS-level private-IP checks, lab profile | localhost only in lab profile | public name → private IP refused | SSRF fixture suite |
 | 5.3 load runs (module 09) | measured lab profile | thresholds frozen from baseline | p95 dispatch lag < 5 s target, 24 h soak | k6 results committed |
 | 5.4 release | installable artifact + docs | honest claims only | n/a | fresh-machine install by another dev |
