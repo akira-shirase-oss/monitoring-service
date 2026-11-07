@@ -26,3 +26,13 @@ fixtures; never on a public bind.
 2. Define the three missing scenarios (incident storm, API reads, session churn) as small
    `.mjs` harnesses beside `lab-profile.mjs` — same lab profile, assert through the real API.
 3. Retention + backup live drills under load.
+
+## 2026-11-07 pass
+
+- `perf/storm.mjs` added: incident storm (40 dead monitors across 10 origins) + API reads in one
+  run. Validated at 180s: 40/40 incidents opened, survivor kept its 15s cadence (probes never
+  starved), 2,878 API reads / 0 failures. Evidence run pending the 24h soak finishing.
+- Design note: dead monitors must spread across origins — one origin throttles to the per-origin
+  bound and slots go missed (the product's own discipline).
+- Session churn remains a gap: needs a non-lab profile with seeded admin + session auth —
+  not covered by lab mode's unauthenticated API.
