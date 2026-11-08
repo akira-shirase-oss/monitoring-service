@@ -1,0 +1,147 @@
+<ref *1> Error: spawnSync sqlite3 ENOBUFS
+    at Object.spawnSync (node:internal/child_process:1143:20)
+    at spawnSync (node:child_process:911:24)
+    at execFileSync (node:child_process:954:15)
+    at sqlite (file:///Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/service-monitor/perf/lab-profile.mjs:58:2)
+    at main (file:///Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/service-monitor/perf/lab-profile.mjs:144:3) {
+  errno: -55,
+  code: 'ENOBUFS',
+  syscall: 'spawnSync sqlite3',
+  path: 'sqlite3',
+  spawnargs: [
+    '-json',
+    '/tmp/smon-load-73052.db',
+    'SELECT m.name, c.outcome, c.http_status, c.detail, c.latency_ms,\n' +
+      '\t\t\t        c.slot_at, c.recorded_at\n' +
+      '\t\t\t   FROM checks c JOIN monitors m ON m.id = c.monitor_id'
+  ],
+  error: [Circular *1],
+  status: null,
+  signal: 'SIGPIPE',
+  output: [
+    null,
+    '[{"name":"flaky-66","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.877674Z","recorded_at":"2026-11-07T00:32:45.823996Z"},\n' +
+      '{"name":"ok-48","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.87301Z","recorded_at":"2026-11-07T00:32:45.824803Z"},\n' +
+      '{"name":"dead-87","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.892256Z","recorded_at":"2026-11-07T00:32:45.825246Z"},\n' +
+      '{"name":"flaky-65","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877673Z","recorded_at":"2026-11-07T00:32:45.82558Z"},\n' +
+      '{"name":"dead-93","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.89226Z","recorded_at":"2026-11-07T00:32:45.825945Z"},\n' +
+      '{"name":"ok-10","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.860431Z","recorded_at":"2026-11-07T00:32:45.826215Z"},\n' +
+      '{"name":"ok-41","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.869738Z","recorded_at":"2026-11-07T00:32:45.826433Z"},\n' +
+      '{"name":"ok-4","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.858996Z","recorded_at":"2026-11-07T00:32:45.826631Z"},\n' +
+      '{"name":"flaky-69","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.879641Z","recorded_at":"2026-11-07T00:32:45.826818Z"},\n' +
+      '{"name":"flaky-60","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877668Z","recorded_at":"2026-11-07T00:32:45.827Z"},\n' +
+      '{"name":"ok-43","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.87103Z","recorded_at":"2026-11-07T00:32:45.827175Z"},\n' +
+      '{"name":"flaky-64","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877672Z","recorded_at":"2026-11-07T00:32:45.827351Z"},\n' +
+      '{"name":"ok-29","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.866668Z","recorded_at":"2026-11-07T00:32:45.827526Z"},\n' +
+      '{"name":"ok-42","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.871029Z","recorded_at":"2026-11-07T00:32:45.827699Z"},\n' +
+      '{"name":"ok-17","outcome":"pass","http_status":200,"detail":null,"latency_ms":7,"slot_at":"2026-11-07T00:32:44.862833Z","recorded_at":"2026-11-07T00:32:45.827885Z"},\n' +
+      '{"name":"ok-2","outcome":"pass","http_status":200,"detail":null,"latency_ms":7,"slot_at":"2026-11-07T00:32:44.860427Z","recorded_at":"2026-11-07T00:32:45.828075Z"},\n' +
+      '{"name":"flaky-53","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.877643Z","recorded_at":"2026-11-07T00:32:46.821309Z"},\n' +
+      '{"name":"flaky-57","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.899229Z","recorded_at":"2026-11-07T00:32:46.822918Z"},\n' +
+      '{"name":"ok-5","outcome":"pass","http_status":200,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.85964Z","recorded_at":"2026-11-07T00:32:46.823746Z"},\n' +
+      '{"name":"ok-22","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.864572Z","recorded_at":"2026-11-07T00:32:46.824477Z"},\n' +
+      '{"name":"flaky-54","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":1,"slot_at":"2026-11-07T00:32:44.87456Z","recorded_at":"2026-11-07T00:32:46.825034Z"},\n' +
+      '{"name":"ok-13","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.86147Z","recorded_at":"2026-11-07T00:32:46.825572Z"},\n' +
+      '{"name":"flaky-50","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.874557Z","recorded_at":"2026-11-07T00:32:46.826339Z"},\n' +
+      '{"name":"ok-8","outcome":"pass","http_status":200,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.86043Z","recorded_at":"2026-11-07T00:32:46.826814Z"},\n' +
+      '{"name":"flaky-67","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.879639Z","recorded_at":"2026-11-07T00:32:46.827337Z"},\n' +
+      '{"name":"dead-92","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.893601Z","recorded_at":"2026-11-07T00:32:46.827857Z"},\n' +
+      '{"name":"dead-90","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.892259Z","recorded_at":"2026-11-07T00:32:46.828254Z"},\n' +
+      '{"name":"ok-16","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.862223Z","recorded_at":"2026-11-07T00:32:46.828638Z"},\n' +
+      '{"name":"ok-44","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.877639Z","recorded_at":"2026-11-07T00:32:46.829032Z"},\n' +
+      '{"name":"ok-39","outcome":"pass","http_status":200,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.869735Z","recorded_at":"2026-11-07T00:32:46.829481Z"},\n' +
+      '{"name":"ok-31","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.86973Z","recorded_at":"2026-11-07T00:32:46.829877Z"},\n' +
+      '{"name":"dead-85","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.888003Z","recorded_at":"2026-11-07T00:32:46.830245Z"},\n' +
+      '{"name":"dead-88","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.892257Z","recorded_at":"2026-11-07T00:32:46.830597Z"},\n' +
+      '{"name":"ok-49","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.873011Z","recorded_at":"2026-11-07T00:32:47.826009Z"},\n' +
+      '{"name":"ok-0","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.85768Z","recorded_at":"2026-11-07T00:32:47.827169Z"},\n' +
+      '{"name":"flaky-59","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.886008Z","recorded_at":"2026-11-07T00:32:47.828019Z"},\n' +
+      '{"name":"ok-38","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.869734Z","recorded_at":"2026-11-07T00:32:47.828646Z"},\n' +
+      '{"name":"flaky-52","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.874559Z","recorded_at":"2026-11-07T00:32:47.829239Z"},\n' +
+      '{"name":"ok-1","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.858778Z","recorded_at":"2026-11-07T00:32:47.829761Z"},\n' +
+      '{"name":"flaky-58","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877647Z","recorded_at":"2026-11-07T00:32:47.830235Z"},\n' +
+      '{"name":"ok-15","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.862221Z","recorded_at":"2026-11-07T00:32:47.830665Z"},\n' +
+      '{"name":"ok-3","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.862819Z","recorded_at":"2026-11-07T00:32:47.831059Z"},\n' +
+      '{"name":"ok-37","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.871026Z","recorded_at":"2026-11-07T00:32:47.831441Z"},\n' +
+      '{"name":"ok-24","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.864575Z","recorded_at":"2026-11-07T00:32:47.831809Z"},\n' +
+      '{"name":"flaky-56","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.877646Z","recorded_at":"2026-11-07T00:32:47.832214Z"},\n' +
+      '{"name":"ok-45","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.871031Z","recorded_at":"2026-11-07T00:32:47.832681Z"},\n' +
+      '{"name":"slow-76","outcome":"pass","http_status":200,"detail":null,"latency_ms":2008,"slot_at":"2026-11-07T00:32:44.886015Z","recorded_at":"2026-11-07T00:32:47.833082Z"},\n' +
+      '{"name":"dead-94","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.892261Z","recorded_at":"2026-11-07T00:32:47.833493Z"},\n' +
+      '{"name":"slow-71","outcome":"pass","http_status":200,"detail":null,"latency_ms":2008,"slot_at":"2026-11-07T00:32:44.880966Z","recorded_at":"2026-11-07T00:32:47.833889Z"},\n' +
+      '{"name":"dead-86","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.888004Z","recorded_at":"2026-11-07T00:32:47.834293Z"},\n' +
+      '{"name":"dead-91","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":7,"slot_at":"2026-11-07T00:32:44.898598Z","recorded_at":"2026-11-07T00:32:47.834728Z"},\n' +
+      '{"name":"hung-95","outcome":"timeout","http_status":null,"detail":"deadline","latency_ms":3003,"slot_at":"2026-11-07T00:32:44.892262Z","recorded_at":"2026-11-07T00:32:48.828009Z"},\n' +
+      '{"name":"hung-98","outcome":"timeout","http_status":null,"detail":"deadline","latency_ms":3004,"slot_at":"2026-11-07T00:32:44.892264Z","recorded_at":"2026-11-07T00:32:48.829997Z"},\n' +
+      '{"name":"slow-81","outcome":"pass","http_status":200,"detail":null,"latency_ms":2005,"slot_at":"2026-11-07T00:32:44.886684Z","recorded_at":"2026-11-07T00:32:48.830834Z"},\n' +
+      '{"name":"ok-21","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.864571Z","recorded_at":"2026-11-07T00:32:48.831491Z"},\n' +
+      '{"name":"ok-36","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.869733Z","recorded_at":"2026-11-07T00:32:48.832129Z"},\n' +
+      '{"name":"ok-11","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.865598Z","recorded_at":"2026-11-07T00:32:48.832702Z"},\n' +
+      '{"name":"ok-12","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.861471Z","recorded_at":"2026-11-07T00:32:48.833206Z"},\n' +
+      '{"name":"ok-46","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.873008Z","recorded_at":"2026-11-07T00:32:48.833729Z"},\n' +
+      '{"nam'... 1104112 more characters,
+    ''
+  ],
+  pid: 53059,
+  stdout: '[{"name":"flaky-66","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.877674Z","recorded_at":"2026-11-07T00:32:45.823996Z"},\n' +
+    '{"name":"ok-48","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.87301Z","recorded_at":"2026-11-07T00:32:45.824803Z"},\n' +
+    '{"name":"dead-87","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.892256Z","recorded_at":"2026-11-07T00:32:45.825246Z"},\n' +
+    '{"name":"flaky-65","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877673Z","recorded_at":"2026-11-07T00:32:45.82558Z"},\n' +
+    '{"name":"dead-93","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.89226Z","recorded_at":"2026-11-07T00:32:45.825945Z"},\n' +
+    '{"name":"ok-10","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.860431Z","recorded_at":"2026-11-07T00:32:45.826215Z"},\n' +
+    '{"name":"ok-41","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.869738Z","recorded_at":"2026-11-07T00:32:45.826433Z"},\n' +
+    '{"name":"ok-4","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.858996Z","recorded_at":"2026-11-07T00:32:45.826631Z"},\n' +
+    '{"name":"flaky-69","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.879641Z","recorded_at":"2026-11-07T00:32:45.826818Z"},\n' +
+    '{"name":"flaky-60","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877668Z","recorded_at":"2026-11-07T00:32:45.827Z"},\n' +
+    '{"name":"ok-43","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.87103Z","recorded_at":"2026-11-07T00:32:45.827175Z"},\n' +
+    '{"name":"flaky-64","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877672Z","recorded_at":"2026-11-07T00:32:45.827351Z"},\n' +
+    '{"name":"ok-29","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.866668Z","recorded_at":"2026-11-07T00:32:45.827526Z"},\n' +
+    '{"name":"ok-42","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.871029Z","recorded_at":"2026-11-07T00:32:45.827699Z"},\n' +
+    '{"name":"ok-17","outcome":"pass","http_status":200,"detail":null,"latency_ms":7,"slot_at":"2026-11-07T00:32:44.862833Z","recorded_at":"2026-11-07T00:32:45.827885Z"},\n' +
+    '{"name":"ok-2","outcome":"pass","http_status":200,"detail":null,"latency_ms":7,"slot_at":"2026-11-07T00:32:44.860427Z","recorded_at":"2026-11-07T00:32:45.828075Z"},\n' +
+    '{"name":"flaky-53","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.877643Z","recorded_at":"2026-11-07T00:32:46.821309Z"},\n' +
+    '{"name":"flaky-57","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.899229Z","recorded_at":"2026-11-07T00:32:46.822918Z"},\n' +
+    '{"name":"ok-5","outcome":"pass","http_status":200,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.85964Z","recorded_at":"2026-11-07T00:32:46.823746Z"},\n' +
+    '{"name":"ok-22","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.864572Z","recorded_at":"2026-11-07T00:32:46.824477Z"},\n' +
+    '{"name":"flaky-54","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":1,"slot_at":"2026-11-07T00:32:44.87456Z","recorded_at":"2026-11-07T00:32:46.825034Z"},\n' +
+    '{"name":"ok-13","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.86147Z","recorded_at":"2026-11-07T00:32:46.825572Z"},\n' +
+    '{"name":"flaky-50","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.874557Z","recorded_at":"2026-11-07T00:32:46.826339Z"},\n' +
+    '{"name":"ok-8","outcome":"pass","http_status":200,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.86043Z","recorded_at":"2026-11-07T00:32:46.826814Z"},\n' +
+    '{"name":"flaky-67","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.879639Z","recorded_at":"2026-11-07T00:32:46.827337Z"},\n' +
+    '{"name":"dead-92","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.893601Z","recorded_at":"2026-11-07T00:32:46.827857Z"},\n' +
+    '{"name":"dead-90","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.892259Z","recorded_at":"2026-11-07T00:32:46.828254Z"},\n' +
+    '{"name":"ok-16","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.862223Z","recorded_at":"2026-11-07T00:32:46.828638Z"},\n' +
+    '{"name":"ok-44","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.877639Z","recorded_at":"2026-11-07T00:32:46.829032Z"},\n' +
+    '{"name":"ok-39","outcome":"pass","http_status":200,"detail":null,"latency_ms":2,"slot_at":"2026-11-07T00:32:44.869735Z","recorded_at":"2026-11-07T00:32:46.829481Z"},\n' +
+    '{"name":"ok-31","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.86973Z","recorded_at":"2026-11-07T00:32:46.829877Z"},\n' +
+    '{"name":"dead-85","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.888003Z","recorded_at":"2026-11-07T00:32:46.830245Z"},\n' +
+    '{"name":"dead-88","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.892257Z","recorded_at":"2026-11-07T00:32:46.830597Z"},\n' +
+    '{"name":"ok-49","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.873011Z","recorded_at":"2026-11-07T00:32:47.826009Z"},\n' +
+    '{"name":"ok-0","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.85768Z","recorded_at":"2026-11-07T00:32:47.827169Z"},\n' +
+    '{"name":"flaky-59","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.886008Z","recorded_at":"2026-11-07T00:32:47.828019Z"},\n' +
+    '{"name":"ok-38","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.869734Z","recorded_at":"2026-11-07T00:32:47.828646Z"},\n' +
+    '{"name":"flaky-52","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.874559Z","recorded_at":"2026-11-07T00:32:47.829239Z"},\n' +
+    '{"name":"ok-1","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.858778Z","recorded_at":"2026-11-07T00:32:47.829761Z"},\n' +
+    '{"name":"flaky-58","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.877647Z","recorded_at":"2026-11-07T00:32:47.830235Z"},\n' +
+    '{"name":"ok-15","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.862221Z","recorded_at":"2026-11-07T00:32:47.830665Z"},\n' +
+    '{"name":"ok-3","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.862819Z","recorded_at":"2026-11-07T00:32:47.831059Z"},\n' +
+    '{"name":"ok-37","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.871026Z","recorded_at":"2026-11-07T00:32:47.831441Z"},\n' +
+    '{"name":"ok-24","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.864575Z","recorded_at":"2026-11-07T00:32:47.831809Z"},\n' +
+    '{"name":"flaky-56","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.877646Z","recorded_at":"2026-11-07T00:32:47.832214Z"},\n' +
+    '{"name":"ok-45","outcome":"pass","http_status":200,"detail":null,"latency_ms":6,"slot_at":"2026-11-07T00:32:44.871031Z","recorded_at":"2026-11-07T00:32:47.832681Z"},\n' +
+    '{"name":"slow-76","outcome":"pass","http_status":200,"detail":null,"latency_ms":2008,"slot_at":"2026-11-07T00:32:44.886015Z","recorded_at":"2026-11-07T00:32:47.833082Z"},\n' +
+    '{"name":"dead-94","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.892261Z","recorded_at":"2026-11-07T00:32:47.833493Z"},\n' +
+    '{"name":"slow-71","outcome":"pass","http_status":200,"detail":null,"latency_ms":2008,"slot_at":"2026-11-07T00:32:44.880966Z","recorded_at":"2026-11-07T00:32:47.833889Z"},\n' +
+    '{"name":"dead-86","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.888004Z","recorded_at":"2026-11-07T00:32:47.834293Z"},\n' +
+    '{"name":"dead-91","outcome":"http_fail","http_status":500,"detail":null,"latency_ms":7,"slot_at":"2026-11-07T00:32:44.898598Z","recorded_at":"2026-11-07T00:32:47.834728Z"},\n' +
+    '{"name":"hung-95","outcome":"timeout","http_status":null,"detail":"deadline","latency_ms":3003,"slot_at":"2026-11-07T00:32:44.892262Z","recorded_at":"2026-11-07T00:32:48.828009Z"},\n' +
+    '{"name":"hung-98","outcome":"timeout","http_status":null,"detail":"deadline","latency_ms":3004,"slot_at":"2026-11-07T00:32:44.892264Z","recorded_at":"2026-11-07T00:32:48.829997Z"},\n' +
+    '{"name":"slow-81","outcome":"pass","http_status":200,"detail":null,"latency_ms":2005,"slot_at":"2026-11-07T00:32:44.886684Z","recorded_at":"2026-11-07T00:32:48.830834Z"},\n' +
+    '{"name":"ok-21","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.864571Z","recorded_at":"2026-11-07T00:32:48.831491Z"},\n' +
+    '{"name":"ok-36","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.869733Z","recorded_at":"2026-11-07T00:32:48.832129Z"},\n' +
+    '{"name":"ok-11","outcome":"pass","http_status":200,"detail":null,"latency_ms":5,"slot_at":"2026-11-07T00:32:44.865598Z","recorded_at":"2026-11-07T00:32:48.832702Z"},\n' +
+    '{"name":"ok-12","outcome":"pass","http_status":200,"detail":null,"latency_ms":4,"slot_at":"2026-11-07T00:32:44.861471Z","recorded_at":"2026-11-07T00:32:48.833206Z"},\n' +
+    '{"name":"ok-46","outcome":"pass","http_status":200,"detail":null,"latency_ms":3,"slot_at":"2026-11-07T00:32:44.873008Z","recorded_at":"2026-11-07T00:32:48.833729Z"},\n' +
+    '{"nam'... 1104112 more characters,
+  stderr: ''
+}

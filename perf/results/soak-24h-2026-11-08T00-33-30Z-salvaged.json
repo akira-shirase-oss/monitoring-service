@@ -1,0 +1,38 @@
+{
+  "scenario": "soak-24h",
+  "date": "2026-11-08T00:33:30Z",
+  "duration_s": 86400,
+  "monitors": 100,
+  "origins": 10,
+  "window": {
+    "first_check": "2026-11-07T00:32:44Z",
+    "last_check": "2026-11-08T00:32:29Z"
+  },
+  "checks": {
+    "total": 576000,
+    "missed": 0,
+    "pass": 447530,
+    "http_fail": 99670,
+    "timeout": 28800
+  },
+  "incidents": {
+    "opened": 6605,
+    "resolved": 6590,
+    "open_at_end": 15
+  },
+  "alerts": {
+    "delivered": 13195,
+    "pending": 0
+  },
+  "storage_bytes": 150974464,
+  "storage_guardrail_bytes": 2147483648,
+  "commit": "a311f90",
+  "machine": "apple-m2-pro-12c",
+  "provenance": "salvaged: the lab-profile summarizer crashed on its final report (execFileSync 1MB maxBuffer vs 576k-row dump). Metrics computed from the preserved run DB /tmp/smon-load-73052.db. Commit-lag and RSS series were in process memory and are lost.",
+  "gates": {
+    "zero_missed_slots": true,
+    "outcome_mix_honest": true,
+    "outbox_drained": true,
+    "storage_under_guardrail": true
+  }
+}
