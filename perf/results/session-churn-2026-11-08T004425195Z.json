@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-08T00:44:25.195Z",
+  "scenario": "session-churn",
+  "duration_s": 300,
+  "logins": 299640,
+  "login_fails": 0,
+  "authed_reads": 299640,
+  "read_fails": 0,
+  "bad_token_401s": 955,
+  "unauthed_refusals": 955,
+  "sessions_rows": 1,
+  "survivor_checks": 20,
+  "machine": "apple-m2-pro-12c",
+  "commit": "4230bbf",
+  "gates": {
+    "logins_work": true,
+    "authed_reads_ok": true,
+    "negatives_enforced": true,
+    "sessions_bounded": true,
+    "probes_unstarved": true
+  },
+  "passed": true
+}

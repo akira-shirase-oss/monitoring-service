@@ -55,7 +55,7 @@ function plan(i) {
 }
 
 const sqlite = (sql) =>
-	execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8' }).trim() || '[]';
+	execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim() || '[]';
 
 function commit() {
 	try {
