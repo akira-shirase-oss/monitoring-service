@@ -1,0 +1,73 @@
+{
+  "scenario": "soak-24h",
+  "date": "2026-11-10T15:15:42.585Z",
+  "descoped": true,
+  "duration_s_planned": 86400,
+  "duration_s_actual": 4687,
+  "window": {
+    "first_check": "2026-11-10T15:15:42.585819Z",
+    "last_check": "2026-11-10T16:33:49.698655Z"
+  },
+  "monitors": 100,
+  "origins": 10,
+  "checks": {
+    "total": 31300,
+    "missed": 0,
+    "pass": 24305,
+    "http_fail": 5430,
+    "timeout": 1565,
+    "other": {}
+  },
+  "incidents": {
+    "opened": 374,
+    "resolved": 357,
+    "open_at_end": 17,
+    "by_state": {
+      "open": 17,
+      "resolved": 357
+    }
+  },
+  "alerts": {
+    "outbox_rows": [
+      {
+        "attempts": 0,
+        "delivered": 0,
+        "n": 3
+      },
+      {
+        "attempts": 1,
+        "delivered": 1,
+        "n": 728
+      }
+    ],
+    "pending_at_end": 3,
+    "note": "outbox_pending_max sampler series was in process memory; pending_at_end is the final DB count"
+  },
+  "commit_lag_ms": {
+    "all": {
+      "p50": 2869,
+      "p95": 4921,
+      "max": 4971
+    },
+    "ok_targets": {
+      "p50": 2931,
+      "p95": 4935,
+      "max": 4971
+    }
+  },
+  "storage_bytes": 7373852,
+  "storage_guardrail_bytes": 2147483648,
+  "unavailable": [
+    "rss_kb series (in-memory sampler)",
+    "sink_hits (fixture endpoint dead)"
+  ],
+  "commit": "84a6811",
+  "machine": "Darwin arm64",
+  "provenance": "descoped: maintainer cut the re-run at ~1.3h on 2026-11-10. Metrics computed from the preserved run DB /tmp/smon-load-4343.db after SIGTERM; the summarizer only writes its JSON at the end of the full duration. A complete 24h run already exists: soak-24h-2026-11-08T00-33-30Z-salvaged.json.",
+  "gates": {
+    "zero_missed_slots": true,
+    "outcome_mix_honest": true,
+    "outbox_drained": false,
+    "storage_under_guardrail": true
+  }
+}
