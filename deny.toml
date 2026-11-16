@@ -1,6 +1,7 @@
-# cargo-deny — `scripts/check.sh` runs `cargo deny check advisories` when cargo-deny is
-# installed. Every RustSec advisory against a locked crate fails the gate unless it is
-# listed below with a dated reason and a re-check date.
+# cargo-deny — `scripts/check-advisories.sh` (run by check.sh) runs `cargo deny check
+# advisories`; without cargo-deny it warns locally and fails when CI is set. Every RustSec
+# advisory against a locked crate fails the gate unless it is listed below, and every entry
+# must carry `re-check YYYY-MM-DD` in its reason: the gate fails once that date has passed.
 
 [advisories]
 ignore = [

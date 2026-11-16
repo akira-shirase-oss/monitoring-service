@@ -52,18 +52,25 @@ the cause in `faults` (D-011): `store writes failing (N consecutive)` means the 
 (disk, perms) — fix the cause rather than restart-looping; `writer exited|panicked` or
 `coordinator …` means the monitor is not observing (statuses read `unknown`) — the
 process then writes one "monitoring unavailable" beat and exits non-zero on its own, and
-the service manager restarts it (D-011); repeated restarts mean the log's task error needs
-fixing; `degraded` with a deliverer, snapshot or retention
+the service manager restarts it (D-011; a coordinator stalled for 2 minutes does the
+same); repeated restarts mean the log's task error needs fixing. After 5 starts in 10
+minutes systemd stops trying and the unit is `failed` (`start request repeated too
+quickly`): fix the cause, then `sudo systemctl reset-failed monitor-server && sudo
+systemctl start monitor-server`; `degraded` with a deliverer, snapshot or retention
 fault means checks still run but that duty has stopped.
 
 ### The store is at its cap (`SMON_MAX_DB_BYTES`)
 
 `/readyz` answers `store writes failing` and the log shows `database or disk is full`.
-The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) frees expired
-rows *before* it writes anything, so it runs at the cap and the next commit after it
-lands. If the store is full of evidence that has not expired yet, retention cannot help:
-raise `SMON_MAX_DB_BYTES` (or shorten the D-012 horizons) in `env` and restart. A
-restart re-applies the new cap to every connection.
+The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) can run at the
+cap: it deletes expired rows before writing their daily summaries, and its own
+transaction may use up to 256 pages (1 MiB at 4 KiB pages) past the cap for those
+summaries. Observation commits land again only once that pass has freed room for them —
+which happens when the expired rows filled whole pages. If the store is full of
+evidence that has not expired yet (or the expired slice is too thin to free a page),
+retention cannot make room for new checks: raise `SMON_MAX_DB_BYTES` (or shorten the
+D-012 horizons) in `env` and restart. A restart re-applies the new cap to every
+connection.
 
 ## Upgrade
 

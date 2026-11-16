@@ -30,6 +30,9 @@ const WRITER_BOUND: usize = 64;
 /// A coordinator that makes no loop pass for this long is stalled: its statuses are frozen,
 /// so the engine reports unavailable. The loop ticks every second when healthy.
 const COORDINATOR_STALL: Duration = Duration::from_secs(30);
+/// A stall this long is not going to clear by itself: exit so the service manager restarts
+/// the process (D-011).
+const COORDINATOR_STALL_EXIT: Duration = Duration::from_secs(120);
 /// How long shutdown waits for the engine tasks (coordinator drain, in-flight deliveries,
 /// the writer's queued commits) after the HTTP server has stopped.
 const ENGINE_DRAIN: Duration = Duration::from_secs(15);
@@ -259,6 +262,7 @@ fn spawn_coordinator(
         shutdown.clone(),
     );
     supervisor.watch("coordinator", Role::Observing, coordinator_task);
+    supervisor.watch_stall(COORDINATOR_STALL_EXIT, Duration::from_secs(5));
     Ok(())
 }
 
@@ -380,11 +384,9 @@ fn spawn_retention(
             }
             let cutoffs = policy.cutoffs(time::OffsetDateTime::now_utc());
             let pass = writer.retain(cutoffs).await;
-            // A failing pass degrades the monitor (D-011) until a pass succeeds again.
-            vitals.duty_result(
-                "retention",
-                pass.as_ref().map(|_| ()).map_err(ToString::to_string),
-            );
+            // A failing pass degrades the monitor (D-011) until a pass succeeds again; the
+            // error is logged there, and `faults` gets a fixed cause (it is public).
+            vitals.retention_outcome(pass.as_ref().map(|_| ()));
             match pass {
                 Ok(report)
                     if report.rows_deleted
@@ -404,8 +406,7 @@ fn spawn_retention(
                         "retention pass"
                     );
                 }
-                Ok(_) => {}
-                Err(error) => tracing::error!(%error, "retention pass failed"),
+                Ok(_) | Err(_) => {}
             }
             // Expired dashboard sessions are the same class of garbage: honest expiry
             // needs no lazy-lookup to be correct, it just keeps the table small.

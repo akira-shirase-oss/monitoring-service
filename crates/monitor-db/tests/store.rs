@@ -1288,3 +1288,86 @@ async fn an_observation_lands_while_a_large_retention_pass_is_still_running() ->
     );
     Ok(())
 }
+
+/// Retention at the cap, harder case: the expired rows are a thin slice scattered among
+/// unexpired evidence, so deleting them frees no whole page, while their daily summaries
+/// (one row per monitor-day) need new pages. Free-before-write alone fails `SQLITE_FULL`
+/// here and the next pass fails the same way; the pass needs a small page reserve.
+#[tokio::test]
+async fn retention_at_the_cap_has_room_for_summaries_of_a_thin_expired_slice() -> anyhow::Result<()>
+{
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("thin.db").display());
+    let setup = Db::connect(&url, 1).await?;
+    setup.migrate().await?;
+    let monitors: Vec<Monitor> = (0..50)
+        .map(|n| {
+            NewMonitor::new(
+                format!("m{n}"),
+                url::Url::parse(&format!("https://m{n}.example.com"))?,
+            )
+            .map(NewMonitor::into_monitor)
+            .map_err(anyhow::Error::from)
+        })
+        .collect::<anyhow::Result<_>>()?;
+    for monitor in &monitors {
+        setup.insert_monitor(monitor).await?;
+    }
+    let (writer, _task) = writer::spawn(
+        setup.clone(),
+        Arc::new(RwLock::new(HashMap::new())),
+        HashMap::new(),
+        Arc::default(),
+        8,
+        false,
+    );
+    // Interleaved by insertion order: an expired row per monitor, then unexpired rows.
+    for days_ago in [8, 9, 10] {
+        for monitor in &monitors {
+            writer
+                .record(at(monitor, CheckOutcome::Pass, days_ago, 0))
+                .await?;
+        }
+        for minute in 0..20 {
+            for monitor in &monitors {
+                writer
+                    .record(at(monitor, CheckOutcome::Pass, 2, minute))
+                    .await?;
+            }
+        }
+    }
+    drop(writer);
+    let used = setup.used_bytes().await?;
+    drop(setup);
+
+    let db = Db::connect_opts(&url, 4, Some(used)).await?;
+    let (writer, _task) = writer::spawn(
+        db.clone(),
+        Arc::new(RwLock::new(HashMap::new())),
+        HashMap::new(),
+        Arc::default(),
+        8,
+        false,
+    );
+    let report = writer
+        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .await
+        .expect("retention must have room for the summaries at the cap");
+    assert_eq!(report.rows_deleted, 150);
+    assert_eq!(report.days_written, 150);
+    // The reserve is bounded: the file grew past the cap by at most the reserve.
+    let page_size = 4096;
+    assert!(
+        db.used_bytes().await? <= used + monitor_db::RETENTION_RESERVE_PAGES * page_size,
+        "the reserve is a bound, not a lift of the cap"
+    );
+    // No pooled connection is left lifted: every ceiling is at most the file's size.
+    let now_used = db.used_bytes().await?;
+    for _ in 0..8 {
+        assert!(
+            db.max_bytes().await? <= now_used.max(used),
+            "the cap is restored"
+        );
+    }
+    Ok(())
+}

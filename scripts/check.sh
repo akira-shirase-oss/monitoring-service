@@ -6,30 +6,16 @@ cd "$(dirname "$0")/.."
 
 scripts/check-toolchain.sh
 
-# Nothing under a source directory may be git-ignored. An ignore rule that swallows source
-# passes every local gate (the files exist here) and breaks every clean checkout — an
-# unanchored `status/` once hid the dashboard's /status route this way.
+# Nothing that is not a build or runtime artifact may be git-ignored.
 if git rev-parse --git-dir >/dev/null 2>&1; then
-    # Unquoted on purpose: the shell expands the globs to real directories.
-    ignored_src="$(git ls-files --others --ignored --exclude-standard -- \
-        apps/*/src apps/status crates/*/src crates/*/tests crates/*/migrations \
-        scripts deploy docs fixtures)"
-    if [ -n "$ignored_src" ]; then
-        echo "git-ignored files under source directories (fix .gitignore):" >&2
-        echo "$ignored_src" >&2
-        exit 1
-    fi
+    scripts/check-ignored.sh
 fi
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-# Supply chain: RustSec advisories against the locked dependencies. deny.toml records each
-# accepted exception with a reason and a re-check date; anything else fails the gate.
-if cargo deny --version >/dev/null 2>&1; then
-    cargo deny --locked check advisories
-else
-    echo "cargo-deny not installed; skipping the advisory check (cargo install cargo-deny)" >&2
-fi
+# Supply chain: RustSec advisories (cargo-deny; required when CI is set) and deny.toml's
+# dated exceptions.
+scripts/check-advisories.sh
 scripts/check-architecture.sh
 npm run check --workspace @service-monitor/dashboard
 npm run build --workspace @service-monitor/dashboard

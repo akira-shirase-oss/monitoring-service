@@ -43,6 +43,8 @@ at-least-once to a receiver — without alerting ever being able to stall observ
   2xx/354-close reply is success; anything else is the same deterministic retry/exhaustion
   path as webhooks. Credentials live in env only and are never logged — `Sink::describe`
   reports the recipient count, not addresses.
+- **No proxies:** the webhook client ignores proxy environment variables and dials the
+  receiver directly; SMTP (lettre) never used them. Egress proxies are not supported.
 - **URL redaction (`redact.rs`):** chat webhooks carry their credential in the path
   (Slack `/services/T…/B…/<token>`, Discord `/api/webhooks/<id>/<token>`) or a query
   token, so stripping userinfo is not redaction. Anything logged shows the webhook as

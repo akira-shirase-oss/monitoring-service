@@ -25,10 +25,12 @@
   incidents and aggregates after 365 d — and runs at the disk cap. **`SMON_MAX_MONITORS`
   caps monitors at 100** (409 `limit_reached`; paused monitors count): pass a higher
   value for `perf/lab-profile.mjs --monitors >100`.
-- **Engine honesty (D-011):** a dead or stalled writer/coordinator reports
-  "monitoring unavailable" (`/readyz` 503, statuses `unknown`, a born-expired public
-  beat) and the process exits non-zero so the service manager restarts it; a stopped
-  supporting duty is `degraded` (`/readyz` 200 with `faults`, `monitor ping` exits 5).
+- **Engine honesty (D-011):** a dead writer/coordinator, or a coordinator stalled
+  (no schedule pass) for 30 s, reports "monitoring unavailable" (`/readyz` 503, statuses
+  `unknown`, a born-expired public beat). A dead task — or a stall that lasts 2 minutes —
+  makes the process exit non-zero so the service manager restarts it; the systemd unit
+  stops after 5 starts in 10 minutes and stays `failed` (RUNBOOK). A stopped supporting
+  duty is `degraded` (`/readyz` 200 with `faults`, `monitor ping` exits 5).
   `/api/monitors` and `status.json` gain a `monitoring` field (additive).
 - **Restart after downtime (D-014)** writes one `missed` row per monitor and resets
   streaks; statuses read `unknown` until the first fresh probe.
@@ -36,6 +38,12 @@
   is `Secure` behind TLS (`SMON_COOKIE_SECURE`); the systemd unit runs as the `smon`
   user (upgrading a root install: RUNBOOK); the SSRF guard refuses every non-global
   IANA special-purpose block; the disk cap applies to every pooled connection.
+- **Proxies are ignored:** the probe and webhook clients no longer honour
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` — a proxied probe bypassed the DNS-layer SSRF
+  guard. Egress proxies are not supported; probes and alerts dial directly.
+- **Configuration details:** a value may start with `#` (only whitespace followed by `#`
+  is an inline comment); a failed retention pass shows on `/readyz` as
+  `retention failing (see the server log)`, never with its error text.
 - **Licence:** MIT.
 
 - M7.3 real-app load drill: `perf/real-app.mjs` — a dependency-free Node app doing

@@ -84,8 +84,8 @@ struct Inner {
     write_failures: WriteHealth,
     draining: AtomicBool,
     stopped: Mutex<Vec<Stopped>>,
-    /// Supporting duties whose last run failed (e.g. a retention pass), with why.
-    failing: Mutex<std::collections::BTreeMap<&'static str, String>>,
+    /// Supporting duties whose last run failed (e.g. a retention pass), with a fixed cause.
+    failing: Mutex<std::collections::BTreeMap<&'static str, &'static str>>,
 }
 
 /// Shared, cheap-to-clone engine health. See the module docs.
@@ -123,14 +123,21 @@ impl Vitals {
             .store(self.now_ms(), Ordering::Relaxed);
     }
 
+    /// How long the coordinator has gone without a loop pass; `None` before it first beats.
+    pub fn coordinator_silence(&self) -> Option<Duration> {
+        let beat = self.inner.coordinator_beat_ms.load(Ordering::Relaxed);
+        (beat != NO_COORDINATOR).then(|| Duration::from_millis(self.now_ms().saturating_sub(beat)))
+    }
+
     /// Shutdown has begun: readiness goes false and stays false.
     pub fn begin_drain(&self) {
         self.inner.draining.store(true, Ordering::Relaxed);
     }
 
     /// A supporting duty's latest run: `Err(why)` marks the monitor degraded until the
-    /// duty next succeeds (`Ok`). Observing is unaffected.
-    pub fn duty_result(&self, duty: &'static str, result: Result<(), String>) {
+    /// duty next succeeds (`Ok`). Observing is unaffected. `why` is a fixed string on
+    /// purpose: faults are public (`/readyz`), so error text never goes there.
+    pub fn duty_result(&self, duty: &'static str, result: Result<(), &'static str>) {
         let mut failing = self
             .inner
             .failing
@@ -144,6 +151,15 @@ impl Vitals {
                 failing.insert(duty, why);
             }
         }
+    }
+
+    /// A retention pass's outcome. The error's detail (SQL, paths, SQLite text) goes to the
+    /// log once; `faults` — served on the unauthenticated `/readyz` — gets a fixed cause.
+    pub fn retention_outcome<E: std::fmt::Display>(&self, result: Result<(), &E>) {
+        if let Err(error) = result {
+            tracing::error!(%error, "retention pass failed");
+        }
+        self.duty_result("retention", result.map_err(|_| "see the server log"));
     }
 
     /// Record an engine task that stopped outside shutdown. Logged by the supervisor.
@@ -190,7 +206,7 @@ impl Vitals {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             for (duty, why) in failing.iter() {
-                faults.push(format!("{duty} failing: {why}"));
+                faults.push(format!("{duty} failing ({why})"));
             }
         }
         // A stall is only news while everything else on the observation path is fine — a
@@ -303,6 +319,38 @@ impl Supervisor {
         });
     }
 
+    /// Watch the coordinator's heartbeat: a coordinator that is alive but makes no loop
+    /// pass for longer than `limit` never "stops", so without this it would stay
+    /// unavailable forever. Past the limit it is an engine failure like a dead task — the
+    /// process exits and the service manager restarts it (D-011). Checked every `every`;
+    /// ends on shutdown.
+    pub fn watch_stall(&self, limit: Duration, every: Duration) {
+        let vitals = self.vitals.clone();
+        let shutdown = self.shutdown.clone();
+        let failure = self.failure.clone();
+        self.tracker.spawn(async move {
+            let mut ticks = tokio::time::interval(every);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    () = shutdown.cancelled() => return,
+                }
+                if let Some(silent) = vitals.coordinator_silence()
+                    && silent > limit
+                {
+                    let cause = format!(
+                        "coordinator stalled (no schedule pass for {}s)",
+                        silent.as_secs()
+                    );
+                    tracing::error!(%cause, "engine stalled past its limit");
+                    failure.raise(cause);
+                    return;
+                }
+            }
+        });
+    }
+
     /// Wait for every watched task to end (shutdown), bounded by `deadline`. Returns
     /// whether they all finished in time.
     pub async fn drain(&self, deadline: Duration) -> bool {
@@ -376,14 +424,14 @@ mod tests {
     #[test]
     fn a_failing_supporting_duty_degrades_until_it_next_succeeds() {
         let (vitals, _) = vitals(Duration::from_secs(30));
-        vitals.duty_result("retention", Err("database is locked".into()));
+        vitals.duty_result("retention", Err("see the server log"));
         let verdict = vitals.verdict();
         assert_eq!(
             verdict.status,
             Availability::Degraded,
             "observing continues"
         );
-        assert_eq!(verdict.faults, ["retention failing: database is locked"]);
+        assert_eq!(verdict.faults, ["retention failing (see the server log)"]);
         vitals.duty_result("retention", Ok(()));
         assert_eq!(vitals.verdict().status, Availability::Ok);
     }

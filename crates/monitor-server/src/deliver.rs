@@ -202,7 +202,11 @@ async fn run(
     let endpoint = sink.describe();
     let prepared = match sink {
         Sink::Webhook { target, secret } => {
+            // Direct to the configured receiver: proxy environment variables must not
+            // silently route alert payloads (monitor names, incident times) through a
+            // third host. Egress proxies are not supported (module 04).
             let client = match reqwest::Client::builder()
+                .no_proxy()
                 .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
                 .build()
             {

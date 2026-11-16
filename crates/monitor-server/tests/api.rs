@@ -1421,3 +1421,43 @@ async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
     assert_eq!(body["status"], "degraded");
     assert_eq!(body["faults"][0], "snapshot exited");
 }
+
+/// `/readyz` is unauthenticated: a failed retention pass may say *that* it failed, never
+/// the store's error text (paths, SQL, SQLite messages). The detail goes to the log.
+#[tokio::test]
+async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
+    let vitals = monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30));
+    let error = monitor_db::QueryError::Io(
+        "disk I/O error on /opt/smon/data/monitor.db: SELECT * FROM checks".into(),
+    );
+    vitals.retention_outcome(Err(&error));
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::connect(&format!("sqlite:{}", tmp.path().join("r.db").display()), 1)
+        .await
+        .unwrap();
+    db.migrate().await.unwrap();
+    let app = router(AppState {
+        db,
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals,
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
+        version: "test",
+    });
+    let response = app
+        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = json_body(response).await.unwrap();
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["faults"][0], "retention failing (see the server log)");
+    let text = body.to_string();
+    assert!(
+        !text.contains("/opt/smon") && !text.contains("SELECT"),
+        "{text}"
+    );
+}

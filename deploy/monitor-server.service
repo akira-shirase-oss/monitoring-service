@@ -3,6 +3,13 @@
 Description=Service Monitor (monitor-server)
 After=network-online.target
 Wants=network-online.target
+# A deterministic crash (an engine task failing on every boot) must not loop forever:
+# after 5 starts within 10 minutes systemd stops restarting and leaves the unit `failed`
+# ("start request repeated too quickly"). The public heartbeat then expires, so the status
+# page says "monitoring unavailable". Fix the cause from the log, then
+# `systemctl reset-failed monitor-server && systemctl start monitor-server`.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
