@@ -687,15 +687,20 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
 /// map is not advanced (memory can never be ahead of the store).
 #[tokio::test]
 async fn writes_past_the_page_ceiling_fail_and_flag_unhealthy() -> anyhow::Result<()> {
-    let db = Db::connect("sqlite::memory:", 1).await?;
-    db.migrate().await?;
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("capped.db").display());
+    let setup = Db::connect(&url, 1).await?;
+    setup.migrate().await?;
     let monitor =
         NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
-    db.insert_monitor(&monitor).await?;
+    setup.insert_monitor(&monitor).await?;
     // SQLite clamps max_page_count up to the current size, so cap at exactly the used
-    // bytes: the database may not grow, and writes fail once free space runs out.
-    let used = db.used_bytes().await?;
-    db.set_max_bytes(used).await?;
+    // bytes: the database may not grow, and writes fail once free space runs out. The
+    // production pool size (4) — the ceiling must hold on whichever connection commits.
+    let used = setup.used_bytes().await?;
+    drop(setup);
+    let db = Db::connect_opts(&url, 4, Some(used)).await?;
+    assert_eq!(db.max_bytes().await?, used);
 
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let write_health: WriteHealth = Arc::default();

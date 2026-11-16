@@ -79,6 +79,12 @@ impl Db {
     /// `connect` plus an optional database size ceiling: `max_db_bytes` is enforced as
     /// `PRAGMA max_page_count`, so writes past the ceiling fail `SQLITE_FULL` — a commit
     /// that cannot land is an error the caller sees, never silent corruption.
+    ///
+    /// `max_page_count` is a *per-connection* setting in SQLite, so it is applied in the
+    /// pool's `after_connect` hook: every connection the pool ever opens — the first, the
+    /// other `max_connections - 1`, and any it reopens after an idle timeout or lifetime
+    /// expiry — carries the ceiling before it can serve a query. Setting it once through
+    /// the pool would cap one connection and leave the rest unbounded.
     pub async fn connect_opts(
         url: &str,
         max_connections: u32,
@@ -88,34 +94,14 @@ impl Db {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            .connect_with(options)
-            .await?;
-        let db = Self { pool };
+        let mut pool = SqlitePoolOptions::new().max_connections(max_connections);
         if let Some(bytes) = max_db_bytes {
-            db.set_max_bytes(bytes).await?;
+            pool = pool.after_connect(move |conn, _meta| {
+                Box::pin(async move { apply_max_bytes(conn, bytes).await })
+            });
         }
-        Ok(db)
-    }
-
-    /// `PRAGMA max_page_count` from a byte ceiling — computed against the database's own
-    /// page size, never an assumed 4 KiB.
-    pub async fn set_max_bytes(&self, bytes: u64) -> Result<(), QueryError> {
-        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
-            .fetch_one(&self.pool)
-            .await?;
-        let page_size = u64::try_from(page_size).unwrap_or(4096).max(1);
-        let pages = (bytes / page_size).max(1);
-        let pages_i64 = i64::try_from(pages).map_err(|_| QueryError::OutOfRange("pages"))?;
-        // PRAGMAs reject bound parameters, so the statement is built dynamically —
-        // `pages_i64` is a computed integer, never input (AssertSqlSafe audited).
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "PRAGMA max_page_count = {pages_i64}"
-        )))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let pool = pool.connect_with(options).await?;
+        Ok(Self { pool })
     }
 
     /// Bytes the database file currently occupies (`page_count * page_size`).
@@ -819,6 +805,25 @@ impl Db {
     }
 }
 
+/// `PRAGMA max_page_count` from a byte ceiling on one connection — computed against the
+/// database's own page size, never an assumed 4 KiB. SQLite clamps the value up to the
+/// current file size, so a store already past the ceiling simply cannot grow further.
+async fn apply_max_bytes(conn: &mut sqlx::SqliteConnection, bytes: u64) -> Result<(), sqlx::Error> {
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(&mut *conn)
+        .await?;
+    let page_size = u64::try_from(page_size).unwrap_or(4096).max(1);
+    let pages = i64::try_from((bytes / page_size).max(1)).unwrap_or(i64::MAX);
+    // PRAGMAs reject bound parameters, so the statement is built dynamically —
+    // `pages` is a computed integer, never input (AssertSqlSafe audited).
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "PRAGMA max_page_count = {pages}"
+    )))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 async fn enqueue_outbox(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     monitor: MonitorId,
@@ -1013,4 +1018,84 @@ pub struct DeliveryRow {
     pub first_fail_at: Option<OffsetDateTime>,
     pub last_fail_at: Option<OffsetDateTime>,
     pub resolved_at: Option<OffsetDateTime>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POOL: u32 = 4;
+
+    /// Check out every pooled connection at once — the pool must open all of them, so
+    /// nothing below can pass by reusing the one connection that happened to be configured.
+    async fn hold_all(db: &Db) -> Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
+        let mut held = Vec::new();
+        for _ in 0..POOL {
+            held.push(db.pool.acquire().await.expect("acquire"));
+        }
+        held
+    }
+
+    /// `PRAGMA max_page_count` is per connection in SQLite. A ceiling set once through
+    /// the pool lands on one connection; the others — and every connection the pool opens
+    /// later — would grow the file without limit.
+    #[tokio::test]
+    async fn the_size_ceiling_is_set_on_every_pooled_connection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite:{}", tmp.path().join("cap.db").display());
+        let cap: u64 = 64 * 1024 * 1024;
+        let db = Db::connect_opts(&url, POOL, Some(cap))
+            .await
+            .expect("connect");
+        db.migrate().await.expect("migrate");
+
+        for mut conn in hold_all(&db).await {
+            let pages: i64 = sqlx::query_scalar("PRAGMA max_page_count")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("max_page_count");
+            let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("page_size");
+            assert_eq!(
+                u64::try_from(pages * page_size).expect("positive"),
+                cap,
+                "every connection must carry the ceiling"
+            );
+        }
+    }
+
+    /// The behavior the ceiling exists for: once the file is at its cap, a large write
+    /// fails `SQLITE_FULL` on *whichever* connection the pool hands out.
+    #[tokio::test]
+    async fn a_capped_store_refuses_growth_on_every_connection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite:{}", tmp.path().join("full.db").display());
+        let setup = Db::connect(&url, 1).await.expect("connect");
+        setup.migrate().await.expect("migrate");
+        let used = setup.used_bytes().await.expect("used");
+        setup.pool.close().await;
+
+        // Reopen capped at exactly the current size: the file may not grow.
+        let db = Db::connect_opts(&url, POOL, Some(used))
+            .await
+            .expect("reconnect");
+        for (n, mut conn) in hold_all(&db).await.into_iter().enumerate() {
+            let grew = sqlx::query(
+                "INSERT INTO sessions (id, created_at, expires_at)
+                 VALUES (hex(randomblob(500000)), 'x', 'x')",
+            )
+            .execute(&mut *conn)
+            .await;
+            let Err(sqlx::Error::Database(error)) = grew else {
+                panic!("connection {n} grew a capped database: {grew:?}");
+            };
+            assert!(
+                error.message().contains("full"),
+                "connection {n}: expected SQLITE_FULL, got {}",
+                error.message()
+            );
+        }
+    }
 }

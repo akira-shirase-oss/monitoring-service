@@ -14,6 +14,7 @@ not a process only the author can babysit.
 
 - **Storage guardrail:** ~2 GiB budget for the SQLite file set + logs. Approaching the cap is
   a warning state; at the cap, writes fail and the API/status say so (module 02 failure case).
+  The ceiling is set per connection (`after_connect`), never once through the pool.
 - **Bounded logs:** structured JSON (tracing), byte-capped rotation, dropped-count surfaced.
 - **Retention:** module 02's 7-day raw + aggregates expiry runs as a scheduled job — bounded
   batches, never blocking the writer on live data.
