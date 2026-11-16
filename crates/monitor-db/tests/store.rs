@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use monitor_db::{Db, Observation, WriteHealth, WriteOutcome, writer};
+use monitor_db::{Db, Observation, RetentionPolicy, WriteHealth, WriteOutcome, writer};
 use monitor_domain::{
     CheckOutcome, Effect, Health, Monitor, MonitorId, NewMonitor, SlotObservation, Status,
 };
@@ -378,7 +378,7 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
     writer.record(pass(&monitor)).await?;
 
     let report = writer
-        .retain(OffsetDateTime::now_utc() - time::Duration::days(7))
+        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
         .await?;
     assert_eq!(report.rows_deleted, 4, "monitor A's four expired rows");
     assert_eq!(report.days_written, 1, "one monitor-day aggregated");
@@ -885,5 +885,196 @@ async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
     );
     db.delete_session("live").await?;
     assert!(!db.session_valid("live").await?);
+    Ok(())
+}
+
+fn at(monitor: &Monitor, outcome: CheckOutcome, days_ago: i64, minute: i64) -> Observation {
+    probe_at(
+        monitor,
+        outcome,
+        OffsetDateTime::now_utc() - time::Duration::days(days_ago)
+            + time::Duration::minutes(minute),
+    )
+}
+
+/// Retention (D-012): an open incident keeps its *birth evidence* raw — the failing streak
+/// from `first_fail_at` to `opened_at`, at most `failures_to_open` rows — not every raw
+/// row the monitor ever wrote. Before, one long-open incident exempted the monitor's whole
+/// history from expiry, and its raw rows grew without bound.
+#[tokio::test]
+async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    // 20 days ago: healthy history.
+    for minute in 0..5 {
+        writer
+            .record(at(&monitor, CheckOutcome::Pass, 20, minute))
+            .await?;
+    }
+    // 9 days ago: the birth streak — three failures open the incident.
+    for minute in 0..3 {
+        writer
+            .record(at(&monitor, CheckOutcome::Transport, 9, minute))
+            .await?;
+    }
+    let incident = db
+        .open_incident(monitor.id)
+        .await?
+        .expect("incident opened");
+    // 8 days ago: still failing while open; then one recent failure.
+    for minute in 0..4 {
+        writer
+            .record(at(&monitor, CheckOutcome::Timeout, 8, minute))
+            .await?;
+    }
+    writer.record(fail(&monitor)).await?;
+
+    let report = writer
+        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .await?;
+    assert_eq!(
+        report.rows_deleted, 9,
+        "5 old passes + 4 old open-period failures"
+    );
+
+    let kept = db.list_checks(monitor.id, 50).await?;
+    let first_fail = incident.first_fail_at.expect("first_fail_at");
+    let birth: Vec<_> = kept
+        .iter()
+        .filter(|row| row.slot_at >= first_fail && row.slot_at <= incident.opened_at)
+        .collect();
+    assert_eq!(
+        birth.len(),
+        3,
+        "the birth streak stays raw while the incident is open"
+    );
+    assert_eq!(
+        kept.len(),
+        4,
+        "birth streak + the row inside the raw window"
+    );
+    // Nothing expired was lost: aggregates carry it, so coverage stays honest.
+    let stats = db
+        .check_stats(
+            monitor.id,
+            OffsetDateTime::now_utc() - time::Duration::days(30),
+        )
+        .await?;
+    assert_eq!(stats.observed, 13);
+    assert_eq!(stats.passed, 5);
+    assert!(
+        db.open_incident(monitor.id).await?.is_some(),
+        "the incident itself is untouched"
+    );
+    Ok(())
+}
+
+/// Retention (D-012) beyond raw checks: delivered outbox rows expire 30 days after delivery,
+/// resolved incidents (with every outbox row they own) 365 days after resolution, daily
+/// aggregates and ended maintenance windows after 365 days. Open incidents and undelivered
+/// rows of kept incidents are never pruned.
+#[tokio::test]
+async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows()
+-> anyhow::Result<()> {
+    let (db, ancient, writer) = store().await?;
+    let recent =
+        NewMonitor::new("recent", url::Url::parse("https://two.example.com")?)?.into_monitor();
+    let open =
+        NewMonitor::new("open", url::Url::parse("https://three.example.com")?)?.into_monitor();
+    db.insert_monitor(&recent).await?;
+    db.insert_monitor(&open).await?;
+
+    // An incident opened and resolved ~400 days ago: past every horizon.
+    for minute in 0..3 {
+        writer
+            .record(at(&ancient, CheckOutcome::Transport, 400, minute))
+            .await?;
+    }
+    for minute in 3..5 {
+        writer
+            .record(at(&ancient, CheckOutcome::Pass, 400, minute))
+            .await?;
+    }
+    // One resolved ~20 days ago: kept, but its opened-event was delivered 40 days ago
+    // (prunable) while the recovered-event is still pending (kept).
+    for minute in 0..3 {
+        writer
+            .record(at(&recent, CheckOutcome::Transport, 20, minute))
+            .await?;
+    }
+    for minute in 3..5 {
+        writer
+            .record(at(&recent, CheckOutcome::Pass, 20, minute))
+            .await?;
+    }
+    let recent_events = db.list_outbox(recent.id).await?;
+    assert_eq!(recent_events.len(), 2);
+    writer
+        .mark_delivery(
+            &recent_events[0].event_id,
+            1,
+            None,
+            Some(OffsetDateTime::now_utc() - time::Duration::days(40)),
+        )
+        .await?;
+    // An open incident from 2 days ago, its event undelivered.
+    for minute in 0..3 {
+        writer
+            .record(at(&open, CheckOutcome::Transport, 2, minute))
+            .await?;
+    }
+    // Maintenance windows: one ended 400 days ago, one ended yesterday.
+    let now = OffsetDateTime::now_utc();
+    db.create_window(
+        ancient.id,
+        now - time::Duration::days(401),
+        now - time::Duration::days(400),
+        "old",
+    )
+    .await?;
+    db.create_window(
+        ancient.id,
+        now - time::Duration::days(2),
+        now - time::Duration::days(1),
+        "new",
+    )
+    .await?;
+
+    let report = writer
+        .retain(RetentionPolicy::default().cutoffs(now))
+        .await?;
+    assert_eq!(report.incidents_deleted, 1);
+    assert_eq!(
+        report.outbox_deleted, 3,
+        "ancient incident's two rows + one delivered row"
+    );
+    assert!(report.aggregates_deleted >= 1);
+    assert_eq!(report.windows_deleted, 1);
+
+    assert!(
+        db.list_incidents(Some(ancient.id), None, 10)
+            .await?
+            .is_empty()
+    );
+    assert!(db.list_outbox(ancient.id).await?.is_empty());
+    let ancient_stats = db
+        .check_stats(ancient.id, now - time::Duration::days(500))
+        .await?;
+    assert_eq!(
+        ancient_stats.observed, 0,
+        "aggregates past 365 days are gone"
+    );
+    assert_eq!(db.list_windows(ancient.id).await?.len(), 1);
+
+    assert_eq!(db.list_incidents(Some(recent.id), None, 10).await?.len(), 1);
+    let left = db.list_outbox(recent.id).await?;
+    assert_eq!(left.len(), 1);
+    assert!(left[0].delivered_at.is_none(), "the pending event survives");
+    let recent_stats = db
+        .check_stats(recent.id, now - time::Duration::days(30))
+        .await?;
+    assert_eq!(recent_stats.observed, 5, "young aggregates are kept");
+
+    assert!(db.open_incident(open.id).await?.is_some());
+    assert_eq!(db.list_outbox(open.id).await?.len(), 1);
     Ok(())
 }

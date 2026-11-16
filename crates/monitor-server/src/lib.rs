@@ -59,6 +59,9 @@ pub struct AppState {
     /// `sessions` row and the cookie's `Max-Age`. Store-side expiry is the authority;
     /// the cookie's copy is a convenience for the browser.
     pub session_ttl: Duration,
+    /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
+    /// they keep history). Bounds the schedule and every per-monitor table (D-012).
+    pub max_monitors: u64,
     pub version: &'static str,
 }
 
@@ -339,7 +342,13 @@ async fn create_monitor(
             .map_err(ApiError::Validation)?,
     };
     let monitor = new.into_monitor();
-    state.db.insert_monitor(&monitor).await?;
+    if !state
+        .db
+        .insert_monitor_within(&monitor, state.max_monitors)
+        .await?
+    {
+        return Err(ApiError::LimitReached(state.max_monitors));
+    }
     publish_registry(&state).await?;
     Ok((
         StatusCode::CREATED,
@@ -796,6 +805,8 @@ pub enum ApiError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("monitor limit reached ({0}); delete an unused monitor first")]
+    LimitReached(u64),
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error("stored data violates the contract")]
@@ -812,6 +823,7 @@ impl ApiError {
                 "invalid_request"
             }
             Self::Conflict(_) => "conflict",
+            Self::LimitReached(_) => "limit_reached",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
         }
@@ -823,7 +835,7 @@ impl ApiError {
             Self::BadId | Self::BadUrl | Self::Validation(_) | Self::Invalid(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
-            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Conflict(_) | Self::LimitReached(_) => StatusCode::CONFLICT,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

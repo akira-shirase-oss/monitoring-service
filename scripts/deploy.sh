@@ -39,7 +39,11 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_STATUS_DIR=/opt/smon/status
 # SMON_DASHBOARD_DIR=/opt/smon/current/dashboard
 # SMON_MAX_DB_BYTES=2147483648
-# SMON_RETENTION_S=604800
+# SMON_RETENTION_S=604800              # raw checks (D-012 lists every horizon)
+# SMON_AGGREGATE_RETENTION_S=31536000  # daily aggregates
+# SMON_INCIDENT_RETENTION_S=31536000   # resolved incidents + their alerts, ended windows
+# SMON_OUTBOX_RETENTION_S=2592000      # delivered alerts
+# SMON_MAX_MONITORS=100
 # SMON_LOG_FILE=/opt/smon/data/monitor.log
 # SMON_WEBHOOK_URL=
 # SMON_WEBHOOK_SECRET=

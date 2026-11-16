@@ -59,7 +59,84 @@ pub struct RetainReport {
     pub days_written: u64,
     /// Raw check rows the pass deleted after aggregating.
     pub rows_deleted: u64,
+    /// Daily-aggregate rows past the aggregate horizon.
+    pub aggregates_deleted: u64,
+    /// Resolved incidents past the incident horizon (their outbox rows go with them).
+    pub incidents_deleted: u64,
+    /// Outbox rows deleted: delivered ones past the outbox horizon, plus every row of a
+    /// pruned incident.
+    pub outbox_deleted: u64,
+    /// Maintenance windows that ended before the incident horizon.
+    pub windows_deleted: u64,
 }
+
+/// How long each kind of record lives (D-012). Every table the monitor writes has a
+/// horizon except `monitors` (bounded by `SMON_MAX_MONITORS`), open incidents (they end
+/// when evidence closes them) and undelivered outbox rows of kept incidents (visible
+/// "no receiver" evidence until their incident ages out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Raw `checks` rows (then rolled into daily aggregates). An open incident's birth
+    /// streak is the one exception — at most `failures_to_open` rows.
+    pub checks: std::time::Duration,
+    /// `check_stats_daily` rows.
+    pub aggregates: std::time::Duration,
+    /// Resolved incidents, counted from `resolved_at`; ended maintenance windows, from
+    /// `ends_at` (a window only explains evidence that is itself kept).
+    pub incidents: std::time::Duration,
+    /// Delivered outbox rows, counted from `delivered_at`.
+    pub delivered_outbox: std::time::Duration,
+}
+
+const DAY: std::time::Duration = std::time::Duration::from_hours(24);
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            checks: DAY * 7,
+            aggregates: DAY * 365,
+            incidents: DAY * 365,
+            delivered_outbox: DAY * 30,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// The expiry instants for a pass run at `now`. A horizon too large to subtract
+    /// saturates to "keep everything".
+    pub fn cutoffs(&self, now: OffsetDateTime) -> RetentionCutoffs {
+        let before = |keep: std::time::Duration| {
+            time::Duration::try_from(keep)
+                .ok()
+                .and_then(|keep| now.checked_sub(keep))
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        };
+        RetentionCutoffs {
+            checks: before(self.checks),
+            aggregates: before(self.aggregates),
+            incidents: before(self.incidents),
+            delivered_outbox: before(self.delivered_outbox),
+        }
+    }
+}
+
+/// Records older than these instants expire in a `retain` pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionCutoffs {
+    pub checks: OffsetDateTime,
+    pub aggregates: OffsetDateTime,
+    pub incidents: OffsetDateTime,
+    pub delivered_outbox: OffsetDateTime,
+}
+
+/// Raw rows a retention pass must keep: the birth streak (`first_fail_at` → `opened_at`)
+/// of the monitor's open incident. Shared by the aggregate and the delete so the two can
+/// never disagree about which rows moved.
+const BIRTH_STREAK_OF_OPEN_INCIDENT: &str = "EXISTS (
+    SELECT 1 FROM incidents i
+     WHERE i.monitor_id = checks.monitor_id AND i.state = 'open'
+       AND checks.slot_at >= COALESCE(i.first_fail_at, i.opened_at)
+       AND checks.slot_at <= i.opened_at)";
 
 /// A handle to the monitor's SQLite store.
 #[derive(Debug, Clone)]
@@ -155,10 +232,25 @@ impl Db {
     }
 
     pub async fn insert_monitor(&self, monitor: &Monitor) -> Result<(), QueryError> {
-        sqlx::query(
+        if self.insert_monitor_within(monitor, u64::MAX).await? {
+            Ok(())
+        } else {
+            Err(QueryError::OutOfRange("monitor count"))
+        }
+    }
+
+    /// Insert unless `max_monitors` already exist — one conditional statement, so two
+    /// concurrent creates can't both slip under the cap. `false` = the cap held.
+    pub async fn insert_monitor_within(
+        &self,
+        monitor: &Monitor,
+        max_monitors: u64,
+    ) -> Result<bool, QueryError> {
+        let inserted = sqlx::query(
             "INSERT INTO monitors (id, name, url, interval_s, timeout_s, fail_threshold,
                                   recover_threshold, generation, paused, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0, ?
+             WHERE (SELECT COUNT(*) FROM monitors) < ?",
         )
         .bind(monitor.id.0.to_string())
         .bind(&monitor.name)
@@ -175,9 +267,10 @@ impl Db {
         .bind(i64::from(monitor.thresholds.passes_to_recover))
         .bind(i64::try_from(monitor.generation).map_err(|_| QueryError::OutOfRange("generation"))?)
         .bind(OffsetDateTime::now_utc())
+        .bind(i64::try_from(max_monitors).unwrap_or(i64::MAX))
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(inserted.rows_affected() == 1)
     }
 
     pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
@@ -559,14 +652,21 @@ impl Db {
         })
     }
 
-    /// Retention pass: roll checks older than `cutoff` into `check_stats_daily`, then
-    /// delete the raw rows — one transaction, so a crash can't produce history that is
-    /// neither raw nor aggregated. Monitors with an open incident keep their raw rows:
-    /// an incident's birth evidence never expires while the incident is open.
-    /// Called only by the single writer.
-    pub async fn retain(&self, cutoff: OffsetDateTime) -> Result<RetainReport, QueryError> {
+    /// Retention pass (D-012), one transaction so a crash can't produce history that is
+    /// neither raw nor aggregated, or an outbox row whose incident is gone:
+    ///
+    /// 1. raw checks older than `cutoffs.checks` roll into `check_stats_daily` and are
+    ///    deleted — except an open incident's birth streak, its evidence while it is open;
+    /// 2. daily aggregates older than `cutoffs.aggregates` are deleted;
+    /// 3. resolved incidents older than `cutoffs.incidents` are deleted with every outbox
+    ///    row they own; ended maintenance windows older than it go too;
+    /// 4. delivered outbox rows older than `cutoffs.delivered_outbox` are deleted.
+    ///
+    /// Open incidents and undelivered rows of kept incidents are never touched. Called
+    /// only by the single writer.
+    pub async fn retain(&self, cutoffs: &RetentionCutoffs) -> Result<RetainReport, QueryError> {
         let mut tx = self.pool.begin().await?;
-        let aggregated = sqlx::query(
+        let aggregated = sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO check_stats_daily
                 (monitor_id, day, pass, http_fail, transport, timeout, missed)
              SELECT monitor_id, date(slot_at),
@@ -574,31 +674,67 @@ impl Db {
                     SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
                     SUM(outcome = 'missed')
              FROM checks
-             WHERE slot_at < ?1
-               AND monitor_id NOT IN (SELECT monitor_id FROM incidents WHERE state = 'open')
+             WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
              GROUP BY monitor_id, date(slot_at)
              ON CONFLICT (monitor_id, day) DO UPDATE SET
                 pass = check_stats_daily.pass + excluded.pass,
                 http_fail = check_stats_daily.http_fail + excluded.http_fail,
                 transport = check_stats_daily.transport + excluded.transport,
                 timeout = check_stats_daily.timeout + excluded.timeout,
-                missed = check_stats_daily.missed + excluded.missed",
-        )
-        .bind(cutoff)
+                missed = check_stats_daily.missed + excluded.missed"
+        )))
+        .bind(cutoffs.checks)
         .execute(&mut *tx)
         .await?;
-        let deleted = sqlx::query(
-            "DELETE FROM checks WHERE slot_at < ?1
-             AND monitor_id NOT IN (SELECT monitor_id FROM incidents WHERE state = 'open')",
+        let deleted = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM checks WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}"
+        )))
+        .bind(cutoffs.checks)
+        .execute(&mut *tx)
+        .await?;
+        let old_days = sqlx::query("DELETE FROM check_stats_daily WHERE day < ?1")
+            .bind(cutoffs.aggregates.date().to_string())
+            .execute(&mut *tx)
+            .await?;
+        let incident_outbox = sqlx::query(
+            "DELETE FROM notify_outbox WHERE incident_id IN (
+               SELECT id FROM incidents WHERE state = 'resolved' AND resolved_at < ?1)",
         )
-        .bind(cutoff)
+        .bind(cutoffs.incidents)
+        .execute(&mut *tx)
+        .await?;
+        let incidents =
+            sqlx::query("DELETE FROM incidents WHERE state = 'resolved' AND resolved_at < ?1")
+                .bind(cutoffs.incidents)
+                .execute(&mut *tx)
+                .await?;
+        let windows = sqlx::query("DELETE FROM maintenance_windows WHERE ends_at < ?1")
+            .bind(cutoffs.incidents)
+            .execute(&mut *tx)
+            .await?;
+        let delivered = sqlx::query(
+            "DELETE FROM notify_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
+        )
+        .bind(cutoffs.delivered_outbox)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(RetainReport {
             days_written: aggregated.rows_affected(),
             rows_deleted: deleted.rows_affected(),
+            aggregates_deleted: old_days.rows_affected(),
+            incidents_deleted: incidents.rows_affected(),
+            outbox_deleted: incident_outbox.rows_affected() + delivered.rows_affected(),
+            windows_deleted: windows.rows_affected(),
         })
+    }
+
+    /// How many monitors exist (paused ones included — they keep history).
+    pub async fn monitor_count(&self) -> Result<u64, QueryError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM monitors")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     /// Check history for a monitor, newest first.

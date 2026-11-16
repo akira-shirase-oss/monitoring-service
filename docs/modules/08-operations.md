@@ -16,8 +16,9 @@ not a process only the author can babysit.
   a warning state; at the cap, writes fail and the API/status say so (module 02 failure case).
   The ceiling is set per connection (`after_connect`), never once through the pool.
 - **Bounded logs:** structured JSON (tracing), byte-capped rotation, dropped-count surfaced.
-- **Retention:** module 02's 7-day raw + aggregates expiry runs as a scheduled job — bounded
-  batches, never blocking the writer on live data.
+- **Retention:** module 02's expiry (D-012: raw checks, aggregates, incidents, windows,
+  delivered outbox; monitor cap) runs as a scheduled job through the writer — one
+  transaction per pass (batching is still owed).
 - **Backup/restore:** consistent backup of `monitor.db` (WAL-aware); restore drill proves open
   incidents and outbox rows survive; restore is documented and rehearsed before M4 exits.
 - **Deploy:** the monitor runs off the target host (independence is the point); upgrade and

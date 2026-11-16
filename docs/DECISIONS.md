@@ -2,6 +2,31 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-012 — Every table has a horizon; the monitor count has a cap
+
+Retention used to exempt *every* raw row of a monitor with an open incident (one
+long-open incident meant unbounded raw history), and never pruned the outbox, incidents,
+aggregates or windows; nothing bounded the number of monitors. At 1 row per slot the
+store's growth must be a function of configuration, not of uptime.
+
+| Record | Horizon (default) | Variable | Counted from |
+|---|---|---|---|
+| raw `checks` | 7 days, then rolled into `check_stats_daily` | `SMON_RETENTION_S` | `slot_at` |
+| open incident's birth streak | while the incident is open | — | rows `first_fail_at`…`opened_at` (≤ `failures_to_open` ≤ 10) |
+| `check_stats_daily` | 365 days | `SMON_AGGREGATE_RETENTION_S` | `day` |
+| resolved incidents + all their outbox rows | 365 days | `SMON_INCIDENT_RETENTION_S` | `resolved_at` |
+| ended maintenance windows | 365 days | `SMON_INCIDENT_RETENTION_S` | `ends_at` |
+| delivered outbox rows | 30 days | `SMON_OUTBOX_RETENTION_S` | `delivered_at` |
+| monitors | cap 100 (create → 409 `limit_reached`) | `SMON_MAX_MONITORS` | — |
+
+The birth streak is the incident's evidence: why it opened. Raw rows written *while* it is
+open are history like any other and age into aggregates, so coverage and success stay
+exact. Never pruned: open incidents, and undelivered (pending or exhausted) outbox rows of
+kept incidents — they remain the visible "no receiver" signal until their incident ages
+out. A pass is one transaction through the single writer; deleting an incident deletes its
+outbox rows first (FK). The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
+concurrent creates cannot overshoot it; paused monitors count (they keep history).
+
 ## D-011 — One engine verdict: a monitor that is not observing serves `unknown`
 
 The committed status map only moves when the writer commits. If the writer task dies, the

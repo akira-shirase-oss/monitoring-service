@@ -40,6 +40,7 @@ async fn app() -> anyhow::Result<(
         ),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        max_monitors: 100,
         version: "test",
     });
     Ok((app, statuses, db, write_health, tmp))
@@ -759,6 +760,7 @@ async fn auth_denies_without_a_valid_bearer_token() {
         vitals: monitor_server::vitals::Vitals::new(write_health, Duration::from_secs(30)),
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
+        max_monitors: 100,
         version: "test",
     };
     let app = monitor_server::router(state);
@@ -819,6 +821,7 @@ async fn authed(token: &str, ttl: Duration) -> anyhow::Result<(Router, Db, tempf
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
+        max_monitors: 100,
         version: "test",
     };
     Ok((monitor_server::router(state), db, tmp))
@@ -1124,6 +1127,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         vitals,
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        max_monitors: 100,
         version: "test",
     });
 
@@ -1177,5 +1181,47 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
     )
     .await?;
     assert_eq!(one["status"], "unknown");
+    Ok(())
+}
+
+/// Retention (D-012): the monitor count is bounded — every per-monitor table and the
+/// schedule scale with it. The cap is one conditional insert, so it holds under races.
+#[tokio::test]
+async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("cap.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let app = router(AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        max_monitors: 2,
+        version: "test",
+    });
+    let create = |n: usize| serde_json::json!({ "name": format!("m{n}"), "url": format!("https://m{n}.example.com/") });
+    for n in 0..2 {
+        let (status, _) = send(&app, "POST", "/api/monitors", Some(create(n))).await?;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let (status, body) = send(&app, "POST", "/api/monitors", Some(create(2))).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "limit_reached");
+    assert_eq!(
+        db.monitor_count().await?,
+        2,
+        "nothing was inserted past the cap"
+    );
+
+    // Deleting one (no history yet) frees a slot.
+    let (_, list) = send(&app, "GET", "/api/monitors", None).await?;
+    let id = list["monitors"][0]["id"].as_str().unwrap().to_owned();
+    let (status, _) = send(&app, "DELETE", &format!("/api/monitors/{id}"), None).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(&app, "POST", "/api/monitors", Some(create(3))).await?;
+    assert_eq!(status, StatusCode::CREATED);
     Ok(())
 }

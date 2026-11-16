@@ -35,6 +35,8 @@ const COORDINATOR_STALL: Duration = Duration::from_secs(30);
 /// How long shutdown waits for the engine tasks (coordinator drain, in-flight deliveries,
 /// the writer's queued commits) after the HTTP server has stopped.
 const ENGINE_DRAIN: Duration = Duration::from_secs(15);
+/// The architecture's lab bound (100 monitors at 60 s); `SMON_MAX_MONITORS` overrides.
+const DEFAULT_MAX_MONITORS: u64 = 100;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -77,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
     // Resolve alert channels up front: email rows only enter the outbox when SMTP is
     // configured, so the writer needs the answer before it starts committing.
     let smtp = smtp_sink()?;
+    let retention = retention_policy()?;
+    let max_monitors: u64 = env_parse("SMON_MAX_MONITORS", DEFAULT_MAX_MONITORS)?;
+    anyhow::ensure!(max_monitors > 0, "SMON_MAX_MONITORS must be at least 1");
 
     // Every engine task is owned by the supervisor from the moment it spawns: an exit
     // outside shutdown flips the vitals verdict, which readiness, the API statuses and the
@@ -130,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
     supervisor.watch(
         "retention",
         Role::Supporting,
-        spawn_retention(&db, &writer, &shutdown),
+        spawn_retention(&db, &writer, retention, &shutdown),
     );
 
     let session_ttl = std::env::var("SMON_SESSION_TTL_S")
@@ -144,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         vitals: vitals.clone(),
         admin_token,
         session_ttl,
+        max_monitors,
         version: env!("CARGO_PKG_VERSION"),
     });
 
@@ -285,12 +291,14 @@ fn spawn_snapshot(
     )
 }
 
-/// Retention (M4.1): raw checks live `SMON_RETENTION_S` (default 7 days), then roll into
-/// daily aggregates. Passes go through the single writer, `SMON_RETENTION_INTERVAL_S`
-/// apart (default hourly) — expiry never touches open incidents or the outbox.
+/// Retention (M4.1, D-012): one pass every `SMON_RETENTION_INTERVAL_S` (default hourly)
+/// through the single writer — raw checks past `SMON_RETENTION_S` roll into daily
+/// aggregates (an open incident keeps only its birth streak raw), then old aggregates,
+/// resolved incidents, ended windows and delivered outbox rows are pruned per the policy.
 fn spawn_retention(
     db: &monitor_db::Db,
     writer: &monitor_db::writer::WriterHandle,
+    policy: monitor_db::RetentionPolicy,
     shutdown: &CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let env_secs = |name: &str, default: u64| {
@@ -299,13 +307,15 @@ fn spawn_retention(
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
-    let keep = Duration::from_secs(env_secs("SMON_RETENTION_S", 7 * 86_400));
     let every = Duration::from_secs(env_secs("SMON_RETENTION_INTERVAL_S", 3_600));
     let db = db.clone();
     let writer = writer.clone();
     let shutdown = shutdown.clone();
     tracing::info!(
-        keep_s = keep.as_secs(),
+        checks_s = policy.checks.as_secs(),
+        aggregates_s = policy.aggregates.as_secs(),
+        incidents_s = policy.incidents.as_secs(),
+        delivered_outbox_s = policy.delivered_outbox.as_secs(),
         every_s = every.as_secs(),
         "retention armed"
     );
@@ -317,14 +327,26 @@ fn spawn_retention(
                 _ = ticks.tick() => {}
                 () = shutdown.cancelled() => return,
             }
-            let cutoff = time::OffsetDateTime::now_utc()
-                - time::Duration::try_from(keep).unwrap_or(time::Duration::MAX);
-            match writer.retain(cutoff).await {
-                Ok(report) if report.rows_deleted > 0 => tracing::info!(
-                    days = report.days_written,
-                    rows = report.rows_deleted,
-                    "retention pass"
-                ),
+            let cutoffs = policy.cutoffs(time::OffsetDateTime::now_utc());
+            match writer.retain(cutoffs).await {
+                Ok(report)
+                    if report.rows_deleted
+                        + report.aggregates_deleted
+                        + report.incidents_deleted
+                        + report.outbox_deleted
+                        + report.windows_deleted
+                        > 0 =>
+                {
+                    tracing::info!(
+                        days = report.days_written,
+                        rows = report.rows_deleted,
+                        aggregates = report.aggregates_deleted,
+                        incidents = report.incidents_deleted,
+                        outbox = report.outbox_deleted,
+                        windows = report.windows_deleted,
+                        "retention pass"
+                    );
+                }
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "retention pass failed"),
             }
@@ -336,6 +358,39 @@ fn spawn_retention(
                 Err(error) => tracing::error!(%error, "session sweep failed"),
             }
         }
+    })
+}
+
+/// A `SMON_*` value parsed strictly: unset means `default`; set but unparsable is a boot
+/// error naming the variable — never a silent fallback.
+fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} is not valid UTF-8"),
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|error| anyhow::anyhow!("{name}={raw:?} is invalid: {error}")),
+    }
+}
+
+/// D-012's horizons, each overridable in seconds.
+fn retention_policy() -> anyhow::Result<monitor_db::RetentionPolicy> {
+    let defaults = monitor_db::RetentionPolicy::default();
+    let secs = |name: &str, default: Duration| -> anyhow::Result<Duration> {
+        let value = env_parse(name, default.as_secs())?;
+        anyhow::ensure!(value > 0, "{name} must be at least 1 second");
+        Ok(Duration::from_secs(value))
+    };
+    Ok(monitor_db::RetentionPolicy {
+        checks: secs("SMON_RETENTION_S", defaults.checks)?,
+        aggregates: secs("SMON_AGGREGATE_RETENTION_S", defaults.aggregates)?,
+        incidents: secs("SMON_INCIDENT_RETENTION_S", defaults.incidents)?,
+        delivered_outbox: secs("SMON_OUTBOX_RETENTION_S", defaults.delivered_outbox)?,
     })
 }
 
