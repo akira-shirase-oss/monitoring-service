@@ -28,7 +28,8 @@ Local file, WAL mode, foreign keys on — no server database, no Redis (guide de
 
 | Trigger | Required result |
 |---|---|
-| Disk write fails | commit fails → `WriteHealth` consecutive-failure counter grows; `/readyz` answers 503 `unavailable`; the counter resets only when a write lands — never paint unsaved results green |
+| Disk write fails | commit fails → `WriteHealth` consecutive-failure counter grows; `/readyz` answers 503 `unavailable`, served statuses read `unknown` and the snapshot beat is born expired (D-011); the counter resets only when a write lands — never paint unsaved results green |
+| Writer task dies | the supervisor sees the exit → `/readyz` 503 `writer exited`/`writer panicked`, statuses `unknown` (`a_dead_writer_makes_the_monitor_report_unavailable`) |
 | Full disk | admission/write fails safely and visibly (module 08 guardrails). The `SMON_MAX_DB_BYTES` ceiling is `PRAGMA max_page_count`, which SQLite scopes to one connection — it is applied in the pool's `after_connect` hook, so every pooled connection (including ones reopened after idle/lifetime expiry) carries it; `a_capped_store_refuses_growth_on_every_connection` holds all four at once |
 | Restart | open incidents reload; streaks rebuild from stored outcomes |
 

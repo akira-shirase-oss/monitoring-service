@@ -21,6 +21,7 @@ use monitor_db::{Observation, WriterHandle};
 use monitor_domain::{Monitor, MonitorId, SlotObservation};
 
 use crate::probe::ProbeClient;
+use crate::vitals::Vitals;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -92,15 +93,18 @@ pub struct Coordinator;
 
 impl Coordinator {
     /// Spawn the coordinator task. `registry` is the live monitor set — the watch channel is
-    /// re-sent by management writes; `writer` is the only path to the store.
+    /// re-sent by management writes; `writer` is the only path to the store. The loop
+    /// stamps `vitals` on every pass, so a coordinator that is alive but stuck (behind a
+    /// wedged writer, say) reads as stalled instead of quietly freezing every status.
     pub fn spawn(
         registry: watch::Receiver<Arc<Vec<Monitor>>>,
         writer: WriterHandle,
         probes: ProbeClient,
         config: Config,
+        vitals: Vitals,
         shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(run(registry, writer, probes, config, shutdown))
+        tokio::spawn(run(registry, writer, probes, config, vitals, shutdown))
     }
 }
 
@@ -109,6 +113,7 @@ async fn run(
     writer: WriterHandle,
     probes: ProbeClient,
     config: Config,
+    vitals: Vitals,
     shutdown: CancellationToken,
 ) {
     let (results_tx, mut results_rx) = mpsc::channel::<Observation>(config.results_bound);
@@ -127,6 +132,7 @@ async fn run(
     );
 
     loop {
+        vitals.coordinator_beat();
         tokio::select! {
             _ = ticker.tick() => {
                 plan_due(&mut runtimes, &mut origins, &global, &config)

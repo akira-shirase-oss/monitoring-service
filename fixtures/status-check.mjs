@@ -18,6 +18,11 @@ try {
 	process.exit(1);
 }
 
+if (snap.monitoring === 'unavailable') {
+	console.log('unavailable: the monitor reports it is not observing (engine fault)');
+	process.exit(1);
+}
+
 const expires = Date.parse(snap.expires_at ?? '');
 if (Number.isNaN(expires)) {
 	console.log('unavailable: snapshot has no valid expires_at');

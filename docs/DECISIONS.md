@@ -2,6 +2,33 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-011 — One engine verdict: a monitor that is not observing serves `unknown`
+
+The committed status map only moves when the writer commits. If the writer task dies, the
+coordinator dies or wedges, or every commit fails, the map freezes at its last value — and
+the API, the dashboard and the public heartbeat used to keep serving that frozen "up" as
+current, because nothing watched the tasks (their `JoinHandle`s were dropped) and
+`/readyz` only saw write failures.
+
+`vitals::Vitals` is now the single verdict, read by `/readyz`, the statuses `/api/monitors`
+serves (with the verdict beside them as `monitoring`), the public snapshot, and through the
+API the dashboard. Inputs: the writer's consecutive-failure counter, a coordinator
+heartbeat stamped on every loop pass (stalled after 30 s of silence), exits of supervised
+tasks, and the drain flag set at shutdown. `vitals::Supervisor` owns every engine task's
+`JoinHandle`; an exit outside shutdown — return, panic or abort — is logged once and
+recorded.
+
+- **unavailable** — not observing: writer or coordinator stopped, coordinator stalled,
+  store writes failing, or shutting down. `/readyz` 503, every served status `unknown`,
+  each snapshot beat written born-expired with `monitoring: "unavailable"`, dashboard
+  banner naming the cause.
+- **degraded** — observing, but a supporting task (a deliverer, the snapshot writer,
+  retention) stopped. `/readyz` 503 with the cause; statuses stay as committed.
+- **ok** — everything running; `/readyz` 200.
+
+Statuses are not rewritten in the store: `unknown` is a property of *serving* while the
+engine is down, and the committed history stays exactly what was observed.
+
 ## D-010 — Certificate trust is deterministic: webpki-roots, never the local store
 
 A monitor should report what a *public* client sees. Reqwest's default on macOS delegates

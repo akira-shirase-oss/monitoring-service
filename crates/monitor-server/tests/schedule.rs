@@ -13,6 +13,7 @@ use monitor_db::{Db, writer};
 use monitor_domain::{Monitor, NewMonitor};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config, Coordinator};
+use monitor_server::vitals::Vitals;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -81,8 +82,14 @@ fn rig(
         64 * 1024,
     )?;
     let shutdown = CancellationToken::new();
-    let _coordinator =
-        Coordinator::spawn(registry_rx, handle, probes, fast_config(), shutdown.clone());
+    let _coordinator = Coordinator::spawn(
+        registry_rx,
+        handle,
+        probes,
+        fast_config(),
+        Vitals::new(Arc::default(), Duration::from_secs(30)),
+        shutdown.clone(),
+    );
     Ok((registry_tx, shutdown))
 }
 

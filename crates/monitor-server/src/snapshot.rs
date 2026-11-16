@@ -8,6 +8,13 @@
 //! Sanitization is an allowlist, not a denylist: the only fields that can leave are the
 //! stable `alias` (id prefix — no names, URLs, or internal ids), `status`, and
 //! `incident_open_since`. Anything not listed here does not exist for the public page.
+//!
+//! The heartbeat is only honest if it stops when observing stops. A live process whose
+//! writer or coordinator has died would otherwise keep re-stamping its last statuses as
+//! fresh. While the engine verdict is not observing (`vitals`), each beat is written
+//! *born expired* (`expires_at = generated_at`), every service `unknown`, and
+//! `monitoring: "unavailable"` — readers that only check expiry say "monitoring
+//! unavailable" at once, without waiting out the TTL on a stale "up".
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,6 +26,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
+
+use crate::vitals::Vitals;
 
 pub struct Config {
     /// Directory the snapshot is written into (created on demand).
@@ -72,21 +81,29 @@ struct Snapshot {
     generated_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
+    /// `available` | `unavailable` — whether the engine was observing when it wrote this.
+    monitoring: &'static str,
     services: Vec<ServiceView>,
 }
 
 /// Build the snapshot from committed state. Statuses come from the post-commit map; open
 /// incidents come from the store. A monitor with no committed evidence is `unknown` —
 /// and a paused monitor reports `unknown` here too, because the public question is
-/// "is the service up", not "is the monitor running".
+/// "is the service up", not "is the monitor running". `observing = false` (the engine
+/// verdict) writes the born-expired, all-`unknown` form described in the module docs.
 pub fn build<S: std::hash::BuildHasher>(
     monitors: &[Monitor],
     statuses: &SharedStatuses,
     open: &HashMap<MonitorId, OffsetDateTime, S>,
     ttl: Duration,
+    observing: bool,
 ) -> serde_json::Value {
     let now = OffsetDateTime::now_utc();
-    let committed = statuses.read().map(|map| map.clone()).unwrap_or_default();
+    let committed = if observing {
+        statuses.read().map(|map| map.clone()).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     let services = monitors
         .iter()
         .map(|monitor| ServiceView {
@@ -98,9 +115,19 @@ pub fn build<S: std::hash::BuildHasher>(
             incident_open_since: open.get(&monitor.id).copied(),
         })
         .collect();
+    let expires_at = if observing {
+        now + time::Duration::try_from(ttl).unwrap_or(time::Duration::MAX)
+    } else {
+        now
+    };
     serde_json::to_value(Snapshot {
         generated_at: now,
-        expires_at: now + time::Duration::try_from(ttl).unwrap_or(time::Duration::MAX),
+        expires_at,
+        monitoring: if observing {
+            "available"
+        } else {
+            "unavailable"
+        },
         services,
     })
     .unwrap_or_else(|_| serde_json::json!({"services": []}))
@@ -111,6 +138,7 @@ pub fn build<S: std::hash::BuildHasher>(
 pub fn spawn(
     db: Db,
     statuses: SharedStatuses,
+    vitals: Vitals,
     config: Config,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -140,7 +168,8 @@ pub fn spawn(
                     continue;
                 }
             };
-            let json = build(&monitors, &statuses, &open, config.ttl);
+            let observing = vitals.verdict().observing();
+            let json = build(&monitors, &statuses, &open, config.ttl, observing);
             let target = config.dir.join("status.json");
             // Write-then-rename: a reader mid-beat sees the old file or the new one, never a
             // torn half-snapshot.

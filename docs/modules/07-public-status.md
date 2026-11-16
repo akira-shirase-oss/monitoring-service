@@ -29,11 +29,19 @@ Let users of the monitored services check availability without a login — and l
 - **Separation from dashboard:** the public page is a different artifact from the dashboard;
   it never embeds management data.
 
+**Engine faults (D-011):** each beat carries `monitoring: "available" | "unavailable"`.
+While the engine is not observing (writer/coordinator stopped or stalled, writes failing),
+the beat is written born expired (`expires_at = generated_at`) with every service
+`unknown`, so a live process with a dead writer cannot keep a stale "up" fresh. The three
+readers (`apps/status`, the dashboard's `/status`, `fixtures/status-check.mjs`) honor both
+the flag and expiry.
+
 ## Failure cases
 
 | Trigger | Required result |
 |---|---|
 | Monitor host down | heartbeat expires → "monitoring unavailable" |
+| Process alive, writer/coordinator dead or stalled | next beat is born expired, all `unknown`, `monitoring: unavailable` (`a_dead_engine_stops_the_heartbeat_reading_fresh`) |
 | Snapshot stale | page shows its age; expired snapshot warns explicitly |
 | Monitor restarted, no fresh data | services show `unknown`, not guessed states |
 

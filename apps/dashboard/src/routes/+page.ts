@@ -1,5 +1,11 @@
 import type { PageLoad } from './$types';
 
+// The engine verdict the API serves beside the list — the same one `/readyz` reports.
+// `unavailable`: not observing (writer/coordinator down or stalled, store writes failing);
+// every status then reads `unknown`. `degraded`: observing, but alerts, the public
+// heartbeat or retention have stopped.
+export type Monitoring = { status: 'ok' | 'degraded' | 'unavailable'; faults: string[] };
+
 export type MonitorView = {
 	id: string;
 	name: string;
@@ -22,14 +28,19 @@ export const load: PageLoad = async ({ fetch }) => {
 	try {
 		const response = await apiFetch('/api/monitors', undefined, fetch);
 		if (response.status === 401) {
-			return { monitors: [] as MonitorView[], reachable: true as const, needsAuth: true as const };
+			return { monitors: [] as MonitorView[], monitoring: null, reachable: true as const, needsAuth: true as const };
 		}
 		if (!response.ok) {
-			return { monitors: [] as MonitorView[], reachable: false as const, needsAuth: false as const };
+			return { monitors: [] as MonitorView[], monitoring: null, reachable: false as const, needsAuth: false as const };
 		}
-		const body = (await response.json()) as { monitors?: MonitorView[] };
-		return { monitors: body.monitors ?? [], reachable: true as const, needsAuth: false as const };
+		const body = (await response.json()) as { monitors?: MonitorView[]; monitoring?: Monitoring };
+		return {
+			monitors: body.monitors ?? [],
+			monitoring: body.monitoring ?? null,
+			reachable: true as const,
+			needsAuth: false as const
+		};
 	} catch {
-		return { monitors: [] as MonitorView[], reachable: false as const, needsAuth: false as const };
+		return { monitors: [] as MonitorView[], monitoring: null, reachable: false as const, needsAuth: false as const };
 	}
 };

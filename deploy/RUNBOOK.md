@@ -37,9 +37,12 @@ sudo launchctl load /Library/LaunchDaemons/com.shirase.smon.plist
 ```
 
 Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
-`curl -sf $SMON_LISTEN/version` → the expected release. If readyz answers
-`unavailable` with a failure count, the store's write path is failing (disk, perms) —
-readiness is honest, fix the cause rather than restart-looping.
+`curl -sf $SMON_LISTEN/version` → the expected release. A 503 names its cause in
+`faults` (D-011): `store writes failing (N consecutive)` means the write path is broken
+(disk, perms) — fix the cause rather than restart-looping; `writer exited|panicked` or
+`coordinator …` means the monitor is not observing (statuses read `unknown`) — the log
+has the task's error, then restart; `degraded` with a deliverer, snapshot or retention
+fault means checks still run but that duty has stopped.
 
 ## Upgrade
 

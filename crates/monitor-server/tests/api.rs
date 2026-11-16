@@ -34,7 +34,10 @@ async fn app() -> anyhow::Result<(
         db: db.clone(),
         statuses: Arc::clone(&statuses),
         registry,
-        write_health: Arc::clone(&write_health),
+        vitals: monitor_server::vitals::Vitals::new(
+            Arc::clone(&write_health),
+            Duration::from_secs(30),
+        ),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         version: "test",
@@ -753,7 +756,7 @@ async fn auth_denies_without_a_valid_bearer_token() {
         db,
         statuses,
         registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
-        write_health,
+        vitals: monitor_server::vitals::Vitals::new(write_health, Duration::from_secs(30)),
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
         version: "test",
@@ -813,7 +816,7 @@ async fn authed(token: &str, ttl: Duration) -> anyhow::Result<(Router, Db, tempf
         db: db.clone(),
         statuses: Arc::new(RwLock::new(HashMap::new())),
         registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
-        write_health: Arc::default(),
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
         version: "test",
@@ -1081,4 +1084,98 @@ async fn an_expired_session_is_denied() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Honest unavailability: the writer is the only path to the store. When it dies, the
+/// committed status map freezes — a monitor whose last commit was a pass would keep
+/// serving "up" forever. The supervisor owns the writer's `JoinHandle`; its exit must turn
+/// readiness 503 and every served status `unknown`, with the cause named.
+#[tokio::test]
+async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<()> {
+    use monitor_server::vitals::{Role, Supervisor, Vitals};
+
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("dead-writer.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let monitor =
+        monitor_domain::NewMonitor::new("watched", url::Url::parse("https://example.com/health")?)?
+            .into_monitor();
+    db.insert_monitor(&monitor).await?;
+
+    let statuses = Arc::new(RwLock::new(HashMap::new()));
+    let write_health: monitor_db::WriteHealth = Arc::default();
+    let vitals = Vitals::new(Arc::clone(&write_health), Duration::from_secs(30));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let supervisor = Supervisor::new(vitals.clone(), shutdown.clone());
+    let (writer, writer_task) = monitor_db::writer::spawn(
+        db.clone(),
+        Arc::clone(&statuses),
+        HashMap::new(),
+        write_health,
+        8,
+        false,
+    );
+    supervisor.watch("writer", Role::Observing, writer_task);
+    let app = router(AppState {
+        db: db.clone(),
+        statuses: Arc::clone(&statuses),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals,
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        version: "test",
+    });
+
+    // One committed pass: the monitor is honestly up.
+    writer
+        .record(monitor_db::Observation {
+            monitor_id: monitor.id,
+            generation: monitor.generation,
+            slot_at: time::OffsetDateTime::now_utc(),
+            slot: monitor_domain::SlotObservation::Probe(monitor_domain::CheckOutcome::Pass),
+            http_status: Some(200),
+            latency_ms: Some(3),
+            detail: None,
+        })
+        .await?;
+    let (status, body) = send(&app, "GET", "/api/monitors", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["monitors"][0]["status"], "up");
+    assert_eq!(body["monitoring"]["status"], "ok");
+
+    // The writer stops (every handle gone — the same exit a crash in its loop produces).
+    drop(writer);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let ready = loop {
+        let response = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty())?)
+            .await?;
+        if response.status() != StatusCode::OK || std::time::Instant::now() > deadline {
+            break response;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let ready = json_body(ready).await?;
+    assert_eq!(ready["status"], "unavailable");
+    assert_eq!(ready["reason"], "writer exited");
+
+    let (_, body) = send(&app, "GET", "/api/monitors", None).await?;
+    assert_eq!(
+        body["monitors"][0]["status"], "unknown",
+        "a frozen status is not current evidence"
+    );
+    assert_eq!(body["monitoring"]["status"], "unavailable");
+    assert_eq!(body["monitoring"]["faults"][0], "writer exited");
+    let (_, one) = send(
+        &app,
+        "GET",
+        &format!("/api/monitors/{}", monitor.id.0),
+        None,
+    )
+    .await?;
+    assert_eq!(one["status"], "unknown");
+    Ok(())
 }

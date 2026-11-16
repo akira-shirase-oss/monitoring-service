@@ -38,7 +38,9 @@ fetch('status.json', { cache: 'no-store' }).then(r => {
 	if (!r.ok) throw new Error('http ' + r.status);
 	return r.json();
 }).then(snap => {
-	const expired = Date.parse(snap.expires_at) < Date.now();
+	// `monitoring: unavailable` = the engine stopped observing while the process lived; such
+	// a beat is also written already-expired, so either check alone reaches the verdict.
+	const expired = snap.monitoring === 'unavailable' || Date.parse(snap.expires_at) < Date.now();
 	meta.textContent = 'snapshot written ' + age(snap.generated_at) +
 		(expired ? ' — expired' : '');
 	if (expired) {

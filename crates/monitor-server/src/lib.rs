@@ -11,6 +11,7 @@ pub mod probe;
 pub mod redact;
 pub mod schedule;
 pub mod snapshot;
+pub mod vitals;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +32,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use monitor_db::{
-    CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses, WriteHealth,
+    CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses,
 };
 use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError};
 
@@ -47,9 +48,10 @@ pub struct AppState {
     pub statuses: SharedStatuses,
     /// The live monitor set the coordinator schedules against. Management writes re-send it.
     pub registry: watch::Sender<Arc<Vec<Monitor>>>,
-    /// Consecutive store-write failures from the writer — nonzero means the write path is
-    /// broken (disk full, I/O error) and readiness must say so.
-    pub write_health: WriteHealth,
+    /// Engine health: write failures, dead or stalled engine tasks, draining. One verdict
+    /// for readiness, the statuses served here and the public snapshot — a monitor that
+    /// is not observing must never serve its last statuses as current.
+    pub vitals: vitals::Vitals,
     /// The management credential (M5.1). `None` only on a loopback listen — boot refuses
     /// a tokenless public listen.
     pub admin_token: auth::AdminToken,
@@ -232,21 +234,22 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
         .into_response()
 }
 
-/// Readiness means the store answers *and* the write path has landed commits. A read can
-/// succeed while every write fails (disk full) — the counter the writer keeps is the truth
-/// about the write path, never a green that unsaved results would contradict.
+/// Readiness means the store answers, the write path lands commits, and every engine task
+/// (writer, coordinator, deliverers, snapshot, retention) is running and not stalled. A
+/// read can succeed while every write fails (disk full), and the HTTP server can answer
+/// while the writer is dead — the vitals verdict is the truth about the engine, never a
+/// green that frozen statuses would contradict.
 async fn readyz(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     state.db.ping().await?;
-    let failures = state
-        .write_health
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if failures > 0 {
+    let verdict = state.vitals.verdict();
+    if verdict.status != vitals::Availability::Ok {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "status": "unavailable",
-                "reason": "store writes failing",
-                "consecutive_failures": failures,
+                "status": verdict.status,
+                "reason": verdict.faults.first(),
+                "faults": verdict.faults,
+                "consecutive_failures": verdict.consecutive_write_failures,
             })),
         )
             .into_response());
@@ -272,13 +275,20 @@ struct MonitorView {
     created_at: OffsetDateTime,
 }
 
+/// The monitor list carries the engine verdict alongside it (`monitoring`), read once so
+/// the statuses and the verdict can't disagree: while the engine is not observing, every
+/// status is `unknown` — the last committed value is history, not current evidence.
 async fn list_monitors(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let verdict = state.vitals.verdict();
     let rows = state.db.list_monitors().await?;
     let monitors: Vec<MonitorView> = rows
         .into_iter()
-        .map(|row| view_from_row(row, &state.statuses))
+        .map(|row| view_from_row(row, &state.statuses, verdict.observing()))
         .collect::<Result<_, _>>()?;
-    Ok(Json(serde_json::json!({ "monitors": monitors })))
+    Ok(Json(serde_json::json!({
+        "monitoring": { "status": verdict.status, "faults": verdict.faults },
+        "monitors": monitors,
+    })))
 }
 
 async fn get_monitor(
@@ -286,7 +296,11 @@ async fn get_monitor(
     Path(id): Path<String>,
 ) -> Result<Json<MonitorView>, ApiError> {
     let row = find_monitor(&state, &id).await?;
-    Ok(Json(view_from_row(row, &state.statuses)?))
+    Ok(Json(view_from_row(
+        row,
+        &state.statuses,
+        state.vitals.verdict().observing(),
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,7 +405,11 @@ async fn patch_monitor(
     }
     publish_registry(&state).await?;
     let row = find_monitor(&state, &id).await?;
-    Ok(Json(view_from_row(row, &state.statuses)?))
+    Ok(Json(view_from_row(
+        row,
+        &state.statuses,
+        state.vitals.verdict().observing(),
+    )?))
 }
 
 /// Delete a monitor with no recorded evidence. A monitor with history can't be deleted —
@@ -733,12 +751,22 @@ async fn find_monitor(state: &AppState, id: &str) -> Result<MonitorRow, ApiError
         .ok_or(ApiError::NotFound)
 }
 
-fn view_from_row(row: MonitorRow, statuses: &SharedStatuses) -> Result<MonitorView, ApiError> {
+/// `observing = false` (the engine verdict) forces `unknown`: a status the engine is no
+/// longer producing is not a status.
+fn view_from_row(
+    row: MonitorRow,
+    statuses: &SharedStatuses,
+    observing: bool,
+) -> Result<MonitorView, ApiError> {
     let created_at = row.created_at;
     let monitor = monitor_domain::Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    let status = statuses.read().map_or(Status::Unknown, |map| {
-        map.get(&monitor.id).copied().unwrap_or(Status::Unknown)
-    });
+    let status = if observing {
+        statuses.read().map_or(Status::Unknown, |map| {
+            map.get(&monitor.id).copied().unwrap_or(Status::Unknown)
+        })
+    } else {
+        Status::Unknown
+    };
     Ok(MonitorView {
         id: monitor.id.0,
         name: monitor.name,
