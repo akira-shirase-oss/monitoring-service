@@ -2,7 +2,7 @@
 //! honestly. A redirect, a refused connection and a hung socket are different evidence and
 //! never collapse into each other.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -108,26 +108,80 @@ impl ProbePolicy {
     }
 }
 
+/// IPv4 blocks the monitor never dials: every entry of the IANA IPv4 special-purpose
+/// registry that is not globally reachable, plus multicast and the reserved 240/4. A few
+/// registry sub-blocks that *are* global anycast services (inside 192.0.0.0/24) are
+/// refused too — none is a meaningful health-check target.
+const LOCAL_V4: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::UNSPECIFIED, 8),           // "this network"
+    (Ipv4Addr::new(10, 0, 0, 0), 8),      // private
+    (Ipv4Addr::new(100, 64, 0, 0), 10),   // shared address space (CGNAT)
+    (Ipv4Addr::new(127, 0, 0, 0), 8),     // loopback
+    (Ipv4Addr::new(169, 254, 0, 0), 16),  // link-local (cloud metadata lives here)
+    (Ipv4Addr::new(172, 16, 0, 0), 12),   // private
+    (Ipv4Addr::new(192, 0, 0, 0), 24),    // IETF protocol assignments
+    (Ipv4Addr::new(192, 0, 2, 0), 24),    // TEST-NET-1
+    (Ipv4Addr::new(192, 88, 99, 0), 24),  // deprecated 6to4 relay anycast
+    (Ipv4Addr::new(192, 168, 0, 0), 16),  // private
+    (Ipv4Addr::new(198, 18, 0, 0), 15),   // benchmarking
+    (Ipv4Addr::new(198, 51, 100, 0), 24), // TEST-NET-2
+    (Ipv4Addr::new(203, 0, 113, 0), 24),  // TEST-NET-3
+    (Ipv4Addr::new(224, 0, 0, 0), 4),     // multicast
+    (Ipv4Addr::new(240, 0, 0, 0), 4),     // reserved, incl. 255.255.255.255
+];
+
+/// IPv6 blocks the monitor never dials (IANA IPv6 special-purpose registry, plus
+/// multicast and deprecated site-local). Forms that embed an IPv4 address — mapped,
+/// NAT64 `64:ff9b::/96`, 6to4 `2002::/16` — are judged by that address first, in
+/// `embedded_v4`. `2001::/23` is refused whole (Teredo, benchmarking, ORCHID, a few anycast
+/// services): conservative, and nothing in it is a health-check target.
+const LOCAL_V6: &[(Ipv6Addr, u8)] = &[
+    (Ipv6Addr::UNSPECIFIED, 96), // ::/96 — unspecified, loopback, v4-compatible
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48), // local-use NAT64
+    (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64), // discard-only
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23), // IETF protocol assignments
+    (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32), // documentation
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // documentation (RFC 9637)
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16), // SRv6 SIDs
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7), // unique-local
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10), // link-local
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10), // deprecated site-local
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8), // multicast
+];
+
+fn in_v4(ip: Ipv4Addr, (net, len): (Ipv4Addr, u8)) -> bool {
+    let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(net) & mask
+}
+
+fn in_v6(ip: Ipv6Addr, (net, len): (Ipv6Addr, u8)) -> bool {
+    let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+    u128::from(ip) & mask == u128::from(net) & mask
+}
+
+/// The IPv4 address an IPv6 address stands for, when it is a translation form a dialer
+/// (or a NAT64/6to4 gateway) would turn into an IPv4 connection.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let segments = v6.segments();
+    let join = |high: u16, low: u16| Ipv4Addr::from((u32::from(high) << 16) | u32::from(low));
+    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(join(segments[6], segments[7])); // NAT64 well-known prefix
+    }
+    if segments[0] == 0x2002 {
+        return Some(join(segments[1], segments[2])); // 6to4
+    }
+    None
+}
+
 fn is_local(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-        }
+        IpAddr::V4(v4) => LOCAL_V4.iter().any(|&block| in_v4(v4, block)),
         IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.is_multicast()
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_local(IpAddr::V4(v4)))
+            embedded_v4(v6).is_some_and(|v4| is_local(IpAddr::V4(v4)))
+                || LOCAL_V6.iter().any(|&block| in_v6(v6, block))
         }
     }
 }
@@ -347,11 +401,10 @@ fn classify(error: &reqwest::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;
 
     #[test]
-    fn is_local_catches_every_non_public_range() {
+    fn is_local_catches_the_common_local_ranges() {
         for ip in [
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -378,6 +431,133 @@ mod tests {
         ] {
             assert!(!is_local(ip), "{ip} must be allowed");
         }
+    }
+
+    fn assert_matrix(refused: &[&str], allowed: &[&str]) {
+        for ip in refused {
+            let parsed: IpAddr = ip.parse().expect(ip);
+            assert!(is_local(parsed), "{ip} must be refused");
+        }
+        for ip in allowed {
+            let parsed: IpAddr = ip.parse().expect(ip);
+            assert!(!is_local(parsed), "{ip} must be allowed");
+        }
+    }
+
+    /// The IANA IPv4 special-purpose registry, block by block: the first and last address
+    /// of every non-global block is refused, the public neighbours just outside it pass.
+    #[test]
+    fn is_local_matches_the_ipv4_special_purpose_registry() {
+        let refused = [
+            "0.0.0.0",
+            "0.255.255.255", // "this network" 0/8
+            "10.0.0.0",
+            "10.255.255.255", // private 10/8
+            "100.64.0.0",
+            "100.127.255.255", // shared / CGNAT 100.64/10
+            "127.0.0.0",
+            "127.255.255.255", // loopback 127/8
+            "169.254.0.0",
+            "169.254.255.255", // link-local 169.254/16
+            "172.16.0.0",
+            "172.31.255.255", // private 172.16/12
+            "192.0.0.0",
+            "192.0.0.255", // IETF protocol assignments 192.0.0/24
+            "192.0.2.0",
+            "192.0.2.255", // TEST-NET-1
+            "192.88.99.0",
+            "192.88.99.255", // deprecated 6to4 relay anycast
+            "192.168.0.0",
+            "192.168.255.255", // private 192.168/16
+            "198.18.0.0",
+            "198.19.255.255", // benchmarking 198.18/15
+            "198.51.100.0",
+            "198.51.100.255", // TEST-NET-2
+            "203.0.113.0",
+            "203.0.113.255", // TEST-NET-3
+            "224.0.0.0",
+            "239.255.255.255", // multicast 224/4
+            "240.0.0.0",
+            "255.255.255.254", // reserved 240/4
+            "255.255.255.255", // limited broadcast
+        ];
+        let allowed = [
+            "1.0.0.0",
+            "9.255.255.255",
+            "11.0.0.0",
+            "100.63.255.255",
+            "100.128.0.0",
+            "126.255.255.255",
+            "128.0.0.0",
+            "172.15.255.255",
+            "172.32.0.0",
+            "192.0.1.0",
+            "192.0.3.0",
+            "192.88.98.255",
+            "192.88.100.0",
+            "192.167.255.255",
+            "192.169.0.0",
+            "198.17.255.255",
+            "198.20.0.0",
+            "203.0.112.255",
+            "203.0.114.0",
+            "223.255.255.255",
+            "8.8.8.8",
+            "1.1.1.1",
+        ];
+        assert_matrix(&refused, &allowed);
+    }
+
+    /// The IANA IPv6 special-purpose registry, same shape — plus the forms that embed an
+    /// IPv4 address (mapped, compatible, NAT64, 6to4), which inherit its verdict.
+    #[test]
+    fn is_local_matches_the_ipv6_special_purpose_registry() {
+        let refused = [
+            "::",
+            "::1", // unspecified, loopback
+            "::8.8.8.8",
+            "::0.0.0.2", // deprecated IPv4-compatible ::/96
+            "::ffff:10.0.0.1",
+            "::ffff:100.64.0.1",
+            "::ffff:198.18.0.1", // v4-mapped local
+            "64:ff9b::a00:1",
+            "64:ff9b::6440:1", // NAT64 of 10.0.0.1, 100.64.0.1
+            "64:ff9b:1::",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", // local-use NAT64 /48
+            "100::",
+            "100::ffff:ffff:ffff:ffff", // discard-only 100::/64
+            "2001::",
+            "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // IETF 2001::/23 (Teredo…)
+            "2001:db8::",
+            "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", // documentation /32
+            "2002:a00:1::",
+            "2002:7f00:1::1", // 6to4 of 10.0.0.1, 127.0.0.1
+            "3fff::",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", // documentation 3fff::/20
+            "5f00::",
+            "5f00:ffff::1", // SRv6 SIDs 5f00::/16
+            "fc00::",
+            "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // unique-local fc00::/7
+            "fe80::",
+            "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // link-local fe80::/10
+            "fec0::",
+            "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // deprecated site-local
+            "ff00::",
+            "ff02::1", // multicast ff00::/8
+        ];
+        let allowed = [
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            "2001:200::1",
+            "2001:4860:4860::8888",
+            "2001:db9::1",
+            "2606:4700:4700::1111",
+            "3fff:1000::1",
+            "5f01::1",
+            "fbff::1",
+        ];
+        assert_matrix(&refused, &allowed);
     }
 
     #[test]

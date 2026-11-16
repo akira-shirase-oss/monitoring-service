@@ -26,8 +26,9 @@ run; what exists is what the commits show. Highlights:
   webhooks (`x-smon-event`, HMAC-SHA256 `x-smon-signature`) and SMTP email through
   the same outbox, with finite jittered retries — the outbox survives restarts and
   restores.
-- **SSRF guard:** `http`/`https` only; private/loopback/link-local/multicast/v4-mapped
-  IP literals refused; DNS answers validated inside the resolver (a public name
+- **SSRF guard:** `http`/`https` only; every non-global IPv4/IPv6 special-purpose
+  block refused (private, loopback, link-local, CGNAT, benchmarking, documentation,
+  reserved, multicast, and v4-mapped/NAT64/6to4 forms of them); DNS answers validated inside the resolver (a public name
   resolving to a private address is refused — `rejected_local`); redirects followed
   ≤5 hops with every hop revalidated. `SMON_PROFILE=lab` permits local targets for
   fixtures.
