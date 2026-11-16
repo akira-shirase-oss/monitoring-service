@@ -62,7 +62,9 @@ open are history like any other and age into aggregates, so coverage and success
 exact. Never pruned: open incidents, and undelivered (pending or exhausted) outbox rows of
 kept incidents — they remain the visible "no receiver" signal until their incident ages
 out. A pass is one transaction through the single writer; deleting an incident deletes its
-outbox rows first (FK). The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
+outbox rows first (FK), and every delete runs before the aggregates are written (the
+expiring rows wait in a `TEMP` table), so a pass can run in a store already at
+`SMON_MAX_DB_BYTES`. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
 concurrent creates cannot overshoot it; paused monitors count (they keep history).
 
 ## D-011 — One engine verdict: a monitor that is not observing serves `unknown`

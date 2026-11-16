@@ -52,6 +52,15 @@ Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
 has the task's error, then restart; `degraded` with a deliverer, snapshot or retention
 fault means checks still run but that duty has stopped.
 
+### The store is at its cap (`SMON_MAX_DB_BYTES`)
+
+`/readyz` answers `store writes failing` and the log shows `database or disk is full`.
+The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) frees expired
+rows *before* it writes anything, so it runs at the cap and the next commit after it
+lands. If the store is full of evidence that has not expired yet, retention cannot help:
+raise `SMON_MAX_DB_BYTES` (or shorten the D-012 horizons) in `env` and restart. A
+restart re-applies the new cap to every connection.
+
 ## Upgrade
 
 ```sh

@@ -670,75 +670,67 @@ impl Db {
     ///
     /// 1. raw checks older than `cutoffs.checks` roll into `check_stats_daily` and are
     ///    deleted — except an open incident's birth streak, its evidence while it is open;
-    /// 2. daily aggregates older than `cutoffs.aggregates` are deleted;
+    /// 2. daily aggregates older than `cutoffs.aggregates` are deleted (and expiring raw
+    ///    rows from such days are not re-aggregated);
     /// 3. resolved incidents older than `cutoffs.incidents` are deleted with every outbox
     ///    row they own; ended maintenance windows older than it go too;
     /// 4. delivered outbox rows older than `cutoffs.delivered_outbox` are deleted.
+    ///
+    /// **Free before write.** At `SMON_MAX_DB_BYTES` the main file has no free page, and a
+    /// pass that wrote its aggregates first failed `SQLITE_FULL` and freed nothing — a full
+    /// store stayed full. So the expiring rows are first copied into a `TEMP` table (temp
+    /// storage, outside the main file's page cap), every delete runs, and only then are the
+    /// aggregates upserted, into the pages the deletes freed.
     ///
     /// Open incidents and undelivered rows of kept incidents are never touched. Called
     /// only by the single writer.
     pub async fn retain(&self, cutoffs: &RetentionCutoffs) -> Result<RetainReport, QueryError> {
         let mut tx = self.pool.begin().await?;
-        let aggregated = sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx::query("DROP TABLE IF EXISTS temp.expiring")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TEMP TABLE expiring AS
+             SELECT id, monitor_id, date(slot_at) AS day, outcome FROM checks
+             WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}"
+        )))
+        .bind(cutoffs.checks)
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query("DELETE FROM checks WHERE id IN (SELECT id FROM temp.expiring)")
+            .execute(&mut *tx)
+            .await?;
+        let aggregate_day = cutoffs.aggregates.date().to_string();
+        let pruned = prune_expired(&mut tx, cutoffs, &aggregate_day).await?;
+        // Space is free now; write the aggregates of what was deleted.
+        let aggregated = sqlx::query(
             "INSERT INTO check_stats_daily
                 (monitor_id, day, pass, http_fail, transport, timeout, missed)
-             SELECT monitor_id, date(slot_at),
+             SELECT monitor_id, day,
                     SUM(outcome = 'pass'), SUM(outcome = 'http_fail'),
                     SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
                     SUM(outcome = 'missed')
-             FROM checks
-             WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
-             GROUP BY monitor_id, date(slot_at)
+             FROM temp.expiring
+             WHERE day >= ?1
+             GROUP BY monitor_id, day
              ON CONFLICT (monitor_id, day) DO UPDATE SET
                 pass = check_stats_daily.pass + excluded.pass,
                 http_fail = check_stats_daily.http_fail + excluded.http_fail,
                 transport = check_stats_daily.transport + excluded.transport,
                 timeout = check_stats_daily.timeout + excluded.timeout,
-                missed = check_stats_daily.missed + excluded.missed"
-        )))
-        .bind(cutoffs.checks)
+                missed = check_stats_daily.missed + excluded.missed",
+        )
+        .bind(&aggregate_day)
         .execute(&mut *tx)
         .await?;
-        let deleted = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM checks WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}"
-        )))
-        .bind(cutoffs.checks)
-        .execute(&mut *tx)
-        .await?;
-        let old_days = sqlx::query("DELETE FROM check_stats_daily WHERE day < ?1")
-            .bind(cutoffs.aggregates.date().to_string())
+        sqlx::query("DROP TABLE temp.expiring")
             .execute(&mut *tx)
             .await?;
-        let incident_outbox = sqlx::query(
-            "DELETE FROM notify_outbox WHERE incident_id IN (
-               SELECT id FROM incidents WHERE state = 'resolved' AND resolved_at < ?1)",
-        )
-        .bind(cutoffs.incidents)
-        .execute(&mut *tx)
-        .await?;
-        let incidents =
-            sqlx::query("DELETE FROM incidents WHERE state = 'resolved' AND resolved_at < ?1")
-                .bind(cutoffs.incidents)
-                .execute(&mut *tx)
-                .await?;
-        let windows = sqlx::query("DELETE FROM maintenance_windows WHERE ends_at < ?1")
-            .bind(cutoffs.incidents)
-            .execute(&mut *tx)
-            .await?;
-        let delivered = sqlx::query(
-            "DELETE FROM notify_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
-        )
-        .bind(cutoffs.delivered_outbox)
-        .execute(&mut *tx)
-        .await?;
         tx.commit().await?;
         Ok(RetainReport {
             days_written: aggregated.rows_affected(),
             rows_deleted: deleted.rows_affected(),
-            aggregates_deleted: old_days.rows_affected(),
-            incidents_deleted: incidents.rows_affected(),
-            outbox_deleted: incident_outbox.rows_affected() + delivered.rows_affected(),
-            windows_deleted: windows.rows_affected(),
+            ..pruned
         })
     }
 
@@ -952,6 +944,50 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Retention's deletes beyond raw checks — old aggregates, resolved incidents with their
+/// outbox rows, ended windows, delivered outbox rows — inside the pass's transaction.
+/// Returns a report with only those counts set.
+async fn prune_expired(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    cutoffs: &RetentionCutoffs,
+    aggregate_day: &str,
+) -> Result<RetainReport, QueryError> {
+    let old_days = sqlx::query("DELETE FROM check_stats_daily WHERE day < ?1")
+        .bind(aggregate_day)
+        .execute(&mut **tx)
+        .await?;
+    let incident_outbox = sqlx::query(
+        "DELETE FROM notify_outbox WHERE incident_id IN (
+           SELECT id FROM incidents WHERE state = 'resolved' AND resolved_at < ?1)",
+    )
+    .bind(cutoffs.incidents)
+    .execute(&mut **tx)
+    .await?;
+    let incidents =
+        sqlx::query("DELETE FROM incidents WHERE state = 'resolved' AND resolved_at < ?1")
+            .bind(cutoffs.incidents)
+            .execute(&mut **tx)
+            .await?;
+    let windows = sqlx::query("DELETE FROM maintenance_windows WHERE ends_at < ?1")
+        .bind(cutoffs.incidents)
+        .execute(&mut **tx)
+        .await?;
+    let delivered = sqlx::query(
+        "DELETE FROM notify_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
+    )
+    .bind(cutoffs.delivered_outbox)
+    .execute(&mut **tx)
+    .await?;
+    Ok(RetainReport {
+        days_written: 0,
+        rows_deleted: 0,
+        aggregates_deleted: old_days.rows_affected(),
+        incidents_deleted: incidents.rows_affected(),
+        outbox_deleted: incident_outbox.rows_affected() + delivered.rows_affected(),
+        windows_deleted: windows.rows_affected(),
+    })
 }
 
 /// `PRAGMA max_page_count` from a byte ceiling on one connection — computed against the

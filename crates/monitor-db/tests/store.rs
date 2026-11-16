@@ -1047,7 +1047,10 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
         report.outbox_deleted, 3,
         "ancient incident's two rows + one delivered row"
     );
-    assert!(report.aggregates_deleted >= 1);
+    assert_eq!(
+        report.aggregates_deleted, 0,
+        "raw rows already past the aggregate horizon are dropped, never aggregated"
+    );
     assert_eq!(report.windows_deleted, 1);
 
     assert!(
@@ -1076,5 +1079,110 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
 
     assert!(db.open_incident(open.id).await?.is_some());
     assert_eq!(db.list_outbox(open.id).await?.len(), 1);
+
+    Ok(())
+}
+
+/// Retention at the disk cap (D-012 + M4.2): once the store reaches `SMON_MAX_DB_BYTES`,
+/// the retention pass is the only thing that can make room — so it must be able to run
+/// *at* the cap. It used to start with an aggregate INSERT, which needs a fresh page,
+/// failed `SQLITE_FULL`, rolled back, and freed nothing: a full store stayed full (and
+/// "store writes failing") forever.
+#[tokio::test]
+async fn retention_frees_space_in_a_store_filled_to_its_cap() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("full.db").display());
+    let setup = Db::connect(&url, 1).await?;
+    setup.migrate().await?;
+    let monitor =
+        NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
+    setup.insert_monitor(&monitor).await?;
+    let used = setup.used_bytes().await?;
+    drop(setup);
+
+    let db = Db::connect_opts(&url, 4, Some(used + 64 * 1024)).await?;
+    let write_health: WriteHealth = Arc::default();
+    let (writer, _task) = writer::spawn(
+        db.clone(),
+        Arc::new(RwLock::new(HashMap::new())),
+        HashMap::new(),
+        Arc::clone(&write_health),
+        8,
+        false,
+    );
+    // Fill to the cap with evidence that has already expired, spread over ~290 days so
+    // its daily aggregates need fresh pages (as months of real history do).
+    let old = OffsetDateTime::now_utc() - time::Duration::days(8);
+    let mut stored = 0;
+    let mut full = false;
+    for n in 0..20_000_i64 {
+        let at = old - time::Duration::days(n % 290) + time::Duration::seconds(n / 290);
+        let observation = probe_at(&monitor, CheckOutcome::Pass, at);
+        if writer.record(observation).await.is_err() {
+            full = true;
+            break;
+        }
+        stored += 1;
+    }
+    assert!(
+        full && stored > 100,
+        "the store must reach its cap ({stored} rows stored)"
+    );
+    assert!(write_health.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+    let report = writer
+        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .await
+        .expect("retention must run at the cap");
+    assert_eq!(report.rows_deleted, stored, "every expired row is freed");
+    let stats = db
+        .check_stats(
+            monitor.id,
+            OffsetDateTime::now_utc() - time::Duration::days(365),
+        )
+        .await?;
+    assert_eq!(stats.passed, stored, "and nothing is lost: aggregated");
+
+    writer
+        .record(pass(&monitor))
+        .await
+        .expect("writes land again after retention");
+    assert_eq!(write_health.load(std::sync::atomic::Ordering::Relaxed), 0);
+    Ok(())
+}
+
+/// Aggregates age out on their own horizon (D-012), independent of raw checks.
+#[tokio::test]
+async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    for minute in 0..4 {
+        writer
+            .record(at(&monitor, CheckOutcome::Pass, 20, minute))
+            .await?;
+    }
+    let now = OffsetDateTime::now_utc();
+    let first = writer
+        .retain(RetentionPolicy::default().cutoffs(now))
+        .await?;
+    assert_eq!((first.rows_deleted, first.aggregates_deleted), (4, 0));
+    assert_eq!(
+        db.check_stats(monitor.id, now - time::Duration::days(30))
+            .await?
+            .observed,
+        4
+    );
+
+    let short = RetentionPolicy {
+        aggregates: std::time::Duration::from_hours(24 * 10),
+        ..RetentionPolicy::default()
+    };
+    let second = writer.retain(short.cutoffs(now)).await?;
+    assert!(second.aggregates_deleted >= 1, "{second:?}");
+    assert_eq!(
+        db.check_stats(monitor.id, now - time::Duration::days(30))
+            .await?
+            .observed,
+        0
+    );
     Ok(())
 }
