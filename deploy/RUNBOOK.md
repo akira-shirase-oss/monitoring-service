@@ -61,7 +61,10 @@ curl -sf .../readyz && curl -sf .../version     # the version must match the new
 ```
 
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
-`down`, never fabricates a recovery.
+`down`, never fabricates a recovery. If the monitor was down for longer than a check
+interval, boot records that gap (one `missed` row per monitor, D-014): statuses read
+`unknown` until the first fresh probe, and failures from before the outage don't count
+toward a new incident.
 
 Stopping (`systemctl stop`, `launchctl kickstart -k`, `kill`) sends SIGTERM, which drains
 like Ctrl-C: readiness goes false, the coordinator stops scheduling, open requests get up

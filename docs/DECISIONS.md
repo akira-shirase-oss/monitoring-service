@@ -2,6 +2,22 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-014 — Downtime is one stored `missed` row per monitor
+
+D-007 made every slot a stored row so rebuilds replay gaps as gaps — but slots that
+passed while the *process* was down produced no row at all. The boot rebuild then replayed
+the last pre-outage observations as current (the first snapshot after a long outage said
+"up"), and failures before and after the outage counted as one consecutive streak.
+
+At boot, before the coordinator or the first snapshot beat, every unpaused monitor whose
+newest stored slot is older than one interval plus the dispatch grace gets one `missed`
+row, at the first slot that never ran, committed through the writer: streaks reset, the
+status reads `unknown` until a fresh probe, and the outage is visible in the record. One
+row per gap, not one per lost slot — coverage already derives expected slots from elapsed
+time, and back-filling hundreds of rows is the catch-up storm the schedule refuses
+elsewhere. A restart inside one interval writes nothing. Pausing and unpausing is not
+covered here (the paused period is the operator's choice, not lost evidence).
+
 ## D-013 — A probe the monitor refused is a missed slot, not a target failure
 
 The SSRF guard refuses local/private/reserved targets before any socket opens. Those

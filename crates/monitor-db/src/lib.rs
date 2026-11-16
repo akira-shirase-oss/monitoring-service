@@ -579,6 +579,19 @@ impl Db {
         Ok(deleted > 0)
     }
 
+    /// The newest stored slot for a monitor (any outcome) — the boot's downtime check.
+    pub async fn last_slot_at(
+        &self,
+        monitor: MonitorId,
+    ) -> Result<Option<OffsetDateTime>, QueryError> {
+        let last: Option<OffsetDateTime> =
+            sqlx::query_scalar("SELECT MAX(slot_at) FROM checks WHERE monitor_id = ?")
+                .bind(monitor.0.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(last)
+    }
+
     /// The `limit` most recent slot observations for a monitor, oldest→newest — the tail the
     /// restart rebuild replays through `Health`.
     pub async fn recent_outcomes(

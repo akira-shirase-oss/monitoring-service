@@ -12,13 +12,12 @@ use lettre::Tokio1Executor;
 use lettre::message::Mailbox;
 use lettre::transport::smtp::AsyncSmtpTransport;
 use monitor_db::SharedStatuses;
-use monitor_domain::Health;
 use monitor_server::config::Config;
 use monitor_server::deliver::{Config as DelivererConfig, Deliverer, Sink};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config as CoordinatorConfig, Coordinator};
 use monitor_server::vitals::{Role, Supervisor, Vitals};
-use monitor_server::{AppState, load_registry, router};
+use monitor_server::{AppState, load_registry, rebuild_health, record_downtime, router};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
@@ -67,7 +66,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("loading the monitor registry")?;
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::new()));
-    let health = rebuild_health(&db, &monitors, &statuses).await?;
+    let health = rebuild_health(&db, &monitors, &statuses)
+        .await
+        .context("rebuilding health from the store")?;
 
     // Resolve alert channels up front: email rows only enter the outbox when SMTP is
     // configured, so the writer needs the answer before it starts committing.
@@ -91,6 +92,12 @@ async fn main() -> anyhow::Result<()> {
         smtp.is_some(),
     );
     supervisor.watch("writer", Role::Observing, writer_task);
+    // Restart honesty: time the process was down is a gap in evidence. One `missed` row
+    // per monitor that slept through a slot resets its streaks (failures either side of
+    // the outage are not consecutive) and makes its status `unknown` until a fresh probe
+    // lands — committed before the coordinator or the first snapshot beat runs.
+    let coordinator_config = CoordinatorConfig::default();
+    record_boot_gaps(&writer, &db, &monitors, coordinator_config.dispatch_grace).await;
     let (registry_tx, registry_rx) = watch::channel(Arc::new(monitors));
 
     let probes = ProbeClient::new(
@@ -106,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         registry_rx,
         writer.clone(),
         probes,
-        CoordinatorConfig::default(),
+        coordinator_config,
         vitals.clone(),
         shutdown.clone(),
     );
@@ -185,28 +192,21 @@ fn with_static_files(app: axum::Router, status_dir: &str, dashboard_dir: &str) -
     }
 }
 
-/// Boot rebuild: replay each monitor's stored tail through `Health` under its *current*
-/// thresholds, seed the status map, and hand the machines to the writer. The rebuild tail
-/// is sized from the monitor's own thresholds — a streak can never exceed them.
-async fn rebuild_health(
+/// D-014: commit the downtime gap for every monitor that slept through a slot. A failure
+/// here is logged and visible through the write-failure counter (readiness), not fatal —
+/// the monitor still boots and observes.
+async fn record_boot_gaps(
+    writer: &monitor_db::writer::WriterHandle,
     db: &monitor_db::Db,
     monitors: &[monitor_domain::Monitor],
-    statuses: &SharedStatuses,
-) -> anyhow::Result<HashMap<monitor_domain::MonitorId, Health>> {
-    let mut health = HashMap::with_capacity(monitors.len());
-    for monitor in monitors {
-        let open = db.open_incident(monitor.id).await?.is_some();
-        let tail = db
-            .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
-            .await?;
-        let rebuilt = Health::rebuild(open, &tail, monitor.thresholds);
-        statuses
-            .write()
-            .map_err(|_| anyhow::anyhow!("status map poisoned at boot"))?
-            .insert(monitor.id, rebuilt.status());
-        health.insert(monitor.id, rebuilt);
+    dispatch_grace: Duration,
+) {
+    let now = time::OffsetDateTime::now_utc();
+    match record_downtime(writer, db, monitors, now, dispatch_grace).await {
+        Ok(0) => {}
+        Ok(gaps) => tracing::info!(monitors = gaps, "recorded downtime gaps from before boot"),
+        Err(error) => tracing::error!(%error, "could not record downtime gaps"),
     }
-    Ok(health)
 }
 
 /// The management credential: configured → required on every /api call; unset → dev mode,

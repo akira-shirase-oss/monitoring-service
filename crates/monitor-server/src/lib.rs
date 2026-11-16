@@ -91,6 +91,76 @@ pub async fn load_registry(db: &Db) -> Result<Vec<Monitor>, QueryError> {
         .collect()
 }
 
+/// Boot rebuild: replay each monitor's stored tail through `Health` under its *current*
+/// thresholds, seed the status map, and hand the machines to the writer. The rebuild tail
+/// is sized from the monitor's own thresholds — a streak can never exceed them.
+pub async fn rebuild_health(
+    db: &Db,
+    monitors: &[Monitor],
+    statuses: &SharedStatuses,
+) -> Result<std::collections::HashMap<MonitorId, monitor_domain::Health>, QueryError> {
+    let mut health = std::collections::HashMap::with_capacity(monitors.len());
+    for monitor in monitors {
+        let open = db.open_incident(monitor.id).await?.is_some();
+        let tail = db
+            .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
+            .await?;
+        let rebuilt = monitor_domain::Health::rebuild(open, &tail, monitor.thresholds);
+        // Boot is single-threaded here: nothing else can have poisoned the map.
+        statuses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(monitor.id, rebuilt.status());
+        health.insert(monitor.id, rebuilt);
+    }
+    Ok(health)
+}
+
+/// Restart honesty: while the process was down, slots passed unobserved — but no row said
+/// so, so the boot rebuild replayed the last pre-outage observations as if they were
+/// current (a stale "up" on the first snapshot) and counted failures before and after the
+/// outage as one consecutive streak.
+///
+/// For every unpaused monitor whose newest stored slot is older than one interval plus the
+/// dispatch grace, commit one `missed` row — at the first slot that never ran — through the
+/// writer: streaks reset, the status reads `unknown` until a fresh probe, and the gap is
+/// part of the record (D-007). One row per gap, not one per lost slot: coverage already
+/// counts expected slots from elapsed time, and a catch-up burst is exactly what the
+/// schedule refuses elsewhere. Returns how many monitors had a gap.
+pub async fn record_downtime(
+    writer: &monitor_db::WriterHandle,
+    db: &Db,
+    monitors: &[Monitor],
+    now: OffsetDateTime,
+    dispatch_grace: Duration,
+) -> Result<usize, monitor_db::WriterError> {
+    let mut gaps = 0;
+    for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
+        let Some(last) = db.last_slot_at(monitor.id).await? else {
+            continue; // never observed: nothing to be stale about
+        };
+        let interval = time::Duration::try_from(monitor.interval).unwrap_or(time::Duration::MAX);
+        let grace = time::Duration::try_from(monitor.interval.min(dispatch_grace))
+            .unwrap_or(time::Duration::ZERO);
+        if now - last <= interval + grace {
+            continue; // the next slot was not yet overdue: no gap
+        }
+        writer
+            .record(monitor_db::Observation {
+                monitor_id: monitor.id,
+                generation: monitor.generation,
+                slot_at: last + interval,
+                slot: monitor_domain::SlotObservation::Missed,
+                http_status: None,
+                latency_ms: None,
+                detail: None,
+            })
+            .await?;
+        gaps += 1;
+    }
+    Ok(gaps)
+}
+
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/monitors", get(list_monitors).post(create_monitor))

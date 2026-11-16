@@ -43,7 +43,7 @@ the flag and expiry.
 | Monitor host down | heartbeat expires → "monitoring unavailable" |
 | Process alive, writer/coordinator dead or stalled | next beat is born expired, all `unknown`, `monitoring: unavailable` (`a_dead_engine_stops_the_heartbeat_reading_fresh`) |
 | Snapshot stale | page shows its age; expired snapshot warns explicitly |
-| Monitor restarted, no fresh data | services show `unknown`, not guessed states |
+| Monitor restarted, no fresh data | services show `unknown`, not guessed states — the boot records the downtime gap before the first beat (D-014) |
 
 ## Testing parameters
 

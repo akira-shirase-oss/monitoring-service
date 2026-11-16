@@ -38,6 +38,7 @@ Local file, WAL mode, foreign keys on — no server database, no Redis (guide de
 | Writer task dies | the supervisor sees the exit → `/readyz` 503 `writer exited`/`writer panicked`, statuses `unknown` (`a_dead_writer_makes_the_monitor_report_unavailable`) |
 | Full disk | admission/write fails safely and visibly (module 08 guardrails). The `SMON_MAX_DB_BYTES` ceiling is `PRAGMA max_page_count`, which SQLite scopes to one connection — it is applied in the pool's `after_connect` hook, so every pooled connection (including ones reopened after idle/lifetime expiry) carries it; `a_capped_store_refuses_growth_on_every_connection` holds all four at once |
 | Restart | open incidents reload; streaks rebuild from stored outcomes |
+| Restart after downtime longer than one interval + grace | one `missed` row per monitor at the first lost slot (D-014): streaks reset, status `unknown` until a fresh probe (`downtime_is_a_gap_failures_either_side_are_not_consecutive`) |
 
 ## Testing parameters
 
