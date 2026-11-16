@@ -143,6 +143,7 @@ const LOCAL_V6: &[(Ipv6Addr, u8)] = &[
     (Ipv6Addr::UNSPECIFIED, 96), // ::/96 — unspecified, loopback, v4-compatible
     (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48), // local-use NAT64
     (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64), // discard-only
+    (Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64), // dummy prefix (RFC 9780)
     (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23), // IETF protocol assignments
     (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32), // documentation
     (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // documentation (RFC 9637)
@@ -554,6 +555,8 @@ mod tests {
             "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", // local-use NAT64 /48
             "100::",
             "100::ffff:ffff:ffff:ffff", // discard-only 100::/64
+            "100:0:0:1::",
+            "100:0:0:1:ffff:ffff:ffff:ffff", // dummy prefix 100:0:0:1::/64 (RFC 9780)
             "2001::",
             "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // IETF 2001::/23 (Teredo…)
             "2001:db8::",
@@ -581,6 +584,7 @@ mod tests {
             "2001:4860:4860::8888",
             "2001:db9::1",
             "2606:4700:4700::1111",
+            "100:0:0:2::1",
             "3fff:1000::1",
             "5f01::1",
             "fbff::1",

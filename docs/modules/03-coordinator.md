@@ -34,7 +34,7 @@ it to the writer — without ever letting a slow target stall the schedule.
   literal: every non-global block of the IANA IPv4 and IPv6 special-purpose registries
   rejected unless `SMON_PROFILE=lab` — 0/8, 10/8, 100.64/10 (CGNAT), 127/8,
   169.254/16, 172.16/12, 192.0.0/24, the three TEST-NETs, 192.88.99/24, 192.168/16,
-  198.18/15, 224/4, 240/4 (incl. broadcast); `::/96`, 64:ff9b:1::/48, 100::/64,
+  198.18/15, 224/4, 240/4 (incl. broadcast); `::/96`, 64:ff9b:1::/48, 100::/64, 100:0:0:1::/64 (RFC 9780),
   2001::/23, 2001:db8::/32, 3fff::/20, 5f00::/16, fc00::/7, fe80::/10, fec0::/10,
   ff00::/8 — and v4-mapped, NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses are
   judged by the IPv4 address they embed (`LOCAL_V4`/`LOCAL_V6` in `probe.rs`). DNS layer — `PolicyResolver` validates every address the OS answer
