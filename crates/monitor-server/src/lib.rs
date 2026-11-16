@@ -11,6 +11,7 @@ pub mod logfile;
 pub mod probe;
 pub mod redact;
 pub mod schedule;
+pub mod serve;
 pub mod snapshot;
 pub mod vitals;
 

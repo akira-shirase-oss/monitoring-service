@@ -16,6 +16,7 @@ use monitor_server::config::Config;
 use monitor_server::deliver::{Config as DelivererConfig, Deliverer, Sink};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config as CoordinatorConfig, Coordinator};
+use monitor_server::serve::{Stopped, serve};
 use monitor_server::vitals::{Role, Supervisor, Vitals};
 use monitor_server::{AppState, load_registry, rebuild_health, record_downtime, router};
 use tokio::sync::watch;
@@ -100,24 +101,15 @@ async fn main() -> anyhow::Result<()> {
     record_boot_gaps(&writer, &db, &monitors, coordinator_config.dispatch_grace).await;
     let (registry_tx, registry_rx) = watch::channel(Arc::new(monitors));
 
-    let probes = ProbeClient::new(
-        ProbePolicy {
-            allow_local_targets: config.lab,
-            extra_roots: Vec::new(),
-        },
-        64 * 1024,
-    )
-    .context("building the probe client")?;
-
-    let coordinator_task = Coordinator::spawn(
+    spawn_coordinator(
+        &config,
         registry_rx,
-        writer.clone(),
-        probes,
+        &writer,
         coordinator_config,
-        vitals.clone(),
-        shutdown.clone(),
-    );
-    supervisor.watch("coordinator", Role::Observing, coordinator_task);
+        &vitals,
+        &shutdown,
+        &supervisor,
+    )?;
 
     // Alerts only run when a receiver is configured; without one, outbox events stay pending
     // in the table — visible, never silently dropped.
@@ -134,6 +126,8 @@ async fn main() -> anyhow::Result<()> {
         spawn_retention(&config, &db, &writer, &shutdown),
     );
 
+    let snapshot_db = db.clone();
+    let snapshot_statuses = Arc::clone(&statuses);
     let app = router(AppState {
         db,
         statuses,
@@ -161,8 +155,48 @@ async fn main() -> anyhow::Result<()> {
         "monitor-server listening"
     );
 
-    serve_until_stopped(listener, app, stop, shutdown, vitals).await?;
+    let stopped = serve(
+        listener,
+        app,
+        stop,
+        supervisor.engine_failure(),
+        shutdown,
+        vitals,
+        HTTP_DRAIN,
+    )
+    .await?;
+    finish(
+        stopped,
+        &supervisor,
+        writer,
+        &snapshot_db,
+        &snapshot_statuses,
+        &config,
+    )
+    .await
+}
 
+/// After serving stops: on an engine failure, one honest "monitoring unavailable" beat
+/// first; then the engine drain; then the exit code — 0 for a signal, an error (exit 1)
+/// for an engine failure so `Restart=on-failure` / launchd `KeepAlive` restart it.
+async fn finish(
+    stopped: Stopped,
+    supervisor: &Supervisor,
+    writer: monitor_db::writer::WriterHandle,
+    db: &monitor_db::Db,
+    statuses: &SharedStatuses,
+    config: &Config,
+) -> anyhow::Result<()> {
+    if matches!(stopped, Stopped::EngineFailed(_)) {
+        let beat = monitor_server::snapshot::Config {
+            dir: config.status_dir.clone().into(),
+            interval: config.status_interval,
+            ttl: config.status_ttl,
+        };
+        if let Err(error) = monitor_server::snapshot::write_beat(db, statuses, &beat, false).await {
+            tracing::error!(%error, "final unavailable snapshot not written");
+        }
+    }
     // The HTTP side is down; let the engine finish. Main's writer handle goes first — the
     // writer exits once every handle is gone, after committing what is already queued.
     drop(writer);
@@ -171,7 +205,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::warn!("engine tasks still running at the drain deadline");
     }
-    Ok(())
+    match stopped {
+        Stopped::Signal(_) => Ok(()),
+        Stopped::EngineFailed(cause) => Err(anyhow::anyhow!(
+            "monitoring engine failed ({cause}); exiting so the service manager restarts it"
+        )),
+    }
 }
 
 /// The public snapshot served unmodified at /status.json — outside /api, so public viewers
@@ -190,6 +229,37 @@ fn with_static_files(app: axum::Router, status_dir: &str, dashboard_dir: &str) -
         tracing::info!(dir = %dashboard_dir, "dashboard not built; API only");
         app
     }
+}
+
+/// The coordinator and its probe client (the SSRF policy follows `SMON_PROFILE`), owned
+/// by the supervisor as an observing task.
+fn spawn_coordinator(
+    config: &Config,
+    registry: watch::Receiver<Arc<Vec<monitor_domain::Monitor>>>,
+    writer: &monitor_db::writer::WriterHandle,
+    coordinator_config: CoordinatorConfig,
+    vitals: &Vitals,
+    shutdown: &CancellationToken,
+    supervisor: &Supervisor,
+) -> anyhow::Result<()> {
+    let probes = ProbeClient::new(
+        ProbePolicy {
+            allow_local_targets: config.lab,
+            extra_roots: Vec::new(),
+        },
+        64 * 1024,
+    )
+    .context("building the probe client")?;
+    let coordinator_task = Coordinator::spawn(
+        registry,
+        writer.clone(),
+        probes,
+        coordinator_config,
+        vitals.clone(),
+        shutdown.clone(),
+    );
+    supervisor.watch("coordinator", Role::Observing, coordinator_task);
+    Ok(())
 }
 
 /// D-014: commit the downtime gap for every monitor that slept through a slot. A failure
@@ -367,43 +437,6 @@ fn stop_signal() -> std::io::Result<impl std::future::Future<Output = &'static s
             }
         }
     })
-}
-
-/// Serve until a stop signal, then drain in order: readiness off and the engine told to
-/// stop at once (`begin_drain`, `cancel`), open HTTP requests given `HTTP_DRAIN` — axum
-/// alone would wait for them forever — and the caller drains the engine tasks after.
-async fn serve_until_stopped(
-    listener: tokio::net::TcpListener,
-    app: axum::Router,
-    stop: impl std::future::Future<Output = &'static str> + Send + 'static,
-    shutdown: CancellationToken,
-    vitals: Vitals,
-) -> std::io::Result<()> {
-    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
-    let graceful = async move {
-        let signal = stop.await;
-        tracing::info!(signal, "shutting down");
-        // Readiness goes false before anything stops, and stays false.
-        vitals.begin_drain();
-        shutdown.cancel();
-        let _ = stopping_tx.send(());
-    };
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(graceful)
-        .into_future();
-    let deadline = async move {
-        if stopping_rx.await.is_err() {
-            std::future::pending::<()>().await;
-        }
-        tokio::time::sleep(HTTP_DRAIN).await;
-    };
-    tokio::select! {
-        result = server => result,
-        () = deadline => {
-            tracing::warn!("HTTP drain deadline hit; abandoning open requests");
-            Ok(())
-        }
-    }
 }
 
 /// The database URL is local-only, but keep a habit: never log a URL whole — parameters may

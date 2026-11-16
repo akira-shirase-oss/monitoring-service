@@ -94,6 +94,15 @@ recorded.
 Statuses are not rewritten in the store: `unknown` is a property of *serving* while the
 engine is down, and the committed history stays exactly what was observed.
 
+*Amended 2026-11-16.* Honest is not enough: a process that stays up without its writer
+or coordinator never heals, and the service manager never restarts it. When an
+**observing** task stops outside shutdown the supervisor raises an engine failure;
+serving stops, one born-expired `monitoring: unavailable` beat is written at once, the
+engine drains, and the process exits non-zero, so systemd `Restart=on-failure` or launchd
+`KeepAlive` restarts it and the boot records the gap (D-014). Supporting tasks stay
+*degraded*, with no exit. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
+and `a_supporting_task_stopping_keeps_serving`.
+
 ## D-010 — Certificate trust is deterministic: webpki-roots, never the local store
 
 A monitor should report what a *public* client sees. Reqwest's default on macOS delegates

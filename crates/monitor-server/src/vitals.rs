@@ -200,6 +200,37 @@ pub struct Supervisor {
     vitals: Vitals,
     shutdown: CancellationToken,
     tracker: TaskTracker,
+    failure: EngineFailure,
+}
+
+/// Raised when an `Observing` task stops outside shutdown. Honest "unavailable" is only half
+/// the answer: a process that stays alive without its writer or coordinator never heals,
+/// and `Restart=on-failure` never fires. Whoever owns the process waits on this, then
+/// exits non-zero so the service manager restarts it (D-011).
+#[derive(Debug, Clone, Default)]
+pub struct EngineFailure {
+    raised: CancellationToken,
+    cause: Arc<Mutex<Option<String>>>,
+}
+
+impl EngineFailure {
+    fn raise(&self, cause: String) {
+        self.cause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(cause);
+        self.raised.cancel();
+    }
+
+    /// Resolves with the first failure's cause (`"writer panicked"`, …).
+    pub async fn wait(&self) -> String {
+        self.raised.cancelled().await;
+        self.cause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| "an engine task stopped".to_owned())
+    }
 }
 
 impl Supervisor {
@@ -208,13 +239,20 @@ impl Supervisor {
             vitals,
             shutdown,
             tracker: TaskTracker::new(),
+            failure: EngineFailure::default(),
         }
+    }
+
+    /// The handle the process owner waits on to exit when observation stops.
+    pub fn engine_failure(&self) -> EngineFailure {
+        self.failure.clone()
     }
 
     /// Watch one engine task until it ends.
     pub fn watch(&self, task: &'static str, role: Role, handle: JoinHandle<()>) {
         let vitals = self.vitals.clone();
         let shutdown = self.shutdown.clone();
+        let failure = self.failure.clone();
         self.tracker.spawn(async move {
             let how = match handle.await {
                 Ok(()) if shutdown.is_cancelled() => return,
@@ -228,6 +266,9 @@ impl Supervisor {
             };
             tracing::error!(task, how, ?role, "engine task stopped outside shutdown");
             vitals.task_stopped(task, role, how);
+            if role == Role::Observing {
+                failure.raise(format!("{task} {how}"));
+            }
         });
     }
 
