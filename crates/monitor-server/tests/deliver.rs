@@ -334,15 +334,21 @@ async fn no_target_means_pending_not_dropped() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn pending_events_survive_a_deliverer_restart() -> anyhow::Result<()> {
-    // Deliverer A targets a dead port: the attempt fails, a retry is booked, the process
-    // goes away. Deliverer B (the "restart") picks the same pending row up and delivers it —
-    // the row, not the process, owns the event.
+    // Deliverer A targets a dead port: its attempt fails and is recorded, the process goes
+    // away. Deliverer B (the "restart") picks the same pending row up and delivers it — the
+    // row, not the process, owns the event.
+    //
+    // Deterministic on a loaded machine: A is allowed exactly one attempt, so it cannot
+    // book and run a second one between the read below and its cancel (it used to, at
+    // load average ~370: attempts 3, not 2). B, with more attempts left, finds the row due
+    // at once.
     let (db, writer) = rig().await?;
     let (monitor, _event) = monitor_with_event(&db, &writer, "fixture").await?;
 
     let shutdown_a = CancellationToken::new();
     let mut dead = fast_config();
     dead.attempt_deadline = Duration::from_millis(200);
+    dead.max_attempts = 1;
     let task_a = Deliverer::spawn(
         db.clone(),
         writer.clone(),
@@ -356,6 +362,13 @@ async fn pending_events_survive_a_deliverer_restart() -> anyhow::Result<()> {
         "failed attempt recorded before the restart"
     );
     assert!(row.delivered_at.is_none());
+    // However long the restart takes, A has nothing more to do.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let row = wait_row(&db, &monitor, |_| true).await?;
+    assert_eq!(
+        row.attempts, 1,
+        "no second attempt by the stopping deliverer"
+    );
     shutdown_a.cancel();
     task_a.await?;
 
