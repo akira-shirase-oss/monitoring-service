@@ -65,6 +65,9 @@ pub struct AppState {
     /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
     /// they keep history). Bounds the schedule and every per-monitor table (D-012).
     pub max_monitors: u64,
+    /// `SMON_PROFILE=lab`: local/private targets may be registered (fixtures). Otherwise
+    /// a URL the SSRF guard would refuse is refused at registration (D-013).
+    pub allow_local_targets: bool,
     pub version: &'static str,
 }
 
@@ -337,6 +340,7 @@ async fn create_monitor(
         ),
     }
     .map_err(ApiError::Validation)?;
+    check_target(&state, &new.url)?;
     let new = match (input.failures_to_open, input.passes_to_recover) {
         (None, None) => new,
         (fail, recover) => new
@@ -406,6 +410,9 @@ async fn patch_monitor(
         passes_to_recover: input.passes_to_recover,
         paused: input.paused,
     };
+    if let Some(url) = &patch.url {
+        check_target(&state, url)?;
+    }
     let merged = patch.apply(&monitor).map_err(ApiError::Validation)?;
     if state
         .db
@@ -441,6 +448,17 @@ async fn delete_monitor(
     }
     publish_registry(&state).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A target the SSRF guard would refuse can never be observed — registering it would only
+/// turn the monitor's own refusal into a "down" target and a page. Names are checked again
+/// at every probe (the DNS answer can change); this catches literals up front.
+fn check_target(state: &AppState, url: &url::Url) -> Result<(), ApiError> {
+    let policy = probe::ProbePolicy {
+        allow_local_targets: state.allow_local_targets,
+        extra_roots: Vec::new(),
+    };
+    policy.check(url).map_err(|_| ApiError::RefusedTarget)
 }
 
 #[derive(Debug, Deserialize)]
@@ -812,6 +830,11 @@ pub enum ApiError {
     Conflict(String),
     #[error("monitor limit reached ({0}); delete an unused monitor first")]
     LimitReached(u64),
+    #[error(
+        "the monitor refuses to probe local, private or reserved addresses (SSRF policy); \
+         SMON_PROFILE=lab allows them for local fixtures"
+    )]
+    RefusedTarget,
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error("stored data violates the contract")]
@@ -829,6 +852,7 @@ impl ApiError {
             }
             Self::Conflict(_) => "conflict",
             Self::LimitReached(_) => "limit_reached",
+            Self::RefusedTarget => "refused_target",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
         }
@@ -837,9 +861,11 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadId | Self::BadUrl | Self::Validation(_) | Self::Invalid(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            Self::BadId
+            | Self::BadUrl
+            | Self::Validation(_)
+            | Self::Invalid(_)
+            | Self::RefusedTarget => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict(_) | Self::LimitReached(_) => StatusCode::CONFLICT,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

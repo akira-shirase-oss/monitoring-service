@@ -282,12 +282,21 @@ impl Plan {
             tracker.spawn(async move {
                 // The permits ride inside `dispatch` and release when the task ends.
                 let result = probes.probe(&dispatch.url, dispatch.deadline).await;
+                // A probe the SSRF guard refused never contacted the target: it is the
+                // monitor declining to look, not evidence the target failed (D-013). It
+                // commits as `missed` — streaks reset, no incident, status `unknown` — and
+                // keeps the refusal as its detail.
+                let refused = result.detail == Some(crate::probe::REJECTED_LOCAL);
                 let observation = Observation {
                     monitor_id: dispatch.monitor_id,
                     generation: dispatch.generation,
                     slot_at: dispatch.slot_at,
-                    slot: SlotObservation::Probe(result.outcome),
-                    http_status: result.http_status,
+                    slot: if refused {
+                        SlotObservation::Missed
+                    } else {
+                        SlotObservation::Probe(result.outcome)
+                    },
+                    http_status: if refused { None } else { result.http_status },
                     latency_ms: Some(u64::try_from(result.latency.as_millis()).unwrap_or(u64::MAX)),
                     detail: result.detail.map(str::to_owned),
                 };

@@ -2,6 +2,24 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-013 — A probe the monitor refused is a missed slot, not a target failure
+
+The SSRF guard refuses local/private/reserved targets before any socket opens. Those
+refusals were committed as `transport` failures, so a loopback literal registered by
+mistake — or a public name whose DNS answer turned private — opened an incident and paged
+about a target nobody had contacted. That is the monitor reporting its own refusal as the
+target being down.
+
+- **At registration:** create (and a PATCH that sets a URL) runs the same
+  `ProbePolicy::check` the probe runs; under the strict profile a refused literal answers
+  422 `refused_target` and is never stored. `SMON_PROFILE=lab` is the explicit opt-in.
+- **At probe time** (names can change their answers): a `rejected_local` probe commits as
+  `missed` with detail `rejected_local` — streaks reset, no incident, status `unknown`,
+  coverage drops. The detail keeps the reason visible in the evidence strip.
+
+A redirect *to* a refused target is unchanged: the 3xx is the target's own answer and
+stays `http_fail` evidence.
+
 ## D-012 — Every table has a horizon; the monitor count has a cap
 
 Retention used to exempt *every* raw row of a monitor with an open incident (one

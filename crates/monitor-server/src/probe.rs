@@ -16,6 +16,10 @@ use monitor_domain::CheckOutcome;
 /// Redirects followed per hop, each revalidated — a hop limit, never a free pass.
 const MAX_REDIRECT_HOPS: usize = 5;
 
+/// The committed detail for a probe the SSRF guard refused (a local address, by literal or
+/// by DNS answer). The coordinator records such a slot as `missed` (D-013).
+pub const REJECTED_LOCAL: &str = "rejected_local";
+
 /// Targets the monitor refuses to contact. Two layers, both M5-complete:
 ///  * URL layer — scheme and IP literals, checked at registration and per redirect hop;
 ///  * DNS layer — every address a name resolves to must pass `is_local` too, enforced by
@@ -301,7 +305,7 @@ impl ProbeClient {
                 outcome: CheckOutcome::Transport,
                 http_status: None,
                 latency: start.elapsed(),
-                detail: Some("rejected_local"),
+                detail: Some(REJECTED_LOCAL),
             },
             Ok(Attempt::Failed(error)) if error.is_timeout() => ProbeResult {
                 outcome: CheckOutcome::Timeout,
@@ -378,7 +382,7 @@ fn classify(error: &reqwest::Error) -> &'static str {
     let mut cause: Option<&dyn std::error::Error> = std::error::Error::source(error);
     while let Some(e) = cause {
         if e.is::<ResolvedLocal>() {
-            return "rejected_local";
+            return REJECTED_LOCAL;
         }
         // TLS errors ride the connect chain, wrapped one or more levels inside
         // io::Error inner refs — recurse until the error or the wrap chain ends.

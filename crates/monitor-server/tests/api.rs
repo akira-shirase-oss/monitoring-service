@@ -42,6 +42,7 @@ async fn app() -> anyhow::Result<(
         session_ttl: Duration::from_hours(12),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        allow_local_targets: false,
         version: "test",
     });
     Ok((app, statuses, db, write_health, tmp))
@@ -763,6 +764,7 @@ async fn auth_denies_without_a_valid_bearer_token() {
         session_ttl: Duration::from_hours(12),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        allow_local_targets: false,
         version: "test",
     };
     let app = monitor_server::router(state);
@@ -833,6 +835,7 @@ async fn authed_with(
         session_ttl: ttl,
         cookie_secure,
         max_monitors: 100,
+        allow_local_targets: false,
         version: "test",
     };
     Ok((monitor_server::router(state), db, tmp))
@@ -1140,6 +1143,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         session_ttl: Duration::from_hours(12),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        allow_local_targets: false,
         version: "test",
     });
 
@@ -1213,6 +1217,7 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         session_ttl: Duration::from_hours(12),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 2,
+        allow_local_targets: false,
         version: "test",
     });
     let create = |n: usize| serde_json::json!({ "name": format!("m{n}"), "url": format!("https://m{n}.example.com/") });
@@ -1297,4 +1302,84 @@ async fn the_session_cookie_is_secure_whenever_the_request_came_over_tls() {
         let cookie = cookie_header(&always, path, &[]).await.unwrap();
         assert!(cookie.contains("; Secure"), "always, {path}: {cookie}");
     }
+}
+
+/// Refused-target honesty, at registration: a target the SSRF policy will refuse can't be
+/// registered (or edited in) under the strict profile — it would only ever report the
+/// monitor's own refusal as the target being down. The lab profile still allows fixtures.
+#[tokio::test]
+async fn refused_targets_cannot_be_registered_outside_the_lab_profile() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    for url in [
+        "http://127.0.0.1:9/health",
+        "http://[::1]/",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.7:8080/",
+        "http://100.64.0.1/",
+    ] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/monitors",
+            Some(serde_json::json!({ "name": "internal", "url": url })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{url}: {body}");
+        assert_eq!(body["error"]["code"], "refused_target", "{url}");
+    }
+
+    // Editing a public monitor onto a refused address is refused the same way.
+    let (status, created) = send(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({ "name": "public", "url": "https://example.com/health" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_owned();
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{id}"),
+        Some(serde_json::json!({ "url": "http://192.168.1.1/" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "refused_target");
+
+    // The lab profile is the explicit opt-in for local fixtures.
+    let (lab, _db, _tmp) = lab_app().await.unwrap();
+    let (status, _) = send(
+        &lab,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({ "name": "fixture", "url": "http://127.0.0.1:9/health" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("lab.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let app = router(AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: true,
+        version: "test",
+    });
+    Ok((app, db, tmp))
 }

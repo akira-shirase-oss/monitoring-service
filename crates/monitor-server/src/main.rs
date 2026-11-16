@@ -136,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         session_ttl: config.session_ttl,
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
+        allow_local_targets: config.lab,
         version: env!("CARGO_PKG_VERSION"),
     });
 
