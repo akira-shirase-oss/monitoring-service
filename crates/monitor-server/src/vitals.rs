@@ -123,6 +123,12 @@ impl Vitals {
             .store(self.now_ms(), Ordering::Relaxed);
     }
 
+    /// How long the coordinator has gone without a loop pass; `None` before it first beats.
+    pub fn coordinator_silence(&self) -> Option<Duration> {
+        let beat = self.inner.coordinator_beat_ms.load(Ordering::Relaxed);
+        (beat != NO_COORDINATOR).then(|| Duration::from_millis(self.now_ms().saturating_sub(beat)))
+    }
+
     /// Shutdown has begun: readiness goes false and stays false.
     pub fn begin_drain(&self) {
         self.inner.draining.store(true, Ordering::Relaxed);
@@ -299,6 +305,38 @@ impl Supervisor {
             vitals.task_stopped(task, role, how);
             if role == Role::Observing {
                 failure.raise(format!("{task} {how}"));
+            }
+        });
+    }
+
+    /// Watch the coordinator's heartbeat: a coordinator that is alive but makes no loop
+    /// pass for longer than `limit` never "stops", so without this it would stay
+    /// unavailable forever. Past the limit it is an engine failure like a dead task — the
+    /// process exits and the service manager restarts it (D-011). Checked every `every`;
+    /// ends on shutdown.
+    pub fn watch_stall(&self, limit: Duration, every: Duration) {
+        let vitals = self.vitals.clone();
+        let shutdown = self.shutdown.clone();
+        let failure = self.failure.clone();
+        self.tracker.spawn(async move {
+            let mut ticks = tokio::time::interval(every);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    () = shutdown.cancelled() => return,
+                }
+                if let Some(silent) = vitals.coordinator_silence()
+                    && silent > limit
+                {
+                    let cause = format!(
+                        "coordinator stalled (no schedule pass for {}s)",
+                        silent.as_secs()
+                    );
+                    tracing::error!(%cause, "engine stalled past its limit");
+                    failure.raise(cause);
+                    return;
+                }
             }
         });
     }

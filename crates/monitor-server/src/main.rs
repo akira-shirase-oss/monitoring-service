@@ -30,6 +30,9 @@ const WRITER_BOUND: usize = 64;
 /// A coordinator that makes no loop pass for this long is stalled: its statuses are frozen,
 /// so the engine reports unavailable. The loop ticks every second when healthy.
 const COORDINATOR_STALL: Duration = Duration::from_secs(30);
+/// A stall this long is not going to clear by itself: exit so the service manager restarts
+/// the process (D-011).
+const COORDINATOR_STALL_EXIT: Duration = Duration::from_secs(120);
 /// How long shutdown waits for the engine tasks (coordinator drain, in-flight deliveries,
 /// the writer's queued commits) after the HTTP server has stopped.
 const ENGINE_DRAIN: Duration = Duration::from_secs(15);
@@ -259,6 +262,7 @@ fn spawn_coordinator(
         shutdown.clone(),
     );
     supervisor.watch("coordinator", Role::Observing, coordinator_task);
+    supervisor.watch_stall(COORDINATOR_STALL_EXIT, Duration::from_secs(5));
     Ok(())
 }
 

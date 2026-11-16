@@ -106,8 +106,11 @@ or coordinator never heals, and the service manager never restarts it. When an
 **observing** task stops outside shutdown the supervisor raises an engine failure;
 serving stops, one born-expired `monitoring: unavailable` beat is written at once, the
 engine drains, and the process exits non-zero, so systemd `Restart=on-failure` or launchd
-`KeepAlive` restarts it and the boot records the gap (D-014). Supporting tasks stay
-*degraded*, with no exit. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
+`KeepAlive` restarts it and the boot records the gap (D-014). A coordinator that is alive
+but makes no loop pass for 2 minutes (4 × the 30 s stall threshold) is treated the same
+way — a stall that long will not clear by itself. Supporting tasks stay *degraded*, with
+no exit. The systemd unit's start limit (5 starts in 10 minutes) turns a deterministic
+crash into a visible `failed` unit rather than an endless 3-second loop. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
 and `a_supporting_task_stopping_keeps_serving`.
 
 ## D-010 — Certificate trust is deterministic: webpki-roots, never the local store

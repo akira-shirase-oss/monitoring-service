@@ -96,3 +96,57 @@ async fn a_supporting_task_stopping_keeps_serving() -> anyhow::Result<()> {
     assert_eq!(stopped, Stopped::Signal("SIGTERM"));
     Ok(())
 }
+
+/// A coordinator that is alive but stuck never "stops", so it used to stay `unavailable`
+/// forever. The stall watchdog turns a stall longer than its limit into the same engine
+/// failure as a dead task — exit, restart, record the gap.
+#[tokio::test]
+async fn a_coordinator_stalled_past_the_limit_ends_serving_as_an_engine_failure()
+-> anyhow::Result<()> {
+    let vitals = Vitals::new(Arc::default(), Duration::from_millis(20));
+    let shutdown = CancellationToken::new();
+    let supervisor = Supervisor::new(vitals.clone(), shutdown.clone());
+    vitals.coordinator_beat(); // one pass, then silence
+    supervisor.watch_stall(Duration::from_millis(150), Duration::from_millis(20));
+    let stopped = tokio::time::timeout(
+        Duration::from_secs(10),
+        serve(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+            app(),
+            std::future::pending(),
+            supervisor.engine_failure(),
+            shutdown,
+            vitals,
+            Duration::from_secs(2),
+        ),
+    )
+    .await
+    .expect("a stalled coordinator must end serving, not stay unavailable forever")?;
+    let Stopped::EngineFailed(cause) = stopped else {
+        panic!("expected an engine failure, got {stopped:?}");
+    };
+    assert!(cause.starts_with("coordinator stalled"), "{cause}");
+    Ok(())
+}
+
+/// A healthy coordinator keeps beating; the watchdog stays quiet.
+#[tokio::test]
+async fn a_beating_coordinator_is_never_called_stalled() -> anyhow::Result<()> {
+    let vitals = Vitals::new(Arc::default(), Duration::from_millis(20));
+    let shutdown = CancellationToken::new();
+    let supervisor = Supervisor::new(vitals.clone(), shutdown.clone());
+    supervisor.watch_stall(Duration::from_millis(150), Duration::from_millis(20));
+    let failure = supervisor.engine_failure();
+    for _ in 0..30 {
+        vitals.coordinator_beat();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let raised = tokio::time::timeout(Duration::from_millis(1), failure.wait()).await;
+    assert!(
+        raised.is_err(),
+        "no failure while the coordinator keeps beating"
+    );
+    shutdown.cancel();
+    assert!(supervisor.drain(Duration::from_secs(2)).await);
+    Ok(())
+}

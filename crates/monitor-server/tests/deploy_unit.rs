@@ -135,3 +135,39 @@ fn the_runbook_upgrade_covers_moving_a_root_install_to_smon() {
         );
     }
 }
+
+/// `[Unit]` settings (where systemd's start-limit keys live).
+fn unit_setting(key: &str) -> Option<&'static str> {
+    let mut in_unit = false;
+    let mut found = None;
+    for line in UNIT.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_unit = line == "[Unit]";
+            continue;
+        }
+        if in_unit
+            && let Some((name, value)) = line.split_once('=')
+            && name.trim() == key
+        {
+            found = Some(value.trim());
+        }
+    }
+    found
+}
+
+/// A deterministic crash (a writer panic on every boot) must not restart forever every 3 s:
+/// past the start limit the unit is left `failed` — a state an operator (and the expiring
+/// public heartbeat) can see — instead of a silent loop.
+#[test]
+fn the_unit_stops_restarting_a_crash_loop() {
+    let interval: u64 = unit_setting("StartLimitIntervalSec")
+        .and_then(|value| value.trim_end_matches('s').parse().ok())
+        .expect("[Unit] must set StartLimitIntervalSec in seconds");
+    let burst: u64 = unit_setting("StartLimitBurst")
+        .and_then(|value| value.parse().ok())
+        .expect("[Unit] must set StartLimitBurst");
+    assert!(
+        burst >= 2 && interval >= burst * 3,
+        "{burst} starts in {interval}s"
+    );
+}
