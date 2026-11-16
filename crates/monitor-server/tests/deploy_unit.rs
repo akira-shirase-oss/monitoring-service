@@ -90,3 +90,48 @@ fn the_env_template_has_no_inline_comments_and_its_examples_parse() {
         panic!("the template's example values must boot: {error}");
     }
 }
+
+const PLIST: &str = include_str!("../../../deploy/com.shirase.smon.plist");
+const RUNBOOK: &str = include_str!("../../../deploy/RUNBOOK.md");
+
+/// launchd sends SIGTERM, then SIGKILL after `ExitTimeOut` (its default is shorter than
+/// the server's 12 s HTTP + 15 s engine drain), so `launchctl kickstart -k` could cut the
+/// drain short.
+#[test]
+fn the_launchd_job_waits_out_the_drain() {
+    let after_key = PLIST
+        .split("<key>ExitTimeOut</key>")
+        .nth(1)
+        .expect("the plist must set ExitTimeOut");
+    let seconds: u64 = after_key
+        .split("<integer>")
+        .nth(1)
+        .and_then(|rest| rest.split("</integer>").next())
+        .and_then(|value| value.trim().parse().ok())
+        .expect("ExitTimeOut is an <integer>");
+    assert!(
+        seconds > 12 + 15,
+        "ExitTimeOut={seconds} cuts the drain short"
+    );
+}
+
+/// Re-copying the new unit onto an install that ran as root fails (217/USER without the
+/// account; SQLite can't write root-owned data/). The upgrade section must carry the steps.
+#[test]
+fn the_runbook_upgrade_covers_moving_a_root_install_to_smon() {
+    let upgrade = RUNBOOK
+        .split("## Upgrade")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("RUNBOOK has an Upgrade section");
+    for step in [
+        "useradd --system",
+        "chown -R smon:smon /opt/smon/data /opt/smon/status",
+        "daemon-reload",
+    ] {
+        assert!(
+            upgrade.contains(step),
+            "Upgrade section is missing `{step}`"
+        );
+    }
+}

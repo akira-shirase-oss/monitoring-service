@@ -76,6 +76,22 @@ own line first; this lists the offending lines:
 grep -nE '^[[:space:]]*SMON_[A-Z_]+=.*[[:space:]]#' /opt/smon/env
 ```
 
+**Upgrading an install that ran as root** (units from before the `smon` user). The new
+unit sets `User=smon`; restarting without the account fails with `217/USER`, and without
+the ownership change SQLite cannot write `data/`. Once, before the normal steps below:
+
+```sh
+sudo systemctl stop monitor-server
+sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
+sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # store, -wal/-shm, logs, snapshot
+sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env
+sudo cp deploy/monitor-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Then check `env` against the strict parser (inline comments above; an admin token of at
+least 32 bytes) and continue:
+
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # new release dir, repoints current
 sudo systemctl restart monitor-server           # or: launchctl kickstart -k system/com.shirase.smon
