@@ -19,14 +19,19 @@ use monitor_domain::{Effect, Health, MonitorId, SlotObservation, Statuses};
 
 use crate::{Db, QueryError, RetainReport, RetentionCutoffs};
 
+/// Rows of each kind one retention command handles (D-012). Small enough that one command
+/// stays short, so an observation queued behind retention waits for one batch, not for a
+/// whole first pass over months of history. Not a measured optimum.
+pub const RETAIN_BATCH: u32 = 5_000;
+
 /// The statuses readers see — written only after commits, never from in-flight results.
 pub type SharedStatuses = Arc<RwLock<Statuses>>;
 
-/// Consecutive store-write failures observed by the writer. `0` means the write path is
-/// healthy; anything above it means the last N commits failed (disk full, I/O error) and
-/// readers like `/readyz` must report unavailable rather than lie green. The counter is
-/// bumped by the writer on every failed commit and reset on the first successful one —
-/// recovery is proven by a landed write, not by a timer.
+/// Consecutive failed *observation* commits. `0` means evidence is landing; anything above
+/// it means the last N observations could not be stored (disk full, I/O error) and readers
+/// like `/readyz` must report unavailable rather than lie green. Bumped on every failed
+/// observation commit and reset on the first successful one — recovery is proven by a
+/// landed write, not by a timer. Retention and delivery bookkeeping do not count.
 pub type WriteHealth = Arc<AtomicU64>;
 
 /// One slot's product, sent to the writer by the coordinator.
@@ -82,6 +87,7 @@ enum Command {
     /// through the writer like everything else — the store has one owner.
     Retain {
         cutoffs: RetentionCutoffs,
+        batch: u32,
         reply: oneshot::Sender<Result<RetainReport, QueryError>>,
     },
 }
@@ -136,12 +142,35 @@ impl WriterHandle {
     /// aggregates; old aggregates, resolved incidents, ended windows and delivered outbox
     /// rows are pruned — one transaction. Open incidents are never touched.
     pub async fn retain(&self, cutoffs: RetentionCutoffs) -> Result<RetainReport, WriterError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Retain { cutoffs, reply })
-            .await
-            .map_err(|_| WriterError::Dead)?;
-        rx.await.map_err(|_| WriterError::Dead)?.map_err(Into::into)
+        self.retain_in_batches(cutoffs, RETAIN_BATCH).await
+    }
+
+    /// A full retention pass as a series of bounded writer commands — `batch` rows of each
+    /// kind per command, repeated until a batch comes back short. Every command is its own
+    /// transaction, so observations queued meanwhile commit between batches instead of
+    /// waiting out the whole pass. Returns the folded report.
+    pub async fn retain_in_batches(
+        &self,
+        cutoffs: RetentionCutoffs,
+        batch: u32,
+    ) -> Result<RetainReport, WriterError> {
+        let mut total = RetainReport::default();
+        loop {
+            let (reply, rx) = oneshot::channel();
+            self.tx
+                .send(Command::Retain {
+                    cutoffs,
+                    batch,
+                    reply,
+                })
+                .await
+                .map_err(|_| WriterError::Dead)?;
+            let report = rx.await.map_err(|_| WriterError::Dead)??;
+            total.add(&report);
+            if report.exhausted(batch) {
+                return Ok(total);
+            }
+        }
     }
 }
 
@@ -195,17 +224,23 @@ async fn run(
                 delivered_at,
                 reply,
             } => {
+                // Delivery bookkeeping is a supporting duty: its failure is the
+                // deliverer's to log and retry, not evidence that observing stopped.
                 let outcome = db
                     .update_delivery(&event_id, attempts, next_attempt_at, delivered_at)
                     .await;
-                track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("delivery reply channel closed; mark still committed");
                 }
             }
-            Command::Retain { cutoffs, reply } => {
-                let outcome = db.retain(&cutoffs).await;
-                track_write(&write_health, &outcome);
+            Command::Retain {
+                cutoffs,
+                batch,
+                reply,
+            } => {
+                // Retention is a supporting duty too: a failed pass degrades the monitor
+                // (the retention task reports it), it does not make it unavailable.
+                let outcome = db.retain(&cutoffs, batch).await;
                 if reply.send(outcome).is_err() {
                     debug!("retain reply channel closed; pass still committed");
                 }
@@ -214,8 +249,9 @@ async fn run(
     }
 }
 
-/// Commit landed → the write path is proven healthy; commit failed → consecutive failures
-/// grow. Dropped observations are *not* write failures — no commit was attempted.
+/// Observation commit landed → the write path is proven healthy; failed → consecutive
+/// failures grow. Only observation commits count (`WriteHealth` means "evidence is not
+/// landing"); dropped observations are not failures — no commit was attempted.
 fn track_write<T>(write_health: &WriteHealth, outcome: &Result<T, QueryError>) {
     match outcome {
         Ok(_) => write_health.store(0, Ordering::Relaxed),

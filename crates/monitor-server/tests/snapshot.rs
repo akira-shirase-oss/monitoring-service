@@ -214,3 +214,28 @@ async fn a_dead_engine_stops_the_heartbeat_reading_fresh() {
         "an unavailable beat must already be expired for expiry-only readers"
     );
 }
+
+/// The final beat an engine failure writes before the process exits: unavailable at once,
+/// not after the TTL runs out on a frozen "up".
+#[tokio::test]
+async fn a_final_beat_reads_unavailable_immediately() {
+    let dir = std::env::temp_dir().join(format!("smon-snap-final-{}", uuid::Uuid::now_v7()));
+    let db = Db::connect("sqlite::memory:", 1).await.unwrap();
+    db.migrate().await.unwrap();
+    let monitor = monitor("final");
+    db.insert_monitor(&monitor).await.unwrap();
+    let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::from([(monitor.id, Status::Up)])));
+    let config = snapshot::Config {
+        dir: dir.clone(),
+        interval: std::time::Duration::from_secs(30),
+        ttl: std::time::Duration::from_secs(90),
+    };
+    snapshot::write_beat(&db, &statuses, &config, false)
+        .await
+        .expect("beat written");
+    let snap: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("status.json")).unwrap()).unwrap();
+    assert_eq!(snap["monitoring"], "unavailable");
+    assert_eq!(snap["services"][0]["status"], "unknown");
+    assert_eq!(snap["expires_at"], snap["generated_at"]);
+}

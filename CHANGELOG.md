@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Security and correctness fixes (2026-11-16) — behaviour changes for existing users
+
+- **Alert payloads: `monitor.url` no longer carries the query, fragment or userinfo.**
+  The webhook payload's `monitor.url` and the email body now show scheme, host, port and
+  path only (`https://api.example.com/health?key=K` → `https://api.example.com/health`),
+  so credentials in a monitored URL don't reach a chat channel or an inbox. Receivers
+  that keyed on the full URL, or told monitors apart only by their query
+  (`/health?region=eu` vs `?region=us`), must key on `monitor.id` instead. Logs show the
+  webhook endpoint as `scheme://host[:port]` only.
+- **Strict configuration.** An invalid or blank `SMON_*` value stops the boot, listing
+  every problem; it no longer falls back to the default. Inline `# comments` after a
+  value are refused (systemd keeps them as part of the value) — move them onto their own
+  line (RUNBOOK, Upgrade). `SMON_PROFILE` accepts only `lab` or `production`;
+  `SMON_STATUS_TTL_S` must exceed `SMON_STATUS_INTERVAL_S`; `SMON_ADMIN_TOKEN`, when set,
+  must be at least 32 bytes with no whitespace or `#`.
+- **Registration refuses local targets** under the strict profile: a loopback, private
+  or reserved IP literal answers 422 `refused_target` (CGNAT `100.64/10` included).
+  Probe-time refusals (a name resolving locally, a redirect to a local name) stay
+  failures that page (D-013).
+- **Retention prunes every table (D-012)** — delivered alerts after 30 d, resolved
+  incidents and aggregates after 365 d — and runs at the disk cap. **`SMON_MAX_MONITORS`
+  caps monitors at 100** (409 `limit_reached`; paused monitors count): pass a higher
+  value for `perf/lab-profile.mjs --monitors >100`.
+- **Engine honesty (D-011):** a dead or stalled writer/coordinator reports
+  "monitoring unavailable" (`/readyz` 503, statuses `unknown`, a born-expired public
+  beat) and the process exits non-zero so the service manager restarts it; a stopped
+  supporting duty is `degraded` (`/readyz` 200 with `faults`, `monitor ping` exits 5).
+  `/api/monitors` and `status.json` gain a `monitoring` field (additive).
+- **Restart after downtime (D-014)** writes one `missed` row per monitor and resets
+  streaks; statuses read `unknown` until the first fresh probe.
+- **Ops:** SIGTERM drains like Ctrl-C and exits 0 (was killed, 143); the session cookie
+  is `Secure` behind TLS (`SMON_COOKIE_SECURE`); the systemd unit runs as the `smon`
+  user (upgrading a root install: RUNBOOK); the SSRF guard refuses every non-global
+  IANA special-purpose block; the disk cap applies to every pooled connection.
+- **Licence:** MIT.
+
 - M7.3 real-app load drill: `perf/real-app.mjs` — a dependency-free Node app doing
   genuine work per request (`/api/items` filters+aggregates, `/api/echo`,
   `/health`), ground-truth route/error/latency stats at `GET /__stats`, and

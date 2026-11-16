@@ -34,7 +34,7 @@ it to the writer — without ever letting a slow target stall the schedule.
   literal: every non-global block of the IANA IPv4 and IPv6 special-purpose registries
   rejected unless `SMON_PROFILE=lab` — 0/8, 10/8, 100.64/10 (CGNAT), 127/8,
   169.254/16, 172.16/12, 192.0.0/24, the three TEST-NETs, 192.88.99/24, 192.168/16,
-  198.18/15, 224/4, 240/4 (incl. broadcast); `::/96`, 64:ff9b:1::/48, 100::/64,
+  198.18/15, 224/4, 240/4 (incl. broadcast); `::/96`, 64:ff9b:1::/48, 100::/64, 100:0:0:1::/64 (RFC 9780),
   2001::/23, 2001:db8::/32, 3fff::/20, 5f00::/16, fc00::/7, fe80::/10, fec0::/10,
   ff00::/8 — and v4-mapped, NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses are
   judged by the IPv4 address they embed (`LOCAL_V4`/`LOCAL_V6` in `probe.rs`). DNS layer — `PolicyResolver` validates every address the OS answer
@@ -42,7 +42,7 @@ it to the writer — without ever letting a slow target stall the schedule.
   (no validate-then-re-resolve gap); one local address fails the whole resolution —
   round-robin DNS makes "usually public" not a defense. Redirects: followed up to 5 hops,
   each hop revalidated through the same URL check; a refused hop leaves the 3xx as
-  `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk) and the coordinator commits that slot as `missed` (D-013) — the monitor refused to look, so
+  `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk) and commits as a `transport` failure that pages (D-013), so
   it never masquerades as a plain `connect` error.
 
 ## Failure cases
@@ -54,7 +54,8 @@ it to the writer — without ever letting a slow target stall the schedule.
 | Edit/pause mid-probe | generation bump; late result dropped at writer |
 | Redirect to refused target | hop stopped; the 3xx stands as `http_fail` |
 | Redirect loop past 5 hops | last 3xx stands as `http_fail` |
-| Name resolves to a local address | DNS-layer refusal → committed as `missed` + `rejected_local` (D-013): no streak, no incident, status `unknown` (`a_probe_the_guard_refuses_is_missed_not_a_failure`) |
+| Name resolves to a local address | DNS-layer refusal → `transport` + `rejected_local`, a failure that pages (D-013; `a_name_that_resolves_to_a_local_address_is_a_failure_that_pages`) |
+| Redirect to a local *name* | the resolver refuses the hop → `transport` + `rejected_local`, pages (`a_redirect_to_a_local_name_is_a_failure_that_pages`) |
 | Local/private literal registered or edited in (strict profile) | 422 `refused_target` at the API — never stored (`refused_targets_cannot_be_registered_outside_the_lab_profile`) |
 | Expired / not-yet-valid cert | `transport` + `cert_expired` / `cert_not_yet_valid` |
 | Trusted cert, wrong hostname | `transport` + `cert_name_mismatch` |

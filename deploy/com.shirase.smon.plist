@@ -14,6 +14,10 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Stop sends SIGTERM, then SIGKILL after this many seconds. The server drains HTTP
+         for up to 12 s and the engine for up to 15 s; launchd's default is shorter. -->
+    <key>ExitTimeOut</key>
+    <integer>40</integer>
     <key>StandardOutPath</key>
     <string>/opt/smon/data/stdout.log</string>
     <key>StandardErrorPath</key>

@@ -86,9 +86,11 @@ executed run.
 
 ## Verification commands
 
-`scripts/check.sh` — toolchain check, `cargo fmt --all -- --check`,
+`scripts/check.sh` — toolchain check, the no-ignored-source guard, `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`,
-`scripts/check-architecture.sh`, `svelte-check` and a dashboard build. Run before every push.
+`cargo deny --locked check advisories` (when cargo-deny is installed; exceptions live in
+`deny.toml` with a reason and a re-check date), `scripts/check-architecture.sh`,
+`svelte-check` and a dashboard build. Run before every push.
 
 ## Working rules
 

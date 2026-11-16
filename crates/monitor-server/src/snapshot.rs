@@ -133,6 +133,38 @@ pub fn build<S: std::hash::BuildHasher>(
     .unwrap_or_else(|_| serde_json::json!({"services": []}))
 }
 
+/// Why one beat was not written.
+#[derive(Debug, thiserror::Error)]
+pub enum BeatError {
+    #[error("reading the store: {0}")]
+    Store(#[from] monitor_db::QueryError),
+    #[error("serializing the snapshot: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("writing the snapshot file: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Write one beat now. `observing = false` writes the born-expired, all-`unknown` form —
+/// the process's last word before it exits on an engine failure.
+pub async fn write_beat(
+    db: &Db,
+    statuses: &SharedStatuses,
+    config: &Config,
+    observing: bool,
+) -> Result<(), BeatError> {
+    let monitors = super::load_registry(db).await?;
+    let open = db.open_incidents().await?;
+    let json = build(&monitors, statuses, &open, config.ttl, observing);
+    let bytes = serde_json::to_vec_pretty(&json)?;
+    std::fs::create_dir_all(&config.dir)?;
+    // Write-then-rename: a reader mid-beat sees the old file or the new one, never a torn
+    // half-snapshot.
+    let tmp = config.dir.join(".status.json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, config.dir.join("status.json"))?;
+    Ok(())
+}
+
 /// Periodic snapshot writer. Its failures are honest: a stopped writer means an expiring
 /// snapshot, which the reader reads as "monitoring unavailable" — the correct verdict.
 pub fn spawn(
@@ -154,37 +186,9 @@ pub fn spawn(
                 _ = ticks.tick() => {}
                 () = shutdown.cancelled() => return,
             }
-            let monitors = match super::load_registry(&db).await {
-                Ok(monitors) => monitors,
-                Err(error) => {
-                    tracing::error!(%error, "snapshot: registry read failed; skipping beat");
-                    continue;
-                }
-            };
-            let open = match db.open_incidents().await {
-                Ok(open) => open,
-                Err(error) => {
-                    tracing::error!(%error, "snapshot: incidents read failed; skipping beat");
-                    continue;
-                }
-            };
             let observing = vitals.verdict().observing();
-            let json = build(&monitors, &statuses, &open, config.ttl, observing);
-            let target = config.dir.join("status.json");
-            // Write-then-rename: a reader mid-beat sees the old file or the new one, never a
-            // torn half-snapshot.
-            let tmp = config.dir.join(".status.json.tmp");
-            match serde_json::to_vec_pretty(&json) {
-                Ok(bytes) => {
-                    if let Err(error) = std::fs::write(&tmp, bytes) {
-                        tracing::error!(%error, "snapshot write failed; skipping beat");
-                        continue;
-                    }
-                    if let Err(error) = std::fs::rename(&tmp, &target) {
-                        tracing::error!(%error, "snapshot rename failed; skipping beat");
-                    }
-                }
-                Err(error) => tracing::error!(%error, "snapshot serialize failed"),
+            if let Err(error) = write_beat(&db, &statuses, &config, observing).await {
+                tracing::error!(%error, "snapshot beat skipped");
             }
         }
     })

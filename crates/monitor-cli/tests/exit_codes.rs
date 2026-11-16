@@ -1,6 +1,6 @@
 //! Pinned exit-code contract for the `monitor` binary (docs/modules/05-api-cli.md):
 //! 0 success · 1 API/application error · 2 usage error · 3 server unreachable ·
-//! 4 unauthorized. Scripts must be able to branch on these.
+//! 4 unauthorized · 5 degraded (`ping` only). Scripts must be able to branch on these.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -168,4 +168,42 @@ fn list_succeeds_against_a_live_server() {
     let output = run(&["--server", &base, "monitors", "list"]);
     assert_eq!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stdout).contains("no monitors yet"));
+}
+
+/// Degraded is not down: the monitor is observing, but a supporting duty (alerts, the
+/// public heartbeat, retention) has stopped. `/readyz` answers 200 with
+/// `"status":"degraded"`; `ping` exits 5 — distinct from success and from an API error —
+/// and names the faults, so scripts can alert on it without treating it as an outage.
+#[test]
+fn ping_exits_5_when_the_monitor_is_degraded() {
+    let base = serve(|_, path| match path {
+        "/livez" => (200, r#"{"status":"alive"}"#.to_string()),
+        "/readyz" => (
+            200,
+            r#"{"status":"degraded","faults":["snapshot exited"]}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let output = run(&["--server", &base, "ping"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("snapshot exited"),
+        "the fault is named"
+    );
+}
+
+/// Unavailable (not observing) stays an error: 503 → exit 1.
+#[test]
+fn ping_exits_1_when_the_monitor_is_unavailable() {
+    let base = serve(|_, path| match path {
+        "/livez" => (200, r#"{"status":"alive"}"#.to_string()),
+        "/readyz" => (
+            503,
+            r#"{"status":"unavailable","reason":"writer panicked","faults":["writer panicked"]}"#
+                .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let output = run(&["--server", &base, "ping"]);
+    assert_eq!(output.status.code(), Some(1));
 }

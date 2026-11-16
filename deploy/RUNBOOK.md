@@ -45,14 +45,52 @@ the boot with every problem listed (`invalid configuration (N problem(s)): …`)
 server never runs on a silently substituted default.
 
 Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
-`curl -sf $SMON_LISTEN/version` → the expected release. A 503 names its cause in
-`faults` (D-011): `store writes failing (N consecutive)` means the write path is broken
+`curl -sf $SMON_LISTEN/version` → the expected release. `/readyz` answers 200 with
+`{"status":"degraded","faults":[…]}` when checks run but a supporting duty has stopped
+(`monitor ping` exits 5), and 503 when the monitor is not observing. Either way it names
+the cause in `faults` (D-011): `store writes failing (N consecutive)` means the write path is broken
 (disk, perms) — fix the cause rather than restart-looping; `writer exited|panicked` or
-`coordinator …` means the monitor is not observing (statuses read `unknown`) — the log
-has the task's error, then restart; `degraded` with a deliverer, snapshot or retention
+`coordinator …` means the monitor is not observing (statuses read `unknown`) — the
+process then writes one "monitoring unavailable" beat and exits non-zero on its own, and
+the service manager restarts it (D-011); repeated restarts mean the log's task error needs
+fixing; `degraded` with a deliverer, snapshot or retention
 fault means checks still run but that duty has stopped.
 
+### The store is at its cap (`SMON_MAX_DB_BYTES`)
+
+`/readyz` answers `store writes failing` and the log shows `database or disk is full`.
+The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) frees expired
+rows *before* it writes anything, so it runs at the cap and the next commit after it
+lands. If the store is full of evidence that has not expired yet, retention cannot help:
+raise `SMON_MAX_DB_BYTES` (or shorten the D-012 horizons) in `env` and restart. A
+restart re-applies the new cap to every connection.
+
 ## Upgrade
+
+**Before upgrading to strict configuration** (invalid `SMON_*` values stop the boot): an
+`env` written by an older `deploy.sh` had comments on the same line as some values. systemd
+keeps those as part of the value, so the new boot refuses them. Move every comment onto its
+own line first; this lists the offending lines:
+
+```sh
+grep -nE '^[[:space:]]*SMON_[A-Z_]+=.*[[:space:]]#' /opt/smon/env
+```
+
+**Upgrading an install that ran as root** (units from before the `smon` user). The new
+unit sets `User=smon`; restarting without the account fails with `217/USER`, and without
+the ownership change SQLite cannot write `data/`. Once, before the normal steps below:
+
+```sh
+sudo systemctl stop monitor-server
+sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
+sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # store, -wal/-shm, logs, snapshot
+sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env
+sudo cp deploy/monitor-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Then check `env` against the strict parser (inline comments above; an admin token of at
+least 32 bytes) and continue:
 
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # new release dir, repoints current
@@ -84,6 +122,11 @@ a newer schema. SQLite's `user_version` guards that — an old binary on a too-n
 fails the migration check at boot and stays down, which is the honest failure.
 
 ## Backup / restore
+
+Restore only into a stopped server, and delete any `monitor.db-wal`/`-shm` beside the
+restored file first: the bundled SQLite (`libsqlite3-sys` 0.37) is affected by
+RUSTSEC-2026-0459, which needs a database opened together with a `-wal` that someone else
+wrote (deny.toml records the assessment and the re-check date).
 
 ```sh
 curl -X POST .../api/backup -d '{"path":"/opt/smon/data/backups/monitor.db"}'

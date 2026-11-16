@@ -77,7 +77,7 @@ export const VOCABULARY: GuideWord[] = [
 	{ word: 'cert_name_mismatch', kind: 'detail', title: 'certificate name mismatch', body: 'The certificate is trusted but for a different hostname (SAN doesn’t match).' },
 	{ word: 'cert_untrusted', kind: 'detail', title: 'certificate untrusted', body: 'The chain doesn’t anchor to a public root — self-signed or an internal CA not added via extra_roots.' },
 	{ word: 'cert_revoked', kind: 'detail', title: 'certificate revoked', body: 'The certificate has been revoked.' },
-	{ word: 'rejected_local', kind: 'detail', title: 'rejected (local address)', body: 'The target resolved to a local/private address — refused by the SSRF policy before dialing. The monitor never contacted it, so the slot is recorded as missed (unknown), not as a failure: no incident, no page.' },
+	{ word: 'rejected_local', kind: 'detail', title: 'rejected (local address)', body: 'The target (or a redirect it sent) resolved to a local/private address — refused by the SSRF policy before dialing. Counted as a failure: every real visitor of that target is broken too, so it can open an incident and page.' },
 	{ word: 'body', kind: 'detail', title: 'body read', body: 'Connected and got a response, but reading the body failed (incl. over the 64 KiB cap).' },
 	{ word: 'request', kind: 'detail', title: 'request', body: 'The request itself could not be built or sent.' },
 

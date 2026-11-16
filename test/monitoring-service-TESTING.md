@@ -66,8 +66,8 @@ Defaults (all overridable with `SMON_*` env vars; listed in the README):
 | `SMON_LISTEN` | `127.0.0.1:58400` |
 | `SMON_DATABASE_URL` | `sqlite:monitor.db` |
 | `SMON_DASHBOARD_DIR` | `apps/dashboard/build` |
-| `SMON_PROFILE` | unset (SSRF guard on). `lab` permits local targets for fixtures. |
-| `SMON_ADMIN_TOKEN` | unset is allowed only on loopback; a tokenless public bind refuses to boot |
+| `SMON_PROFILE` | unset or `production` (SSRF guard on). `lab` permits local targets for fixtures. Any other value refuses to boot. |
+| `SMON_ADMIN_TOKEN` | unset is allowed only on loopback; a tokenless public bind refuses to boot. When set: at least 32 bytes, no whitespace or `#`, or the boot refuses (`openssl rand -hex 32`) |
 
 A useful local lab:
 
@@ -92,7 +92,7 @@ and add monitors with short intervals, e.g. `monitor monitors add ok http://127.
 
 ## Happy-path checklist
 
-- [ ] `monitor ping` sees `/livez` and `/readyz`.
+- [ ] `monitor ping` sees `/livez` and `/readyz`: exit 0 when ready, 5 when degraded (`/readyz` 200 `"status":"degraded"` with `faults`), 1 when unavailable (`/readyz` 503).
 - [ ] Add a monitor, `monitor monitors list` / `show <id>` shows it, and checks start landing (default interval is 60s unless you pass `--interval_s`).
 - [ ] The dashboard loads (dev server on :58600, or the built app on :58400), lists the monitor, and the uptime strip leaves unobserved slots as gaps rather than filling them in green.
 - [ ] Pause / unpause works; editing a field bumps the generation (`monitor monitors show` / the API).
@@ -115,6 +115,7 @@ monitor maintenance add|list|rm
 - Point a monitor at the fault server's `/hang` or `/slow?ms=20000` with a 2s timeout. The outcome should be `timeout`, not a pass and not a generic transport error.
 - `/fail` or `/status/500` should be `http_fail`, a refused port `transport`. Those classes should not collapse into each other.
 - After a restart, previously committed checks, open incidents, and the outbox should still be there (`restart_rebuilds_streaks_and_open_incidents_from_the_store` in the store tests).
+- After the server was down for longer than a monitor's interval (D-014), boot writes one `missed` row per monitor at the first slot that never ran: its status reads `unknown` until the next probe, and failures before and after the outage do not add up to an incident (`downtime_is_a_gap_failures_either_side_are_not_consecutive`).
 - Unobserved slots in the dashboard should stay gaps, never interpolated green. A monitor with no committed evidence should read `unknown`, not "all down."
 
 **Incidents and signed alerts**
@@ -125,8 +126,9 @@ monitor maintenance add|list|rm
 
 **SSRF / policy**
 
-- Without `SMON_PROFILE=lab`, adding `http://127.0.0.1:...` (or another private/loopback literal) should be rejected (`rejected_local`).
-- Redirects *are* followed, up to 5 hops, and every hop is revalidated (`docs` and the probe tests). A redirect to a private address should be refused. A redirect loop should end as `http_fail`. (Note: `fixtures/README.md` still says a 301 should prove the probe does *not* follow redirects — that disagrees with the main README and the tests.)
+- Without `SMON_PROFILE=lab`, adding (or editing a monitor to) `http://127.0.0.1:...` or another loopback, private or reserved literal — CGNAT `100.64.0.0/10` included — is rejected at registration: HTTP 422, code `refused_target`. Nothing is stored.
+- A *name* that resolves to a local address is refused at probe time and recorded as `transport` + `rejected_local` — a failure that opens an incident and pages (D-013).
+- Redirects *are* followed, up to 5 hops, and every hop is revalidated (`docs` and the probe tests). A redirect to a private *literal* stops there and the 3xx stands as `http_fail`; a redirect to a local *name* (`http://localhost/…`) is refused at the resolver and recorded as `transport` + `rejected_local`, which pages. A redirect loop should end as `http_fail`. (Note: `fixtures/README.md` still says a 301 should prove the probe does *not* follow redirects — that disagrees with the main README and the tests.)
 
 **Auth**
 

@@ -1047,7 +1047,10 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
         report.outbox_deleted, 3,
         "ancient incident's two rows + one delivered row"
     );
-    assert!(report.aggregates_deleted >= 1);
+    assert_eq!(
+        report.aggregates_deleted, 0,
+        "raw rows already past the aggregate horizon are dropped, never aggregated"
+    );
     assert_eq!(report.windows_deleted, 1);
 
     assert!(
@@ -1076,5 +1079,212 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
 
     assert!(db.open_incident(open.id).await?.is_some());
     assert_eq!(db.list_outbox(open.id).await?.len(), 1);
+
+    Ok(())
+}
+
+/// Retention at the disk cap (D-012 + M4.2): once the store reaches `SMON_MAX_DB_BYTES`,
+/// the retention pass is the only thing that can make room — so it must be able to run
+/// *at* the cap. It used to start with an aggregate INSERT, which needs a fresh page,
+/// failed `SQLITE_FULL`, rolled back, and freed nothing: a full store stayed full (and
+/// "store writes failing") forever.
+#[tokio::test]
+async fn retention_frees_space_in_a_store_filled_to_its_cap() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("full.db").display());
+    let setup = Db::connect(&url, 1).await?;
+    setup.migrate().await?;
+    let monitor =
+        NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
+    setup.insert_monitor(&monitor).await?;
+    let used = setup.used_bytes().await?;
+    drop(setup);
+
+    let db = Db::connect_opts(&url, 4, Some(used + 64 * 1024)).await?;
+    let write_health: WriteHealth = Arc::default();
+    let (writer, _task) = writer::spawn(
+        db.clone(),
+        Arc::new(RwLock::new(HashMap::new())),
+        HashMap::new(),
+        Arc::clone(&write_health),
+        8,
+        false,
+    );
+    // Fill to the cap with evidence that has already expired, spread over ~290 days so
+    // its daily aggregates need fresh pages (as months of real history do).
+    let old = OffsetDateTime::now_utc() - time::Duration::days(8);
+    let mut stored = 0;
+    let mut full = false;
+    for n in 0..20_000_i64 {
+        let at = old - time::Duration::days(n % 290) + time::Duration::seconds(n / 290);
+        let observation = probe_at(&monitor, CheckOutcome::Pass, at);
+        if writer.record(observation).await.is_err() {
+            full = true;
+            break;
+        }
+        stored += 1;
+    }
+    assert!(
+        full && stored > 100,
+        "the store must reach its cap ({stored} rows stored)"
+    );
+    assert!(write_health.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+    let report = writer
+        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .await
+        .expect("retention must run at the cap");
+    assert_eq!(report.rows_deleted, stored, "every expired row is freed");
+    let stats = db
+        .check_stats(
+            monitor.id,
+            OffsetDateTime::now_utc() - time::Duration::days(365),
+        )
+        .await?;
+    assert_eq!(stats.passed, stored, "and nothing is lost: aggregated");
+
+    writer
+        .record(pass(&monitor))
+        .await
+        .expect("writes land again after retention");
+    assert_eq!(write_health.load(std::sync::atomic::Ordering::Relaxed), 0);
+    Ok(())
+}
+
+/// Aggregates age out on their own horizon (D-012), independent of raw checks.
+#[tokio::test]
+async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    for minute in 0..4 {
+        writer
+            .record(at(&monitor, CheckOutcome::Pass, 20, minute))
+            .await?;
+    }
+    let now = OffsetDateTime::now_utc();
+    let first = writer
+        .retain(RetentionPolicy::default().cutoffs(now))
+        .await?;
+    assert_eq!((first.rows_deleted, first.aggregates_deleted), (4, 0));
+    assert_eq!(
+        db.check_stats(monitor.id, now - time::Duration::days(30))
+            .await?
+            .observed,
+        4
+    );
+
+    let short = RetentionPolicy {
+        aggregates: std::time::Duration::from_hours(24 * 10),
+        ..RetentionPolicy::default()
+    };
+    let second = writer.retain(short.cutoffs(now)).await?;
+    assert!(second.aggregates_deleted >= 1, "{second:?}");
+    assert_eq!(
+        db.check_stats(monitor.id, now - time::Duration::days(30))
+            .await?
+            .observed,
+        0
+    );
+    Ok(())
+}
+
+/// `WriteHealth` means "observations are not landing" — the verdict that makes the whole
+/// monitor *unavailable* (statuses `unknown`, born-expired beat). A failed retention pass
+/// or delivery mark is a supporting duty failing; it used to bump the same counter and
+/// flip the monitor to "not observing" until the next observation commit.
+#[tokio::test]
+async fn only_failed_observation_commits_count_as_write_failures() -> anyhow::Result<()> {
+    let (db, monitor, _) = store().await?;
+    let write_health: WriteHealth = Arc::default();
+    let (writer, _task) = writer::spawn(
+        db.clone(),
+        Arc::new(RwLock::new(HashMap::new())),
+        HashMap::new(),
+        Arc::clone(&write_health),
+        8,
+        false,
+    );
+    db.close().await; // every command now fails
+    let failures = || write_health.load(std::sync::atomic::Ordering::Relaxed);
+
+    assert!(
+        writer
+            .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+            .await
+            .is_err()
+    );
+    assert!(writer.mark_delivery("evt", 1, None, None).await.is_err());
+    assert_eq!(
+        failures(),
+        0,
+        "supporting-duty failures are not observation failures"
+    );
+
+    assert!(writer.record(pass(&monitor)).await.is_err());
+    assert_eq!(failures(), 1, "a failed observation commit is");
+    Ok(())
+}
+
+/// Batched retention (D-012): one writer command handles at most `batch` rows of each kind,
+/// and a pass is a series of commands — the folded result equals a single unbounded pass.
+#[tokio::test]
+async fn retention_runs_in_bounded_batches_and_converges() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    for minute in 0..25 {
+        writer
+            .record(at(&monitor, CheckOutcome::Pass, 9, minute))
+            .await?;
+    }
+    let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
+    let report = writer.retain_in_batches(cutoffs, 10).await?;
+    assert_eq!(report.rows_deleted, 25);
+    assert_eq!(db.list_checks(monitor.id, 100).await?.len(), 0);
+    let stats = db
+        .check_stats(
+            monitor.id,
+            OffsetDateTime::now_utc() - time::Duration::days(30),
+        )
+        .await?;
+    assert_eq!(stats.passed, 25, "aggregates merge across batches");
+    Ok(())
+}
+
+/// The point of batching: an observation committed while a large retention pass runs lands
+/// between batches, not after the whole pass. Before, the pass was one transaction inside
+/// the single writer, and the coordinator (which awaits its commits) stalled behind it.
+#[tokio::test]
+async fn an_observation_lands_while_a_large_retention_pass_is_still_running() -> anyhow::Result<()>
+{
+    let (db, monitor, writer) = store().await?;
+    for second in 0..2_000 {
+        writer
+            .record(probe_at(
+                &monitor,
+                CheckOutcome::Pass,
+                OffsetDateTime::now_utc() - time::Duration::days(9)
+                    + time::Duration::seconds(second),
+            ))
+            .await?;
+    }
+    let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
+    let retention = {
+        let writer = writer.clone();
+        tokio::spawn(async move { writer.retain_in_batches(cutoffs, 10).await })
+    };
+    tokio::task::yield_now().await;
+    writer.record(pass(&monitor)).await?;
+    // The observation is committed; how much expired history was still waiting? With
+    // batches, nearly all of it (the record waited for at most a batch or two).
+    let waiting = db.list_checks(monitor.id, 5_000).await?.len();
+    assert!(
+        waiting > 1_000,
+        "the observation waited for the whole pass ({waiting} rows left when it landed)"
+    );
+    let report = retention.await??;
+    assert_eq!(report.rows_deleted, 2_000);
+    assert_eq!(
+        db.list_checks(monitor.id, 10).await?.len(),
+        1,
+        "the fresh row stays"
+    );
     Ok(())
 }

@@ -18,23 +18,27 @@ time, and back-filling hundreds of rows is the catch-up storm the schedule refus
 elsewhere. A restart inside one interval writes nothing. Pausing and unpausing is not
 covered here (the paused period is the operator's choice, not lost evidence).
 
-## D-013 — A probe the monitor refused is a missed slot, not a target failure
+## D-013 — Refused literals are rejected at registration; probe-time refusals page
 
-The SSRF guard refuses local/private/reserved targets before any socket opens. Those
-refusals were committed as `transport` failures, so a loopback literal registered by
-mistake — or a public name whose DNS answer turned private — opened an incident and paged
-about a target nobody had contacted. That is the monitor reporting its own refusal as the
-target being down.
+The SSRF guard refuses local/private/reserved targets before any socket opens. Before
+D-013 a loopback or private *literal* could be registered under the strict profile and
+then failed every slot — the monitor reporting its own policy as the target being down.
 
 - **At registration:** create (and a PATCH that sets a URL) runs the same
   `ProbePolicy::check` the probe runs; under the strict profile a refused literal answers
   422 `refused_target` and is never stored. `SMON_PROFILE=lab` is the explicit opt-in.
-- **At probe time** (names can change their answers): a `rejected_local` probe commits as
-  `missed` with detail `rejected_local` — streaks reset, no incident, status `unknown`,
-  coverage drops. The detail keeps the reason visible in the evidence strip.
+- **At probe time:** a refusal stays a **target failure** — `transport` + detail
+  `rejected_local` — and pages like any other. This covers a public name whose DNS answer
+  turned private (parked at 127.0.0.1, hijacked) and a redirect hop to a local *name*
+  (`http://localhost/…`, refused by the resolver). Both are real outages for every
+  visitor of the target.
 
-A redirect *to* a refused target is unchanged: the 3xx is the target's own answer and
-stays `http_fail` evidence.
+*Revised 2026-11-16.* The first version of D-013 committed probe-time refusals as
+`missed`. That turned exactly those two outages into a silent `unknown` that never paged —
+the opposite of this project's promise — and was reverted. A redirect to a refused
+*literal* stays what it always was: the 3xx is the target's own answer, `http_fail`
+evidence. Pinned by `a_redirect_to_a_local_name_is_a_failure_that_pages` and
+`a_name_that_resolves_to_a_local_address_is_a_failure_that_pages`.
 
 ## D-012 — Every table has a horizon; the monitor count has a cap
 
@@ -57,8 +61,11 @@ The birth streak is the incident's evidence: why it opened. Raw rows written *wh
 open are history like any other and age into aggregates, so coverage and success stay
 exact. Never pruned: open incidents, and undelivered (pending or exhausted) outbox rows of
 kept incidents — they remain the visible "no receiver" signal until their incident ages
-out. A pass is one transaction through the single writer; deleting an incident deletes its
-outbox rows first (FK). The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
+out. A pass is a series of bounded transactions through the single writer (at most
+5,000 rows of each kind per command, so observations interleave between them); deleting an incident deletes its
+outbox rows first (FK), and every delete runs before the aggregates are written (the
+expiring rows wait in a `TEMP` table), so a pass can run in a store already at
+`SMON_MAX_DB_BYTES`. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
 concurrent creates cannot overshoot it; paused monitors count (they keep history).
 
 ## D-011 — One engine verdict: a monitor that is not observing serves `unknown`
@@ -71,7 +78,9 @@ current, because nothing watched the tasks (their `JoinHandle`s were dropped) an
 
 `vitals::Vitals` is now the single verdict, read by `/readyz`, the statuses `/api/monitors`
 serves (with the verdict beside them as `monitoring`), the public snapshot, and through the
-API the dashboard. Inputs: the writer's consecutive-failure counter, a coordinator
+API the dashboard. Inputs: the writer's consecutive failed-*observation*-commit counter
+(retention and delivery bookkeeping don't count — a failed retention pass marks the
+monitor degraded until a pass succeeds), a coordinator
 heartbeat stamped on every loop pass (stalled after 30 s of silence), exits of supervised
 tasks, and the drain flag set at shutdown. `vitals::Supervisor` owns every engine task's
 `JoinHandle`; an exit outside shutdown — return, panic or abort — is logged once and
@@ -82,11 +91,23 @@ recorded.
   each snapshot beat written born-expired with `monitoring: "unavailable"`, dashboard
   banner naming the cause.
 - **degraded** — observing, but a supporting task (a deliverer, the snapshot writer,
-  retention) stopped. `/readyz` 503 with the cause; statuses stay as committed.
+  retention) stopped, or the last retention pass failed. `/readyz` **200** with
+  `"status":"degraded"` and the faults (the monitor still observes and serves; only
+  `unavailable` takes it out of rotation); `monitor ping` exits 5. Statuses stay as
+  committed.
 - **ok** — everything running; `/readyz` 200.
 
 Statuses are not rewritten in the store: `unknown` is a property of *serving* while the
 engine is down, and the committed history stays exactly what was observed.
+
+*Amended 2026-11-16.* Honest is not enough: a process that stays up without its writer
+or coordinator never heals, and the service manager never restarts it. When an
+**observing** task stops outside shutdown the supervisor raises an engine failure;
+serving stops, one born-expired `monitoring: unavailable` beat is written at once, the
+engine drains, and the process exits non-zero, so systemd `Restart=on-failure` or launchd
+`KeepAlive` restarts it and the boot records the gap (D-014). Supporting tasks stay
+*degraded*, with no exit. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
+and `a_supporting_task_stopping_keeps_serving`.
 
 ## D-010 — Certificate trust is deterministic: webpki-roots, never the local store
 

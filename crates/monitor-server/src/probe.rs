@@ -17,7 +17,7 @@ use monitor_domain::CheckOutcome;
 const MAX_REDIRECT_HOPS: usize = 5;
 
 /// The committed detail for a probe the SSRF guard refused (a local address, by literal or
-/// by DNS answer). The coordinator records such a slot as `missed` (D-013).
+/// by DNS answer, on the first hop or a redirect). It rides a `transport` failure (D-013).
 pub const REJECTED_LOCAL: &str = "rejected_local";
 
 /// Targets the monitor refuses to contact. Two layers, both M5-complete:
@@ -143,6 +143,7 @@ const LOCAL_V6: &[(Ipv6Addr, u8)] = &[
     (Ipv6Addr::UNSPECIFIED, 96), // ::/96 — unspecified, loopback, v4-compatible
     (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48), // local-use NAT64
     (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64), // discard-only
+    (Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64), // dummy prefix (RFC 9780)
     (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23), // IETF protocol assignments
     (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32), // documentation
     (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // documentation (RFC 9637)
@@ -215,6 +216,26 @@ pub struct ProbeClient {
 
 impl ProbeClient {
     pub fn new(policy: ProbePolicy, max_body: usize) -> Result<Self, reqwest::Error> {
+        Self::build(policy, max_body, &[])
+    }
+
+    /// A client whose DNS answers for `pins` bypass the policy — unit tests only: it lets an
+    /// offline test stand a "public" first hop on a loopback fixture, so a *later* hop can
+    /// be refused by the real resolver. Never reachable from production code.
+    #[cfg(test)]
+    pub(crate) fn pinned(
+        policy: ProbePolicy,
+        max_body: usize,
+        pins: &[(&str, SocketAddr)],
+    ) -> Result<Self, reqwest::Error> {
+        Self::build(policy, max_body, pins)
+    }
+
+    fn build(
+        policy: ProbePolicy,
+        max_body: usize,
+        pins: &[(&str, SocketAddr)],
+    ) -> Result<Self, reqwest::Error> {
         // TLS truth (D-010): a preconfigured rustls client on the webpki-roots bundle.
         // The platform verifier (Security.framework / schannel) flattens certificate
         // failures into opaque OS errors — the detail taxonomy below is only possible
@@ -229,7 +250,11 @@ impl ProbeClient {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let redirect_policy = policy.clone();
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        for (name, addr) in pins {
+            builder = builder.resolve(name, *addr);
+        }
+        let client = builder
             .tls_backend_preconfigured(tls)
             .redirect(redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= MAX_REDIRECT_HOPS {
@@ -530,6 +555,8 @@ mod tests {
             "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", // local-use NAT64 /48
             "100::",
             "100::ffff:ffff:ffff:ffff", // discard-only 100::/64
+            "100:0:0:1::",
+            "100:0:0:1:ffff:ffff:ffff:ffff", // dummy prefix 100:0:0:1::/64 (RFC 9780)
             "2001::",
             "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // IETF 2001::/23 (Teredo…)
             "2001:db8::",
@@ -557,6 +584,7 @@ mod tests {
             "2001:4860:4860::8888",
             "2001:db9::1",
             "2606:4700:4700::1111",
+            "100:0:0:2::1",
             "3fff:1000::1",
             "5f01::1",
             "fbff::1",

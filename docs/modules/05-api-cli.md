@@ -57,7 +57,9 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   application error (envelope errors like `not_found`/`conflict`/`invalid_request`, or an
   unexpected response); `2` usage error (clap rejects, empty `edit`); `3` server
   unreachable (connect refused, DNS, timeout — no HTTP answer at all); `4` unauthorized
-  (401/403 — the token is missing or wrong). Errors print to stderr, results to stdout.
+  (401/403 — the token is missing or wrong); `5` (`ping` only) degraded — `/readyz`
+  answered 200 `"status":"degraded"`: observing, but a supporting duty stopped; the faults
+  print to stderr. Errors print to stderr, results to stdout.
 - **Truthful readiness:** `/readyz` fails when the store doesn't answer (module 02 failure
   case: disk write fails → unready, not green).
 

@@ -84,6 +84,8 @@ struct Inner {
     write_failures: WriteHealth,
     draining: AtomicBool,
     stopped: Mutex<Vec<Stopped>>,
+    /// Supporting duties whose last run failed (e.g. a retention pass), with why.
+    failing: Mutex<std::collections::BTreeMap<&'static str, String>>,
 }
 
 /// Shared, cheap-to-clone engine health. See the module docs.
@@ -104,6 +106,7 @@ impl Vitals {
                 write_failures,
                 draining: AtomicBool::new(false),
                 stopped: Mutex::new(Vec::new()),
+                failing: Mutex::new(std::collections::BTreeMap::new()),
             }),
         }
     }
@@ -123,6 +126,24 @@ impl Vitals {
     /// Shutdown has begun: readiness goes false and stays false.
     pub fn begin_drain(&self) {
         self.inner.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// A supporting duty's latest run: `Err(why)` marks the monitor degraded until the
+    /// duty next succeeds (`Ok`). Observing is unaffected.
+    pub fn duty_result(&self, duty: &'static str, result: Result<(), String>) {
+        let mut failing = self
+            .inner
+            .failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match result {
+            Ok(()) => {
+                failing.remove(duty);
+            }
+            Err(why) => {
+                failing.insert(duty, why);
+            }
+        }
     }
 
     /// Record an engine task that stopped outside shutdown. Logged by the supervisor.
@@ -160,6 +181,16 @@ impl Vitals {
                 if task.role == Role::Observing {
                     observing = false;
                 }
+            }
+        }
+        {
+            let failing = self
+                .inner
+                .failing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (duty, why) in failing.iter() {
+                faults.push(format!("{duty} failing: {why}"));
             }
         }
         // A stall is only news while everything else on the observation path is fine — a
@@ -200,6 +231,37 @@ pub struct Supervisor {
     vitals: Vitals,
     shutdown: CancellationToken,
     tracker: TaskTracker,
+    failure: EngineFailure,
+}
+
+/// Raised when an `Observing` task stops outside shutdown. Honest "unavailable" is only half
+/// the answer: a process that stays alive without its writer or coordinator never heals,
+/// and `Restart=on-failure` never fires. Whoever owns the process waits on this, then
+/// exits non-zero so the service manager restarts it (D-011).
+#[derive(Debug, Clone, Default)]
+pub struct EngineFailure {
+    raised: CancellationToken,
+    cause: Arc<Mutex<Option<String>>>,
+}
+
+impl EngineFailure {
+    fn raise(&self, cause: String) {
+        self.cause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(cause);
+        self.raised.cancel();
+    }
+
+    /// Resolves with the first failure's cause (`"writer panicked"`, …).
+    pub async fn wait(&self) -> String {
+        self.raised.cancelled().await;
+        self.cause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| "an engine task stopped".to_owned())
+    }
 }
 
 impl Supervisor {
@@ -208,13 +270,20 @@ impl Supervisor {
             vitals,
             shutdown,
             tracker: TaskTracker::new(),
+            failure: EngineFailure::default(),
         }
+    }
+
+    /// The handle the process owner waits on to exit when observation stops.
+    pub fn engine_failure(&self) -> EngineFailure {
+        self.failure.clone()
     }
 
     /// Watch one engine task until it ends.
     pub fn watch(&self, task: &'static str, role: Role, handle: JoinHandle<()>) {
         let vitals = self.vitals.clone();
         let shutdown = self.shutdown.clone();
+        let failure = self.failure.clone();
         self.tracker.spawn(async move {
             let how = match handle.await {
                 Ok(()) if shutdown.is_cancelled() => return,
@@ -228,6 +297,9 @@ impl Supervisor {
             };
             tracing::error!(task, how, ?role, "engine task stopped outside shutdown");
             vitals.task_stopped(task, role, how);
+            if role == Role::Observing {
+                failure.raise(format!("{task} {how}"));
+            }
         });
     }
 
@@ -299,6 +371,21 @@ mod tests {
         assert!(verdict.faults[0].starts_with("coordinator stalled"));
         vitals.coordinator_beat();
         assert_eq!(vitals.verdict().status, Availability::Ok, "a beat recovers");
+    }
+
+    #[test]
+    fn a_failing_supporting_duty_degrades_until_it_next_succeeds() {
+        let (vitals, _) = vitals(Duration::from_secs(30));
+        vitals.duty_result("retention", Err("database is locked".into()));
+        let verdict = vitals.verdict();
+        assert_eq!(
+            verdict.status,
+            Availability::Degraded,
+            "observing continues"
+        );
+        assert_eq!(verdict.faults, ["retention failing: database is locked"]);
+        vitals.duty_result("retention", Ok(()));
+        assert_eq!(vitals.verdict().status, Availability::Ok);
     }
 
     #[test]

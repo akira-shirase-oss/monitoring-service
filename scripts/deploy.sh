@@ -33,26 +33,37 @@ cp target/release/monitor-server target/release/monitor "$DEST/bin/"
 ln -sfn "$DEST" "$PREFIX/current"
 
 [ -f "$PREFIX/env" ] || cat > "$PREFIX/env" <<'ENV'
-# SMON_ADMIN_TOKEN=   # REQUIRED on any non-loopback SMON_LISTEN — boot refuses without it
+# systemd EnvironmentFile: one KEY=value per line, comments on their own lines only —
+# `KEY=value   # note` makes the note part of the value, and the boot refuses it.
+# Every value is checked at boot; an invalid or blank one stops the server (README).
+#
+# REQUIRED on any non-loopback SMON_LISTEN (boot refuses without it). At least 32
+# characters, no spaces or '#' — generate one: openssl rand -hex 32
+# SMON_ADMIN_TOKEN=
 # SMON_DATABASE_URL=sqlite:/opt/smon/data/monitor.db
 # SMON_LISTEN=127.0.0.1:58400
 # SMON_STATUS_DIR=/opt/smon/status
 # SMON_DASHBOARD_DIR=/opt/smon/current/dashboard
 # SMON_MAX_DB_BYTES=2147483648
-# SMON_RETENTION_S=604800              # raw checks (D-012 lists every horizon)
-# SMON_AGGREGATE_RETENTION_S=31536000  # daily aggregates
-# SMON_INCIDENT_RETENTION_S=31536000   # resolved incidents + their alerts, ended windows
-# SMON_OUTBOX_RETENTION_S=2592000      # delivered alerts
+# Retention horizons in seconds (D-012 lists every one): raw checks, daily aggregates,
+# resolved incidents with their alerts and ended windows, delivered alerts.
+# SMON_RETENTION_S=604800
+# SMON_AGGREGATE_RETENTION_S=31536000
+# SMON_INCIDENT_RETENTION_S=31536000
+# SMON_OUTBOX_RETENTION_S=2592000
 # SMON_MAX_MONITORS=100
 # SMON_LOG_FILE=/opt/smon/data/monitor.log
 # SMON_WEBHOOK_URL=
 # SMON_WEBHOOK_SECRET=
-# Email channel — set all three or none (partial config refuses to boot):
-# SMON_SMTP_DSN=smtps://user:pass@smtp.example.com:465   # or smtp://host:587?tls=required
+# Email channel — set all three or none (partial config refuses to boot). The DSN can
+# also be smtp://host:587?tls=required for mandatory STARTTLS.
+# SMON_SMTP_DSN=smtps://user:pass@smtp.example.com:465
 # SMON_SMTP_FROM=alerts@example.com
 # SMON_SMTP_TO=oncall@example.com,backup@example.com
-# SMON_SESSION_TTL_S=43200   # dashboard session lifetime (default 12h)
-# SMON_COOKIE_SECURE=auto     # auto: Secure when the TLS proxy says so; always: every cookie
+# Dashboard session lifetime in seconds (default 12 h).
+# SMON_SESSION_TTL_S=43200
+# auto: the session cookie is Secure when the TLS proxy says so; always: every cookie.
+# SMON_COOKIE_SECURE=auto
 ENV
 
 if [ -d apps/dashboard/build ]; then

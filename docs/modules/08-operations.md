@@ -17,8 +17,10 @@ not a process only the author can babysit.
   The ceiling is set per connection (`after_connect`), never once through the pool.
 - **Bounded logs:** structured JSON (tracing), byte-capped rotation, dropped-count surfaced.
 - **Retention:** module 02's expiry (D-012: raw checks, aggregates, incidents, windows,
-  delivered outbox; monitor cap) runs as a scheduled job through the writer — one
-  transaction per pass (batching is still owed).
+  delivered outbox; monitor cap) runs as a scheduled job through the writer, in batches:
+  each writer command handles at most `RETAIN_BATCH` (5,000) rows of each kind in its
+  own transaction, so observations commit between batches instead of waiting out a long
+  first pass (`an_observation_lands_while_a_large_retention_pass_is_still_running`).
 - **Backup/restore:** consistent backup of `monitor.db` (WAL-aware); restore drill proves open
   incidents and outbox rows survive; restore is documented and rehearsed before M4 exits.
 - **Deploy:** the monitor runs off the target host (independence is the point); upgrade and
@@ -30,7 +32,9 @@ not a process only the author can babysit.
   Parsed once into a typed `Config` (`config.rs`) with ranges and cross-field rules
   (`SMON_STATUS_TTL_S` > `SMON_STATUS_INTERVAL_S`, the SMTP trio all-or-none); an
   invalid or blank value fails the boot listing every problem, unknown `SMON_*` names
-  are warned about. Pinned by `invalid_smon_values_fail_the_boot_and_name_every_problem`
+  are warned about. `SMON_ADMIN_TOKEN` must be ≥ 32 bytes with no whitespace or `#`
+  (a pasted template line or placeholder is not a credential). Pinned by
+  `invalid_smon_values_fail_the_boot_and_name_every_problem`
   against the real binary.
 
 ## Failure cases
@@ -39,6 +43,7 @@ not a process only the author can babysit.
 |---|---|
 | Disk full | writes fail; status unready; nothing half-written |
 | Invalid `SMON_*` value | boot fails naming every bad variable; no store created, no work started |
+| Writer or coordinator stops (panic, exit) | final unavailable beat → drain → exit non-zero → restarted by the service manager; the boot records the gap (D-011, D-014) |
 | SIGTERM (systemd/launchd stop, `kill`) or SIGINT | same drain: readiness off, engine cancelled, open HTTP requests ≤ 12 s, engine tasks ≤ 15 s, exit 0 (`sigterm_and_sigint_drain_the_engine_and_exit_cleanly`, real binary) |
 | Log volume explodes | rotation caps it; dropped count visible |
 | Upgrade mid-incident | incidents + outbox survive; generation model holds |

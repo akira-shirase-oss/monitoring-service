@@ -38,7 +38,8 @@ run; what exists is what the commits show. Highlights:
   monitors at 100); `SMON_MAX_DB_BYTES` caps the store and `/readyz` goes 503 when
   the write path fails; `SMON_LOG_FILE` bounds logs to two generations; `VACUUM INTO`
   backups behind `POST /api/backup`; versioned releases + rollback by repoint.
-- **Auth:** `SMON_ADMIN_TOKEN` → `Bearer` for CLI/scripts, or the HttpOnly
+- **Auth:** `SMON_ADMIN_TOKEN` (at least 32 bytes, no spaces or `#` — e.g.
+  `openssl rand -hex 32`; a weaker value refuses to boot) → `Bearer` for CLI/scripts, or the HttpOnly
   `smon_session` cookie the dashboard earns at `POST /api/login` (store-side
   expiry, `SMON_SESSION_TTL_S`; `Origin` must match `Host`, mandatory on
   cookie-authed writes). Tokenless loopback is dev mode, tokenless public bind
@@ -118,7 +119,8 @@ same outbox — no PagerDuty.
 
 All via `SMON_*` env vars (defaults in `deploy.sh`'s generated `env` file). They are
 parsed once at boot (`crates/monitor-server/src/config.rs`): an invalid or blank value
-fails the boot with every problem listed — never a silent fall-back to the default — and
+fails the boot with every problem listed — never a silent fall-back to the default (an
+inline `# comment` after a value counts: systemd keeps it as part of the value) — and
 unknown `SMON_*` names are logged as likely typos. Secrets and webhook URLs are never
 echoed in those messages.
 
@@ -137,8 +139,10 @@ proxy in front reports `X-Forwarded-Proto: https` or `Forwarded: proto=https`) o
 
 ## Verify
 
-`scripts/check.sh` — toolchain check, `cargo fmt --check`, `cargo clippy -- -D warnings`,
-`cargo test`, the architecture rule, `svelte-check` and a dashboard build. Plus the
+`scripts/check.sh` — toolchain check, a guard that no source file is git-ignored,
+`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo deny check
+advisories` when cargo-deny is installed (accepted exceptions, each dated and reasoned, in
+`deny.toml`), the architecture rule, `svelte-check` and a dashboard build. Plus the
 drills: `scripts/e2e.sh` (Playwright), `scripts/backup-drill.sh` (backup → destroy →
 restore), `perf/lab-profile.mjs` (load baseline).
 
