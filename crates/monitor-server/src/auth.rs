@@ -30,6 +30,53 @@ pub type AdminToken = Option<Arc<str>>;
 /// The `HttpOnly` cookie name the session id rides on.
 pub const SESSION_COOKIE: &str = "smon_session";
 
+/// When the session cookie carries `Secure` (`SMON_COOKIE_SECURE`). The server itself
+/// speaks plain HTTP; TLS is terminated in front of it, so "was this request TLS" is what
+/// the proxy reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CookieSecure {
+    /// Whenever the request reached the proxy over TLS: `X-Forwarded-Proto: https` or
+    /// `Forwarded: proto=https`. Believing a client that sends these itself is safe in this
+    /// direction — it can only *add* the flag to its own cookie, never remove it.
+    #[default]
+    Auto,
+    /// On every cookie — for a proxy that does not forward the scheme.
+    Always,
+}
+
+impl CookieSecure {
+    /// The cookie attribute for this request: `"; Secure"` or nothing.
+    pub fn attribute(self, headers: &header::HeaderMap) -> &'static str {
+        if self == Self::Always || came_over_tls(headers) {
+            "; Secure"
+        } else {
+            ""
+        }
+    }
+}
+
+/// Any `https` in `X-Forwarded-Proto` (a list when proxies chain) or a `proto=https` pair
+/// in `Forwarded` (RFC 7239). "Any", because adding `Secure` is the safe direction.
+fn came_over_tls(headers: &header::HeaderMap) -> bool {
+    let values = |name| {
+        headers
+            .get_all(name)
+            .into_iter()
+            .filter_map(|value| value.to_str().ok())
+    };
+    let forwarded_proto = values("x-forwarded-proto")
+        .flat_map(|value| value.split(','))
+        .any(|proto| proto.trim().eq_ignore_ascii_case("https"));
+    let forwarded = values("forwarded")
+        .flat_map(|value| value.split([',', ';']))
+        .filter_map(|pair| pair.split_once('='))
+        .any(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("proto")
+                && value.trim().trim_matches('"').eq_ignore_ascii_case("https")
+        });
+    forwarded_proto || forwarded
+}
+
 /// Which credential authorized the request — decides whether Origin is mandatory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Credential {

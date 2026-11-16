@@ -131,6 +131,9 @@ echoed in those messages.
 `SMON_SMTP_DSN` `SMON_SMTP_FROM` `SMON_SMTP_TO` — all three required together for the
 email channel; a partial set fails the boot.
 `SMON_SESSION_TTL_S` — dashboard session lifetime in seconds (default 43200).
+`SMON_COOKIE_SECURE` — `auto` (default: the session cookie is `Secure` whenever the TLS
+proxy in front reports `X-Forwarded-Proto: https` or `Forwarded: proto=https`) or
+`always` (for a proxy that doesn't forward the scheme).
 
 ## Verify
 

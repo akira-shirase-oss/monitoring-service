@@ -134,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
         vitals: vitals.clone(),
         admin_token,
         session_ttl: config.session_ttl,
+        cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
         version: env!("CARGO_PKG_VERSION"),
     });

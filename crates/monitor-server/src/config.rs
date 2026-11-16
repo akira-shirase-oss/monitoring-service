@@ -23,6 +23,7 @@ use url::Url;
 pub const KNOWN: &[&str] = &[
     "SMON_ADMIN_TOKEN",
     "SMON_AGGREGATE_RETENTION_S",
+    "SMON_COOKIE_SECURE",
     "SMON_DASHBOARD_DIR",
     "SMON_DATABASE_URL",
     "SMON_INCIDENT_RETENTION_S",
@@ -86,6 +87,7 @@ pub struct Config {
     pub webhook_secret: Option<String>,
     pub smtp: Option<SmtpSettings>,
     pub session_ttl: Duration,
+    pub cookie_secure: crate::auth::CookieSecure,
     pub max_monitors: u64,
 }
 
@@ -319,6 +321,16 @@ impl Config {
             Duration::from_hours(12),
             60..=MAX_HORIZON_S,
         );
+        let cookie_secure = match env.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
+            None | Some("auto") => crate::auth::CookieSecure::Auto,
+            Some("always") => crate::auth::CookieSecure::Always,
+            Some(other) => {
+                env.problems.push(format!(
+                    "SMON_COOKIE_SECURE={other:?}: expected `auto` or `always`"
+                ));
+                crate::auth::CookieSecure::Auto
+            }
+        };
         let max_monitors = env.ranged("SMON_MAX_MONITORS", 100, 1..=100_000);
 
         if !env.problems.is_empty() {
@@ -344,6 +356,7 @@ impl Config {
             webhook_secret,
             smtp,
             session_ttl,
+            cookie_secure,
             max_monitors,
         })
     }
@@ -403,6 +416,7 @@ mod tests {
             ("SMON_PROFILE", "Lab"),
             ("SMON_DATABASE_URL", "postgres://x"),
             ("SMON_OUTBOX_RETENTION_S", "1.5"),
+            ("SMON_COOKIE_SECURE", "yes"),
         ] {
             let error = load(&[(name, value)]).expect_err(name);
             assert!(

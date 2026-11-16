@@ -60,6 +60,8 @@ pub struct AppState {
     /// `sessions` row and the cookie's `Max-Age`. Store-side expiry is the authority;
     /// the cookie's copy is a convenience for the browser.
     pub session_ttl: Duration,
+    /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
+    pub cookie_secure: auth::CookieSecure,
     /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
     /// they keep history). Bounds the schedule and every per-monitor table (D-012).
     pub max_monitors: u64,
@@ -207,9 +209,10 @@ async fn login(
         [(
             axum::http::header::SET_COOKIE,
             format!(
-                "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
                 auth::SESSION_COOKIE,
-                state.session_ttl.as_secs()
+                state.session_ttl.as_secs(),
+                state.cookie_secure.attribute(&headers),
             ),
         )],
     )
@@ -230,8 +233,9 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
         [(
             axum::http::header::SET_COOKIE,
             format!(
-                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-                auth::SESSION_COOKIE
+                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+                auth::SESSION_COOKIE,
+                state.cookie_secure.attribute(&headers),
             ),
         )],
     )

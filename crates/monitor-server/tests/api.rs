@@ -40,6 +40,7 @@ async fn app() -> anyhow::Result<(
         ),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         version: "test",
     });
@@ -760,6 +761,7 @@ async fn auth_denies_without_a_valid_bearer_token() {
         vitals: monitor_server::vitals::Vitals::new(write_health, Duration::from_secs(30)),
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         version: "test",
     };
@@ -810,6 +812,14 @@ async fn auth_denies_without_a_valid_bearer_token() {
 /// Builds an authed router (admin token + configurable session ttl) on a scratch store —
 /// the M7.2 session tests all share this rig.
 async fn authed(token: &str, ttl: Duration) -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
+    authed_with(token, ttl, monitor_server::auth::CookieSecure::Auto).await
+}
+
+async fn authed_with(
+    token: &str,
+    ttl: Duration,
+    cookie_secure: monitor_server::auth::CookieSecure,
+) -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let url = format!("sqlite:{}", tmp.path().join("auth.db").display());
     let db = Db::connect(&url, 1).await?;
@@ -821,6 +831,7 @@ async fn authed(token: &str, ttl: Duration) -> anyhow::Result<(Router, Db, tempf
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
+        cookie_secure,
         max_monitors: 100,
         version: "test",
     };
@@ -1127,6 +1138,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         vitals,
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         version: "test",
     });
@@ -1199,6 +1211,7 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 2,
         version: "test",
     });
@@ -1224,4 +1237,64 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
     let (status, _) = send(&app, "POST", "/api/monitors", Some(create(3))).await?;
     assert_eq!(status, StatusCode::CREATED);
     Ok(())
+}
+
+/// The `Set-Cookie` header of one login (or logout) call with the given extra headers.
+async fn cookie_header(
+    app: &Router,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<String> {
+    let mut request = Request::post(path)
+        .header("content-type", "application/json")
+        .header("host", "mon.example.com");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(r#"{"token":"s3cret"}"#))?)
+        .await?;
+    anyhow::ensure!(response.status() == StatusCode::NO_CONTENT, "{path}");
+    Ok(response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned())
+}
+
+/// Behind a TLS-terminating proxy the session cookie must be `Secure`, or a browser sends
+/// it over any plain-http request to the same host (a downgraded link, a captive portal)
+/// where it can be read. The proxy says the hop was TLS in `X-Forwarded-Proto` /
+/// `Forwarded: proto=https`; `SMON_COOKIE_SECURE=always` forces the flag regardless.
+/// Plain-http dev keeps working: no TLS signal, no flag.
+#[tokio::test]
+async fn the_session_cookie_is_secure_whenever_the_request_came_over_tls() {
+    use monitor_server::auth::CookieSecure;
+
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
+    let plain = cookie_header(&app, "/api/login", &[]).await.unwrap();
+    assert!(!plain.contains("Secure"), "plain http: {plain}");
+    for tls in [
+        [("x-forwarded-proto", "https")],
+        [(
+            "forwarded",
+            "for=203.0.113.9;proto=https;host=mon.example.com",
+        )],
+    ] {
+        for path in ["/api/login", "/api/logout"] {
+            let cookie = cookie_header(&app, path, &tls).await.unwrap();
+            assert!(cookie.contains("; Secure"), "{path} {tls:?}: {cookie}");
+        }
+    }
+
+    let (always, _db, _tmp) =
+        authed_with("s3cret", Duration::from_secs(3600), CookieSecure::Always)
+            .await
+            .unwrap();
+    for path in ["/api/login", "/api/logout"] {
+        let cookie = cookie_header(&always, path, &[]).await.unwrap();
+        assert!(cookie.contains("; Secure"), "always, {path}: {cookie}");
+    }
 }

@@ -52,6 +52,7 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_SMTP_FROM=alerts@example.com
 # SMON_SMTP_TO=oncall@example.com,backup@example.com
 # SMON_SESSION_TTL_S=43200   # dashboard session lifetime (default 12h)
+# SMON_COOKIE_SECURE=auto     # auto: Secure when the TLS proxy says so; always: every cookie
 ENV
 
 if [ -d apps/dashboard/build ]; then
