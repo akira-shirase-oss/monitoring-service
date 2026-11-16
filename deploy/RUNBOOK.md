@@ -27,11 +27,15 @@ rolling back the binary cannot roll back evidence.
 scripts/deploy.sh --prefix /opt/smon            # builds --release, installs, links
 $EDITOR /opt/smon/env                            # at minimum SMON_DATABASE_URL, SMON_STATUS_DIR
 
-# systemd
+# systemd — the unit runs as the unprivileged system user `smon`, never root
+sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
+sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # the only paths it writes
+sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env  # systemd reads it as root
 sudo cp deploy/monitor-server.service /etc/systemd/system/
-sudo systemctl enable --now monitor-server
+sudo systemctl daemon-reload && sudo systemctl enable --now monitor-server
 
-# macOS launchd
+# macOS launchd (development hosts; this plist still runs as root — add a UserName
+# key for a dedicated account before using it anywhere that matters)
 sudo cp deploy/com.shirase.smon.plist /Library/LaunchDaemons/
 sudo launchctl load /Library/LaunchDaemons/com.shirase.smon.plist
 ```

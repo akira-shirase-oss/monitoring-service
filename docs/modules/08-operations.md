@@ -22,7 +22,10 @@ not a process only the author can babysit.
 - **Backup/restore:** consistent backup of `monitor.db` (WAL-aware); restore drill proves open
   incidents and outbox rows survive; restore is documented and rehearsed before M4 exits.
 - **Deploy:** the monitor runs off the target host (independence is the point); upgrade and
-  rollback are scripted; the public status page is hosted elsewhere (module 07).
+  rollback are scripted; the public status page is hosted elsewhere (module 07). The
+  systemd unit runs as the system user `smon` with no capabilities and a read-only
+  system except `data/` and `status/`; `TimeoutStopSec=40s` outlasts the SIGTERM drain
+  (pinned by `tests/deploy_unit.rs`).
 - **Config:** env-driven (`SMON_*`), localhost-bound by default, secrets never logged.
   Parsed once into a typed `Config` (`config.rs`) with ranges and cross-field rules
   (`SMON_STATUS_TTL_S` > `SMON_STATUS_INTERVAL_S`, the SMTP trio all-or-none); an
