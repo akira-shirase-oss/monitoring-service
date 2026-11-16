@@ -120,6 +120,13 @@ pub struct RetentionPolicy {
     pub delivered_outbox: std::time::Duration,
 }
 
+/// Pages a retention transaction may allocate past `SMON_MAX_DB_BYTES` (1 MiB at the default
+/// 4 KiB page size). Deleting a thin slice of expired rows scattered among unexpired
+/// evidence frees no whole page, while its daily summaries need new ones; without a
+/// reserve such a pass fails `SQLITE_FULL` at the cap every time. The file can exceed the
+/// cap by at most this much per pass, and only by what the summaries actually use.
+pub const RETENTION_RESERVE_PAGES: u64 = 256;
+
 const DAY: std::time::Duration = std::time::Duration::from_hours(24);
 
 impl Default for RetentionPolicy {
@@ -174,6 +181,9 @@ const BIRTH_STREAK_OF_OPEN_INCIDENT: &str = "EXISTS (
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: SqlitePool,
+    /// The `SMON_MAX_DB_BYTES` ceiling every connection carries, if any — retention lifts
+    /// it by `RETENTION_RESERVE_PAGES` for its own transaction and restores it after.
+    max_db_bytes: Option<u64>,
 }
 
 impl Db {
@@ -210,7 +220,7 @@ impl Db {
             });
         }
         let pool = pool.connect_with(options).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, max_db_bytes })
     }
 
     /// Bytes the database file currently occupies (`page_count * page_size`).
@@ -732,55 +742,29 @@ impl Db {
         batch: u32,
     ) -> Result<RetainReport, QueryError> {
         let batch = i64::from(batch.max(1));
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DROP TABLE IF EXISTS temp.expiring")
-            .execute(&mut *tx)
+        let mut conn = self.pool.acquire().await?;
+        let Some(cap) = self.max_db_bytes else {
+            return retain_batch(&mut conn, cutoffs, batch).await;
+        };
+        // Lift the ceiling on this one connection for this one transaction, then put it
+        // back whatever happened: SQLite clamps the restored ceiling up to the file's size,
+        // so pages the summaries used stay usable and nothing more is granted. A connection
+        // whose ceiling can't be restored is closed, never returned to the pool lifted.
+        let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&mut *conn)
             .await?;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE TEMP TABLE expiring AS
-             SELECT id, monitor_id, date(slot_at) AS day, outcome FROM checks
-             WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
-             ORDER BY id LIMIT ?2"
+        let lifted = pages.saturating_add(i64::try_from(RETENTION_RESERVE_PAGES).unwrap_or(0));
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "PRAGMA max_page_count = {lifted}"
         )))
-        .bind(cutoffs.checks)
-        .bind(batch)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-        let deleted = sqlx::query("DELETE FROM checks WHERE id IN (SELECT id FROM temp.expiring)")
-            .execute(&mut *tx)
-            .await?;
-        let aggregate_day = cutoffs.aggregates.date().to_string();
-        let pruned = prune_expired(&mut tx, cutoffs, &aggregate_day, batch).await?;
-        // Space is free now; write the aggregates of what was deleted.
-        let aggregated = sqlx::query(
-            "INSERT INTO check_stats_daily
-                (monitor_id, day, pass, http_fail, transport, timeout, missed)
-             SELECT monitor_id, day,
-                    SUM(outcome = 'pass'), SUM(outcome = 'http_fail'),
-                    SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
-                    SUM(outcome = 'missed')
-             FROM temp.expiring
-             WHERE day >= ?1
-             GROUP BY monitor_id, day
-             ON CONFLICT (monitor_id, day) DO UPDATE SET
-                pass = check_stats_daily.pass + excluded.pass,
-                http_fail = check_stats_daily.http_fail + excluded.http_fail,
-                transport = check_stats_daily.transport + excluded.transport,
-                timeout = check_stats_daily.timeout + excluded.timeout,
-                missed = check_stats_daily.missed + excluded.missed",
-        )
-        .bind(&aggregate_day)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DROP TABLE temp.expiring")
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(RetainReport {
-            days_written: aggregated.rows_affected(),
-            rows_deleted: deleted.rows_affected(),
-            ..pruned
-        })
+        let result = retain_batch(&mut conn, cutoffs, batch).await;
+        if let Err(error) = apply_max_bytes(&mut conn, cap).await {
+            tracing::error!(%error, "could not restore the size ceiling; closing the connection");
+            let _ = conn.close().await;
+        }
+        result
     }
 
     /// How many monitors exist (paused ones included — they keep history).
@@ -993,6 +977,64 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// One bounded retention batch, in one transaction on `conn` (see `Db::retain`).
+async fn retain_batch(
+    conn: &mut sqlx::SqliteConnection,
+    cutoffs: &RetentionCutoffs,
+    batch: i64,
+) -> Result<RetainReport, QueryError> {
+    use sqlx::Connection as _;
+    let mut tx = conn.begin().await?;
+    sqlx::query("DROP TABLE IF EXISTS temp.expiring")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TEMP TABLE expiring AS
+         SELECT id, monitor_id, date(slot_at) AS day, outcome FROM checks
+         WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
+         ORDER BY id LIMIT ?2"
+    )))
+    .bind(cutoffs.checks)
+    .bind(batch)
+    .execute(&mut *tx)
+    .await?;
+    let deleted = sqlx::query("DELETE FROM checks WHERE id IN (SELECT id FROM temp.expiring)")
+        .execute(&mut *tx)
+        .await?;
+    let aggregate_day = cutoffs.aggregates.date().to_string();
+    let pruned = prune_expired(&mut tx, cutoffs, &aggregate_day, batch).await?;
+    // Space is free now; write the aggregates of what was deleted.
+    let aggregated = sqlx::query(
+        "INSERT INTO check_stats_daily
+            (monitor_id, day, pass, http_fail, transport, timeout, missed)
+         SELECT monitor_id, day,
+                SUM(outcome = 'pass'), SUM(outcome = 'http_fail'),
+                SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
+                SUM(outcome = 'missed')
+         FROM temp.expiring
+         WHERE day >= ?1
+         GROUP BY monitor_id, day
+         ON CONFLICT (monitor_id, day) DO UPDATE SET
+            pass = check_stats_daily.pass + excluded.pass,
+            http_fail = check_stats_daily.http_fail + excluded.http_fail,
+            transport = check_stats_daily.transport + excluded.transport,
+            timeout = check_stats_daily.timeout + excluded.timeout,
+            missed = check_stats_daily.missed + excluded.missed",
+    )
+    .bind(&aggregate_day)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DROP TABLE temp.expiring")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(RetainReport {
+        days_written: aggregated.rows_affected(),
+        rows_deleted: deleted.rows_affected(),
+        ..pruned
+    })
 }
 
 /// Retention's deletes beyond raw checks — old aggregates, resolved incidents with their

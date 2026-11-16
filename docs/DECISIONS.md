@@ -64,8 +64,9 @@ kept incidents — they remain the visible "no receiver" signal until their inci
 out. A pass is a series of bounded transactions through the single writer (at most
 5,000 rows of each kind per command, so observations interleave between them); deleting an incident deletes its
 outbox rows first (FK), and every delete runs before the aggregates are written (the
-expiring rows wait in a `TEMP` table), so a pass can run in a store already at
-`SMON_MAX_DB_BYTES`. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
+expiring rows wait in a `TEMP` table), and its transaction may allocate up to 256 pages
+past the cap for the summaries (restored on the same connection afterwards), so a pass
+can run in a store already at `SMON_MAX_DB_BYTES`. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
 concurrent creates cannot overshoot it; paused monitors count (they keep history).
 
 ## D-011 — One engine verdict: a monitor that is not observing serves `unknown`

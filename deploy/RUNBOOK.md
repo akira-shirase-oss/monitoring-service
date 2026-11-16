@@ -59,11 +59,15 @@ fault means checks still run but that duty has stopped.
 ### The store is at its cap (`SMON_MAX_DB_BYTES`)
 
 `/readyz` answers `store writes failing` and the log shows `database or disk is full`.
-The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) frees expired
-rows *before* it writes anything, so it runs at the cap and the next commit after it
-lands. If the store is full of evidence that has not expired yet, retention cannot help:
-raise `SMON_MAX_DB_BYTES` (or shorten the D-012 horizons) in `env` and restart. A
-restart re-applies the new cap to every connection.
+The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) can run at the
+cap: it deletes expired rows before writing their daily summaries, and its own
+transaction may use up to 256 pages (1 MiB at 4 KiB pages) past the cap for those
+summaries. Observation commits land again only once that pass has freed room for them —
+which happens when the expired rows filled whole pages. If the store is full of
+evidence that has not expired yet (or the expired slice is too thin to free a page),
+retention cannot make room for new checks: raise `SMON_MAX_DB_BYTES` (or shorten the
+D-012 horizons) in `env` and restart. A restart re-applies the new cap to every
+connection.
 
 ## Upgrade
 
