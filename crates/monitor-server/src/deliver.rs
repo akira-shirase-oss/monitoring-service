@@ -52,10 +52,11 @@ impl Sink {
         }
     }
 
-    /// What the logs may say — never credentials or full recipient lists.
+    /// What the logs may say — scheme and host only (chat webhooks carry their secret in
+    /// the path or query), never credentials or full recipient lists.
     fn describe(&self) -> String {
         match self {
-            Self::Webhook { target, .. } => redact(target),
+            Self::Webhook { target, .. } => crate::redact::origin(target),
             Self::Email { to, .. } => format!("smtp relay → {} recipient(s)", to.len()),
         }
     }
@@ -107,7 +108,9 @@ struct Payload<'a> {
 struct MonitorRef<'a> {
     id: &'a str,
     name: &'a str,
-    url: &'a str,
+    /// Scheme, host, port and path — userinfo and query are stripped (`redact::for_alert`):
+    /// an alert lands in a channel or inbox whose readers are not the monitor's admins.
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,7 +132,7 @@ impl<'a> From<&'a DeliveryRow> for Payload<'a> {
             monitor: MonitorRef {
                 id: &row.monitor_id,
                 name: &row.monitor_name,
-                url: &row.monitor_url,
+                url: crate::redact::for_alert_str(&row.monitor_url),
             },
             incident: IncidentRef {
                 id: row.incident_id,
@@ -425,7 +428,11 @@ fn email_body(row: &DeliveryRow, kind: &str) -> String {
     use std::fmt::Write;
     let mut body = format!(
         "Service Monitor: {kind}\n\nEvent:    {}\nMonitor:  {} <{}>\nIncident: #{}\nOpened:   {}",
-        row.event_id, row.monitor_name, row.monitor_url, row.incident_id, row.opened_at
+        row.event_id,
+        row.monitor_name,
+        crate::redact::for_alert_str(&row.monitor_url),
+        row.incident_id,
+        row.opened_at
     );
     if let Some(first_fail) = row.first_fail_at {
         let _ = write!(body, "\nFailing since: {first_fail}");
@@ -448,13 +455,6 @@ fn hex_lower(bytes: &[u8]) -> String {
             let _ = write!(out, "{b:02x}");
             out
         })
-}
-
-fn redact(url: &Url) -> String {
-    let mut redacted = url.clone();
-    let _ = redacted.set_password(None);
-    redacted.set_username("").ok();
-    redacted.to_string()
 }
 
 #[cfg(test)]
@@ -552,10 +552,21 @@ mod tests {
     }
 
     #[test]
-    fn redact_strips_credentials_from_logged_urls() {
-        let url = Url::parse("https://user:hunter2@example.com/hook").expect("url");
-        let shown = redact(&url);
-        assert!(!shown.contains("hunter2"), "password must not be logged");
-        assert!(!shown.contains("user"), "username must not be logged");
+    fn the_logged_endpoint_is_the_origin_only() {
+        let sink = Sink::Webhook {
+            target: Url::parse("https://user:hunter2@hooks.slack.com/services/T0/B0/XYZ?x=1")
+                .expect("url"),
+            secret: None,
+        };
+        assert_eq!(sink.describe(), "https://hooks.slack.com");
+    }
+
+    #[test]
+    fn email_body_strips_credentials_from_the_monitor_url() {
+        let mut row = row();
+        row.monitor_url = "https://u:pw@example.com/health?token=T0K".to_owned();
+        let body = email_body(&row, "incident opened");
+        assert!(body.contains("<https://example.com/health>"), "{body}");
+        assert!(!body.contains("pw") && !body.contains("T0K"), "{body}");
     }
 }

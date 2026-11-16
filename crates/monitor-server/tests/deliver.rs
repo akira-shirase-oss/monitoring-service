@@ -387,3 +387,153 @@ fn hex(bytes: &[u8]) -> String {
             out
         })
 }
+
+/// A `MakeWriter` that appends every formatted log line to a shared buffer, so a test can
+/// read exactly what an operator's log pipeline would receive.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+}
+
+/// Slack, Discord and most chat webhooks carry their credential in the path (or a query
+/// token): whoever reads the URL can post to the channel. The deliverer logs its endpoint at
+/// every boot, so the log line may say scheme + host and nothing else.
+#[tokio::test]
+async fn webhook_secrets_in_the_path_or_query_never_reach_the_logs() -> anyhow::Result<()> {
+    let captured = Captured::default();
+    let writer_for_logs = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .json()
+        .with_writer(move || writer_for_logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let secrets = [
+        (
+            "https://hooks.slack.com/services/T0SECRET1/B0SECRET2/XoXoSlackToken123",
+            "https://hooks.slack.com",
+            &["T0SECRET1", "B0SECRET2", "XoXoSlackToken123", "/services"][..],
+        ),
+        (
+            "https://discord.com/api/webhooks/1234567890/DiscordTokenAbc",
+            "https://discord.com",
+            &["1234567890", "DiscordTokenAbc", "/api/webhooks"][..],
+        ),
+        (
+            "https://ops:hunter2@hooks.example.com:8443/in?token=QueryToken42#frag",
+            "https://hooks.example.com:8443",
+            &["hunter2", "ops", "QueryToken42", "token=", "/in", "frag"][..],
+        ),
+    ];
+    for (n, (target, shown, hidden)) in secrets.into_iter().enumerate() {
+        let (db, writer) = rig().await?;
+        let shutdown = CancellationToken::new();
+        let task = Deliverer::spawn(
+            db,
+            writer,
+            fast_config(),
+            webhook_sink(target, Some(b"the-secret"))?,
+            shutdown.clone(),
+        );
+        // The endpoint line is logged once the client is built; wait for it, not a timer.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while captured.text().matches("deliverer running").count() <= n
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+        task.await?;
+
+        let logs = captured.text();
+        assert!(
+            logs.contains(shown),
+            "the log should still say where alerts go ({shown}): {logs}"
+        );
+        for secret in hidden {
+            assert!(
+                !logs.contains(secret),
+                "{secret:?} from {target} leaked into the logs: {logs}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The monitored URL rides inside every alert — to a chat channel or an inbox whose readers
+/// are not necessarily the monitor's admins. Credentials in its userinfo or query must not.
+#[tokio::test]
+async fn alert_payloads_strip_credentials_from_the_monitor_url() -> anyhow::Result<()> {
+    let (db, writer) = rig().await?;
+    let monitor = NewMonitor::new(
+        "secret-health",
+        url::Url::parse("https://probe:pa55word@api.example.com/health?api_key=K3Y#x")?,
+    )?
+    .into_monitor();
+    db.insert_monitor(&monitor).await?;
+    for _ in 0..3 {
+        writer
+            .record(Observation {
+                monitor_id: monitor.id,
+                generation: monitor.generation,
+                slot_at: OffsetDateTime::now_utc(),
+                slot: SlotObservation::Probe(CheckOutcome::Transport),
+                http_status: None,
+                latency_ms: None,
+                detail: None,
+            })
+            .await?;
+    }
+    let (target, mut hits) = stub(0, vec![]).await?;
+    let shutdown = CancellationToken::new();
+    let task = Deliverer::spawn(
+        db.clone(),
+        writer,
+        fast_config(),
+        webhook_sink(&target, None)?,
+        shutdown.clone(),
+    );
+    let (_headers, body) = tokio::time::timeout(Duration::from_secs(5), hits.recv())
+        .await?
+        .expect("the event must arrive");
+    shutdown.cancel();
+    task.await?;
+
+    let text = String::from_utf8_lossy(&body);
+    for secret in ["probe", "pa55word", "api_key", "K3Y"] {
+        assert!(
+            !text.contains(secret),
+            "{secret:?} leaked into the alert: {text}"
+        );
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        parsed["monitor"]["url"], "https://api.example.com/health",
+        "the alert still names the endpoint"
+    );
+    Ok(())
+}

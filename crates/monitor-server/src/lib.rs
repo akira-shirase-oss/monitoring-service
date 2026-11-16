@@ -8,6 +8,7 @@ pub mod auth;
 pub mod deliver;
 pub mod logfile;
 pub mod probe;
+pub mod redact;
 pub mod schedule;
 pub mod snapshot;
 
