@@ -141,3 +141,7 @@ proxy in front reports `X-Forwarded-Proto: https` or `Forwarded: proto=https`) o
 `cargo test`, the architecture rule, `svelte-check` and a dashboard build. Plus the
 drills: `scripts/e2e.sh` (Playwright), `scripts/backup-drill.sh` (backup → destroy →
 restore), `perf/lab-profile.mjs` (load baseline).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 akira-shirase-oss.

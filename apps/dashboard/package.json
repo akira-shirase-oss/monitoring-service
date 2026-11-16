@@ -2,6 +2,7 @@
   "name": "@service-monitor/dashboard",
   "private": true,
   "version": "0.0.0",
+  "license": "MIT",
   "description": "Service Monitor's dashboard: a static SvelteKit app the Rust server can serve on its own origin.",
   "type": "module",
   "scripts": {

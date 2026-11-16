@@ -146,7 +146,7 @@ Send Vinay (`akira-shirase-oss` / @404humandev) a note, or open a GitHub issue o
 
 ## Setup notes we hit
 
-- No `LICENSE` file (Cargo.toml says publishing waits on the licence; licence itself is unset).
+- Licensed MIT (`LICENSE`, 2026-11-16); the crates are not published to crates.io.
 - No CI (`.github/workflows` is absent).
 - `Cargo.toml` `repository` points at `https://github.com/akira-shirase-oss/service-monitor`, which is not this repo.
 - `fixtures/README.md` is stale on redirects (see above).
