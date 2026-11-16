@@ -436,7 +436,7 @@ impl Health {
                 self.fresh = true;
                 if self.incident_open {
                     if outcome.is_pass() {
-                        self.recovery_passes += 1;
+                        self.recovery_passes = self.recovery_passes.saturating_add(1);
                         if self.recovery_passes >= thresholds.passes_to_recover {
                             self.incident_open = false;
                             self.consecutive_failures = 0;
@@ -452,7 +452,11 @@ impl Health {
                     self.consecutive_failures = 0;
                     Effect::Unchanged
                 } else {
-                    self.consecutive_failures += 1;
+                    // Saturating: inside a maintenance window the streak keeps counting
+                    // past the threshold (suppression), so it can exceed any threshold —
+                    // and `u8::MAX` is still >= every threshold (1..=10), so a saturated
+                    // streak opens on the first failure after the window, as it should.
+                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                     if self.consecutive_failures >= thresholds.failures_to_open {
                         if suppress_open {
                             // Suppression silences the page, not the evidence: keep
@@ -1058,5 +1062,31 @@ mod tests {
             passed: 6,
         };
         assert_eq!(stats.coverage_bps(), Some(10_000));
+    }
+
+    /// A maintenance window keeps the failure streak counting past the threshold — on
+    /// purpose, so the first failure after the window opens at once. A long window on a
+    /// broken target (a 1-minute monitor in a 5-hour window is 300 failures) used to
+    /// overflow the `u8` streak: a panic in the writer task under debug builds, a wrap to
+    /// a small count — and a lost incident — in release.
+    #[test]
+    fn a_long_maintenance_window_cannot_overflow_the_streak() {
+        let mut health = Health::new();
+        for n in 1..=600 {
+            let effect = health.rec_windowed(SlotObservation::Probe(CheckOutcome::Timeout));
+            let expected = if n < 3 {
+                Effect::Unchanged
+            } else {
+                Effect::IncidentSuppressed
+            };
+            assert_eq!(effect, expected, "failure {n}");
+        }
+        // The window ends with the target still broken: the next failure opens, exactly
+        // as it does after a short window.
+        assert_eq!(
+            health.rec(SlotObservation::Probe(CheckOutcome::Timeout)),
+            Effect::IncidentOpened
+        );
+        assert_eq!(health.status(), Status::Down);
     }
 }

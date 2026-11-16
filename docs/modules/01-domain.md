@@ -33,6 +33,7 @@ deterministically without a database, a network or a clock.
 | Timeout vs refused vs bad status | distinct `CheckOutcome` variants |
 | Coverage gap | `SlotObservation::Missed`, resets streaks |
 | Crash before commit | nothing recorded — state machine only sees committed observations |
+| Long maintenance window on a broken target | streak keeps counting with saturating `u8` arithmetic (it never wraps or panics past 255) and opens on the first failure after the window (`a_long_maintenance_window_cannot_overflow_the_streak`) |
 
 ## Testing parameters
 
