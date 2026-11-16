@@ -38,6 +38,12 @@
   is `Secure` behind TLS (`SMON_COOKIE_SECURE`); the systemd unit runs as the `smon`
   user (upgrading a root install: RUNBOOK); the SSRF guard refuses every non-global
   IANA special-purpose block; the disk cap applies to every pooled connection.
+- **Proxies are ignored:** the probe and webhook clients no longer honour
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` — a proxied probe bypassed the DNS-layer SSRF
+  guard. Egress proxies are not supported; probes and alerts dial directly.
+- **Configuration details:** a value may start with `#` (only whitespace followed by `#`
+  is an inline comment); a failed retention pass shows on `/readyz` as
+  `retention failing (see the server log)`, never with its error text.
 - **Licence:** MIT.
 
 - M7.3 real-app load drill: `perf/real-app.mjs` — a dependency-free Node app doing
