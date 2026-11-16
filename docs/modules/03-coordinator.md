@@ -42,7 +42,7 @@ it to the writer — without ever letting a slow target stall the schedule.
   (no validate-then-re-resolve gap); one local address fails the whole resolution —
   round-robin DNS makes "usually public" not a defense. Redirects: followed up to 5 hops,
   each hop revalidated through the same URL check; a refused hop leaves the 3xx as
-  `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk) and the coordinator commits that slot as `missed` (D-013) — the monitor refused to look, so
+  `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk) and commits as a `transport` failure that pages (D-013), so
   it never masquerades as a plain `connect` error.
 
 ## Failure cases
@@ -54,7 +54,8 @@ it to the writer — without ever letting a slow target stall the schedule.
 | Edit/pause mid-probe | generation bump; late result dropped at writer |
 | Redirect to refused target | hop stopped; the 3xx stands as `http_fail` |
 | Redirect loop past 5 hops | last 3xx stands as `http_fail` |
-| Name resolves to a local address | DNS-layer refusal → committed as `missed` + `rejected_local` (D-013): no streak, no incident, status `unknown` (`a_probe_the_guard_refuses_is_missed_not_a_failure`) |
+| Name resolves to a local address | DNS-layer refusal → `transport` + `rejected_local`, a failure that pages (D-013; `a_name_that_resolves_to_a_local_address_is_a_failure_that_pages`) |
+| Redirect to a local *name* | the resolver refuses the hop → `transport` + `rejected_local`, pages (`a_redirect_to_a_local_name_is_a_failure_that_pages`) |
 | Local/private literal registered or edited in (strict profile) | 422 `refused_target` at the API — never stored (`refused_targets_cannot_be_registered_outside_the_lab_profile`) |
 | Expired / not-yet-valid cert | `transport` + `cert_expired` / `cert_not_yet_valid` |
 | Trusted cert, wrong hostname | `transport` + `cert_name_mismatch` |

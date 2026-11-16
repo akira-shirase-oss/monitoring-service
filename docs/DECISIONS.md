@@ -18,23 +18,27 @@ time, and back-filling hundreds of rows is the catch-up storm the schedule refus
 elsewhere. A restart inside one interval writes nothing. Pausing and unpausing is not
 covered here (the paused period is the operator's choice, not lost evidence).
 
-## D-013 — A probe the monitor refused is a missed slot, not a target failure
+## D-013 — Refused literals are rejected at registration; probe-time refusals page
 
-The SSRF guard refuses local/private/reserved targets before any socket opens. Those
-refusals were committed as `transport` failures, so a loopback literal registered by
-mistake — or a public name whose DNS answer turned private — opened an incident and paged
-about a target nobody had contacted. That is the monitor reporting its own refusal as the
-target being down.
+The SSRF guard refuses local/private/reserved targets before any socket opens. Before
+D-013 a loopback or private *literal* could be registered under the strict profile and
+then failed every slot — the monitor reporting its own policy as the target being down.
 
 - **At registration:** create (and a PATCH that sets a URL) runs the same
   `ProbePolicy::check` the probe runs; under the strict profile a refused literal answers
   422 `refused_target` and is never stored. `SMON_PROFILE=lab` is the explicit opt-in.
-- **At probe time** (names can change their answers): a `rejected_local` probe commits as
-  `missed` with detail `rejected_local` — streaks reset, no incident, status `unknown`,
-  coverage drops. The detail keeps the reason visible in the evidence strip.
+- **At probe time:** a refusal stays a **target failure** — `transport` + detail
+  `rejected_local` — and pages like any other. This covers a public name whose DNS answer
+  turned private (parked at 127.0.0.1, hijacked) and a redirect hop to a local *name*
+  (`http://localhost/…`, refused by the resolver). Both are real outages for every
+  visitor of the target.
 
-A redirect *to* a refused target is unchanged: the 3xx is the target's own answer and
-stays `http_fail` evidence.
+*Revised 2026-11-16.* The first version of D-013 committed probe-time refusals as
+`missed`. That turned exactly those two outages into a silent `unknown` that never paged —
+the opposite of this project's promise — and was reverted. A redirect to a refused
+*literal* stays what it always was: the 3xx is the target's own answer, `http_fail`
+evidence. Pinned by `a_redirect_to_a_local_name_is_a_failure_that_pages` and
+`a_name_that_resolves_to_a_local_address_is_a_failure_that_pages`.
 
 ## D-012 — Every table has a horizon; the monitor count has a cap
 

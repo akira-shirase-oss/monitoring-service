@@ -17,7 +17,7 @@ use monitor_domain::CheckOutcome;
 const MAX_REDIRECT_HOPS: usize = 5;
 
 /// The committed detail for a probe the SSRF guard refused (a local address, by literal or
-/// by DNS answer). The coordinator records such a slot as `missed` (D-013).
+/// by DNS answer, on the first hop or a redirect). It rides a `transport` failure (D-013).
 pub const REJECTED_LOCAL: &str = "rejected_local";
 
 /// Targets the monitor refuses to contact. Two layers, both M5-complete:
@@ -215,6 +215,26 @@ pub struct ProbeClient {
 
 impl ProbeClient {
     pub fn new(policy: ProbePolicy, max_body: usize) -> Result<Self, reqwest::Error> {
+        Self::build(policy, max_body, &[])
+    }
+
+    /// A client whose DNS answers for `pins` bypass the policy — unit tests only: it lets an
+    /// offline test stand a "public" first hop on a loopback fixture, so a *later* hop can
+    /// be refused by the real resolver. Never reachable from production code.
+    #[cfg(test)]
+    pub(crate) fn pinned(
+        policy: ProbePolicy,
+        max_body: usize,
+        pins: &[(&str, SocketAddr)],
+    ) -> Result<Self, reqwest::Error> {
+        Self::build(policy, max_body, pins)
+    }
+
+    fn build(
+        policy: ProbePolicy,
+        max_body: usize,
+        pins: &[(&str, SocketAddr)],
+    ) -> Result<Self, reqwest::Error> {
         // TLS truth (D-010): a preconfigured rustls client on the webpki-roots bundle.
         // The platform verifier (Security.framework / schannel) flattens certificate
         // failures into opaque OS errors — the detail taxonomy below is only possible
@@ -229,7 +249,11 @@ impl ProbeClient {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let redirect_policy = policy.clone();
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        for (name, addr) in pins {
+            builder = builder.resolve(name, *addr);
+        }
+        let client = builder
             .tls_backend_preconfigured(tls)
             .redirect(redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= MAX_REDIRECT_HOPS {

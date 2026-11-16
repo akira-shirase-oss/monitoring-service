@@ -282,21 +282,16 @@ impl Plan {
             tracker.spawn(async move {
                 // The permits ride inside `dispatch` and release when the task ends.
                 let result = probes.probe(&dispatch.url, dispatch.deadline).await;
-                // A probe the SSRF guard refused never contacted the target: it is the
-                // monitor declining to look, not evidence the target failed (D-013). It
-                // commits as `missed` — streaks reset, no incident, status `unknown` — and
-                // keeps the refusal as its detail.
-                let refused = result.detail == Some(crate::probe::REJECTED_LOCAL);
+                // A probe the SSRF guard refused at probe time (a name resolving to a local
+                // address, a redirect to one) is a *target failure*: every real visitor of
+                // that target is broken too. It commits as `transport` + `rejected_local`
+                // and pages like any failure (D-013). Only registration refuses literals.
                 let observation = Observation {
                     monitor_id: dispatch.monitor_id,
                     generation: dispatch.generation,
                     slot_at: dispatch.slot_at,
-                    slot: if refused {
-                        SlotObservation::Missed
-                    } else {
-                        SlotObservation::Probe(result.outcome)
-                    },
-                    http_status: if refused { None } else { result.http_status },
+                    slot: SlotObservation::Probe(result.outcome),
+                    http_status: result.http_status,
                     latency_ms: Some(u64::try_from(result.latency.as_millis()).unwrap_or(u64::MAX)),
                     detail: result.detail.map(str::to_owned),
                 };
@@ -351,4 +346,150 @@ fn origin_key(url: &Url) -> String {
     let host = url.host_str().unwrap_or_default();
     let port = url.port_or_known_default().unwrap_or_default();
     format!("{host}:{port}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    use axum::Router;
+    use axum::response::Redirect;
+    use axum::routing::get;
+    use monitor_db::{Db, writer};
+    use monitor_domain::NewMonitor;
+
+    use super::*;
+    use crate::probe::ProbePolicy;
+    use crate::vitals::Vitals;
+
+    fn fast() -> Config {
+        Config {
+            tick: Duration::from_millis(20),
+            dispatch_grace: Duration::from_millis(60),
+            global_slots: 4,
+            per_origin_slots: 2,
+            results_bound: 64,
+            shutdown_deadline: Duration::from_millis(500),
+        }
+    }
+
+    /// Run the real coordinator + writer against `url` under the *strict* profile for a
+    /// few slots; return the committed (outcome, detail) rows and whether an incident is open.
+    async fn observe_strict(
+        url: &str,
+        pins: &[(&str, std::net::SocketAddr)],
+    ) -> (Vec<(String, Option<String>)>, bool) {
+        let db = Db::connect("sqlite::memory:", 1).await.expect("db");
+        db.migrate().await.expect("migrate");
+        let stored = NewMonitor::new("guarded", Url::parse(url).expect("url"))
+            .expect("monitor")
+            .into_monitor();
+        db.insert_monitor(&stored).await.expect("insert");
+        let mut monitor = stored.clone();
+        monitor.interval = Duration::from_millis(60);
+        monitor.timeout = Duration::from_millis(400);
+
+        let statuses = Arc::new(RwLock::new(HashMap::new()));
+        let (handle, _writer) = writer::spawn(
+            db.clone(),
+            statuses,
+            HashMap::new(),
+            Arc::default(),
+            32,
+            false,
+        );
+        let probes = ProbeClient::pinned(
+            ProbePolicy {
+                allow_local_targets: false,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            pins,
+        )
+        .expect("probe client");
+        let (_registry_tx, registry_rx) = watch::channel(Arc::new(vec![monitor.clone()]));
+        let shutdown = CancellationToken::new();
+        let task = Coordinator::spawn(
+            registry_rx,
+            handle,
+            probes,
+            fast(),
+            Vitals::new(Arc::default(), Duration::from_secs(30)),
+            shutdown.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        shutdown.cancel();
+        let _ = task.await;
+        let rows = db
+            .list_checks(monitor.id, 100)
+            .await
+            .expect("checks")
+            .into_iter()
+            .map(|row| (row.outcome, row.detail))
+            .collect();
+        let open = db
+            .open_incident(monitor.id)
+            .await
+            .expect("incident")
+            .is_some();
+        (rows, open)
+    }
+
+    fn assert_refusals_page(rows: &[(String, Option<String>)], open: bool, case: &str) {
+        let refused: Vec<_> = rows
+            .iter()
+            .filter(|(_, detail)| detail.as_deref() == Some(crate::probe::REJECTED_LOCAL))
+            .collect();
+        assert!(
+            refused.len() >= 3,
+            "{case}: expected refused probes, got {rows:?}"
+        );
+        for (outcome, _) in &refused {
+            assert_eq!(
+                outcome, "transport",
+                "{case}: a refusal is a target failure: {rows:?}"
+            );
+        }
+        assert!(
+            open,
+            "{case}: three refused probes must open an incident (page)"
+        );
+    }
+
+    /// A public target that starts redirecting to a local *name* (`localhost`) is broken
+    /// for every real visitor. The guard rightly refuses the hop at the resolver — and that
+    /// refusal must page, not vanish into a `missed` slot.
+    #[tokio::test]
+    async fn a_redirect_to_a_local_name_is_a_failure_that_pages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let port = addr.port();
+        let app =
+            Router::new().route(
+                "/moved",
+                get(move || async move {
+                    Redirect::temporary(&format!("http://localhost:{port}/health"))
+                }),
+            );
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        // `public.test` stands for a public name: pinned to the fixture, past the policy.
+        let (rows, open) = observe_strict(
+            &format!("http://public.test:{port}/moved"),
+            &[("public.test", addr)],
+        )
+        .await;
+        assert_refusals_page(&rows, open, "redirect to localhost");
+    }
+
+    /// A public name whose DNS answer turned private (parked at 127.0.0.1, or hijacked)
+    /// is an outage for its users: refused by the resolver, recorded as a failure, paged.
+    #[tokio::test]
+    async fn a_name_that_resolves_to_a_local_address_is_a_failure_that_pages() {
+        let (rows, open) = observe_strict("http://localhost:9/health", &[]).await;
+        assert_refusals_page(&rows, open, "name resolving to loopback");
+    }
 }
