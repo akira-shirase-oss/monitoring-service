@@ -313,14 +313,14 @@ impl<F: Fn(&str) -> Option<String>> Reader<F> {
     }
 }
 
-/// `#` at the start or after whitespace — how a comment begins in a shell-style env file.
+/// Whitespace followed by `#` — how an inline comment starts in an env file. A value that
+/// merely *begins* with `#` is not one: systemd and `sh` both keep a leading `#` as part of
+/// the value, and random secrets do start with it.
 fn has_inline_comment(value: &str) -> bool {
-    let value = value.trim_start();
-    value.starts_with('#')
-        || value
-            .as_bytes()
-            .windows(2)
-            .any(|pair| pair[0].is_ascii_whitespace() && pair[1] == b'#')
+    value
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[0].is_ascii_whitespace() && pair[1] == b'#')
 }
 
 impl Config {
@@ -534,6 +534,22 @@ mod tests {
         let good = "3f9a1c0e7b2d4a6f8e1c3b5d7f9a0c2e4b6d8f1a3c5e7b9d0f2a4c6e8b1d3f5a";
         let config = load(&[("SMON_ADMIN_TOKEN", good)]).expect("a 64-hex token is fine");
         assert_eq!(config.admin_token.as_deref(), Some(good));
+    }
+
+    /// A value that merely *starts* with `#` is not a comment: systemd and `sh` both keep a
+    /// leading `#` as part of the value, and random secrets do start with one.
+    #[test]
+    fn a_leading_hash_is_part_of_the_value() {
+        let config = load(&[
+            ("SMON_WEBHOOK_SECRET", "#Kq9!vZ2pL7xR4m"),
+            ("SMON_WEBHOOK_URL", "https://hooks.example.com/in#frag"),
+        ])
+        .expect("a leading or embedded # without whitespace is a value");
+        assert_eq!(config.webhook_secret.as_deref(), Some("#Kq9!vZ2pL7xR4m"));
+        // Whitespace then '#' is still the inline-comment mistake.
+        let error = load(&[("SMON_WEBHOOK_SECRET", "#Kq9!vZ2pL7xR4m # rotate monthly")])
+            .expect_err("inline comment");
+        assert!(error.to_string().contains("inline comment"), "{error}");
     }
 
     #[test]
