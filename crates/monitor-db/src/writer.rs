@@ -19,6 +19,11 @@ use monitor_domain::{Effect, Health, MonitorId, SlotObservation, Statuses};
 
 use crate::{Db, QueryError, RetainReport, RetentionCutoffs};
 
+/// Rows of each kind one retention command handles (D-012). Small enough that one command
+/// stays short, so an observation queued behind retention waits for one batch, not for a
+/// whole first pass over months of history. Not a measured optimum.
+pub const RETAIN_BATCH: u32 = 5_000;
+
 /// The statuses readers see — written only after commits, never from in-flight results.
 pub type SharedStatuses = Arc<RwLock<Statuses>>;
 
@@ -82,6 +87,7 @@ enum Command {
     /// through the writer like everything else — the store has one owner.
     Retain {
         cutoffs: RetentionCutoffs,
+        batch: u32,
         reply: oneshot::Sender<Result<RetainReport, QueryError>>,
     },
 }
@@ -136,12 +142,35 @@ impl WriterHandle {
     /// aggregates; old aggregates, resolved incidents, ended windows and delivered outbox
     /// rows are pruned — one transaction. Open incidents are never touched.
     pub async fn retain(&self, cutoffs: RetentionCutoffs) -> Result<RetainReport, WriterError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Retain { cutoffs, reply })
-            .await
-            .map_err(|_| WriterError::Dead)?;
-        rx.await.map_err(|_| WriterError::Dead)?.map_err(Into::into)
+        self.retain_in_batches(cutoffs, RETAIN_BATCH).await
+    }
+
+    /// A full retention pass as a series of bounded writer commands — `batch` rows of each
+    /// kind per command, repeated until a batch comes back short. Every command is its own
+    /// transaction, so observations queued meanwhile commit between batches instead of
+    /// waiting out the whole pass. Returns the folded report.
+    pub async fn retain_in_batches(
+        &self,
+        cutoffs: RetentionCutoffs,
+        batch: u32,
+    ) -> Result<RetainReport, WriterError> {
+        let mut total = RetainReport::default();
+        loop {
+            let (reply, rx) = oneshot::channel();
+            self.tx
+                .send(Command::Retain {
+                    cutoffs,
+                    batch,
+                    reply,
+                })
+                .await
+                .map_err(|_| WriterError::Dead)?;
+            let report = rx.await.map_err(|_| WriterError::Dead)??;
+            total.add(&report);
+            if report.exhausted(batch) {
+                return Ok(total);
+            }
+        }
     }
 }
 
@@ -204,10 +233,14 @@ async fn run(
                     debug!("delivery reply channel closed; mark still committed");
                 }
             }
-            Command::Retain { cutoffs, reply } => {
+            Command::Retain {
+                cutoffs,
+                batch,
+                reply,
+            } => {
                 // Retention is a supporting duty too: a failed pass degrades the monitor
                 // (the retention task reports it), it does not make it unavailable.
-                let outcome = db.retain(&cutoffs).await;
+                let outcome = db.retain(&cutoffs, batch).await;
                 if reply.send(outcome).is_err() {
                     debug!("retain reply channel closed; pass still committed");
                 }

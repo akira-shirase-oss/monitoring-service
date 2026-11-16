@@ -61,7 +61,8 @@ The birth streak is the incident's evidence: why it opened. Raw rows written *wh
 open are history like any other and age into aggregates, so coverage and success stay
 exact. Never pruned: open incidents, and undelivered (pending or exhausted) outbox rows of
 kept incidents — they remain the visible "no receiver" signal until their incident ages
-out. A pass is one transaction through the single writer; deleting an incident deletes its
+out. A pass is a series of bounded transactions through the single writer (at most
+5,000 rows of each kind per command, so observations interleave between them); deleting an incident deletes its
 outbox rows first (FK), and every delete runs before the aggregates are written (the
 expiring rows wait in a `TEMP` table), so a pass can run in a store already at
 `SMON_MAX_DB_BYTES`. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so

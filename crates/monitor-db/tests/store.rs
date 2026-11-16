@@ -1223,3 +1223,68 @@ async fn only_failed_observation_commits_count_as_write_failures() -> anyhow::Re
     assert_eq!(failures(), 1, "a failed observation commit is");
     Ok(())
 }
+
+/// Batched retention (D-012): one writer command handles at most `batch` rows of each kind,
+/// and a pass is a series of commands — the folded result equals a single unbounded pass.
+#[tokio::test]
+async fn retention_runs_in_bounded_batches_and_converges() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    for minute in 0..25 {
+        writer
+            .record(at(&monitor, CheckOutcome::Pass, 9, minute))
+            .await?;
+    }
+    let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
+    let report = writer.retain_in_batches(cutoffs, 10).await?;
+    assert_eq!(report.rows_deleted, 25);
+    assert_eq!(db.list_checks(monitor.id, 100).await?.len(), 0);
+    let stats = db
+        .check_stats(
+            monitor.id,
+            OffsetDateTime::now_utc() - time::Duration::days(30),
+        )
+        .await?;
+    assert_eq!(stats.passed, 25, "aggregates merge across batches");
+    Ok(())
+}
+
+/// The point of batching: an observation committed while a large retention pass runs lands
+/// between batches, not after the whole pass. Before, the pass was one transaction inside
+/// the single writer, and the coordinator (which awaits its commits) stalled behind it.
+#[tokio::test]
+async fn an_observation_lands_while_a_large_retention_pass_is_still_running() -> anyhow::Result<()>
+{
+    let (db, monitor, writer) = store().await?;
+    for second in 0..2_000 {
+        writer
+            .record(probe_at(
+                &monitor,
+                CheckOutcome::Pass,
+                OffsetDateTime::now_utc() - time::Duration::days(9)
+                    + time::Duration::seconds(second),
+            ))
+            .await?;
+    }
+    let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
+    let retention = {
+        let writer = writer.clone();
+        tokio::spawn(async move { writer.retain_in_batches(cutoffs, 10).await })
+    };
+    tokio::task::yield_now().await;
+    writer.record(pass(&monitor)).await?;
+    // The observation is committed; how much expired history was still waiting? With
+    // batches, nearly all of it (the record waited for at most a batch or two).
+    let waiting = db.list_checks(monitor.id, 5_000).await?.len();
+    assert!(
+        waiting > 1_000,
+        "the observation waited for the whole pass ({waiting} rows left when it landed)"
+    );
+    let report = retention.await??;
+    assert_eq!(report.rows_deleted, 2_000);
+    assert_eq!(
+        db.list_checks(monitor.id, 10).await?.len(),
+        1,
+        "the fresh row stays"
+    );
+    Ok(())
+}

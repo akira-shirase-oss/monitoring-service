@@ -17,8 +17,10 @@ not a process only the author can babysit.
   The ceiling is set per connection (`after_connect`), never once through the pool.
 - **Bounded logs:** structured JSON (tracing), byte-capped rotation, dropped-count surfaced.
 - **Retention:** module 02's expiry (D-012: raw checks, aggregates, incidents, windows,
-  delivered outbox; monitor cap) runs as a scheduled job through the writer — one
-  transaction per pass (batching is still owed).
+  delivered outbox; monitor cap) runs as a scheduled job through the writer, in batches:
+  each writer command handles at most `RETAIN_BATCH` (5,000) rows of each kind in its
+  own transaction, so observations commit between batches instead of waiting out a long
+  first pass (`an_observation_lands_while_a_large_retention_pass_is_still_running`).
 - **Backup/restore:** consistent backup of `monitor.db` (WAL-aware); restore drill proves open
   incidents and outbox rows survive; restore is documented and rehearsed before M4 exits.
 - **Deploy:** the monitor runs off the target host (independence is the point); upgrade and
