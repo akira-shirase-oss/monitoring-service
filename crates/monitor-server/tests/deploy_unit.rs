@@ -47,3 +47,46 @@ fn the_stop_timeout_outlasts_the_drain() {
         "TimeoutStopSec={timeout} cuts the drain short"
     );
 }
+
+const DEPLOY_SH: &str = include_str!("../../../scripts/deploy.sh");
+
+/// The `KEY=value` lines of the env template `deploy.sh` writes, as an operator gets them
+/// by deleting the leading `# `.
+fn env_template_settings() -> Option<Vec<(String, &'static str)>> {
+    let start = DEPLOY_SH.find("<<'ENV'\n")? + "<<'ENV'\n".len();
+    let end = start + DEPLOY_SH[start..].find("\nENV\n")?;
+    Some(
+        DEPLOY_SH[start..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix("# SMON_"))
+            .filter_map(|rest| rest.split_once('='))
+            .map(|(key, value)| (format!("SMON_{key}"), value))
+            .collect(),
+    )
+}
+
+/// systemd's `EnvironmentFile=` has no inline comments: `KEY=43200   # note` sets the value
+/// to the whole string. With strict `SMON_*` parsing, uncommenting such a template line
+/// stops the boot. Every template line must be a bare `KEY=value`, and every example value
+/// in it must pass the parser as written.
+#[test]
+fn the_env_template_has_no_inline_comments_and_its_examples_parse() {
+    let settings = env_template_settings().expect("deploy.sh writes an env template");
+    assert!(settings.len() >= 15, "template parsed: {settings:?}");
+    for (key, value) in &settings {
+        assert!(
+            !value.contains('#'),
+            "{key}: inline comment in the template value {value:?} — systemd keeps it"
+        );
+    }
+    let examples: std::collections::HashMap<String, String> = settings
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (key.clone(), (*value).to_owned()))
+        .collect();
+    if let Err(error) =
+        monitor_server::config::Config::from_lookup(|name| examples.get(name).cloned())
+    {
+        panic!("the template's example values must boot: {error}");
+    }
+}

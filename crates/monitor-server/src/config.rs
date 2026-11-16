@@ -138,12 +138,21 @@ struct Reader<F> {
 }
 
 impl<F: Fn(&str) -> Option<String>> Reader<F> {
-    /// The raw value: `None` when unset; a blank value is a problem (and treated as unset).
+    /// The raw value: `None` when unset; a blank value is a problem (and treated as unset),
+    /// and so is an inline comment — systemd's `EnvironmentFile=` keeps `# …` after a value
+    /// as part of it. The value is not echoed: it may be a secret.
     fn raw(&mut self, name: &str) -> Option<String> {
         let value = (self.lookup)(name)?;
         if value.trim().is_empty() {
             self.problems.push(format!(
                 "{name} is set but blank; unset it to use the default"
+            ));
+            return None;
+        }
+        if has_inline_comment(&value) {
+            self.problems.push(format!(
+                "{name} contains an inline comment (`… # …`): systemd EnvironmentFile keeps it \
+                 as part of the value — put the comment on its own line"
             ));
             return None;
         }
@@ -276,6 +285,16 @@ impl<F: Fn(&str) -> Option<String>> Reader<F> {
         };
         (webhook_url, webhook_secret, smtp)
     }
+}
+
+/// `#` at the start or after whitespace — how a comment begins in a shell-style env file.
+fn has_inline_comment(value: &str) -> bool {
+    let value = value.trim_start();
+    value.starts_with('#')
+        || value
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_whitespace() && pair[1] == b'#')
 }
 
 impl Config {
@@ -435,6 +454,33 @@ mod tests {
         ])
         .expect_err("three problems");
         assert_eq!(error.problems.len(), 3, "{error}");
+    }
+
+    /// systemd keeps `# …` after a value as part of it; the error must say so instead of
+    /// a bare "invalid digit".
+    #[test]
+    fn an_inline_comment_is_named_as_the_problem() {
+        for (name, value) in [
+            (
+                "SMON_SESSION_TTL_S",
+                "43200   # dashboard session lifetime (default 12h)",
+            ),
+            (
+                "SMON_COOKIE_SECURE",
+                "auto     # auto: Secure when the TLS proxy says so",
+            ),
+            (
+                "SMON_DATABASE_URL",
+                "sqlite:/opt/smon/data/monitor.db # the store",
+            ),
+        ] {
+            let error = load(&[(name, value)]).expect_err(name);
+            let text = error.to_string();
+            assert!(
+                text.contains(name) && text.contains("inline comment"),
+                "{name}: {text}"
+            );
+        }
     }
 
     #[test]

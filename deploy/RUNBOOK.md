@@ -65,6 +65,15 @@ restart re-applies the new cap to every connection.
 
 ## Upgrade
 
+**Before upgrading to strict configuration** (invalid `SMON_*` values stop the boot): an
+`env` written by an older `deploy.sh` had comments on the same line as some values. systemd
+keeps those as part of the value, so the new boot refuses them. Move every comment onto its
+own line first; this lists the offending lines:
+
+```sh
+grep -nE '^[[:space:]]*SMON_[A-Z_]+=.*[[:space:]]#' /opt/smon/env
+```
+
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # new release dir, repoints current
 sudo systemctl restart monitor-server           # or: launchctl kickstart -k system/com.shirase.smon
