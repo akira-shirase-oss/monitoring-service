@@ -77,7 +77,9 @@ current, because nothing watched the tasks (their `JoinHandle`s were dropped) an
 
 `vitals::Vitals` is now the single verdict, read by `/readyz`, the statuses `/api/monitors`
 serves (with the verdict beside them as `monitoring`), the public snapshot, and through the
-API the dashboard. Inputs: the writer's consecutive-failure counter, a coordinator
+API the dashboard. Inputs: the writer's consecutive failed-*observation*-commit counter
+(retention and delivery bookkeeping don't count — a failed retention pass marks the
+monitor degraded until a pass succeeds), a coordinator
 heartbeat stamped on every loop pass (stalled after 30 s of silence), exits of supervised
 tasks, and the drain flag set at shutdown. `vitals::Supervisor` owns every engine task's
 `JoinHandle`; an exit outside shutdown — return, panic or abort — is logged once and
@@ -88,7 +90,7 @@ recorded.
   each snapshot beat written born-expired with `monitoring: "unavailable"`, dashboard
   banner naming the cause.
 - **degraded** — observing, but a supporting task (a deliverer, the snapshot writer,
-  retention) stopped. `/readyz` 503 with the cause; statuses stay as committed.
+  retention) stopped, or the last retention pass failed. `/readyz` 503 with the cause; statuses stay as committed.
 - **ok** — everything running; `/readyz` 200.
 
 Statuses are not rewritten in the store: `unknown` is a property of *serving* while the

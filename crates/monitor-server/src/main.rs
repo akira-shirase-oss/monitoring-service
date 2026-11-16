@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
     supervisor.watch(
         "retention",
         Role::Supporting,
-        spawn_retention(&config, &db, &writer, &shutdown),
+        spawn_retention(&config, &db, &writer, &vitals, &shutdown),
     );
 
     let snapshot_db = db.clone();
@@ -353,10 +353,12 @@ fn spawn_retention(
     config: &Config,
     db: &monitor_db::Db,
     writer: &monitor_db::writer::WriterHandle,
+    vitals: &Vitals,
     shutdown: &CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let policy = config.retention;
     let every = config.retention_interval;
+    let vitals = vitals.clone();
     let db = db.clone();
     let writer = writer.clone();
     let shutdown = shutdown.clone();
@@ -377,7 +379,13 @@ fn spawn_retention(
                 () = shutdown.cancelled() => return,
             }
             let cutoffs = policy.cutoffs(time::OffsetDateTime::now_utc());
-            match writer.retain(cutoffs).await {
+            let pass = writer.retain(cutoffs).await;
+            // A failing pass degrades the monitor (D-011) until a pass succeeds again.
+            vitals.duty_result(
+                "retention",
+                pass.as_ref().map(|_| ()).map_err(ToString::to_string),
+            );
+            match pass {
                 Ok(report)
                     if report.rows_deleted
                         + report.aggregates_deleted

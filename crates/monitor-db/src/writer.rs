@@ -22,11 +22,11 @@ use crate::{Db, QueryError, RetainReport, RetentionCutoffs};
 /// The statuses readers see — written only after commits, never from in-flight results.
 pub type SharedStatuses = Arc<RwLock<Statuses>>;
 
-/// Consecutive store-write failures observed by the writer. `0` means the write path is
-/// healthy; anything above it means the last N commits failed (disk full, I/O error) and
-/// readers like `/readyz` must report unavailable rather than lie green. The counter is
-/// bumped by the writer on every failed commit and reset on the first successful one —
-/// recovery is proven by a landed write, not by a timer.
+/// Consecutive failed *observation* commits. `0` means evidence is landing; anything above
+/// it means the last N observations could not be stored (disk full, I/O error) and readers
+/// like `/readyz` must report unavailable rather than lie green. Bumped on every failed
+/// observation commit and reset on the first successful one — recovery is proven by a
+/// landed write, not by a timer. Retention and delivery bookkeeping do not count.
 pub type WriteHealth = Arc<AtomicU64>;
 
 /// One slot's product, sent to the writer by the coordinator.
@@ -195,17 +195,19 @@ async fn run(
                 delivered_at,
                 reply,
             } => {
+                // Delivery bookkeeping is a supporting duty: its failure is the
+                // deliverer's to log and retry, not evidence that observing stopped.
                 let outcome = db
                     .update_delivery(&event_id, attempts, next_attempt_at, delivered_at)
                     .await;
-                track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("delivery reply channel closed; mark still committed");
                 }
             }
             Command::Retain { cutoffs, reply } => {
+                // Retention is a supporting duty too: a failed pass degrades the monitor
+                // (the retention task reports it), it does not make it unavailable.
                 let outcome = db.retain(&cutoffs).await;
-                track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("retain reply channel closed; pass still committed");
                 }
@@ -214,8 +216,9 @@ async fn run(
     }
 }
 
-/// Commit landed → the write path is proven healthy; commit failed → consecutive failures
-/// grow. Dropped observations are *not* write failures — no commit was attempted.
+/// Observation commit landed → the write path is proven healthy; failed → consecutive
+/// failures grow. Only observation commits count (`WriteHealth` means "evidence is not
+/// landing"); dropped observations are not failures — no commit was attempted.
 fn track_write<T>(write_health: &WriteHealth, outcome: &Result<T, QueryError>) {
     match outcome {
         Ok(_) => write_health.store(0, Ordering::Relaxed),

@@ -203,6 +203,11 @@ impl Db {
         Ok(u64::try_from(pages).unwrap_or(u64::MAX) * u64::try_from(page_size).unwrap_or(4096))
     }
 
+    /// Close every pooled connection; later queries fail. Shutdown and tests.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     pub async fn migrate(&self) -> Result<(), DbError> {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())

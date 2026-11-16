@@ -1186,3 +1186,40 @@ async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `WriteHealth` means "observations are not landing" — the verdict that makes the whole
+/// monitor *unavailable* (statuses `unknown`, born-expired beat). A failed retention pass
+/// or delivery mark is a supporting duty failing; it used to bump the same counter and
+/// flip the monitor to "not observing" until the next observation commit.
+#[tokio::test]
+async fn only_failed_observation_commits_count_as_write_failures() -> anyhow::Result<()> {
+    let (db, monitor, _) = store().await?;
+    let write_health: WriteHealth = Arc::default();
+    let (writer, _task) = writer::spawn(
+        db.clone(),
+        Arc::new(RwLock::new(HashMap::new())),
+        HashMap::new(),
+        Arc::clone(&write_health),
+        8,
+        false,
+    );
+    db.close().await; // every command now fails
+    let failures = || write_health.load(std::sync::atomic::Ordering::Relaxed);
+
+    assert!(
+        writer
+            .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+            .await
+            .is_err()
+    );
+    assert!(writer.mark_delivery("evt", 1, None, None).await.is_err());
+    assert_eq!(
+        failures(),
+        0,
+        "supporting-duty failures are not observation failures"
+    );
+
+    assert!(writer.record(pass(&monitor)).await.is_err());
+    assert_eq!(failures(), 1, "a failed observation commit is");
+    Ok(())
+}

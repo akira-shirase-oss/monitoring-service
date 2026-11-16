@@ -84,6 +84,8 @@ struct Inner {
     write_failures: WriteHealth,
     draining: AtomicBool,
     stopped: Mutex<Vec<Stopped>>,
+    /// Supporting duties whose last run failed (e.g. a retention pass), with why.
+    failing: Mutex<std::collections::BTreeMap<&'static str, String>>,
 }
 
 /// Shared, cheap-to-clone engine health. See the module docs.
@@ -104,6 +106,7 @@ impl Vitals {
                 write_failures,
                 draining: AtomicBool::new(false),
                 stopped: Mutex::new(Vec::new()),
+                failing: Mutex::new(std::collections::BTreeMap::new()),
             }),
         }
     }
@@ -123,6 +126,24 @@ impl Vitals {
     /// Shutdown has begun: readiness goes false and stays false.
     pub fn begin_drain(&self) {
         self.inner.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// A supporting duty's latest run: `Err(why)` marks the monitor degraded until the
+    /// duty next succeeds (`Ok`). Observing is unaffected.
+    pub fn duty_result(&self, duty: &'static str, result: Result<(), String>) {
+        let mut failing = self
+            .inner
+            .failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match result {
+            Ok(()) => {
+                failing.remove(duty);
+            }
+            Err(why) => {
+                failing.insert(duty, why);
+            }
+        }
     }
 
     /// Record an engine task that stopped outside shutdown. Logged by the supervisor.
@@ -160,6 +181,16 @@ impl Vitals {
                 if task.role == Role::Observing {
                     observing = false;
                 }
+            }
+        }
+        {
+            let failing = self
+                .inner
+                .failing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (duty, why) in failing.iter() {
+                faults.push(format!("{duty} failing: {why}"));
             }
         }
         // A stall is only news while everything else on the observation path is fine — a
@@ -340,6 +371,21 @@ mod tests {
         assert!(verdict.faults[0].starts_with("coordinator stalled"));
         vitals.coordinator_beat();
         assert_eq!(vitals.verdict().status, Availability::Ok, "a beat recovers");
+    }
+
+    #[test]
+    fn a_failing_supporting_duty_degrades_until_it_next_succeeds() {
+        let (vitals, _) = vitals(Duration::from_secs(30));
+        vitals.duty_result("retention", Err("database is locked".into()));
+        let verdict = vitals.verdict();
+        assert_eq!(
+            verdict.status,
+            Availability::Degraded,
+            "observing continues"
+        );
+        assert_eq!(verdict.faults, ["retention failing: database is locked"]);
+        vitals.duty_result("retention", Ok(()));
+        assert_eq!(vitals.verdict().status, Availability::Ok);
     }
 
     #[test]
