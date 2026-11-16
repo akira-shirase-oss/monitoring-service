@@ -1,0 +1,24 @@
+# cargo-deny — `scripts/check.sh` runs `cargo deny check advisories` when cargo-deny is
+# installed. Every RustSec advisory against a locked crate fails the gate unless it is
+# listed below with a dated reason and a re-check date.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0459 / CVE-2026-119375 (recorded 2026-11-16). SQLite before 3.54.0 can
+    # return uninitialized page-cache memory when it opens a database together with a
+    # sibling `-wal` file of a different page size that a less trusted party wrote. We lock
+    # libsqlite3-sys 0.37.0 (bundled SQLite 3.53.x) through sqlx-sqlite 0.9.0, the newest
+    # sqlx release, whose `libsqlite3-sys >=0.30.1, <0.38.0` bound blocks the patched 0.39.
+    #
+    # Exposure, assessed negligible: the server only opens its own store, whose `-wal`
+    # lives in `data/`, writable only by the service user (deploy/monitor-server.service);
+    # `POST /api/backup` writes backups with VACUUM INTO and never opens them; a restore
+    # removes `-wal`/`-shm` first (deploy/RUNBOOK.md). Residual risk: restoring a backup
+    # together with an untrusted `-wal`, or running the default relative
+    # `sqlite:monitor.db` from a directory others can write.
+    #
+    # Re-check by 2026-12-16, and as soon as an sqlx-sqlite release allows
+    # libsqlite3-sys >= 0.39: take it and delete this entry. Do not switch to
+    # `sqlite-unbundled` instead — distro SQLite is likely older than 3.54.
+    { id = "RUSTSEC-2026-0459", reason = "patched libsqlite3-sys 0.39 blocked by sqlx-sqlite 0.9.0 (<0.38); exposure negligible, see deny.toml; re-check 2026-12-16" },
+]

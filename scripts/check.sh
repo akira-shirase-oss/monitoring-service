@@ -23,6 +23,13 @@ fi
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+# Supply chain: RustSec advisories against the locked dependencies. deny.toml records each
+# accepted exception with a reason and a re-check date; anything else fails the gate.
+if cargo deny --version >/dev/null 2>&1; then
+    cargo deny --locked check advisories
+else
+    echo "cargo-deny not installed; skipping the advisory check (cargo install cargo-deny)" >&2
+fi
 scripts/check-architecture.sh
 npm run check --workspace @service-monitor/dashboard
 npm run build --workspace @service-monitor/dashboard

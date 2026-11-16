@@ -139,8 +139,10 @@ proxy in front reports `X-Forwarded-Proto: https` or `Forwarded: proto=https`) o
 
 ## Verify
 
-`scripts/check.sh` — toolchain check, `cargo fmt --check`, `cargo clippy -- -D warnings`,
-`cargo test`, the architecture rule, `svelte-check` and a dashboard build. Plus the
+`scripts/check.sh` — toolchain check, a guard that no source file is git-ignored,
+`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo deny check
+advisories` when cargo-deny is installed (accepted exceptions, each dated and reasoned, in
+`deny.toml`), the architecture rule, `svelte-check` and a dashboard build. Plus the
 drills: `scripts/e2e.sh` (Playwright), `scripts/backup-drill.sh` (backup → destroy →
 restore), `perf/lab-profile.mjs` (load baseline).
 

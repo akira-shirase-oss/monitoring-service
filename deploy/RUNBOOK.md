@@ -123,6 +123,11 @@ fails the migration check at boot and stays down, which is the honest failure.
 
 ## Backup / restore
 
+Restore only into a stopped server, and delete any `monitor.db-wal`/`-shm` beside the
+restored file first: the bundled SQLite (`libsqlite3-sys` 0.37) is affected by
+RUSTSEC-2026-0459, which needs a database opened together with a `-wal` that someone else
+wrote (deny.toml records the assessment and the re-check date).
+
 ```sh
 curl -X POST .../api/backup -d '{"path":"/opt/smon/data/backups/monitor.db"}'
 # restore: stop, copy the snapshot over data/monitor.db (remove -wal/-shm), start
