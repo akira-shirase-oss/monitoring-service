@@ -23,7 +23,9 @@ dist/
 *.db-shm
 *.db-wal
 /var/
-status/
+# The snapshot writer's default SMON_STATUS_DIR (relative to the repo root). Anchored:
+# an unanchored `status/` also matched apps/dashboard/src/routes/status/ and hid it.
+/status/
 apps/dashboard/test-results/
 apps/dashboard/playwright-report/
 
