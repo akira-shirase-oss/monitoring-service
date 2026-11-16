@@ -105,3 +105,91 @@ fn a_bad_webhook_url_fails_the_boot_without_echoing_it() {
         "{stderr}"
     );
 }
+
+/// Start the server and stream its stdout (JSON log lines) into a channel.
+fn start_logged(
+    dir: &std::path::Path,
+) -> anyhow::Result<(Child, std::sync::mpsc::Receiver<String>)> {
+    use std::io::BufRead;
+    let mut child = server(dir, &[]).spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdout is piped"))?;
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    Ok((child, lines_rx))
+}
+
+/// Collect log lines until one contains `needle` (or the deadline passes).
+fn read_until(
+    lines: &std::sync::mpsc::Receiver<String>,
+    needle: &str,
+    deadline: Duration,
+) -> Vec<String> {
+    let end = Instant::now() + deadline;
+    let mut seen = Vec::new();
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        match lines.recv_timeout(left) {
+            Ok(line) => {
+                let hit = line.contains(needle);
+                seen.push(line);
+                if hit {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    seen
+}
+
+/// systemd, launchd and `kill` stop a service with SIGTERM. It used to take the default
+/// action — immediate death, no drain: in-flight probes, queued commits and deliveries
+/// abandoned, the process "killed by signal 15". SIGTERM now runs the same drain as Ctrl-C
+/// (readiness off, engine cancelled, bounded HTTP + engine drains) and exits 0.
+#[test]
+fn sigterm_and_sigint_drain_the_engine_and_exit_cleanly() {
+    for signal in ["-TERM", "-INT"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, lines) = start_logged(dir.path()).expect("start monitor-server");
+        let boot = read_until(&lines, "monitor-server listening", Duration::from_secs(30));
+        assert!(
+            boot.iter().any(|l| l.contains("monitor-server listening")),
+            "server never came up: {boot:?}"
+        );
+        let sent = Command::new("kill")
+            .args([signal, &child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success());
+
+        let status = wait_exit(&mut child, Duration::from_secs(40))
+            .unwrap_or_else(|| panic!("{signal}: the server did not stop within the drain bounds"));
+        assert!(
+            status.success(),
+            "{signal}: expected a clean exit after the drain, got {status}"
+        );
+        let shutdown = read_until(&lines, "engine drained", Duration::from_secs(5));
+        let name = &signal[1..];
+        assert!(
+            shutdown
+                .iter()
+                .any(|l| l.contains("shutting down") && l.contains(name)),
+            "{signal}: no shutdown line naming the signal: {shutdown:?}"
+        );
+        assert!(
+            shutdown.iter().any(|l| l.contains("engine drained")),
+            "{signal}: the engine drain did not complete: {shutdown:?}"
+        );
+    }
+}

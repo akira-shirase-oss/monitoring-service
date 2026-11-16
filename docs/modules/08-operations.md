@@ -36,6 +36,7 @@ not a process only the author can babysit.
 |---|---|
 | Disk full | writes fail; status unready; nothing half-written |
 | Invalid `SMON_*` value | boot fails naming every bad variable; no store created, no work started |
+| SIGTERM (systemd/launchd stop, `kill`) or SIGINT | same drain: readiness off, engine cancelled, open HTTP requests ≤ 12 s, engine tasks ≤ 15 s, exit 0 (`sigterm_and_sigint_drain_the_engine_and_exit_cleanly`, real binary) |
 | Log volume explodes | rotation caps it; dropped count visible |
 | Upgrade mid-incident | incidents + outbox survive; generation model holds |
 | Restore from backup | consistent store; no replayed external effects as "fresh" |

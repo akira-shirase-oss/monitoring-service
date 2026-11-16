@@ -59,6 +59,11 @@ curl -sf .../readyz && curl -sf .../version     # the version must match the new
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
 `down`, never fabricates a recovery.
 
+Stopping (`systemctl stop`, `launchctl kickstart -k`, `kill`) sends SIGTERM, which drains
+like Ctrl-C: readiness goes false, the coordinator stops scheduling, open requests get up
+to 12 s and the engine (in-flight probes, deliveries, queued commits) up to 15 s, then the
+process exits 0. The log shows `shutting down` (with the signal), then `engine drained`.
+
 ## Rollback
 
 ```sh

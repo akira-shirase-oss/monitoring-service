@@ -33,6 +33,9 @@ const COORDINATOR_STALL: Duration = Duration::from_secs(30);
 /// How long shutdown waits for the engine tasks (coordinator drain, in-flight deliveries,
 /// the writer's queued commits) after the HTTP server has stopped.
 const ENGINE_DRAIN: Duration = Duration::from_secs(15);
+/// How long shutdown lets open HTTP requests finish. axum's graceful shutdown waits
+/// without a deadline; the API's own request timeout is 10 s, so this is a little more.
+const HTTP_DRAIN: Duration = Duration::from_secs(12);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -137,6 +140,9 @@ async fn main() -> anyhow::Result<()> {
 
     let app = with_static_files(app, &config.status_dir, &config.dashboard_dir);
 
+    // Install the stop signals before serving: a registration failure is a boot error,
+    // not a detached panic that would look like a clean shutdown (rust-mastery ch. 12).
+    let stop = stop_signal().context("installing SIGTERM/SIGINT handlers")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     tracing::info!(
@@ -146,9 +152,7 @@ async fn main() -> anyhow::Result<()> {
         "monitor-server listening"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown, vitals))
-        .await?;
+    serve_until_stopped(listener, app, stop, shutdown, vitals).await?;
 
     // The HTTP side is down; let the engine finish. Main's writer handle goes first — the
     // writer exits once every handle is gone, after committing what is already queued.
@@ -334,15 +338,70 @@ fn spawn_retention(
     })
 }
 
-async fn shutdown_signal(shutdown: CancellationToken, vitals: Vitals) {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::error!(%error, "failed to listen for ctrl-c");
-        return;
+/// SIGTERM (systemd, launchd, `kill`) and SIGINT (Ctrl-C) mean the same thing: stop. Both
+/// are registered here, before the server starts; the returned future resolves with the
+/// signal's name.
+#[cfg(unix)]
+fn stop_signal() -> std::io::Result<impl std::future::Future<Output = &'static str>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn stop_signal() -> std::io::Result<impl std::future::Future<Output = &'static str>> {
+    Ok(async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "ctrl-c",
+            Err(error) => {
+                tracing::error!(%error, "ctrl-c handler failed; stopping");
+                "ctrl-c handler error"
+            }
+        }
+    })
+}
+
+/// Serve until a stop signal, then drain in order: readiness off and the engine told to
+/// stop at once (`begin_drain`, `cancel`), open HTTP requests given `HTTP_DRAIN` — axum
+/// alone would wait for them forever — and the caller drains the engine tasks after.
+async fn serve_until_stopped(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    stop: impl std::future::Future<Output = &'static str> + Send + 'static,
+    shutdown: CancellationToken,
+    vitals: Vitals,
+) -> std::io::Result<()> {
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful = async move {
+        let signal = stop.await;
+        tracing::info!(signal, "shutting down");
+        // Readiness goes false before anything stops, and stays false.
+        vitals.begin_drain();
+        shutdown.cancel();
+        let _ = stopping_tx.send(());
+    };
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(graceful)
+        .into_future();
+    let deadline = async move {
+        if stopping_rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(HTTP_DRAIN).await;
+    };
+    tokio::select! {
+        result = server => result,
+        () = deadline => {
+            tracing::warn!("HTTP drain deadline hit; abandoning open requests");
+            Ok(())
+        }
     }
-    tracing::info!("shutting down");
-    // Readiness goes false before anything stops, and stays false.
-    vitals.begin_drain();
-    shutdown.cancel();
 }
 
 /// The database URL is local-only, but keep a habit: never log a URL whole — parameters may
