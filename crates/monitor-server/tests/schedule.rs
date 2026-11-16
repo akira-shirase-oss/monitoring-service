@@ -13,6 +13,7 @@ use monitor_db::{Db, writer};
 use monitor_domain::{Monitor, NewMonitor};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config, Coordinator};
+use monitor_server::vitals::Vitals;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -63,6 +64,14 @@ fn rig(
     db: &Db,
     monitors: Vec<Monitor>,
 ) -> anyhow::Result<(watch::Sender<Arc<Vec<Monitor>>>, CancellationToken)> {
+    rig_with(db, monitors, true)
+}
+
+fn rig_with(
+    db: &Db,
+    monitors: Vec<Monitor>,
+    allow_local_targets: bool,
+) -> anyhow::Result<(watch::Sender<Arc<Vec<Monitor>>>, CancellationToken)> {
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let (handle, _writer) = writer::spawn(
         db.clone(),
@@ -75,14 +84,20 @@ fn rig(
     let (registry_tx, registry_rx) = watch::channel(Arc::new(monitors));
     let probes = ProbeClient::new(
         ProbePolicy {
-            allow_local_targets: true,
+            allow_local_targets,
             extra_roots: Vec::new(),
         },
         64 * 1024,
     )?;
     let shutdown = CancellationToken::new();
-    let _coordinator =
-        Coordinator::spawn(registry_rx, handle, probes, fast_config(), shutdown.clone());
+    let _coordinator = Coordinator::spawn(
+        registry_rx,
+        handle,
+        probes,
+        fast_config(),
+        Vitals::new(Arc::default(), Duration::from_secs(30)),
+        shutdown.clone(),
+    );
     Ok((registry_tx, shutdown))
 }
 
@@ -174,6 +189,54 @@ async fn registry_updates_schedule_a_new_monitor() -> anyhow::Result<()> {
     assert!(
         outcomes.iter().any(|o| o == "pass"),
         "expected the new monitor to be probed, got {outcomes:?}"
+    );
+    Ok(())
+}
+
+/// Refused-target honesty: a name that resolves to a local address is refused by the SSRF
+/// guard before any socket opens. That is the monitor declining to look — no evidence
+/// about the target — so the slot commits as `missed` (detail `rejected_local`): no
+/// failure streak, no incident, no page. Before, it committed `transport` failures and
+/// opened an incident blaming a target nobody had contacted.
+#[tokio::test]
+async fn a_probe_the_guard_refuses_is_missed_not_a_failure() -> anyhow::Result<()> {
+    let url = fixture(Router::new().route("/ok", get(|| async { "ok" }))).await?;
+    let db = store().await?;
+    // `localhost` is a name: registration can't refuse it, only the resolver can.
+    let target = Url::parse(&format!("http://localhost:{}/ok", url.port().unwrap_or(80)))?;
+    let monitor = monitor(
+        &db,
+        target,
+        Duration::from_millis(60),
+        Duration::from_millis(250),
+    )
+    .await?;
+    let (_tx, shutdown) = rig_with(&db, vec![monitor.clone()], false)?;
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    shutdown.cancel();
+
+    let checks = db.list_checks(monitor.id, 200).await?;
+    assert!(
+        checks.len() >= 4,
+        "expected several slots, got {}",
+        checks.len()
+    );
+    for check in &checks {
+        assert_eq!(
+            check.outcome, "missed",
+            "a refused probe is not a target failure"
+        );
+    }
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.detail.as_deref() == Some("rejected_local")),
+        "the refusal is still recorded as the reason"
+    );
+    assert!(
+        db.open_incident(monitor.id).await?.is_none(),
+        "no incident for a target the monitor never contacted"
     );
     Ok(())
 }

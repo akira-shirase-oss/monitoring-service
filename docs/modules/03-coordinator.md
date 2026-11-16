@@ -31,13 +31,18 @@ it to the writer — without ever letting a slow target stall the schedule.
   generation no longer matches the stored monitor.
 - **Target policy (SSRF, complete in M5.2):** two layers, both live. URL layer — scheme
   `http`/`https` only (checked at probe time and at every redirect hop); host as an IP
-  literal: loopback/private/link-local/unspecified/broadcast/multicast rejected unless
-  `SMON_PROFILE=lab`. DNS layer — `PolicyResolver` validates every address the OS answer
+  literal: every non-global block of the IANA IPv4 and IPv6 special-purpose registries
+  rejected unless `SMON_PROFILE=lab` — 0/8, 10/8, 100.64/10 (CGNAT), 127/8,
+  169.254/16, 172.16/12, 192.0.0/24, the three TEST-NETs, 192.88.99/24, 192.168/16,
+  198.18/15, 224/4, 240/4 (incl. broadcast); `::/96`, 64:ff9b:1::/48, 100::/64,
+  2001::/23, 2001:db8::/32, 3fff::/20, 5f00::/16, fc00::/7, fe80::/10, fec0::/10,
+  ff00::/8 — and v4-mapped, NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses are
+  judged by the IPv4 address they embed (`LOCAL_V4`/`LOCAL_V6` in `probe.rs`). DNS layer — `PolicyResolver` validates every address the OS answer
   contains *inside* reqwest's resolver, so the dialer only ever sees validated addresses
   (no validate-then-re-resolve gap); one local address fails the whole resolution —
   round-robin DNS makes "usually public" not a defense. Redirects: followed up to 5 hops,
   each hop revalidated through the same URL check; a refused hop leaves the 3xx as
-  `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk), so
+  `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk) and the coordinator commits that slot as `missed` (D-013) — the monitor refused to look, so
   it never masquerades as a plain `connect` error.
 
 ## Failure cases
@@ -49,7 +54,8 @@ it to the writer — without ever letting a slow target stall the schedule.
 | Edit/pause mid-probe | generation bump; late result dropped at writer |
 | Redirect to refused target | hop stopped; the 3xx stands as `http_fail` |
 | Redirect loop past 5 hops | last 3xx stands as `http_fail` |
-| Name resolves to a local address | `transport` + `rejected_local` (DNS-layer refusal) |
+| Name resolves to a local address | DNS-layer refusal → committed as `missed` + `rejected_local` (D-013): no streak, no incident, status `unknown` (`a_probe_the_guard_refuses_is_missed_not_a_failure`) |
+| Local/private literal registered or edited in (strict profile) | 422 `refused_target` at the API — never stored (`refused_targets_cannot_be_registered_outside_the_lab_profile`) |
 | Expired / not-yet-valid cert | `transport` + `cert_expired` / `cert_not_yet_valid` |
 | Trusted cert, wrong hostname | `transport` + `cert_name_mismatch` |
 | Self-signed / untrusted chain | `transport` + `cert_untrusted` |
@@ -58,8 +64,9 @@ it to the writer — without ever letting a slow target stall the schedule.
 ## Testing parameters
 
 - **Unit:** classify each reqwest error kind; policy accept/reject matrix (schemes, IP
-  literals, lab vs normal profile); `is_local` over every non-public range incl.
-  v4-mapped v6; `validate_addrs` mixed-answer refusal; the resolver refusing a real
+  literals, lab vs normal profile); `is_local_matches_the_ipv4_special_purpose_registry` and `…_ipv6_…` —
+  first/last address of every refused block, the public neighbours just outside, and
+  the embedded-IPv4 forms; `validate_addrs` mixed-answer refusal; the resolver refusing a real
   `localhost` lookup under the strict profile.
 - **Integration (ephemeral fixtures):** 200 → `pass`; 500 → `http_fail`; silent socket →
   `timeout` under a 200 ms test deadline; refused port → `transport`; chunked 1 MiB body →

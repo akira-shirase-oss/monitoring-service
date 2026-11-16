@@ -14,20 +14,32 @@ not a process only the author can babysit.
 
 - **Storage guardrail:** ~2 GiB budget for the SQLite file set + logs. Approaching the cap is
   a warning state; at the cap, writes fail and the API/status say so (module 02 failure case).
+  The ceiling is set per connection (`after_connect`), never once through the pool.
 - **Bounded logs:** structured JSON (tracing), byte-capped rotation, dropped-count surfaced.
-- **Retention:** module 02's 7-day raw + aggregates expiry runs as a scheduled job — bounded
-  batches, never blocking the writer on live data.
+- **Retention:** module 02's expiry (D-012: raw checks, aggregates, incidents, windows,
+  delivered outbox; monitor cap) runs as a scheduled job through the writer — one
+  transaction per pass (batching is still owed).
 - **Backup/restore:** consistent backup of `monitor.db` (WAL-aware); restore drill proves open
   incidents and outbox rows survive; restore is documented and rehearsed before M4 exits.
 - **Deploy:** the monitor runs off the target host (independence is the point); upgrade and
-  rollback are scripted; the public status page is hosted elsewhere (module 07).
+  rollback are scripted; the public status page is hosted elsewhere (module 07). The
+  systemd unit runs as the system user `smon` with no capabilities and a read-only
+  system except `data/` and `status/`; `TimeoutStopSec=40s` outlasts the SIGTERM drain
+  (pinned by `tests/deploy_unit.rs`).
 - **Config:** env-driven (`SMON_*`), localhost-bound by default, secrets never logged.
+  Parsed once into a typed `Config` (`config.rs`) with ranges and cross-field rules
+  (`SMON_STATUS_TTL_S` > `SMON_STATUS_INTERVAL_S`, the SMTP trio all-or-none); an
+  invalid or blank value fails the boot listing every problem, unknown `SMON_*` names
+  are warned about. Pinned by `invalid_smon_values_fail_the_boot_and_name_every_problem`
+  against the real binary.
 
 ## Failure cases
 
 | Trigger | Required result |
 |---|---|
 | Disk full | writes fail; status unready; nothing half-written |
+| Invalid `SMON_*` value | boot fails naming every bad variable; no store created, no work started |
+| SIGTERM (systemd/launchd stop, `kill`) or SIGINT | same drain: readiness off, engine cancelled, open HTTP requests ≤ 12 s, engine tasks ≤ 15 s, exit 0 (`sigterm_and_sigint_drain_the_engine_and_exit_cleanly`, real binary) |
 | Log volume explodes | rotation caps it; dropped count visible |
 | Upgrade mid-incident | incidents + outbox survive; generation model holds |
 | Restore from backup | consistent store; no replayed external effects as "fresh" |

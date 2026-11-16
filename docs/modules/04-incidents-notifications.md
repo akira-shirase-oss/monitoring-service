@@ -43,6 +43,15 @@ at-least-once to a receiver — without alerting ever being able to stall observ
   2xx/354-close reply is success; anything else is the same deterministic retry/exhaustion
   path as webhooks. Credentials live in env only and are never logged — `Sink::describe`
   reports the recipient count, not addresses.
+- **URL redaction (`redact.rs`):** chat webhooks carry their credential in the path
+  (Slack `/services/T…/B…/<token>`, Discord `/api/webhooks/<id>/<token>`) or a query
+  token, so stripping userinfo is not redaction. Anything logged shows the webhook as
+  `scheme://host[:port]` only (`redact::origin`). The monitored URL inside an alert — the
+  webhook payload's `monitor.url` and the email body — keeps scheme, host, port and path
+  and drops userinfo, query and fragment (`redact::for_alert`): an alert's readers are a
+  channel or an inbox, not the monitor's admins. Pinned by
+  `webhook_secrets_in_the_path_or_query_never_reach_the_logs` (captures the real log
+  output) and `alert_payloads_strip_credentials_from_the_monitor_url`.
 
 ## Failure cases
 

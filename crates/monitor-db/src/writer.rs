@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use monitor_domain::{Effect, Health, MonitorId, SlotObservation, Statuses};
 
-use crate::{Db, QueryError, RetainReport};
+use crate::{Db, QueryError, RetainReport, RetentionCutoffs};
 
 /// The statuses readers see — written only after commits, never from in-flight results.
 pub type SharedStatuses = Arc<RwLock<Statuses>>;
@@ -81,7 +81,7 @@ enum Command {
     /// A retention pass: aggregate + delete expired checks in one transaction. Goes
     /// through the writer like everything else — the store has one owner.
     Retain {
-        cutoff: OffsetDateTime,
+        cutoffs: RetentionCutoffs,
         reply: oneshot::Sender<Result<RetainReport, QueryError>>,
     },
 }
@@ -132,13 +132,13 @@ impl WriterHandle {
         rx.await.map_err(|_| WriterError::Dead)?.map_err(Into::into)
     }
 
-    /// Run one retention pass: checks older than `cutoff` are rolled into daily
-    /// aggregates and deleted in the same transaction. Open incidents and the outbox
-    /// are never touched.
-    pub async fn retain(&self, cutoff: OffsetDateTime) -> Result<RetainReport, WriterError> {
+    /// Run one retention pass (D-012, `Db::retain`): expired checks roll into daily
+    /// aggregates; old aggregates, resolved incidents, ended windows and delivered outbox
+    /// rows are pruned — one transaction. Open incidents are never touched.
+    pub async fn retain(&self, cutoffs: RetentionCutoffs) -> Result<RetainReport, WriterError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Command::Retain { cutoff, reply })
+            .send(Command::Retain { cutoffs, reply })
             .await
             .map_err(|_| WriterError::Dead)?;
         rx.await.map_err(|_| WriterError::Dead)?.map_err(Into::into)
@@ -203,8 +203,8 @@ async fn run(
                     debug!("delivery reply channel closed; mark still committed");
                 }
             }
-            Command::Retain { cutoff, reply } => {
-                let outcome = db.retain(cutoff).await;
+            Command::Retain { cutoffs, reply } => {
+                let outcome = db.retain(&cutoffs).await;
                 track_write(&write_health, &outcome);
                 if reply.send(outcome).is_err() {
                     debug!("retain reply channel closed; pass still committed");

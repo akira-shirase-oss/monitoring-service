@@ -2,6 +2,92 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-014 — Downtime is one stored `missed` row per monitor
+
+D-007 made every slot a stored row so rebuilds replay gaps as gaps — but slots that
+passed while the *process* was down produced no row at all. The boot rebuild then replayed
+the last pre-outage observations as current (the first snapshot after a long outage said
+"up"), and failures before and after the outage counted as one consecutive streak.
+
+At boot, before the coordinator or the first snapshot beat, every unpaused monitor whose
+newest stored slot is older than one interval plus the dispatch grace gets one `missed`
+row, at the first slot that never ran, committed through the writer: streaks reset, the
+status reads `unknown` until a fresh probe, and the outage is visible in the record. One
+row per gap, not one per lost slot — coverage already derives expected slots from elapsed
+time, and back-filling hundreds of rows is the catch-up storm the schedule refuses
+elsewhere. A restart inside one interval writes nothing. Pausing and unpausing is not
+covered here (the paused period is the operator's choice, not lost evidence).
+
+## D-013 — A probe the monitor refused is a missed slot, not a target failure
+
+The SSRF guard refuses local/private/reserved targets before any socket opens. Those
+refusals were committed as `transport` failures, so a loopback literal registered by
+mistake — or a public name whose DNS answer turned private — opened an incident and paged
+about a target nobody had contacted. That is the monitor reporting its own refusal as the
+target being down.
+
+- **At registration:** create (and a PATCH that sets a URL) runs the same
+  `ProbePolicy::check` the probe runs; under the strict profile a refused literal answers
+  422 `refused_target` and is never stored. `SMON_PROFILE=lab` is the explicit opt-in.
+- **At probe time** (names can change their answers): a `rejected_local` probe commits as
+  `missed` with detail `rejected_local` — streaks reset, no incident, status `unknown`,
+  coverage drops. The detail keeps the reason visible in the evidence strip.
+
+A redirect *to* a refused target is unchanged: the 3xx is the target's own answer and
+stays `http_fail` evidence.
+
+## D-012 — Every table has a horizon; the monitor count has a cap
+
+Retention used to exempt *every* raw row of a monitor with an open incident (one
+long-open incident meant unbounded raw history), and never pruned the outbox, incidents,
+aggregates or windows; nothing bounded the number of monitors. At 1 row per slot the
+store's growth must be a function of configuration, not of uptime.
+
+| Record | Horizon (default) | Variable | Counted from |
+|---|---|---|---|
+| raw `checks` | 7 days, then rolled into `check_stats_daily` | `SMON_RETENTION_S` | `slot_at` |
+| open incident's birth streak | while the incident is open | — | rows `first_fail_at`…`opened_at` (≤ `failures_to_open` ≤ 10) |
+| `check_stats_daily` | 365 days | `SMON_AGGREGATE_RETENTION_S` | `day` |
+| resolved incidents + all their outbox rows | 365 days | `SMON_INCIDENT_RETENTION_S` | `resolved_at` |
+| ended maintenance windows | 365 days | `SMON_INCIDENT_RETENTION_S` | `ends_at` |
+| delivered outbox rows | 30 days | `SMON_OUTBOX_RETENTION_S` | `delivered_at` |
+| monitors | cap 100 (create → 409 `limit_reached`) | `SMON_MAX_MONITORS` | — |
+
+The birth streak is the incident's evidence: why it opened. Raw rows written *while* it is
+open are history like any other and age into aggregates, so coverage and success stay
+exact. Never pruned: open incidents, and undelivered (pending or exhausted) outbox rows of
+kept incidents — they remain the visible "no receiver" signal until their incident ages
+out. A pass is one transaction through the single writer; deleting an incident deletes its
+outbox rows first (FK). The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
+concurrent creates cannot overshoot it; paused monitors count (they keep history).
+
+## D-011 — One engine verdict: a monitor that is not observing serves `unknown`
+
+The committed status map only moves when the writer commits. If the writer task dies, the
+coordinator dies or wedges, or every commit fails, the map freezes at its last value — and
+the API, the dashboard and the public heartbeat used to keep serving that frozen "up" as
+current, because nothing watched the tasks (their `JoinHandle`s were dropped) and
+`/readyz` only saw write failures.
+
+`vitals::Vitals` is now the single verdict, read by `/readyz`, the statuses `/api/monitors`
+serves (with the verdict beside them as `monitoring`), the public snapshot, and through the
+API the dashboard. Inputs: the writer's consecutive-failure counter, a coordinator
+heartbeat stamped on every loop pass (stalled after 30 s of silence), exits of supervised
+tasks, and the drain flag set at shutdown. `vitals::Supervisor` owns every engine task's
+`JoinHandle`; an exit outside shutdown — return, panic or abort — is logged once and
+recorded.
+
+- **unavailable** — not observing: writer or coordinator stopped, coordinator stalled,
+  store writes failing, or shutting down. `/readyz` 503, every served status `unknown`,
+  each snapshot beat written born-expired with `monitoring: "unavailable"`, dashboard
+  banner naming the cause.
+- **degraded** — observing, but a supporting task (a deliverer, the snapshot writer,
+  retention) stopped. `/readyz` 503 with the cause; statuses stay as committed.
+- **ok** — everything running; `/readyz` 200.
+
+Statuses are not rewritten in the store: `unknown` is a property of *serving* while the
+engine is down, and the committed history stays exactly what was observed.
+
 ## D-010 — Certificate trust is deterministic: webpki-roots, never the local store
 
 A monitor should report what a *public* client sees. Reqwest's default on macOS delegates

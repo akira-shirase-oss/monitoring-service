@@ -387,3 +387,57 @@ fn hex(bytes: &[u8]) -> String {
             out
         })
 }
+
+/// The monitored URL rides inside every alert — to a chat channel or an inbox whose readers
+/// are not necessarily the monitor's admins. Credentials in its userinfo or query must not.
+#[tokio::test]
+async fn alert_payloads_strip_credentials_from_the_monitor_url() -> anyhow::Result<()> {
+    let (db, writer) = rig().await?;
+    let monitor = NewMonitor::new(
+        "secret-health",
+        url::Url::parse("https://probe:pa55word@api.example.com/health?api_key=K3Y#x")?,
+    )?
+    .into_monitor();
+    db.insert_monitor(&monitor).await?;
+    for _ in 0..3 {
+        writer
+            .record(Observation {
+                monitor_id: monitor.id,
+                generation: monitor.generation,
+                slot_at: OffsetDateTime::now_utc(),
+                slot: SlotObservation::Probe(CheckOutcome::Transport),
+                http_status: None,
+                latency_ms: None,
+                detail: None,
+            })
+            .await?;
+    }
+    let (target, mut hits) = stub(0, vec![]).await?;
+    let shutdown = CancellationToken::new();
+    let task = Deliverer::spawn(
+        db.clone(),
+        writer,
+        fast_config(),
+        webhook_sink(&target, None)?,
+        shutdown.clone(),
+    );
+    let (_headers, body) = tokio::time::timeout(Duration::from_secs(5), hits.recv())
+        .await?
+        .expect("the event must arrive");
+    shutdown.cancel();
+    task.await?;
+
+    let text = String::from_utf8_lossy(&body);
+    for secret in ["probe", "pa55word", "api_key", "K3Y"] {
+        assert!(
+            !text.contains(secret),
+            "{secret:?} leaked into the alert: {text}"
+        );
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        parsed["monitor"]["url"], "https://api.example.com/health",
+        "the alert still names the endpoint"
+    );
+    Ok(())
+}

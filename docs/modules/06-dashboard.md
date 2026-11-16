@@ -28,7 +28,10 @@ evidence, check history and incident timelines — a client of the API, never of
 - **Static SPA, same origin:** built by `vite build`, served by monitor-server; `ssr = false`;
   no queries to SQLite, no authority.
 - **Truthfulness first:** unreachable server → "cannot see" banner (never a green board);
-  `unknown` is a displayed state; stale data is labeled with its timestamps.
+  `unknown` is a displayed state; stale data is labeled with its timestamps. A reachable
+  server whose engine is not observing (D-011) serves `monitoring` beside the list —
+  `unavailable` (every status already `unknown`) or `degraded` — and the list shows a
+  banner naming the cause; it is the same verdict `/readyz` reports.
 - **Coverage ≠ success:** check history separates "did we look" (coverage) from "what did we
   see" (outcome). A grey gap in the strip means no observation existed.
 - **States vocabulary:** `up`, `down`, `unknown`, `paused` — badges use the status tokens
@@ -41,6 +44,7 @@ evidence, check history and incident timelines — a client of the API, never of
 | Trigger | Required result |
 |---|---|
 | API down | "cannot see" banner; no fabricated data |
+| API up, writer/coordinator dead or writes failing | "monitoring is unavailable" banner with the cause; statuses `unknown` |
 | Slow API | loading state, never stale-shown-as-fresh |
 | Long history | bounded pages; virtualization when justified |
 

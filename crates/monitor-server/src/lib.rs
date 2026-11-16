@@ -5,11 +5,14 @@
 //! the writer publishes — never from in-flight probes.
 
 pub mod auth;
+pub mod config;
 pub mod deliver;
 pub mod logfile;
 pub mod probe;
+pub mod redact;
 pub mod schedule;
 pub mod snapshot;
+pub mod vitals;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +33,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use monitor_db::{
-    CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses, WriteHealth,
+    CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses,
 };
 use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError};
 
@@ -46,9 +49,10 @@ pub struct AppState {
     pub statuses: SharedStatuses,
     /// The live monitor set the coordinator schedules against. Management writes re-send it.
     pub registry: watch::Sender<Arc<Vec<Monitor>>>,
-    /// Consecutive store-write failures from the writer — nonzero means the write path is
-    /// broken (disk full, I/O error) and readiness must say so.
-    pub write_health: WriteHealth,
+    /// Engine health: write failures, dead or stalled engine tasks, draining. One verdict
+    /// for readiness, the statuses served here and the public snapshot — a monitor that
+    /// is not observing must never serve its last statuses as current.
+    pub vitals: vitals::Vitals,
     /// The management credential (M5.1). `None` only on a loopback listen — boot refuses
     /// a tokenless public listen.
     pub admin_token: auth::AdminToken,
@@ -56,6 +60,14 @@ pub struct AppState {
     /// `sessions` row and the cookie's `Max-Age`. Store-side expiry is the authority;
     /// the cookie's copy is a convenience for the browser.
     pub session_ttl: Duration,
+    /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
+    pub cookie_secure: auth::CookieSecure,
+    /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
+    /// they keep history). Bounds the schedule and every per-monitor table (D-012).
+    pub max_monitors: u64,
+    /// `SMON_PROFILE=lab`: local/private targets may be registered (fixtures). Otherwise
+    /// a URL the SSRF guard would refuse is refused at registration (D-013).
+    pub allow_local_targets: bool,
     pub version: &'static str,
 }
 
@@ -77,6 +89,76 @@ pub async fn load_registry(db: &Db) -> Result<Vec<Monitor>, QueryError> {
         .into_iter()
         .map(Monitor::try_from)
         .collect()
+}
+
+/// Boot rebuild: replay each monitor's stored tail through `Health` under its *current*
+/// thresholds, seed the status map, and hand the machines to the writer. The rebuild tail
+/// is sized from the monitor's own thresholds — a streak can never exceed them.
+pub async fn rebuild_health(
+    db: &Db,
+    monitors: &[Monitor],
+    statuses: &SharedStatuses,
+) -> Result<std::collections::HashMap<MonitorId, monitor_domain::Health>, QueryError> {
+    let mut health = std::collections::HashMap::with_capacity(monitors.len());
+    for monitor in monitors {
+        let open = db.open_incident(monitor.id).await?.is_some();
+        let tail = db
+            .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
+            .await?;
+        let rebuilt = monitor_domain::Health::rebuild(open, &tail, monitor.thresholds);
+        // Boot is single-threaded here: nothing else can have poisoned the map.
+        statuses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(monitor.id, rebuilt.status());
+        health.insert(monitor.id, rebuilt);
+    }
+    Ok(health)
+}
+
+/// Restart honesty: while the process was down, slots passed unobserved — but no row said
+/// so, so the boot rebuild replayed the last pre-outage observations as if they were
+/// current (a stale "up" on the first snapshot) and counted failures before and after the
+/// outage as one consecutive streak.
+///
+/// For every unpaused monitor whose newest stored slot is older than one interval plus the
+/// dispatch grace, commit one `missed` row — at the first slot that never ran — through the
+/// writer: streaks reset, the status reads `unknown` until a fresh probe, and the gap is
+/// part of the record (D-007). One row per gap, not one per lost slot: coverage already
+/// counts expected slots from elapsed time, and a catch-up burst is exactly what the
+/// schedule refuses elsewhere. Returns how many monitors had a gap.
+pub async fn record_downtime(
+    writer: &monitor_db::WriterHandle,
+    db: &Db,
+    monitors: &[Monitor],
+    now: OffsetDateTime,
+    dispatch_grace: Duration,
+) -> Result<usize, monitor_db::WriterError> {
+    let mut gaps = 0;
+    for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
+        let Some(last) = db.last_slot_at(monitor.id).await? else {
+            continue; // never observed: nothing to be stale about
+        };
+        let interval = time::Duration::try_from(monitor.interval).unwrap_or(time::Duration::MAX);
+        let grace = time::Duration::try_from(monitor.interval.min(dispatch_grace))
+            .unwrap_or(time::Duration::ZERO);
+        if now - last <= interval + grace {
+            continue; // the next slot was not yet overdue: no gap
+        }
+        writer
+            .record(monitor_db::Observation {
+                monitor_id: monitor.id,
+                generation: monitor.generation,
+                slot_at: last + interval,
+                slot: monitor_domain::SlotObservation::Missed,
+                http_status: None,
+                latency_ms: None,
+                detail: None,
+            })
+            .await?;
+        gaps += 1;
+    }
+    Ok(gaps)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -200,9 +282,10 @@ async fn login(
         [(
             axum::http::header::SET_COOKIE,
             format!(
-                "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
                 auth::SESSION_COOKIE,
-                state.session_ttl.as_secs()
+                state.session_ttl.as_secs(),
+                state.cookie_secure.attribute(&headers),
             ),
         )],
     )
@@ -223,29 +306,31 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
         [(
             axum::http::header::SET_COOKIE,
             format!(
-                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-                auth::SESSION_COOKIE
+                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+                auth::SESSION_COOKIE,
+                state.cookie_secure.attribute(&headers),
             ),
         )],
     )
         .into_response()
 }
 
-/// Readiness means the store answers *and* the write path has landed commits. A read can
-/// succeed while every write fails (disk full) — the counter the writer keeps is the truth
-/// about the write path, never a green that unsaved results would contradict.
+/// Readiness means the store answers, the write path lands commits, and every engine task
+/// (writer, coordinator, deliverers, snapshot, retention) is running and not stalled. A
+/// read can succeed while every write fails (disk full), and the HTTP server can answer
+/// while the writer is dead — the vitals verdict is the truth about the engine, never a
+/// green that frozen statuses would contradict.
 async fn readyz(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     state.db.ping().await?;
-    let failures = state
-        .write_health
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if failures > 0 {
+    let verdict = state.vitals.verdict();
+    if verdict.status != vitals::Availability::Ok {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "status": "unavailable",
-                "reason": "store writes failing",
-                "consecutive_failures": failures,
+                "status": verdict.status,
+                "reason": verdict.faults.first(),
+                "faults": verdict.faults,
+                "consecutive_failures": verdict.consecutive_write_failures,
             })),
         )
             .into_response());
@@ -271,13 +356,20 @@ struct MonitorView {
     created_at: OffsetDateTime,
 }
 
+/// The monitor list carries the engine verdict alongside it (`monitoring`), read once so
+/// the statuses and the verdict can't disagree: while the engine is not observing, every
+/// status is `unknown` — the last committed value is history, not current evidence.
 async fn list_monitors(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let verdict = state.vitals.verdict();
     let rows = state.db.list_monitors().await?;
     let monitors: Vec<MonitorView> = rows
         .into_iter()
-        .map(|row| view_from_row(row, &state.statuses))
+        .map(|row| view_from_row(row, &state.statuses, verdict.observing()))
         .collect::<Result<_, _>>()?;
-    Ok(Json(serde_json::json!({ "monitors": monitors })))
+    Ok(Json(serde_json::json!({
+        "monitoring": { "status": verdict.status, "faults": verdict.faults },
+        "monitors": monitors,
+    })))
 }
 
 async fn get_monitor(
@@ -285,7 +377,11 @@ async fn get_monitor(
     Path(id): Path<String>,
 ) -> Result<Json<MonitorView>, ApiError> {
     let row = find_monitor(&state, &id).await?;
-    Ok(Json(view_from_row(row, &state.statuses)?))
+    Ok(Json(view_from_row(
+        row,
+        &state.statuses,
+        state.vitals.verdict().observing(),
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +410,7 @@ async fn create_monitor(
         ),
     }
     .map_err(ApiError::Validation)?;
+    check_target(&state, &new.url)?;
     let new = match (input.failures_to_open, input.passes_to_recover) {
         (None, None) => new,
         (fail, recover) => new
@@ -324,7 +421,13 @@ async fn create_monitor(
             .map_err(ApiError::Validation)?,
     };
     let monitor = new.into_monitor();
-    state.db.insert_monitor(&monitor).await?;
+    if !state
+        .db
+        .insert_monitor_within(&monitor, state.max_monitors)
+        .await?
+    {
+        return Err(ApiError::LimitReached(state.max_monitors));
+    }
     publish_registry(&state).await?;
     Ok((
         StatusCode::CREATED,
@@ -377,6 +480,9 @@ async fn patch_monitor(
         passes_to_recover: input.passes_to_recover,
         paused: input.paused,
     };
+    if let Some(url) = &patch.url {
+        check_target(&state, url)?;
+    }
     let merged = patch.apply(&monitor).map_err(ApiError::Validation)?;
     if state
         .db
@@ -390,7 +496,11 @@ async fn patch_monitor(
     }
     publish_registry(&state).await?;
     let row = find_monitor(&state, &id).await?;
-    Ok(Json(view_from_row(row, &state.statuses)?))
+    Ok(Json(view_from_row(
+        row,
+        &state.statuses,
+        state.vitals.verdict().observing(),
+    )?))
 }
 
 /// Delete a monitor with no recorded evidence. A monitor with history can't be deleted —
@@ -408,6 +518,17 @@ async fn delete_monitor(
     }
     publish_registry(&state).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A target the SSRF guard would refuse can never be observed — registering it would only
+/// turn the monitor's own refusal into a "down" target and a page. Names are checked again
+/// at every probe (the DNS answer can change); this catches literals up front.
+fn check_target(state: &AppState, url: &url::Url) -> Result<(), ApiError> {
+    let policy = probe::ProbePolicy {
+        allow_local_targets: state.allow_local_targets,
+        extra_roots: Vec::new(),
+    };
+    policy.check(url).map_err(|_| ApiError::RefusedTarget)
 }
 
 #[derive(Debug, Deserialize)]
@@ -732,12 +853,22 @@ async fn find_monitor(state: &AppState, id: &str) -> Result<MonitorRow, ApiError
         .ok_or(ApiError::NotFound)
 }
 
-fn view_from_row(row: MonitorRow, statuses: &SharedStatuses) -> Result<MonitorView, ApiError> {
+/// `observing = false` (the engine verdict) forces `unknown`: a status the engine is no
+/// longer producing is not a status.
+fn view_from_row(
+    row: MonitorRow,
+    statuses: &SharedStatuses,
+    observing: bool,
+) -> Result<MonitorView, ApiError> {
     let created_at = row.created_at;
     let monitor = monitor_domain::Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    let status = statuses.read().map_or(Status::Unknown, |map| {
-        map.get(&monitor.id).copied().unwrap_or(Status::Unknown)
-    });
+    let status = if observing {
+        statuses.read().map_or(Status::Unknown, |map| {
+            map.get(&monitor.id).copied().unwrap_or(Status::Unknown)
+        })
+    } else {
+        Status::Unknown
+    };
     Ok(MonitorView {
         id: monitor.id.0,
         name: monitor.name,
@@ -767,6 +898,13 @@ pub enum ApiError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("monitor limit reached ({0}); delete an unused monitor first")]
+    LimitReached(u64),
+    #[error(
+        "the monitor refuses to probe local, private or reserved addresses (SSRF policy); \
+         SMON_PROFILE=lab allows them for local fixtures"
+    )]
+    RefusedTarget,
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error("stored data violates the contract")]
@@ -783,6 +921,8 @@ impl ApiError {
                 "invalid_request"
             }
             Self::Conflict(_) => "conflict",
+            Self::LimitReached(_) => "limit_reached",
+            Self::RefusedTarget => "refused_target",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
         }
@@ -791,10 +931,12 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadId | Self::BadUrl | Self::Validation(_) | Self::Invalid(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
-            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::BadId
+            | Self::BadUrl
+            | Self::Validation(_)
+            | Self::Invalid(_)
+            | Self::RefusedTarget => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict(_) | Self::LimitReached(_) => StatusCode::CONFLICT,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

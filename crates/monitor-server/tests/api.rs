@@ -34,9 +34,15 @@ async fn app() -> anyhow::Result<(
         db: db.clone(),
         statuses: Arc::clone(&statuses),
         registry,
-        write_health: Arc::clone(&write_health),
+        vitals: monitor_server::vitals::Vitals::new(
+            Arc::clone(&write_health),
+            Duration::from_secs(30),
+        ),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
         version: "test",
     });
     Ok((app, statuses, db, write_health, tmp))
@@ -753,9 +759,12 @@ async fn auth_denies_without_a_valid_bearer_token() {
         db,
         statuses,
         registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
-        write_health,
+        vitals: monitor_server::vitals::Vitals::new(write_health, Duration::from_secs(30)),
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
         version: "test",
     };
     let app = monitor_server::router(state);
@@ -805,6 +814,14 @@ async fn auth_denies_without_a_valid_bearer_token() {
 /// Builds an authed router (admin token + configurable session ttl) on a scratch store —
 /// the M7.2 session tests all share this rig.
 async fn authed(token: &str, ttl: Duration) -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
+    authed_with(token, ttl, monitor_server::auth::CookieSecure::Auto).await
+}
+
+async fn authed_with(
+    token: &str,
+    ttl: Duration,
+    cookie_secure: monitor_server::auth::CookieSecure,
+) -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let url = format!("sqlite:{}", tmp.path().join("auth.db").display());
     let db = Db::connect(&url, 1).await?;
@@ -813,9 +830,12 @@ async fn authed(token: &str, ttl: Duration) -> anyhow::Result<(Router, Db, tempf
         db: db.clone(),
         statuses: Arc::new(RwLock::new(HashMap::new())),
         registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
-        write_health: Arc::default(),
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
+        cookie_secure,
+        max_monitors: 100,
+        allow_local_targets: false,
         version: "test",
     };
     Ok((monitor_server::router(state), db, tmp))
@@ -1081,4 +1101,285 @@ async fn an_expired_session_is_denied() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Honest unavailability: the writer is the only path to the store. When it dies, the
+/// committed status map freezes — a monitor whose last commit was a pass would keep
+/// serving "up" forever. The supervisor owns the writer's `JoinHandle`; its exit must turn
+/// readiness 503 and every served status `unknown`, with the cause named.
+#[tokio::test]
+async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<()> {
+    use monitor_server::vitals::{Role, Supervisor, Vitals};
+
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("dead-writer.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let monitor =
+        monitor_domain::NewMonitor::new("watched", url::Url::parse("https://example.com/health")?)?
+            .into_monitor();
+    db.insert_monitor(&monitor).await?;
+
+    let statuses = Arc::new(RwLock::new(HashMap::new()));
+    let write_health: monitor_db::WriteHealth = Arc::default();
+    let vitals = Vitals::new(Arc::clone(&write_health), Duration::from_secs(30));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let supervisor = Supervisor::new(vitals.clone(), shutdown.clone());
+    let (writer, writer_task) = monitor_db::writer::spawn(
+        db.clone(),
+        Arc::clone(&statuses),
+        HashMap::new(),
+        write_health,
+        8,
+        false,
+    );
+    supervisor.watch("writer", Role::Observing, writer_task);
+    let app = router(AppState {
+        db: db.clone(),
+        statuses: Arc::clone(&statuses),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals,
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
+        version: "test",
+    });
+
+    // One committed pass: the monitor is honestly up.
+    writer
+        .record(monitor_db::Observation {
+            monitor_id: monitor.id,
+            generation: monitor.generation,
+            slot_at: time::OffsetDateTime::now_utc(),
+            slot: monitor_domain::SlotObservation::Probe(monitor_domain::CheckOutcome::Pass),
+            http_status: Some(200),
+            latency_ms: Some(3),
+            detail: None,
+        })
+        .await?;
+    let (status, body) = send(&app, "GET", "/api/monitors", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["monitors"][0]["status"], "up");
+    assert_eq!(body["monitoring"]["status"], "ok");
+
+    // The writer stops (every handle gone — the same exit a crash in its loop produces).
+    drop(writer);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let ready = loop {
+        let response = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty())?)
+            .await?;
+        if response.status() != StatusCode::OK || std::time::Instant::now() > deadline {
+            break response;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let ready = json_body(ready).await?;
+    assert_eq!(ready["status"], "unavailable");
+    assert_eq!(ready["reason"], "writer exited");
+
+    let (_, body) = send(&app, "GET", "/api/monitors", None).await?;
+    assert_eq!(
+        body["monitors"][0]["status"], "unknown",
+        "a frozen status is not current evidence"
+    );
+    assert_eq!(body["monitoring"]["status"], "unavailable");
+    assert_eq!(body["monitoring"]["faults"][0], "writer exited");
+    let (_, one) = send(
+        &app,
+        "GET",
+        &format!("/api/monitors/{}", monitor.id.0),
+        None,
+    )
+    .await?;
+    assert_eq!(one["status"], "unknown");
+    Ok(())
+}
+
+/// Retention (D-012): the monitor count is bounded — every per-monitor table and the
+/// schedule scale with it. The cap is one conditional insert, so it holds under races.
+#[tokio::test]
+async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("cap.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let app = router(AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 2,
+        allow_local_targets: false,
+        version: "test",
+    });
+    let create = |n: usize| serde_json::json!({ "name": format!("m{n}"), "url": format!("https://m{n}.example.com/") });
+    for n in 0..2 {
+        let (status, _) = send(&app, "POST", "/api/monitors", Some(create(n))).await?;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let (status, body) = send(&app, "POST", "/api/monitors", Some(create(2))).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "limit_reached");
+    assert_eq!(
+        db.monitor_count().await?,
+        2,
+        "nothing was inserted past the cap"
+    );
+
+    // Deleting one (no history yet) frees a slot.
+    let (_, list) = send(&app, "GET", "/api/monitors", None).await?;
+    let id = list["monitors"][0]["id"].as_str().unwrap().to_owned();
+    let (status, _) = send(&app, "DELETE", &format!("/api/monitors/{id}"), None).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(&app, "POST", "/api/monitors", Some(create(3))).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    Ok(())
+}
+
+/// The `Set-Cookie` header of one login (or logout) call with the given extra headers.
+async fn cookie_header(
+    app: &Router,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<String> {
+    let mut request = Request::post(path)
+        .header("content-type", "application/json")
+        .header("host", "mon.example.com");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(r#"{"token":"s3cret"}"#))?)
+        .await?;
+    anyhow::ensure!(response.status() == StatusCode::NO_CONTENT, "{path}");
+    Ok(response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned())
+}
+
+/// Behind a TLS-terminating proxy the session cookie must be `Secure`, or a browser sends
+/// it over any plain-http request to the same host (a downgraded link, a captive portal)
+/// where it can be read. The proxy says the hop was TLS in `X-Forwarded-Proto` /
+/// `Forwarded: proto=https`; `SMON_COOKIE_SECURE=always` forces the flag regardless.
+/// Plain-http dev keeps working: no TLS signal, no flag.
+#[tokio::test]
+async fn the_session_cookie_is_secure_whenever_the_request_came_over_tls() {
+    use monitor_server::auth::CookieSecure;
+
+    let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
+    let plain = cookie_header(&app, "/api/login", &[]).await.unwrap();
+    assert!(!plain.contains("Secure"), "plain http: {plain}");
+    for tls in [
+        [("x-forwarded-proto", "https")],
+        [(
+            "forwarded",
+            "for=203.0.113.9;proto=https;host=mon.example.com",
+        )],
+    ] {
+        for path in ["/api/login", "/api/logout"] {
+            let cookie = cookie_header(&app, path, &tls).await.unwrap();
+            assert!(cookie.contains("; Secure"), "{path} {tls:?}: {cookie}");
+        }
+    }
+
+    let (always, _db, _tmp) =
+        authed_with("s3cret", Duration::from_secs(3600), CookieSecure::Always)
+            .await
+            .unwrap();
+    for path in ["/api/login", "/api/logout"] {
+        let cookie = cookie_header(&always, path, &[]).await.unwrap();
+        assert!(cookie.contains("; Secure"), "always, {path}: {cookie}");
+    }
+}
+
+/// Refused-target honesty, at registration: a target the SSRF policy will refuse can't be
+/// registered (or edited in) under the strict profile — it would only ever report the
+/// monitor's own refusal as the target being down. The lab profile still allows fixtures.
+#[tokio::test]
+async fn refused_targets_cannot_be_registered_outside_the_lab_profile() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    for url in [
+        "http://127.0.0.1:9/health",
+        "http://[::1]/",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.7:8080/",
+        "http://100.64.0.1/",
+    ] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/monitors",
+            Some(serde_json::json!({ "name": "internal", "url": url })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{url}: {body}");
+        assert_eq!(body["error"]["code"], "refused_target", "{url}");
+    }
+
+    // Editing a public monitor onto a refused address is refused the same way.
+    let (status, created) = send(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({ "name": "public", "url": "https://example.com/health" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_owned();
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{id}"),
+        Some(serde_json::json!({ "url": "http://192.168.1.1/" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "refused_target");
+
+    // The lab profile is the explicit opt-in for local fixtures.
+    let (lab, _db, _tmp) = lab_app().await.unwrap();
+    let (status, _) = send(
+        &lab,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({ "name": "fixture", "url": "http://127.0.0.1:9/health" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("lab.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let app = router(AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: true,
+        version: "test",
+    });
+    Ok((app, db, tmp))
 }

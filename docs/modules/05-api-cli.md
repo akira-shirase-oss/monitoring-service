@@ -33,7 +33,10 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   enabled.
 - **Session login (M7.2):** `POST /api/login {token}` exchanges the admin token for a
   `sessions` row (migration 0007) + `Set-Cookie: smon_session=<id>; HttpOnly;
-  SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>`. Store-side
+  SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>[; Secure]` —
+  `Secure` whenever the TLS proxy reports the request as https (`X-Forwarded-Proto`,
+  `Forwarded: proto=`), or always with `SMON_COOKIE_SECURE=always`; logout's expiring
+  cookie carries the same flag (`the_session_cookie_is_secure_whenever_the_request_came_over_tls`). Store-side
   `expires_at` is the authority — the cookie's Max-Age is a browser hint. The token
   itself never lands in browser storage; it can be rotated without stranding copies.
   `POST /api/logout` deletes the row and expires the cookie — idempotent. A wrong

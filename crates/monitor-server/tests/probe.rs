@@ -273,12 +273,24 @@ async fn tls_fixture_chain(
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 if let Ok(mut tls) = acceptor.accept(stream).await {
-                    use tokio::io::AsyncWriteExt;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Read the request head before answering: closing a socket with the
+                    // request still unread makes the kernel send RST, which can reach the
+                    // client while it is still writing — a `request` error, not a pass.
+                    let mut head = Vec::with_capacity(1024);
+                    let mut buf = [0_u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
                     let _ = tls
                         .write_all(
                             b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
                         )
                         .await;
+                    let _ = tls.shutdown().await;
                 }
             });
         }

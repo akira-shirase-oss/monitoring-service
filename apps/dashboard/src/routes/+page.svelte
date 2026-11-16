@@ -109,6 +109,28 @@
 			</Card.Content>
 		</Card.Root>
 	{:else}
+		{#if data.monitoring && data.monitoring.status !== 'ok'}
+			<Card.Root class="border-attention/40 bg-attention-soft">
+				<Card.Content class="flex items-start gap-3 p-4">
+					<TriangleAlert class="mt-0.5 size-4 shrink-0 text-attention-ink" />
+					<div>
+						<p class="text-sm font-medium text-attention-ink">
+							{data.monitoring.status === 'unavailable'
+								? 'Monitoring is unavailable.'
+								: 'Monitoring is degraded.'}
+						</p>
+						<p class="mt-0.5 text-sm text-attention-ink/80">
+							{data.monitoring.status === 'unavailable'
+								? 'The monitor is not observing right now, so every status below reads unknown. This says nothing about your targets.'
+								: 'Checks are still running, but part of the monitor has stopped.'}
+							{#if data.monitoring.faults.length > 0}
+								Cause: {data.monitoring.faults.join('; ')}.
+							{/if}
+						</p>
+					</div>
+				</Card.Content>
+			</Card.Root>
+		{/if}
 		{#if adding}
 			<Card.Root>
 				<Card.Content class="p-4">

@@ -26,13 +26,16 @@ run; what exists is what the commits show. Highlights:
   webhooks (`x-smon-event`, HMAC-SHA256 `x-smon-signature`) and SMTP email through
   the same outbox, with finite jittered retries — the outbox survives restarts and
   restores.
-- **SSRF guard:** `http`/`https` only; private/loopback/link-local/multicast/v4-mapped
-  IP literals refused; DNS answers validated inside the resolver (a public name
+- **SSRF guard:** `http`/`https` only; every non-global IPv4/IPv6 special-purpose
+  block refused (private, loopback, link-local, CGNAT, benchmarking, documentation,
+  reserved, multicast, and v4-mapped/NAT64/6to4 forms of them); DNS answers validated inside the resolver (a public name
   resolving to a private address is refused — `rejected_local`); redirects followed
   ≤5 hops with every hop revalidated. `SMON_PROFILE=lab` permits local targets for
   fixtures.
-- **Operate:** retention rolls expired checks into daily aggregates (open incidents
-  keep raw evidence); `SMON_MAX_DB_BYTES` caps the store and `/readyz` goes 503 when
+- **Operate:** retention rolls expired checks into daily aggregates and gives every
+  table a horizon (D-012 — an open incident keeps its birth streak raw; delivered
+  alerts 30 d, resolved incidents and aggregates 365 d; `SMON_MAX_MONITORS` caps
+  monitors at 100); `SMON_MAX_DB_BYTES` caps the store and `/readyz` goes 503 when
   the write path fails; `SMON_LOG_FILE` bounds logs to two generations; `VACUUM INTO`
   backups behind `POST /api/backup`; versioned releases + rollback by repoint.
 - **Auth:** `SMON_ADMIN_TOKEN` → `Bearer` for CLI/scripts, or the HttpOnly
@@ -113,16 +116,24 @@ same outbox — no PagerDuty.
 
 ## Configuration
 
-All via `SMON_*` env vars (defaults in `deploy.sh`'s generated `env` file):
+All via `SMON_*` env vars (defaults in `deploy.sh`'s generated `env` file). They are
+parsed once at boot (`crates/monitor-server/src/config.rs`): an invalid or blank value
+fails the boot with every problem listed — never a silent fall-back to the default — and
+unknown `SMON_*` names are logged as likely typos. Secrets and webhook URLs are never
+echoed in those messages.
 
 `SMON_DATABASE_URL` `SMON_LISTEN` `SMON_DASHBOARD_DIR` `SMON_ADMIN_TOKEN`
 `SMON_PROFILE` (`lab` permits local targets — never in production) `SMON_MAX_DB_BYTES`
-`SMON_RETENTION_S` `SMON_RETENTION_INTERVAL_S` `SMON_STATUS_DIR`
+`SMON_RETENTION_S` `SMON_RETENTION_INTERVAL_S` `SMON_AGGREGATE_RETENTION_S`
+`SMON_INCIDENT_RETENTION_S` `SMON_OUTBOX_RETENTION_S` `SMON_MAX_MONITORS` `SMON_STATUS_DIR`
 `SMON_STATUS_INTERVAL_S` `SMON_STATUS_TTL_S` `SMON_LOG_FILE` `SMON_LOG_MAX_BYTES`
 `SMON_WEBHOOK_URL` `SMON_WEBHOOK_SECRET`
 `SMON_SMTP_DSN` `SMON_SMTP_FROM` `SMON_SMTP_TO` — all three required together for the
 email channel; a partial set fails the boot.
 `SMON_SESSION_TTL_S` — dashboard session lifetime in seconds (default 43200).
+`SMON_COOKIE_SECURE` — `auto` (default: the session cookie is `Secure` whenever the TLS
+proxy in front reports `X-Forwarded-Proto: https` or `Forwarded: proto=https`) or
+`always` (for a proxy that doesn't forward the scheme).
 
 ## Verify
 
@@ -130,3 +141,7 @@ email channel; a partial set fails the boot.
 `cargo test`, the architecture rule, `svelte-check` and a dashboard build. Plus the
 drills: `scripts/e2e.sh` (Playwright), `scripts/backup-drill.sh` (backup → destroy →
 restore), `perf/lab-profile.mjs` (load baseline).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 akira-shirase-oss.

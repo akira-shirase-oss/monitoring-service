@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use monitor_db::{Db, SharedStatuses, writer};
 use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation, Status};
 use monitor_server::snapshot;
+use monitor_server::vitals::{Role, Vitals};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -32,6 +33,7 @@ fn the_snapshot_is_an_allowlist_not_a_leak() {
         &statuses,
         &open,
         std::time::Duration::from_secs(90),
+        true,
     );
     let service = &snap["services"][0];
     let mut keys: Vec<&str> = service
@@ -67,6 +69,7 @@ fn a_monitor_with_no_committed_evidence_is_unknown() {
         &statuses,
         &HashMap::new(),
         std::time::Duration::from_secs(90),
+        true,
     );
     assert_eq!(snap["services"][0]["status"], "unknown");
     assert!(snap["services"][0]["incident_open_since"].is_null());
@@ -81,6 +84,7 @@ fn the_snapshot_declares_its_own_expiry() {
         &statuses,
         &HashMap::new(),
         std::time::Duration::from_secs(90),
+        true,
     );
     let generated = OffsetDateTime::parse(
         snap["generated_at"].as_str().unwrap(),
@@ -133,6 +137,7 @@ async fn the_writer_beats_a_real_file_with_committed_evidence() {
     let _handle = snapshot::spawn(
         db,
         Arc::clone(&statuses),
+        Vitals::new(Arc::default(), std::time::Duration::from_secs(30)),
         snapshot::Config {
             dir: dir.clone(),
             interval: std::time::Duration::from_millis(50),
@@ -156,4 +161,56 @@ async fn the_writer_beats_a_real_file_with_committed_evidence() {
     assert_eq!(services[0]["status"], "up");
     assert!(services[0]["incident_open_since"].is_null());
     shutdown.cancel();
+}
+
+/// Honest unavailability, public side: a live process whose writer has died would keep
+/// re-stamping its last statuses as a fresh heartbeat. While the engine is not observing,
+/// every beat is born expired, every service `unknown`, and says `monitoring: unavailable`.
+#[tokio::test]
+async fn a_dead_engine_stops_the_heartbeat_reading_fresh() {
+    let dir = std::env::temp_dir().join(format!("smon-snap-dead-{}", uuid::Uuid::now_v7()));
+    let db = Db::connect("sqlite::memory:", 1).await.unwrap();
+    db.migrate().await.unwrap();
+    let monitor = monitor("snap-target");
+    db.insert_monitor(&monitor).await.unwrap();
+    // The committed map still says up — exactly the stale value a dead writer leaves.
+    let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::from([(monitor.id, Status::Up)])));
+    let vitals = Vitals::new(Arc::default(), std::time::Duration::from_secs(30));
+    vitals.task_stopped("writer", Role::Observing, "panicked");
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let _handle = snapshot::spawn(
+        db,
+        Arc::clone(&statuses),
+        vitals,
+        snapshot::Config {
+            dir: dir.clone(),
+            interval: std::time::Duration::from_millis(50),
+            ttl: std::time::Duration::from_secs(90),
+        },
+        shutdown.clone(),
+    );
+    let mut snap = None;
+    for _ in 0..100 {
+        if let Ok(bytes) = std::fs::read(dir.join("status.json")) {
+            snap = Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    shutdown.cancel();
+    let snap = snap.expect("snapshot file appeared");
+    assert_eq!(snap["monitoring"], "unavailable");
+    assert_eq!(snap["services"][0]["status"], "unknown");
+    let parse = |key: &str| {
+        OffsetDateTime::parse(
+            snap[key].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    assert!(
+        parse("expires_at") <= parse("generated_at"),
+        "an unavailable beat must already be expired for expiry-only readers"
+    );
 }

@@ -6,16 +6,38 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# A dedicated system account, never root: the process parses responses from the network
+# and holds alert credentials. It owns only data/ and status/ (deploy/RUNBOOK.md, Install);
+# releases/ and env stay root-owned, so it cannot rewrite its own binary or config.
+# systemd reads EnvironmentFile as root before dropping to this user, so env can be 0600.
+User=smon
+Group=smon
 EnvironmentFile=/opt/smon/env
 ExecStart=/opt/smon/current/bin/monitor-server
 Restart=on-failure
 RestartSec=3s
+# Stop sends SIGTERM (the server drains: HTTP <= 12 s, engine <= 15 s), then SIGKILL after
+# this — longer than the drain, so a graceful stop is never cut short.
+TimeoutStopSec=40s
 # Hard stops consistent with the project's own bounds: the store is byte-capped by
 # SMON_MAX_DB_BYTES, logs by SMON_LOG_MAX_BYTES; the kernel adds its own here.
 LimitNOFILE=4096
 MemoryMax=512M
+# Sandboxing: no capabilities (58400 is an unprivileged port), no privilege gain, a
+# read-only system except the two directories the monitor writes.
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/opt/smon/data /opt/smon/status
 
 [Install]

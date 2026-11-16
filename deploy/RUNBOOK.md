@@ -27,19 +27,30 @@ rolling back the binary cannot roll back evidence.
 scripts/deploy.sh --prefix /opt/smon            # builds --release, installs, links
 $EDITOR /opt/smon/env                            # at minimum SMON_DATABASE_URL, SMON_STATUS_DIR
 
-# systemd
+# systemd — the unit runs as the unprivileged system user `smon`, never root
+sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
+sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # the only paths it writes
+sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env  # systemd reads it as root
 sudo cp deploy/monitor-server.service /etc/systemd/system/
-sudo systemctl enable --now monitor-server
+sudo systemctl daemon-reload && sudo systemctl enable --now monitor-server
 
-# macOS launchd
+# macOS launchd (development hosts; this plist still runs as root — add a UserName
+# key for a dedicated account before using it anywhere that matters)
 sudo cp deploy/com.shirase.smon.plist /Library/LaunchDaemons/
 sudo launchctl load /Library/LaunchDaemons/com.shirase.smon.plist
 ```
 
+If the unit fails to start, read its log first: an invalid or blank `SMON_*` value stops
+the boot with every problem listed (`invalid configuration (N problem(s)): …`) — the
+server never runs on a silently substituted default.
+
 Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
-`curl -sf $SMON_LISTEN/version` → the expected release. If readyz answers
-`unavailable` with a failure count, the store's write path is failing (disk, perms) —
-readiness is honest, fix the cause rather than restart-looping.
+`curl -sf $SMON_LISTEN/version` → the expected release. A 503 names its cause in
+`faults` (D-011): `store writes failing (N consecutive)` means the write path is broken
+(disk, perms) — fix the cause rather than restart-looping; `writer exited|panicked` or
+`coordinator …` means the monitor is not observing (statuses read `unknown`) — the log
+has the task's error, then restart; `degraded` with a deliverer, snapshot or retention
+fault means checks still run but that duty has stopped.
 
 ## Upgrade
 
@@ -50,7 +61,15 @@ curl -sf .../readyz && curl -sf .../version     # the version must match the new
 ```
 
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
-`down`, never fabricates a recovery.
+`down`, never fabricates a recovery. If the monitor was down for longer than a check
+interval, boot records that gap (one `missed` row per monitor, D-014): statuses read
+`unknown` until the first fresh probe, and failures from before the outage don't count
+toward a new incident.
+
+Stopping (`systemctl stop`, `launchctl kickstart -k`, `kill`) sends SIGTERM, which drains
+like Ctrl-C: readiness goes false, the coordinator stops scheduling, open requests get up
+to 12 s and the engine (in-flight probes, deliveries, queued commits) up to 15 s, then the
+process exits 0. The log shows `shutting down` (with the signal), then `engine drained`.
 
 ## Rollback
 

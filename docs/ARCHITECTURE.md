@@ -21,7 +21,13 @@ monitor-server
 │   └── probe tasks             — bounded workers (global slots, per-origin caps)
 ├── db-writer task              — the ONLY writer; mpsc commands, one tx per observation
 └── notify-deliverer task       — separate pool; reads the outbox, finite retries
+(+ snapshot writer, retention)  — every task's JoinHandle is owned by the supervisor (D-011)
 ```
+
+Supervision (D-011): an engine task that exits outside shutdown, or a coordinator that
+stops making loop passes, flips the `vitals` verdict — `/readyz` 503, statuses served as
+`unknown`, the public snapshot born expired — so a live process never presents frozen
+statuses as current.
 
 The guide asks for one coordinator and bounded probe workers: a single task owns the schedule
 because "one attempt per slot" is a serialization property, and probes fan out to short-lived

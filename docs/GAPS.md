@@ -19,7 +19,7 @@ rebuild log ships), mined before its removal from `minimal-portfolio`.
 | Dashboard admits unknown/STALE (1.3) | unreachable/auth/missing states + self-expiring status.json heartbeat |
 | Fair queue (1.4) | 20 global / 2 per origin, `try_acquire` → missed; proven in the load baseline |
 | Persistence + restart rebuild (2.1, 2.5) | Boot rebuild from committed evidence; upgrade/rollback drill keeps `down` |
-| Retention (2.6) | Stronger — daily aggregates keep coverage true; open incidents keep raw rows |
+| Retention (2.6) | Stronger — daily aggregates keep coverage true; every table has a horizon and an open incident keeps its birth streak raw (D-012) |
 | Disk limits + backups (2.7) | `SMON_MAX_DB_BYTES` → real 503; `VACUUM INTO` + restore drill |
 | No green without proof | `unknown` first-class; coverage ≠ success everywhere |
 | Signed webhooks + retries (old M3) | Done in rebuild M2 |

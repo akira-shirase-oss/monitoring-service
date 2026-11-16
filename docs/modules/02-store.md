@@ -1,8 +1,10 @@
 # Module 02 — Store (`crates/monitor-db`)
 
-**Status:** single-writer task live (M1); retention live (M4.1): checks older than
+**Status:** single-writer task live (M1); retention live (M4.1, D-012): checks older than
 `SMON_RETENTION_S` (default 7 d) roll into `check_stats_daily` and delete in one transaction;
-monitors with open incidents keep raw rows; `check_stats` unions both tables.
+an open incident keeps only its birth streak raw; aggregates, resolved incidents, ended
+windows and delivered outbox rows have horizons too; `check_stats` unions both tables;
+`SMON_MAX_MONITORS` caps the monitor count.
 
 ## Purpose
 
@@ -19,8 +21,12 @@ Local file, WAL mode, foreign keys on — no server database, no Redis (guide de
   index — at most one open incident per monitor), `notify_outbox` (stable `event_id` unique).
 - **Rebuild, don't trust memory:** on boot, open incidents come from the table and streaks are
   rebuilt by replaying each monitor's latest outcomes.
-- **Retention (M4):** raw checks expire after 7 days; aggregates keep bounded history. Expiry
-  must never delete rows referenced by an open incident or an undelivered outbox entry.
+- **Retention (M4, D-012):** raw checks expire after 7 days into daily aggregates (365 days);
+  resolved incidents and their outbox rows after 365 days; delivered outbox rows 30 days
+  after delivery; ended windows after 365 days. Expiry never deletes an open incident, its
+  birth-streak rows, or an undelivered outbox row of a kept incident. Tests:
+  `an_open_incident_keeps_only_its_birth_streak_past_retention`,
+  `retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows`.
 - **Corrupt rows are errors, not defaults:** `MonitorRow::try_from` revalidates stored values;
   a violation returns `Corrupt`, never a guessed monitor.
 
@@ -28,9 +34,11 @@ Local file, WAL mode, foreign keys on — no server database, no Redis (guide de
 
 | Trigger | Required result |
 |---|---|
-| Disk write fails | commit fails → `WriteHealth` consecutive-failure counter grows; `/readyz` answers 503 `unavailable`; the counter resets only when a write lands — never paint unsaved results green |
-| Full disk | admission/write fails safely and visibly (module 08 guardrails) |
+| Disk write fails | commit fails → `WriteHealth` consecutive-failure counter grows; `/readyz` answers 503 `unavailable`, served statuses read `unknown` and the snapshot beat is born expired (D-011); the counter resets only when a write lands — never paint unsaved results green |
+| Writer task dies | the supervisor sees the exit → `/readyz` 503 `writer exited`/`writer panicked`, statuses `unknown` (`a_dead_writer_makes_the_monitor_report_unavailable`) |
+| Full disk | admission/write fails safely and visibly (module 08 guardrails). The `SMON_MAX_DB_BYTES` ceiling is `PRAGMA max_page_count`, which SQLite scopes to one connection — it is applied in the pool's `after_connect` hook, so every pooled connection (including ones reopened after idle/lifetime expiry) carries it; `a_capped_store_refuses_growth_on_every_connection` holds all four at once |
 | Restart | open incidents reload; streaks rebuild from stored outcomes |
+| Restart after downtime longer than one interval + grace | one `missed` row per monitor at the first lost slot (D-014): streaks reset, status `unknown` until a fresh probe (`downtime_is_a_gap_failures_either_side_are_not_consecutive`) |
 
 ## Testing parameters
 
