@@ -50,6 +50,8 @@ pub const KNOWN: &[&str] = &[
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
+/// The shortest admin token accepted (`openssl rand -hex 32` makes 64).
+const MIN_ADMIN_TOKEN_BYTES: usize = 32;
 /// Upper bound on any retention or session horizon: ten years, in seconds.
 const MAX_HORIZON_S: u64 = 10 * 366 * 86_400;
 
@@ -161,6 +163,30 @@ impl<F: Fn(&str) -> Option<String>> Reader<F> {
 
     fn string(&mut self, name: &str, default: &str) -> String {
         self.raw(name).unwrap_or_else(|| default.to_owned())
+    }
+
+    /// The admin token guards every write, so a weak one is refused, never echoed: at
+    /// least `MIN_ADMIN_TOKEN_BYTES`, no whitespace (a pasted template line or a
+    /// line-wrapped secret), no `#` (a comment that systemd made part of the value).
+    fn admin_token(&mut self, token: String) -> Option<String> {
+        let problem = if token.chars().any(char::is_whitespace) {
+            Some("contains whitespace")
+        } else if token.contains('#') {
+            Some("contains '#'")
+        } else if token.len() < MIN_ADMIN_TOKEN_BYTES {
+            Some("is shorter than 32 bytes")
+        } else {
+            None
+        };
+        match problem {
+            None => Some(token),
+            Some(problem) => {
+                self.problems.push(format!(
+                    "SMON_ADMIN_TOKEN {problem} — use a random token, e.g. `openssl rand -hex 32`"
+                ));
+                None
+            }
+        }
     }
 
     /// A parsed non-secret value; the offending text is echoed back.
@@ -328,7 +354,9 @@ impl Config {
             }
         };
         // Secrets: presence is checked, contents never echoed.
-        let admin_token = env.raw("SMON_ADMIN_TOKEN");
+        let admin_token = env
+            .raw("SMON_ADMIN_TOKEN")
+            .and_then(|token| env.admin_token(token));
         let max_db_bytes = env.ranged("SMON_MAX_DB_BYTES", 2 * 1024 * MIB, MIB..=u64::MAX);
         let (retention, retention_interval) = env.retention();
         let (status_dir, status_interval, status_ttl) = env.status();
@@ -483,6 +511,31 @@ mod tests {
         }
     }
 
+    /// The admin token guards every write. A placeholder, a short word or a value with
+    /// spaces is a guessable credential — or a template line pasted by mistake — and must
+    /// not boot. The error never echoes the token.
+    #[test]
+    fn weak_or_malformed_admin_tokens_are_refused() {
+        for bad in [
+            "changeme",
+            "s3cret-but-only-31-bytes-long!!",
+            "a token with spaces in it, long enough to pass",
+            "0123456789abcdef0123456789abcdef#tail",
+            "\t0123456789abcdef0123456789abcdef",
+        ] {
+            let error = load(&[("SMON_ADMIN_TOKEN", bad)]).expect_err(bad);
+            let text = error.to_string();
+            assert!(text.contains("SMON_ADMIN_TOKEN"), "{text}");
+            assert!(
+                !text.contains(bad.trim()),
+                "the token must not be echoed: {text}"
+            );
+        }
+        let good = "3f9a1c0e7b2d4a6f8e1c3b5d7f9a0c2e4b6d8f1a3c5e7b9d0f2a4c6e8b1d3f5a";
+        let config = load(&[("SMON_ADMIN_TOKEN", good)]).expect("a 64-hex token is fine");
+        assert_eq!(config.admin_token.as_deref(), Some(good));
+    }
+
     #[test]
     fn blank_values_are_errors_not_defaults() {
         let error = load(&[("SMON_ADMIN_TOKEN", "  ")]).expect_err("blank token");
@@ -518,7 +571,10 @@ mod tests {
         );
 
         let config = load(&[
-            ("SMON_ADMIN_TOKEN", "tok-123"),
+            (
+                "SMON_ADMIN_TOKEN",
+                "tok-123-0123456789abcdef0123456789abcdef",
+            ),
             (
                 "SMON_WEBHOOK_URL",
                 "https://hooks.slack.com/services/T0/B0/S3CRET",

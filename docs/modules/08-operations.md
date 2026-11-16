@@ -30,7 +30,9 @@ not a process only the author can babysit.
   Parsed once into a typed `Config` (`config.rs`) with ranges and cross-field rules
   (`SMON_STATUS_TTL_S` > `SMON_STATUS_INTERVAL_S`, the SMTP trio all-or-none); an
   invalid or blank value fails the boot listing every problem, unknown `SMON_*` names
-  are warned about. Pinned by `invalid_smon_values_fail_the_boot_and_name_every_problem`
+  are warned about. `SMON_ADMIN_TOKEN` must be ≥ 32 bytes with no whitespace or `#`
+  (a pasted template line or placeholder is not a credential). Pinned by
+  `invalid_smon_values_fail_the_boot_and_name_every_problem`
   against the real binary.
 
 ## Failure cases

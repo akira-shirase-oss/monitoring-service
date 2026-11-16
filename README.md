@@ -38,7 +38,8 @@ run; what exists is what the commits show. Highlights:
   monitors at 100); `SMON_MAX_DB_BYTES` caps the store and `/readyz` goes 503 when
   the write path fails; `SMON_LOG_FILE` bounds logs to two generations; `VACUUM INTO`
   backups behind `POST /api/backup`; versioned releases + rollback by repoint.
-- **Auth:** `SMON_ADMIN_TOKEN` → `Bearer` for CLI/scripts, or the HttpOnly
+- **Auth:** `SMON_ADMIN_TOKEN` (at least 32 bytes, no spaces or `#` — e.g.
+  `openssl rand -hex 32`; a weaker value refuses to boot) → `Bearer` for CLI/scripts, or the HttpOnly
   `smon_session` cookie the dashboard earns at `POST /api/login` (store-side
   expiry, `SMON_SESSION_TTL_S`; `Origin` must match `Host`, mandatory on
   cookie-authed writes). Tokenless loopback is dev mode, tokenless public bind

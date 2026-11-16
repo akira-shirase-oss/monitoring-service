@@ -40,7 +40,7 @@ export default defineConfig({
 				SMON_STATUS_DIR: `/tmp/smon-e2e-status-${process.pid}`,
 				// M7.2: e2e runs the real auth path — the dashboard earns its session
 				// cookie exactly like a deployed instance.
-				SMON_ADMIN_TOKEN: 'e2e-token'
+				SMON_ADMIN_TOKEN: 'e2e-token-for-the-playwright-suite-0001'
 			},
 			url: `http://127.0.0.1:${SERVER_PORT}/livez`,
 			reuseExistingServer: false,

@@ -15,7 +15,7 @@ const DURATION_S = Number(arg('duration-s', 300));
 const OUT_DIR = resolve(ROOT, arg('out', 'perf/results'));
 const FIXTURE_PORT = 58740, SERVER_PORT = 58440;
 const DB = `/tmp/smon-churn-${process.pid}.db`, LOG = `/tmp/smon-churn-${process.pid}.log`;
-const BASE = `http://127.0.0.1:${SERVER_PORT}`, TOKEN = 'churn-secret';
+const BASE = `http://127.0.0.1:${SERVER_PORT}`, TOKEN = 'churn-secret-for-the-session-churn-run-01';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sqlite = (sql) => execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8' }).trim() || '[]';
 const children = [];

@@ -1,7 +1,7 @@
 import { expect, test, type APIRequestContext, type BrowserContext, type Page } from '@playwright/test';
 
 const FAULT = process.env['SMON_E2E_FAULT_PORT'] ?? '58710';
-const TOKEN = 'e2e-token';
+const TOKEN = 'e2e-token-for-the-playwright-suite-0001';
 // Direct API calls use the CLI contract: Bearer, no Origin needed.
 const AUTH = { authorization: `Bearer ${TOKEN}` };
 

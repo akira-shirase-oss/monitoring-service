@@ -67,7 +67,7 @@ Defaults (all overridable with `SMON_*` env vars; listed in the README):
 | `SMON_DATABASE_URL` | `sqlite:monitor.db` |
 | `SMON_DASHBOARD_DIR` | `apps/dashboard/build` |
 | `SMON_PROFILE` | unset (SSRF guard on). `lab` permits local targets for fixtures. |
-| `SMON_ADMIN_TOKEN` | unset is allowed only on loopback; a tokenless public bind refuses to boot |
+| `SMON_ADMIN_TOKEN` | unset is allowed only on loopback; a tokenless public bind refuses to boot. When set: at least 32 bytes, no whitespace or `#`, or the boot refuses (`openssl rand -hex 32`) |
 
 A useful local lab:
 
