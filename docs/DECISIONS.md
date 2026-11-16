@@ -90,7 +90,10 @@ recorded.
   each snapshot beat written born-expired with `monitoring: "unavailable"`, dashboard
   banner naming the cause.
 - **degraded** — observing, but a supporting task (a deliverer, the snapshot writer,
-  retention) stopped, or the last retention pass failed. `/readyz` 503 with the cause; statuses stay as committed.
+  retention) stopped, or the last retention pass failed. `/readyz` **200** with
+  `"status":"degraded"` and the faults (the monitor still observes and serves; only
+  `unavailable` takes it out of rotation); `monitor ping` exits 5. Statuses stay as
+  committed.
 - **ok** — everything running; `/readyz` 200.
 
 Statuses are not rewritten in the store: `unknown` is a property of *serving* while the

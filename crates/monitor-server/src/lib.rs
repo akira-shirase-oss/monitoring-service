@@ -324,6 +324,15 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
 async fn readyz(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     state.db.ping().await?;
     let verdict = state.vitals.verdict();
+    if verdict.status == vitals::Availability::Degraded {
+        // Still observing and serving: ready, with the faults named (D-011). Only a
+        // monitor that is not observing is taken out of rotation.
+        return Ok(Json(serde_json::json!({
+            "status": verdict.status,
+            "faults": verdict.faults,
+        }))
+        .into_response());
+    }
     if verdict.status != vitals::Availability::Ok {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,

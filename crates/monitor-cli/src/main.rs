@@ -140,6 +140,9 @@ const EXIT_ERROR: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;
 const EXIT_UNAUTHORIZED: u8 = 4;
+/// `ping` only: the monitor is observing, but a supporting duty (alerts, the public
+/// heartbeat, retention) has stopped — not an outage, not "all good" either.
+const EXIT_DEGRADED: u8 = 5;
 
 #[derive(Debug)]
 struct CliFailure {
@@ -191,7 +194,24 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Ping => {
             get(&client, &format!("{base}/livez")).await?;
-            get(&client, &format!("{base}/readyz")).await?;
+            let ready = get(&client, &format!("{base}/readyz")).await?;
+            let ready: serde_json::Value = serde_json::from_str(&ready).unwrap_or_default();
+            if ready["status"] == "degraded" {
+                let faults: Vec<&str> = ready["faults"]
+                    .as_array()
+                    .map(|faults| {
+                        faults
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Err(CliFailure {
+                    code: EXIT_DEGRADED,
+                    message: format!("live and observing, but degraded: {}", faults.join("; ")),
+                }
+                .into());
+            }
             println!("live and ready");
         }
         Command::Monitors { action } => monitors(&client, base, action).await?,

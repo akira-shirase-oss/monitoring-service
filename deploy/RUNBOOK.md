@@ -45,8 +45,10 @@ the boot with every problem listed (`invalid configuration (N problem(s)): …`)
 server never runs on a silently substituted default.
 
 Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
-`curl -sf $SMON_LISTEN/version` → the expected release. A 503 names its cause in
-`faults` (D-011): `store writes failing (N consecutive)` means the write path is broken
+`curl -sf $SMON_LISTEN/version` → the expected release. `/readyz` answers 200 with
+`{"status":"degraded","faults":[…]}` when checks run but a supporting duty has stopped
+(`monitor ping` exits 5), and 503 when the monitor is not observing. Either way it names
+the cause in `faults` (D-011): `store writes failing (N consecutive)` means the write path is broken
 (disk, perms) — fix the cause rather than restart-looping; `writer exited|panicked` or
 `coordinator …` means the monitor is not observing (statuses read `unknown`) — the
 process then writes one "monitoring unavailable" beat and exits non-zero on its own, and

@@ -1383,3 +1383,41 @@ async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
     });
     Ok((app, db, tmp))
 }
+
+/// Degraded is not unready: the monitor still observes and serves, so `/readyz` answers 200
+/// with the faults (load balancers and the RUNBOOK's `curl -sf` gate keep working); only
+/// `unavailable` (not observing) is 503.
+#[tokio::test]
+async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
+    let vitals = monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30));
+    vitals.task_stopped(
+        "snapshot",
+        monitor_server::vitals::Role::Supporting,
+        "exited",
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::connect(&format!("sqlite:{}", tmp.path().join("d.db").display()), 1)
+        .await
+        .unwrap();
+    db.migrate().await.unwrap();
+    let app = router(AppState {
+        db,
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals,
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
+        version: "test",
+    });
+    let response = app
+        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await.unwrap();
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["faults"][0], "snapshot exited");
+}
