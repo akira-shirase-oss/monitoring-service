@@ -250,7 +250,10 @@ impl ProbeClient {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let redirect_policy = policy.clone();
-        let mut builder = reqwest::Client::builder();
+        // No proxy, ever: a proxied request is resolved by the proxy, so the DNS-layer
+        // guard below would never see the name (HTTP_PROXY would turn
+        // `http://metadata.internal…` into whatever the proxy answers). Probes go direct.
+        let mut builder = reqwest::Client::builder().no_proxy();
         for (name, addr) in pins {
             builder = builder.resolve(name, *addr);
         }

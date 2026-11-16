@@ -43,7 +43,9 @@ it to the writer — without ever letting a slow target stall the schedule.
   round-robin DNS makes "usually public" not a defense. Redirects: followed up to 5 hops,
   each hop revalidated through the same URL check; a refused hop leaves the 3xx as
   `http_fail` evidence. A DNS refusal classifies `rejected_local` (cause-chain walk) and commits as a `transport` failure that pages (D-013), so
-  it never masquerades as a plain `connect` error.
+  it never masquerades as a plain `connect` error. The probe client ignores
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (`no_proxy`): a proxied request is resolved by
+  the proxy and would bypass the DNS layer (`proxy_environment_variables_route_nothing`).
 
 ## Failure cases
 
