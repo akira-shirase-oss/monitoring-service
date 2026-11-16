@@ -36,6 +36,10 @@ sudo cp deploy/com.shirase.smon.plist /Library/LaunchDaemons/
 sudo launchctl load /Library/LaunchDaemons/com.shirase.smon.plist
 ```
 
+If the unit fails to start, read its log first: an invalid or blank `SMON_*` value stops
+the boot with every problem listed (`invalid configuration (N problem(s)): …`) — the
+server never runs on a silently substituted default.
+
 Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
 `curl -sf $SMON_LISTEN/version` → the expected release. A 503 names its cause in
 `faults` (D-011): `store writes failing (N consecutive)` means the write path is broken

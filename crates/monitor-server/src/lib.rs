@@ -5,6 +5,7 @@
 //! the writer publishes — never from in-flight probes.
 
 pub mod auth;
+pub mod config;
 pub mod deliver;
 pub mod logfile;
 pub mod probe;

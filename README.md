@@ -116,7 +116,11 @@ same outbox — no PagerDuty.
 
 ## Configuration
 
-All via `SMON_*` env vars (defaults in `deploy.sh`'s generated `env` file):
+All via `SMON_*` env vars (defaults in `deploy.sh`'s generated `env` file). They are
+parsed once at boot (`crates/monitor-server/src/config.rs`): an invalid or blank value
+fails the boot with every problem listed — never a silent fall-back to the default — and
+unknown `SMON_*` names are logged as likely typos. Secrets and webhook URLs are never
+echoed in those messages.
 
 `SMON_DATABASE_URL` `SMON_LISTEN` `SMON_DASHBOARD_DIR` `SMON_ADMIN_TOKEN`
 `SMON_PROFILE` (`lab` permits local targets — never in production) `SMON_MAX_DB_BYTES`

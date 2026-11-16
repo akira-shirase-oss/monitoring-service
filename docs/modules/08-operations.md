@@ -24,12 +24,18 @@ not a process only the author can babysit.
 - **Deploy:** the monitor runs off the target host (independence is the point); upgrade and
   rollback are scripted; the public status page is hosted elsewhere (module 07).
 - **Config:** env-driven (`SMON_*`), localhost-bound by default, secrets never logged.
+  Parsed once into a typed `Config` (`config.rs`) with ranges and cross-field rules
+  (`SMON_STATUS_TTL_S` > `SMON_STATUS_INTERVAL_S`, the SMTP trio all-or-none); an
+  invalid or blank value fails the boot listing every problem, unknown `SMON_*` names
+  are warned about. Pinned by `invalid_smon_values_fail_the_boot_and_name_every_problem`
+  against the real binary.
 
 ## Failure cases
 
 | Trigger | Required result |
 |---|---|
 | Disk full | writes fail; status unready; nothing half-written |
+| Invalid `SMON_*` value | boot fails naming every bad variable; no store created, no work started |
 | Log volume explodes | rotation caps it; dropped count visible |
 | Upgrade mid-incident | incidents + outbox survive; generation model holds |
 | Restore from backup | consistent store; no replayed external effects as "fresh" |
