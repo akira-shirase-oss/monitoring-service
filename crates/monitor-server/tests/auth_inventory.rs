@@ -2,10 +2,10 @@
 //! whole inventory, not for one sample route.
 //!
 //! The inventory comes from the router itself, so a new route can't be missed:
-//! - **paths** are read from `router()`'s source (every `.route("…")` literal, inside and
+//! - **paths** are read from `routes()`'s source (every `.route("…")` literal, inside and
 //!   outside the auth layer) and `app()`'s (the snapshot and the dashboard fallback); a
 //!   route added outside the layer that isn't on the short public list fails here, and a
-//!   routing call anywhere else in the crate fails `routes_are_assembled_only_in_router_and_app`;
+//!   routing call anywhere else in the crate fails `routes_are_assembled_only_in_routes_and_app`;
 //! - **methods** come from the live router: an authorized request with a method nobody
 //!   routes gets axum's 405 with an `Allow` header naming every method routed on that
 //!   path (without a credential even that 405 is a 401 — the route list isn't public).
@@ -45,21 +45,21 @@ fn literals_after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// (protected paths, public paths) as `router()` declares them.
+/// (protected paths, public paths) as `routes()` declares them.
 #[expect(
     clippy::expect_used,
     reason = "test helper: a source it can't read is a failed test"
 )]
 fn declared_routes() -> (Vec<String>, Vec<String>) {
     let start = ROUTER_SOURCE
-        .find("pub fn router(")
-        .expect("router() exists in lib.rs");
+        .find("fn routes(")
+        .expect("routes() exists in lib.rs");
     let body = &ROUTER_SOURCE[start..];
-    let body = &body[..body.find("\n}\n").expect("router() ends")];
+    let body = &body[..body.find("\n}\n").expect("routes() ends")];
     for unsupported in [".merge(", ".nest_service(", ".route_service(", ".fallback"] {
         assert!(
             !body.contains(unsupported),
-            "router() uses `{unsupported}`: teach this inventory test about it first"
+            "routes() uses `{unsupported}`: teach this inventory test about it first"
         );
     }
     let (api, outer) = body
@@ -319,10 +319,10 @@ fn fn_body<'a>(source: &'a str, name: &str) -> Option<(usize, &'a str)> {
 
 /// L3: the inventory read `router()` only, so a route added where the app is assembled
 /// (a `.route` in `main.rs`) was public and went unnoticed. Every routing call in the
-/// crate — any file under `src/`, found by listing it — must sit in `router()` or `app()`
+/// crate — any file under `src/`, found by listing it — must sit in `routes()` or `app()`
 /// in lib.rs, which is what the inventory reads and what `main.rs` serves.
 #[test]
-fn routes_are_assembled_only_in_router_and_app() {
+fn routes_are_assembled_only_in_routes_and_app() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files: Vec<_> = std::fs::read_dir(&src)
         .unwrap_or_else(|e| panic!("read src/: {e}"))
@@ -331,11 +331,11 @@ fn routes_are_assembled_only_in_router_and_app() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
         .collect();
     files.sort();
-    let allowed: Vec<(usize, usize)> = ["router", "app"]
+    let allowed: Vec<(usize, usize)> = ["routes", "app"]
         .iter()
         .filter_map(|name| fn_body(ROUTER_SOURCE, name).map(|(at, body)| (at, at + body.len())))
         .collect();
-    assert_eq!(allowed.len(), 2, "lib.rs defines router() and app()");
+    assert_eq!(allowed.len(), 2, "lib.rs defines routes() and app()");
     for path in files {
         let name = path
             .file_name()
@@ -355,7 +355,7 @@ fn routes_are_assembled_only_in_router_and_app() {
                     name == "lib.rs" && allowed.iter().any(|(s, e)| (*s..*e).contains(&at));
                 assert!(
                     inside,
-                    "{name}:{line}: `{call}` outside lib.rs router()/app() escapes the auth inventory"
+                    "{name}:{line}: `{call}` outside lib.rs routes()/app() escapes the auth inventory"
                 );
             }
         }

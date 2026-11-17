@@ -196,3 +196,41 @@ async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Res
     assert_eq!(db.sweep_expired_sessions().await?, 1);
     Ok(())
 }
+
+/// L7: `Router::layer` makes the *last* call outermost, so the request-id layer sat
+/// innermost: the propagating layer never saw a generated id, responses carried
+/// `x-request-id` only when the client sent one, and the 408 came from outside the trace.
+/// Every response — a plain read, a refusal, a timeout — now carries an id.
+#[tokio::test]
+async fn every_response_carries_a_request_id_even_a_timeout() -> anyhow::Result<()> {
+    let (app, _db, _tmp) = app().await?;
+    for request in [
+        Request::get("/livez").body(Body::empty())?,
+        Request::get("/api/monitors").body(Body::empty())?, // 401
+    ] {
+        let response = app.clone().oneshot(request).await?;
+        assert!(
+            response.headers().get("x-request-id").is_some(),
+            "{}: no x-request-id",
+            response.status()
+        );
+    }
+    let stalled =
+        Full::new(Bytes::from_static(br#"{"token":""#)).with_trailers(std::future::pending::<
+            Option<Result<axum::http::HeaderMap, std::convert::Infallible>>,
+        >());
+    let request = Request::post("/api/login")
+        .header("content-type", "application/json")
+        .body(Body::new(stalled))?;
+    tokio::time::pause();
+    let response = tokio::time::timeout(Duration::from_secs(60), app.oneshot(request))
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within 60 s"))??;
+    tokio::time::resume();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(
+        response.headers().get("x-request-id").is_some(),
+        "the 408 carries an id"
+    );
+    Ok(())
+}

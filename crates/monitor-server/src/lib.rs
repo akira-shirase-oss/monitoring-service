@@ -178,7 +178,15 @@ pub async fn record_downtime(
     Ok(gaps)
 }
 
+/// The management API under its service stack ([`layered`]) — what the in-process tests
+/// drive. [`app`] is the same plus the static routes, which is what the server answers.
 pub fn router(state: AppState) -> Router {
+    layered(routes(state))
+}
+
+/// Every API and health route, unlayered. With [`app`], the only place a route is added
+/// (`tests/auth_inventory.rs`).
+fn routes(state: AppState) -> Router {
     let api = Router::new()
         .route("/monitors", get(list_monitors).post(create_monitor))
         .route(
@@ -214,16 +222,26 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::Extension(LoginSlots(Arc::new(
             tokio::sync::Semaphore::new(LOGIN_SLOTS),
         ))))
-        // Order matters: request id first, then tracing, panic catch, timeout, body limit.
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(TraceLayer::new_for_http())
-        .layer(CatchPanicLayer::new())
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            REQUEST_TIMEOUT,
-        ))
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
+}
+
+/// The service stack, as one `ServiceBuilder` — its *first* layer is the outermost
+/// (rust-mastery ch. 12): set the request id → propagate it to the response → trace →
+/// catch panics → time out → limit bodies. So every response, a 408 or a caught panic
+/// included, carries `x-request-id` and passes through the trace. (`Router::layer` calls
+/// chain the other way round — the last is outermost — which once left the id innermost.)
+fn layered(app: Router) -> Router {
+    app.layer(
+        tower::ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(TraceLayer::new_for_http())
+            .layer(CatchPanicLayer::new())
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                REQUEST_TIMEOUT,
+            ))
+            .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT)),
+    )
 }
 
 /// Everything the server answers: [`router`] plus the public snapshot at `/status.json`
@@ -239,7 +257,7 @@ pub fn app(
     csp: &str,
 ) -> Router {
     use tower_http::services::{ServeDir, ServeFile};
-    let app = router(state).route_service(
+    let app = routes(state).route_service(
         "/status.json",
         ServeFile::new(status_dir.join("status.json")),
     );
@@ -249,7 +267,8 @@ pub fn app(
     } else {
         app
     };
-    headers::harden(app, csp)
+    // The static routes get the same stack as the API: ids, trace, timeout.
+    headers::harden(layered(app), csp)
 }
 
 async fn livez() -> Json<serde_json::Value> {
