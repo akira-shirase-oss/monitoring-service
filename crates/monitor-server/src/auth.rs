@@ -158,7 +158,11 @@ pub async fn require_auth(
     } else if let Some(session) = session_cookie(request.headers().get(header::COOKIE)) {
         match state
             .db
-            .session_valid(&session_key(token, session), state.session_idle)
+            .session_valid_at(
+                &session_key(token, session),
+                (state.clock)(),
+                state.session_idle,
+            )
             .await
         {
             Ok(true) => Some(Credential::Cookie),

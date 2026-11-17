@@ -30,6 +30,7 @@ async fn app() -> anyhow::Result<(axum::Router, Db, tempfile::TempDir)> {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::ZERO,
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
         trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,

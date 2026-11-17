@@ -47,6 +47,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The penalty a wrong login token pays (`throttle::PENALTY_SLOTS` at once at most).
 const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
 
+/// Wall-clock time for session expiry (D-016). Injected so tests can move it; the server
+/// uses [`system_clock`].
+pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
+/// The real clock.
+pub fn system_clock() -> Clock {
+    Arc::new(OffsetDateTime::now_utc)
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
@@ -68,6 +77,8 @@ pub struct AppState {
     /// `SMON_SESSION_IDLE_S`: a session unused for this long ends, inside its lifetime too
     /// (D-016). The dashboard's 15 s refresh keeps an open tab's session in use.
     pub session_idle: Duration,
+    /// "Now" for session creation, expiry and idleness.
+    pub clock: Clock,
     /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
     pub cookie_secure: auth::CookieSecure,
     /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
@@ -345,11 +356,12 @@ async fn login(
 
     // The cookie gets the id; the store only its token-bound digest (D-016).
     let id = Uuid::new_v4().simple().to_string();
-    let expires = OffsetDateTime::now_utc()
+    let now = (state.clock)();
+    let expires = now
         + time::Duration::seconds(i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX));
     if let Err(error) = state
         .db
-        .create_session(&auth::session_key(admin, &id), expires)
+        .create_session_at(&auth::session_key(admin, &id), now, expires)
         .await
     {
         tracing::error!(%error, "session insert failed");

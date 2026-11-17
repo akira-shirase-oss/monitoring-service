@@ -667,9 +667,20 @@ impl Db {
         id: &str,
         expires_at: OffsetDateTime,
     ) -> Result<(), QueryError> {
+        self.create_session_at(id, OffsetDateTime::now_utc(), expires_at)
+            .await
+    }
+
+    /// [`Db::create_session`] created at an explicit `now` (the server's injected clock).
+    pub async fn create_session_at(
+        &self,
+        id: &str,
+        now: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<(), QueryError> {
         sqlx::query("INSERT INTO sessions (id, created_at, expires_at) VALUES (?, ?, ?)")
             .bind(id)
-            .bind(OffsetDateTime::now_utc())
+            .bind(now)
             .bind(expires_at)
             .execute(&self.pool)
             .await?;

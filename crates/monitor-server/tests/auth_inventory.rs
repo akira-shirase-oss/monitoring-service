@@ -152,6 +152,7 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::from_hours(1),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
         trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,

@@ -284,6 +284,7 @@ fn app_state(
         admin_token,
         session_ttl: config.session_ttl,
         session_idle: config.session_idle,
+        clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
