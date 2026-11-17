@@ -344,3 +344,82 @@ fn a_tokenless_non_loopback_listen_refuses_to_boot_and_binds_nothing() {
         );
     }
 }
+
+/// `server()`, started through `sh` with `umask` set first — the way a service manager
+/// hands the process its umask.
+#[cfg(unix)]
+fn server_with_umask(dir: &std::path::Path, umask: &str, args: &[&str]) -> Command {
+    let template = server(dir, &[]);
+    let mut shell = Command::new("sh");
+    shell
+        .arg("-c")
+        .arg(format!("umask {umask}; exec \"$@\""))
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_monitor-server"))
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            shell.env(key, value);
+        }
+    }
+    shell
+}
+
+/// The real binary, whatever umask its service manager hands it: under a permissive 022
+/// `--init` still creates an owner-only store, and under the unit's 077 the public
+/// snapshot is still readable by the static host that publishes it (0644) while the store
+/// and its WAL stay 0600.
+#[cfg(unix)]
+#[test]
+fn the_store_is_owner_only_and_the_snapshot_public_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path).map_or_else(
+            |e| panic!("{}: {e}", path.display()),
+            |meta| meta.permissions().mode() & 0o777,
+        )
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let init = server_with_umask(dir.path(), "022", &["--init"])
+        .output()
+        .expect("--init");
+    assert!(init.status.success(), "--init: {init:?}");
+    assert_eq!(
+        mode(&dir.path().join("boot.db")),
+        0o600,
+        "store under umask 022"
+    );
+
+    let mut child = server_with_umask(dir.path(), "077", &[])
+        .spawn()
+        .expect("serve");
+    let snapshot = dir.path().join("status/status.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !snapshot.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let snapshot_mode = snapshot.exists().then(|| mode(&snapshot));
+    let wal = dir.path().join("boot.db-wal");
+    let wal_mode = wal.exists().then(|| mode(&wal));
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let _ = wait_exit(&mut child, Duration::from_secs(40));
+    assert_eq!(
+        snapshot_mode,
+        Some(0o644),
+        "public snapshot under umask 077"
+    );
+    assert_eq!(
+        mode(&dir.path().join("boot.db")),
+        0o600,
+        "store under umask 077"
+    );
+    if let Some(wal_mode) = wal_mode {
+        assert_eq!(wal_mode, 0o600, "the WAL");
+    }
+}

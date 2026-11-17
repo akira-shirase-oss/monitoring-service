@@ -235,3 +235,27 @@ fn a_perf_harness_refuses_a_port_that_is_already_in_use_and_kills_nothing() {
         "a refused run writes no results"
     );
 }
+
+/// RUSTSEC-2026-0459 needs a store opened with a `-wal` someone else wrote. The restore
+/// drill — the procedure the RUNBOOK points to — removes `-wal`/`-shm` before it starts the
+/// server on the restored file.
+#[test]
+fn the_restore_drill_removes_the_wal_and_shm_before_restarting() {
+    let lines = code(DRILL);
+    let restored = lines
+        .iter()
+        .position(|line| line.starts_with("cp \"$BACKUP\" \"$DB\""))
+        .expect("the drill restores the backup over the store");
+    let restart = restored
+        + lines[restored..]
+            .iter()
+            .position(|line| line.starts_with("./target/debug/monitor-server"))
+            .expect("the drill restarts on the restored store");
+    assert!(
+        lines[..restart]
+            .iter()
+            .skip(restored.saturating_sub(3))
+            .any(|line| *line == "rm -f \"$DB-wal\" \"$DB-shm\""),
+        "-wal/-shm must be removed before the restored store is opened"
+    );
+}

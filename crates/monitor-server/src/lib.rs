@@ -870,7 +870,8 @@ async fn list_incidents(
 #[derive(Debug, Deserialize)]
 pub struct BackupRequest {
     /// Absolute path the snapshot is written to. Relative paths are rejected — where a
-    /// backup lands is an operator's explicit choice, not a cwd accident.
+    /// backup lands is an operator's explicit choice, not a cwd accident — and so is an
+    /// existing file: a backup is created new, owner-only (0600).
     pub path: String,
 }
 
@@ -884,7 +885,10 @@ async fn backup(
     if !path.is_absolute() {
         return Err(ApiError::BadId);
     }
-    let bytes = state.db.backup(&path).await?;
+    let bytes = state.db.backup(&path).await.map_err(|error| match error {
+        QueryError::Invalid(message) => ApiError::Invalid(message),
+        other => ApiError::Db(other),
+    })?;
     Ok(Json(serde_json::json!({
         "path": input.path,
         "bytes": bytes,

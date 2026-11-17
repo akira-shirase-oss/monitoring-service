@@ -193,6 +193,26 @@ const BIRTH_STREAK_OF_OPEN_INCIDENT: &str = "EXISTS (
        AND checks.slot_at >= COALESCE(i.first_fail_at, i.opened_at)
        AND checks.slot_at <= i.opened_at)";
 
+/// Create a missing store file empty and owner-only (0600) before SQLite opens it: SQLite
+/// would create it with the process umask (usually 0644), and its `-wal`/`-shm` take the
+/// store's mode. An existing store is left as it is.
+async fn create_owner_only(path: std::path::PathBuf) -> Result<(), DbError> {
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(QueryError::io(&error)),
+        }
+    })
+    .await
+    .map_err(|error| QueryError::Io(error.to_string()))?
+    .map_err(DbError::from)
+}
+
 /// A handle to the monitor's SQLite store.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -269,6 +289,12 @@ impl Db {
             .create_if_missing(create)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
+        // sqlx renames an in-memory database to a shared-cache `file:` name — decide from
+        // the URL the caller wrote, never from that name.
+        let in_memory = url.contains(":memory:") || url.contains("mode=memory");
+        if create && !in_memory {
+            create_owner_only(options.get_filename().to_path_buf()).await?;
+        }
         let mut pool = SqlitePoolOptions::new().max_connections(max_connections);
         if let Some(bytes) = max_db_bytes {
             pool = pool.after_connect(move |conn, _meta| {
@@ -315,13 +341,42 @@ impl Db {
     /// way to copy a live database without quiescing it. This reads the store; it does
     /// not write it, so the single-writer invariant is untouched. Returns the backup's
     /// size in bytes — a zero-length "backup" is no backup at all.
+    ///
+    /// The target must not exist: it is created empty and owner-only (0600) first —
+    /// `VACUUM INTO` fills an empty file and keeps its mode — so a backup is never readable
+    /// by others, not even between creation and a chmod, and never overwrites or reuses a
+    /// file that was already there ([`QueryError::Invalid`]).
     pub async fn backup(&self, path: &std::path::Path) -> Result<u64, QueryError> {
+        let target = path.to_path_buf();
+        let created = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            options.open(&target).map(drop)
+        })
+        .await
+        .map_err(|error| QueryError::Io(error.to_string()))?;
+        match created {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(QueryError::Invalid(
+                    "the backup target already exists; choose a new path".into(),
+                ));
+            }
+            Err(error) => return Err(QueryError::io(&error)),
+        }
         // VACUUM INTO takes no bound parameters; the path is quoted as an SQL string
         // literal with '' escaping — never interpolated raw (AssertSqlSafe audited).
         let escaped = path.to_string_lossy().replace('\'', "''");
-        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{escaped}'")))
+        let vacuum = sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{escaped}'")))
             .execute(&self.pool)
-            .await?;
+            .await;
+        if let Err(error) = vacuum {
+            // Leave no empty "backup" behind to be mistaken for one.
+            let _ = std::fs::remove_file(path);
+            return Err(error.into());
+        }
         let bytes = std::fs::metadata(path)
             .map_err(|error| QueryError::io(&error))?
             .len();

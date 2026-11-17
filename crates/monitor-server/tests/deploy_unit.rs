@@ -247,3 +247,15 @@ fn the_runbook_install_says_egress_must_be_direct() {
         "Install must state that egress is direct and proxy variables are ignored"
     );
 }
+
+/// Files the service creates (store, WAL, logs, backups) are owner-only by default; the
+/// public snapshot is the one file widened on purpose (snapshot.rs). The RUNBOOK makes
+/// `data/` itself 0700, so nobody else can plant a `-wal` beside the store.
+#[test]
+fn the_unit_creates_owner_only_files_and_data_is_private() {
+    assert_eq!(service_setting("UMask"), Some("0077"));
+    assert!(
+        RUNBOOK.contains("chmod 700 /opt/smon/data"),
+        "the RUNBOOK install makes data/ owner-only"
+    );
+}

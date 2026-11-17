@@ -1621,3 +1621,24 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
     );
     Ok(())
 }
+
+/// A backup is created new: a path that already exists is refused with 422 and left as it
+/// was — `POST /api/backup` can't be pointed at a file to overwrite or a pre-planted one.
+#[tokio::test]
+async fn a_backup_onto_an_existing_file_is_refused_and_leaves_it_alone() -> anyhow::Result<()> {
+    let (app, _statuses, _db, _wh, _tmp) = app().await?;
+    let tmp = tempfile::tempdir()?;
+    let taken = tmp.path().join("taken.db");
+    std::fs::write(&taken, b"not yours")?;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/backup",
+        Some(serde_json::json!({ "path": taken.display().to_string() })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(std::fs::read(&taken)?, b"not yours");
+    Ok(())
+}

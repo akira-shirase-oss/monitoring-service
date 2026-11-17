@@ -38,6 +38,7 @@ sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/no
 # volume that isn't mounted yet can never be mistaken for a new install):
 sudo sh -c 'set -a; . /opt/smon/env; set +a; exec /opt/smon/current/bin/monitor-server --init'
 sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # the only paths it writes
+sudo chmod 700 /opt/smon/data   # store, -wal/-shm, logs, backups: nobody else reads or plants files
 sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env  # systemd reads it as root
 sudo cp deploy/monitor-server.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now monitor-server
@@ -105,6 +106,7 @@ the ownership change SQLite cannot write `data/`. Once, before the normal steps 
 sudo systemctl stop monitor-server
 sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
 sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # store, -wal/-shm, logs, snapshot
+sudo chmod 700 /opt/smon/data && sudo chmod 600 /opt/smon/data/monitor.db*  # owner-only
 sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env
 sudo cp deploy/monitor-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -144,13 +146,20 @@ fails the migration check at boot and stays down, which is the honest failure.
 
 ## Backup / restore
 
+Backups are created new and owner-only (0600): the target path must not exist yet
+(an existing file is refused with 422, never overwritten). Keep them inside `data/` (0700)
+or another owner-only directory — they hold monitored URLs and alert history.
+
 Restore only into a stopped server, and delete any `monitor.db-wal`/`-shm` beside the
 restored file first: the bundled SQLite (`libsqlite3-sys` 0.37) is affected by
 RUSTSEC-2026-0459, which needs a database opened together with a `-wal` that someone else
 wrote (deny.toml records the assessment and the re-check date).
 
 ```sh
-curl -X POST .../api/backup -d '{"path":"/opt/smon/data/backups/monitor.db"}'
+# a new name each time (an existing file is refused); data/backups/ is owned by smon
+curl -X POST .../api/backup -H "authorization: Bearer $SMON_ADMIN_TOKEN" \
+    -H 'content-type: application/json' \
+    -d "{\"path\":\"/opt/smon/data/backups/monitor-$(date -u +%Y%m%dT%H%M%SZ).db\"}"
 # restore: stop, copy the snapshot over data/monitor.db (remove -wal/-shm), start
 scripts/backup-drill.sh   # the drill that proves it (own ports 58460/58461; safe beside a live monitor)
 ```

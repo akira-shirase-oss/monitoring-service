@@ -1411,3 +1411,41 @@ async fn retention_at_the_cap_has_room_for_summaries_of_a_thin_expired_slice() -
     }
     Ok(())
 }
+
+/// The store and its backups hold session digests, monitored URLs and alert history; the
+/// RUSTSEC-2026-0459 assessment in deny.toml relies on nobody but the service user being
+/// able to read or plant files beside them. A new store and every backup are created
+/// owner-only (0600) whatever the process umask, and the WAL inherits the store's mode.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_new_store_and_its_backups_are_owner_only() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &std::path::Path| -> anyhow::Result<u32> {
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+    };
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("private.db");
+    let db = Db::connect(&format!("sqlite:{}", path.display()), 1).await?;
+    db.migrate().await?;
+    let monitor =
+        NewMonitor::new("private", url::Url::parse("https://example.com/health")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+    assert_eq!(mode(&path)?, 0o600, "the store");
+    let wal = tmp.path().join("private.db-wal");
+    if wal.exists() {
+        assert_eq!(mode(&wal)?, 0o600, "the WAL takes the store's mode");
+    }
+
+    let backup = tmp.path().join("backup.db");
+    assert!(db.backup(&backup).await? > 0);
+    assert_eq!(mode(&backup)?, 0o600, "the backup");
+
+    // An existing file is never overwritten or reused (and keeps its own contents).
+    std::fs::write(tmp.path().join("taken.db"), b"someone else's file")?;
+    assert!(db.backup(&tmp.path().join("taken.db")).await.is_err());
+    assert_eq!(
+        std::fs::read(tmp.path().join("taken.db"))?,
+        b"someone else's file"
+    );
+    Ok(())
+}

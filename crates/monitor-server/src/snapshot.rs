@@ -161,6 +161,13 @@ pub async fn write_beat(
     // half-snapshot.
     let tmp = config.dir.join(".status.json.tmp");
     std::fs::write(&tmp, bytes)?;
+    // The snapshot is public by design and the static host that publishes it may read it
+    // as another user: 0644 even under the unit's owner-only UMask=0077.
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &tmp,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )?;
     std::fs::rename(&tmp, config.dir.join("status.json"))?;
     Ok(())
 }
