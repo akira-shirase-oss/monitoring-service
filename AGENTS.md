@@ -89,7 +89,7 @@ executed run.
 `scripts/check.sh` — toolchain check, `scripts/check-ignored.sh` (no ignored path other than
 build/runtime artifacts), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`,
-`scripts/check-advisories.sh` (`cargo deny --locked check advisories`, required when `CI` is set;
+`scripts/check-advisories.sh` (`cargo deny --locked check advisories bans licenses sources`, required when `CI` is set;
 `deny.toml` exceptions need a re-check date that has not passed), `scripts/check-architecture.sh`,
 `svelte-check` and a dashboard build. Run before every push.
 
