@@ -138,15 +138,15 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
     let vitals = Vitals::new(Arc::clone(&write_health), COORDINATOR_STALL);
     let supervisor = Supervisor::new(vitals.clone(), shutdown.clone());
 
-    let (writer, writer_task) = monitor_db::writer::spawn(
-        db.clone(),
-        Arc::clone(&statuses),
+    let writer = spawn_writer(
+        &db,
+        &statuses,
         health,
-        Arc::clone(&write_health),
-        WRITER_BOUND,
+        &write_health,
         smtp.is_some(),
-    );
-    supervisor.watch("writer", Role::Observing, writer_task);
+        &supervisor,
+    )
+    .await?;
     // Restart honesty: time the process was down is a gap in evidence. One `missed` row
     // per monitor that slept through a slot resets its streaks (failures either side of
     // the outage are not consecutive) and makes its status `unknown` until a fresh probe
@@ -266,6 +266,32 @@ async fn finish(
             "monitoring engine failed ({cause}); exiting so the service manager restarts it"
         )),
     }
+}
+
+/// The single writer, on a connection of its own so its commits never queue behind API
+/// reads for a pooled one, owned by the supervisor as an observing task.
+async fn spawn_writer(
+    db: &monitor_db::Db,
+    statuses: &SharedStatuses,
+    health: HashMap<monitor_domain::MonitorId, monitor_domain::Health>,
+    write_health: &monitor_db::WriteHealth,
+    queue_email: bool,
+    supervisor: &Supervisor,
+) -> anyhow::Result<monitor_db::writer::WriterHandle> {
+    let writer_db = db
+        .writer_connection()
+        .await
+        .context("opening the writer's connection")?;
+    let (writer, task) = monitor_db::writer::spawn(
+        writer_db,
+        Arc::clone(statuses),
+        health,
+        Arc::clone(write_health),
+        WRITER_BOUND,
+        queue_email,
+    );
+    supervisor.watch("writer", Role::Observing, task);
+    Ok(writer)
 }
 
 /// The management API's state: the shared engine handles plus the settings it reads.
