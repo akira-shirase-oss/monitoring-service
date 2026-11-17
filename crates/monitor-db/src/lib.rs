@@ -1674,4 +1674,50 @@ mod tests {
             );
         }
     }
+
+    /// The writer's own connection (D-018) after a store error and after the connection
+    /// itself is lost (an I/O failure, or sqlx's idle and lifetime limits): the pool opens
+    /// a replacement, and the replacement is under the same bounds — still one connection,
+    /// still the `SMON_MAX_DB_BYTES` ceiling.
+    #[tokio::test]
+    async fn the_writers_connection_recovers_and_keeps_its_bounds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite:{}", tmp.path().join("w.db").display());
+        let setup = Db::connect(&url, 1).await.expect("connect");
+        setup.migrate().await.expect("migrate");
+        let used = setup.used_bytes().await.expect("used");
+        setup.pool.close().await;
+        let api = Db::connect_opts(&url, POOL, Some(used))
+            .await
+            .expect("api pool");
+        let writer = api.writer_connection().await.expect("writer connection");
+        let oversized = "INSERT INTO sessions (id, created_at, expires_at)
+                    VALUES (hex(randomblob(500000)), 'x', 'x')";
+        let small = "INSERT INTO sessions (id, created_at, expires_at) VALUES ('s', 'x', 'x')";
+
+        // A store error (the ceiling: SQLITE_FULL) is an error, not a dead connection.
+        assert!(sqlx::query(oversized).execute(&writer.pool).await.is_err());
+        sqlx::query(small)
+            .execute(&writer.pool)
+            .await
+            .expect("writes after an error");
+
+        // Lose the connection outright; the next use opens a replacement.
+        let conn = writer.pool.acquire().await.expect("acquire");
+        conn.close().await.expect("close");
+        sqlx::query("DELETE FROM sessions")
+            .execute(&writer.pool)
+            .await
+            .expect("writes after the connection is lost");
+        assert!(
+            writer.pool.size() <= 1,
+            "still one connection: {}",
+            writer.pool.size()
+        );
+        let refused = sqlx::query(oversized).execute(&writer.pool).await;
+        let Err(sqlx::Error::Database(error)) = refused else {
+            panic!("the replacement connection grew a capped store: {refused:?}");
+        };
+        assert!(error.message().contains("full"), "{}", error.message());
+    }
 }
