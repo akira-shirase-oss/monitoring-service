@@ -8,6 +8,10 @@ is inherent), samples RSS and outbox depth, then writes a results JSON here.
 
     node perf/lab-profile.mjs --duration-s 600 --monitors 100 [--origins 10]
 
+`lab-profile.mjs` and `api-load.mjs` take `--bin release` to drive
+`target/release/monitor-server` (debug is the default); `lab-profile.mjs --mix ok` points every monitor at `/ok`, and more than 100 monitors raises
+`SMON_MAX_MONITORS` to the count.
+
 Ports: every harness starts its own server and fixtures on its own defaults — never
 58400, where an installed monitor listens — and each is a flag:
 
@@ -18,6 +22,7 @@ Ports: every harness starts its own server and fixtures on its own defaults — 
 | `session-churn.mjs` | `--server-port 58440` | `--fixture-port 58740` |
 | `real-app-load.mjs` | `--server-port 58450` | `--app-port 58800`, `--sink-port 58740` |
 | `connections.mjs` | `--server-port 58462` | — (`--cap 16`; ~40 s: slow header, idle keep-alive, connection cap, non-reading clients, request cap) |
+| `api-load.mjs` | `--server-port 58460` | `--fixture-port 58461` (… +`origins`−1); k6 drives `perf/k6/api-reads.js` (`--requests 1000000 --vus 32`, bearer-authed reads beside the 100-monitor lab mix) |
 
 A port that already answers refuses the run before anything starts, and a harness only
 drives the server it started: if that child has exited when `/livez` answers, the run

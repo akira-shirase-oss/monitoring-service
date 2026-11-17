@@ -7,6 +7,12 @@
 //
 //   node perf/lab-profile.mjs [--duration-s 600] [--monitors 100] [--out perf/results]
 //                             [--server-port 58430] [--fixture-port 58700] [--origins 10]
+//                             [--bin debug|release] [--mix lab|ok]
+//
+// `--bin release` drives target/release/monitor-server (build it first). `--mix ok` points
+// every monitor at /ok — the scheduler/writer path without slow or hung targets holding
+// slots; the default `lab` mix is the guide's. More than 100 monitors raises
+// SMON_MAX_MONITORS to the count, since the harness registers them itself.
 //
 // Its own ports (server 58430, fixtures 58700…58700+origins−1) — never 58400, where an
 // installed monitor listens. A busy port refuses the run before anything starts, and the
@@ -34,6 +40,12 @@ const FIXTURE_PORT = Number(arg('fixture-port', 58700));
 // accidentally measure it). Spread monitors across ORIGINS fixture ports.
 const ORIGINS = Number(arg('origins', 10));
 const SERVER_PORT = Number(arg('server-port', 58430));
+const BIN_PROFILE = arg('bin', 'debug');
+if (!['debug', 'release'].includes(BIN_PROFILE)) throw new Error(`--bin ${BIN_PROFILE}: expected debug or release`);
+const BIN =
+	BIN_PROFILE === 'release' ? `${ROOT}/target/release/monitor-server` : `${ROOT}/target/debug/monitor-server`;
+const MIX = arg('mix', 'lab');
+if (!['lab', 'ok'].includes(MIX)) throw new Error(`--mix ${MIX}: expected lab or ok`);
 const DB = `/tmp/smon-load-${process.pid}.db`;
 const LOG = `/tmp/smon-load-${process.pid}.log`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`;
@@ -49,9 +61,11 @@ const CLASSES = [
 	{ w: 5, name: 'hung', path: () => '/hang' },
 ];
 
+const MIXES = { lab: CLASSES, ok: [{ w: 100, name: 'ok', path: () => '/ok' }] };
+
 function plan(i) {
 	let x = i % 100;
-	for (const c of CLASSES) {
+	for (const c of MIXES[MIX]) {
 		if (x < c.w) {
 			return { name: `${c.name}-${i}`, port: FIXTURE_PORT + (i % ORIGINS), path: c.path(i) };
 		}
@@ -74,6 +88,9 @@ function commit() {
 	}
 }
 
+const loadavg = () =>
+	execFileSync('sysctl', ['-n', 'vm.loadavg'], { encoding: 'utf8' }).trim().replace(/[{}]/g, '').trim().split(/\s+/).map(Number);
+
 function pct(sorted, p) {
 	if (sorted.length === 0) return null;
 	return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
@@ -93,6 +110,7 @@ async function main() {
 	]);
 	mkdirSync(OUT_DIR, { recursive: true });
 	const started = new Date();
+	const loadBefore = loadavg();
 	for (let o = 0; o < ORIGINS; o++) {
 		run('node', [`${ROOT}/fixtures/fault-server.mjs`, String(FIXTURE_PORT + o)]);
 	}
@@ -106,12 +124,13 @@ async function main() {
 		SMON_LOG_FILE: LOG,
 		SMON_LOG_MAX_BYTES: String(8 * 1024 * 1024),
 		RUST_LOG: 'monitor_server=info',
+		...(N_MONITORS > 100 ? { SMON_MAX_MONITORS: String(N_MONITORS) } : {}),
 	};
-	execFileSync(`${ROOT}/target/debug/monitor-server`, ['--init'], {
+	execFileSync(BIN, ['--init'], {
 		env: { ...process.env, ...serverEnv },
 		stdio: 'ignore',
 	});
-	const server = run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
+	const server = run(BIN, [], serverEnv);
 	await waitOwnServer(BASE, server);
 
 	const t0 = Date.now();
@@ -196,6 +215,11 @@ async function main() {
 			interval_s: 15,
 			timeout_s: 3,
 			registered_ms,
+			bin: BIN_PROFILE,
+			mix: MIX,
+			origins: ORIGINS,
+			loadavg_before: loadBefore,
+			loadavg_after: loadavg(),
 		},
 		checks: {
 			total: checks.length,
