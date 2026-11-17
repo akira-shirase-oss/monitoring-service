@@ -40,6 +40,7 @@ async fn app() -> anyhow::Result<(
         ),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -762,6 +763,7 @@ async fn auth_denies_without_a_valid_bearer_token() {
         vitals: monitor_server::vitals::Vitals::new(write_health, Duration::from_secs(30)),
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -833,6 +835,7 @@ async fn authed_with(
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
+        session_idle: Duration::from_hours(1),
         cookie_secure,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1141,6 +1144,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         vitals,
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1215,6 +1219,7 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 2,
         allow_local_targets: false,
@@ -1376,6 +1381,7 @@ async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: true,
@@ -1407,6 +1413,7 @@ async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
         vitals,
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1443,6 +1450,7 @@ async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
         vitals,
         admin_token: None,
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1472,6 +1480,7 @@ fn authed_on(db: &Db, token: &str) -> Router {
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(token)),
         session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1566,5 +1575,49 @@ async fn the_store_and_its_backups_hold_no_usable_session_id() -> anyhow::Result
             );
         }
     }
+    Ok(())
+}
+
+/// D-016: a dashboard session also ends when it goes unused for `SMON_SESSION_IDLE_S`,
+/// inside its 12 h lifetime; use keeps it alive. (A 1 s idle limit here; the config floor
+/// is 60 s.)
+#[tokio::test]
+async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::connect(
+        &format!("sqlite:{}", tmp.path().join("idle.db").display()),
+        1,
+    )
+    .await?;
+    db.migrate().await?;
+    let token = "idle-token-0123456789abcdef0123456789abcd";
+    let app = monitor_server::router(monitor_server::AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: Some(Arc::from(token)),
+        session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_secs(1),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
+        version: "test",
+    });
+    let cookie = login_cookie(&app, token).await?;
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            read_with_cookie(&app, &cookie).await?,
+            StatusCode::OK,
+            "used every 0.6 s: alive past the 1 s limit"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert_eq!(
+        read_with_cookie(&app, &cookie).await?,
+        StatusCode::UNAUTHORIZED,
+        "unused for 1.3 s: ended"
+    );
     Ok(())
 }

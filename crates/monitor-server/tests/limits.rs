@@ -29,6 +29,7 @@ async fn app() -> anyhow::Result<(axum::Router, Db, tempfile::TempDir)> {
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::ZERO,
+        session_idle: Duration::from_hours(1),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,

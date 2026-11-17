@@ -121,7 +121,11 @@ pub async fn require_auth(
     let credential = if bearer_matches(request.headers().get(header::AUTHORIZATION), token) {
         Some(Credential::Bearer)
     } else if let Some(session) = session_cookie(request.headers().get(header::COOKIE)) {
-        match state.db.session_valid(&session_key(token, session)).await {
+        match state
+            .db
+            .session_valid(&session_key(token, session), state.session_idle)
+            .await
+        {
             Ok(true) => Some(Credential::Cookie),
             Ok(false) => None,
             Err(error) => {

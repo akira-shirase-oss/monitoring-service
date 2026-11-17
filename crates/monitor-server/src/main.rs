@@ -185,6 +185,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         vitals: vitals.clone(),
         admin_token,
         session_ttl: config.session_ttl,
+        session_idle: config.session_idle,
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
         allow_local_targets: config.lab,

@@ -18,6 +18,14 @@ the new token. Migration 0008 deletes the raw-id rows written before this (every
 in again once). Pinned by `rotating_the_admin_token_ends_every_session` and
 `the_store_and_its_backups_hold_no_usable_session_id`.
 
+A session also ends when it goes unused for `SMON_SESSION_IDLE_S` (default 1 h), inside
+its absolute lifetime (`SMON_SESSION_TTL_S`, 12 h). Use refreshes `last_seen_at`
+(migration 0009) at most once a minute, so the dashboard's 15 s refresh is not a write per
+request, and a failed refresh (a store at its byte cap) still authorizes. An open tab keeps
+its session alive; a forgotten one ends within the hour. Pinned by
+`an_idle_session_ends_and_use_keeps_it_alive` (store) and
+`an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive` (API).
+
 ## D-015 — A normal start requires an existing store; only `--init` creates one
 
 The store is meant to live on its own volume (the SaaS droplet uses a DigitalOcean volume).

@@ -855,6 +855,8 @@ async fn an_incident_enqueues_one_row_per_configured_channel() -> anyhow::Result
     Ok(())
 }
 
+const IDLE: std::time::Duration = std::time::Duration::from_hours(1);
+
 /// M7.2: session rows are the cookie's authority — create, validate, expire, sweep.
 #[tokio::test]
 async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
@@ -866,10 +868,10 @@ async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
         .await?;
     db.create_session("dead", now - time::Duration::seconds(1))
         .await?;
-    assert!(db.session_valid("live").await?);
-    assert!(!db.session_valid("missing").await?);
+    assert!(db.session_valid("live", IDLE).await?);
+    assert!(!db.session_valid("missing", IDLE).await?);
     // An expired row is denied and deleted on sight — one lookup is the whole contract.
-    assert!(!db.session_valid("dead").await?);
+    assert!(!db.session_valid("dead", IDLE).await?);
 
     db.create_session("gone-soon", now - time::Duration::seconds(1))
         .await?;
@@ -880,11 +882,49 @@ async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
         "the untouched expired row swept"
     );
     assert!(
-        db.session_valid("live").await?,
+        db.session_valid("live", IDLE).await?,
         "the live session survives the sweep"
     );
     db.delete_session("live").await?;
-    assert!(!db.session_valid("live").await?);
+    assert!(!db.session_valid("live", IDLE).await?);
+    Ok(())
+}
+
+/// D-016: a session unused for longer than the idle limit ends, even inside its absolute
+/// lifetime; use keeps it alive (refreshing `last_seen_at`), up to that lifetime.
+#[tokio::test]
+async fn an_idle_session_ends_and_use_keeps_it_alive() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let t0 = OffsetDateTime::now_utc();
+    let min = time::Duration::minutes;
+    db.create_session("used", t0 + time::Duration::hours(12))
+        .await?;
+    db.create_session("idle", t0 + time::Duration::hours(12))
+        .await?;
+
+    // "used" is used every 40 minutes for 3 hours: always valid.
+    for step in 1..=4 {
+        assert!(
+            db.session_valid_at("used", t0 + min(40 * step), IDLE)
+                .await?,
+            "used at +{} min",
+            40 * step
+        );
+    }
+    // "idle" was last used at creation: past the hour it is gone, and stays gone.
+    assert!(db.session_valid_at("idle", t0 + min(59), IDLE).await?);
+    assert!(!db.session_valid_at("idle", t0 + min(59 + 61), IDLE).await?);
+    assert!(!db.session_valid_at("idle", t0 + min(59 + 62), IDLE).await?);
+    // And "used" ends the same way once its use stops.
+    assert!(
+        !db.session_valid_at("used", t0 + min(160 + 61), IDLE)
+            .await?
+    );
+    // The absolute lifetime still wins over use.
+    db.create_session("short", t0 + min(30)).await?;
+    assert!(db.session_valid_at("short", t0 + min(20), IDLE).await?);
+    assert!(!db.session_valid_at("short", t0 + min(31), IDLE).await?);
     Ok(())
 }
 

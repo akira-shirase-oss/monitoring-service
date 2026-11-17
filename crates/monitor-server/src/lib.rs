@@ -73,6 +73,9 @@ pub struct AppState {
     /// `sessions` row and the cookie's `Max-Age`. Store-side expiry is the authority;
     /// the cookie's copy is a convenience for the browser.
     pub session_ttl: Duration,
+    /// `SMON_SESSION_IDLE_S`: a session unused for this long ends, inside its lifetime too
+    /// (D-016). The dashboard's 15 s refresh keeps an open tab's session in use.
+    pub session_idle: Duration,
     /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
     pub cookie_secure: auth::CookieSecure,
     /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —

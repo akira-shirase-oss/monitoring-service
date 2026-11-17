@@ -576,26 +576,59 @@ impl Db {
         Ok(())
     }
 
-    /// A session authorizes only while `expires_at` is in the future. An expired row is
-    /// deleted on sight — the sweep in retention is the sweeper, this is the guard.
-    pub async fn session_valid(&self, id: &str) -> Result<bool, QueryError> {
-        let now = OffsetDateTime::now_utc();
-        let row: Option<(OffsetDateTime,)> =
-            sqlx::query_as("SELECT expires_at FROM sessions WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            Some((expires,)) if expires > now => Ok(true),
-            Some(_) => {
-                sqlx::query("DELETE FROM sessions WHERE id = ?")
-                    .bind(id)
+    /// A session authorizes only while `expires_at` is in the future and it was last used
+    /// less than `idle` ago (D-016). A row past either limit is deleted on sight — the
+    /// sweep in retention is the sweeper, this is the guard.
+    pub async fn session_valid(
+        &self,
+        key: &str,
+        idle: std::time::Duration,
+    ) -> Result<bool, QueryError> {
+        self.session_valid_at(key, OffsetDateTime::now_utc(), idle)
+            .await
+    }
+
+    /// [`Db::session_valid`] at an explicit `now` (tests drive the clock). A valid lookup
+    /// refreshes `last_seen_at` once `min(idle / 4, 60 s)` has passed since the last
+    /// refresh, so a dashboard polling every 15 s is not a write per request. A refresh
+    /// that fails (a store at its byte cap) is logged and the session still authorizes:
+    /// the full-disk moment is when the operator most needs the dashboard.
+    pub async fn session_valid_at(
+        &self,
+        key: &str,
+        now: OffsetDateTime,
+        idle: std::time::Duration,
+    ) -> Result<bool, QueryError> {
+        let row: Option<(OffsetDateTime, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
+            "SELECT expires_at, created_at, last_seen_at FROM sessions WHERE id = ?",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((expires, created, last_seen)) = row else {
+            return Ok(false);
+        };
+        let idle = time::Duration::try_from(idle).unwrap_or(time::Duration::MAX);
+        let unused = now - last_seen.unwrap_or(created);
+        if expires > now && unused < idle {
+            let refresh_every: time::Duration = (idle / 4_i32).min(time::Duration::minutes(1));
+            if unused >= refresh_every {
+                let touched = sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(key)
                     .execute(&self.pool)
-                    .await?;
-                Ok(false)
+                    .await;
+                if let Err(error) = touched {
+                    tracing::warn!(%error, "session last_seen refresh failed");
+                }
             }
-            None => Ok(false),
+            return Ok(true);
         }
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(false)
     }
 
     /// Logout deletes the row — an idempotent no-op on an already-gone session.
