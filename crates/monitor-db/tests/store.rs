@@ -1472,3 +1472,78 @@ async fn a_backup_path_with_quotes_writes_exactly_that_file() -> anyhow::Result<
     assert!(db.list_monitors().await.is_ok(), "the store is intact");
     Ok(())
 }
+
+/// L6: a store created before stores were owner-only (or copied in with `cp`) kept its old
+/// mode — `-rw-r--r--` for the store, its `-wal` and `-shm` after the upgrade — and the
+/// RUSTSEC-2026-0459 assessment relies on owner-only files. Opening a store now tightens
+/// it and its sidecars to 0600.
+#[cfg(unix)]
+#[tokio::test]
+async fn opening_an_existing_store_makes_it_and_its_sidecars_owner_only() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("old.db");
+    let url = format!("sqlite:{}", path.display());
+    {
+        let db = Db::connect(&url, 1).await?;
+        db.migrate().await?;
+        let monitor =
+            NewMonitor::new("old", url::Url::parse("https://example.com/")?)?.into_monitor();
+        db.insert_monitor(&monitor).await?;
+        db.close().await;
+    }
+    let files: Vec<_> = ["old.db", "old.db-wal", "old.db-shm"]
+        .iter()
+        .map(|name| tmp.path().join(name))
+        .collect();
+    for file in &files {
+        if !file.exists() {
+            std::fs::write(file, b"")?; // a sidecar left beside it
+        }
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644))?;
+    }
+    let db = Db::connect_existing(&url, 1, None).await?;
+    for file in &files {
+        let mode = std::fs::metadata(file)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}", file.display());
+    }
+    assert_eq!(db.list_monitors().await?.len(), 1, "the store is untouched");
+    Ok(())
+}
+
+/// L5: what the RUNBOOK's rollback rests on. Migrations are forward-only and recorded in
+/// sqlx's `_sqlx_migrations` table (not SQLite's `user_version`): a binary that doesn't
+/// know a migration the store has applied refuses to start on it. Rolling back across a
+/// migration therefore means restoring the backup taken before the upgrade.
+#[tokio::test]
+async fn an_older_binary_refuses_a_store_a_newer_one_migrated() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("newer.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    db.close().await;
+    // A newer binary's migration, as it would have been recorded.
+    let raw = sqlx::SqlitePool::connect(&url).await?;
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (9999, 'from a newer release', TRUE, X'00', 0)",
+    )
+    .execute(&raw)
+    .await?;
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&raw)
+        .await?;
+    raw.close().await;
+    assert_eq!(user_version, 0, "user_version is not what guards this");
+
+    let db = Db::connect_existing(&url, 1, None).await?;
+    let refused = db
+        .migrate()
+        .await
+        .expect_err("an unknown applied migration must refuse");
+    assert!(
+        refused.to_string().contains("9999"),
+        "the error names the migration: {refused}"
+    );
+    Ok(())
+}

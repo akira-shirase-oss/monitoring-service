@@ -12,7 +12,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use monitor_db::{Db, Observation, OutboxRow, writer};
 use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation};
 use monitor_server::deliver::{Config, Deliverer, Sink};

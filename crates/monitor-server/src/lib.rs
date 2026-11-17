@@ -14,6 +14,7 @@ pub mod redact;
 pub mod schedule;
 pub mod serve;
 pub mod snapshot;
+pub mod throttle;
 pub mod vitals;
 
 use std::sync::Arc;
@@ -43,18 +44,17 @@ use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, Valid
 const BODY_LIMIT: usize = 16 * 1024;
 /// Every handler answers inside this; probes run on their own deadlines elsewhere.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Logins evaluated at once. `POST /api/login` is the one unauthenticated credential
-/// check: a wrong token keeps its slot for [`WRONG_TOKEN_DELAY`], so guesses are bounded
-/// to about `LOGIN_SLOTS / 0.3 s` however many connections are opened; the rest get 429
-/// before the token is compared. The bearer token (CLI) never queues here.
-const LOGIN_SLOTS: usize = 4;
-/// The penalty a wrong token pays while holding its login slot.
+/// The penalty a wrong login token pays (`throttle::PENALTY_SLOTS` at once at most).
 const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
 
-/// The login slots ([`LOGIN_SLOTS`]): one set per router, so each server (and each test
-/// router) has its own.
-#[derive(Clone)]
-struct LoginSlots(Arc<tokio::sync::Semaphore>);
+/// Wall-clock time for session expiry (D-016). Injected so tests can move it; the server
+/// uses [`system_clock`].
+pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
+/// The real clock.
+pub fn system_clock() -> Clock {
+    Arc::new(OffsetDateTime::now_utc)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -77,11 +77,16 @@ pub struct AppState {
     /// `SMON_SESSION_IDLE_S`: a session unused for this long ends, inside its lifetime too
     /// (D-016). The dashboard's 15 s refresh keeps an open tab's session in use.
     pub session_idle: Duration,
+    /// "Now" for session creation, expiry and idleness.
+    pub clock: Clock,
     /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
     pub cookie_secure: auth::CookieSecure,
     /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
     /// they keep history). Bounds the schedule and every per-monitor table (D-012).
     pub max_monitors: u64,
+    /// `SMON_TRUSTED_PROXY`: the reverse proxy whose right-most `X-Forwarded-For` entry
+    /// names the client for credential throttling (`throttle.rs`). `None`: the TCP peer.
+    pub trusted_proxy: Option<std::net::IpAddr>,
     /// `SMON_PROFILE=lab`: local/private targets may be registered (fixtures). Otherwise
     /// a URL the SSRF guard would refuse is refused at registration (D-013).
     pub allow_local_targets: bool,
@@ -178,7 +183,16 @@ pub async fn record_downtime(
     Ok(gaps)
 }
 
+/// The management API under its service stack ([`layered`]) — what the in-process tests
+/// drive. [`app`] is the same plus the static routes, which is what the server answers.
 pub fn router(state: AppState) -> Router {
+    layered(routes(state))
+}
+
+/// Every API and health route, unlayered. With [`app`], the only place a route is added
+/// (`tests/auth_inventory.rs`).
+fn routes(state: AppState) -> Router {
+    let trusted_proxy = state.trusted_proxy;
     let api = Router::new()
         .route("/monitors", get(list_monitors).post(create_monitor))
         .route(
@@ -211,19 +225,54 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logout", post(logout))
         .nest("/api", api)
         .with_state(state)
-        .layer(axum::Extension(LoginSlots(Arc::new(
-            tokio::sync::Semaphore::new(LOGIN_SLOTS),
-        ))))
-        // Order matters: request id first, then tracing, panic catch, timeout, body limit.
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(TraceLayer::new_for_http())
-        .layer(CatchPanicLayer::new())
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            REQUEST_TIMEOUT,
-        ))
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
+}
+
+/// The service stack, as one `ServiceBuilder` — its *first* layer is the outermost
+/// (rust-mastery ch. 12): set the request id → propagate it to the response → trace →
+/// catch panics → time out → limit bodies. So every response, a 408 or a caught panic
+/// included, carries `x-request-id` and passes through the trace. (`Router::layer` calls
+/// chain the other way round — the last is outermost — which once left the id innermost.)
+fn layered(app: Router) -> Router {
+    app.layer(
+        tower::ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(TraceLayer::new_for_http())
+            .layer(CatchPanicLayer::new())
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                REQUEST_TIMEOUT,
+            ))
+            .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT)),
+    )
+}
+
+/// Everything the server answers: [`router`] plus the public snapshot at `/status.json`
+/// (outside `/api`, so public viewers never touch the management surface; expiry is the
+/// file's own claim) and the dashboard build as the fallback when it has been built, all
+/// under the browser hardening headers (`csp` from [`headers::dashboard_csp`]). This is
+/// what `main.rs` serves; every route in the crate is added here or in [`router`]
+/// (`tests/auth_inventory.rs` holds the crate to it).
+pub fn app(
+    state: AppState,
+    status_dir: &std::path::Path,
+    dashboard_dir: &std::path::Path,
+    csp: &str,
+) -> Router {
+    use tower_http::services::{ServeDir, ServeFile};
+    let app = routes(state).route_service(
+        "/status.json",
+        ServeFile::new(status_dir.join("status.json")),
+    );
+    let app = if dashboard_dir.is_dir() {
+        let index = ServeFile::new(dashboard_dir.join("200.html"));
+        app.fallback_service(ServeDir::new(dashboard_dir).fallback(index))
+    } else {
+        app
+    };
+    // The static routes get the same stack as the API: ids, trace, timeout.
+    headers::harden(layered(app), csp)
 }
 
 async fn livez() -> Json<serde_json::Value> {
@@ -247,7 +296,7 @@ pub struct LoginBody {
 /// without a stray copy in localStorage.
 async fn login(
     State(state): State<AppState>,
-    axum::Extension(slots): axum::Extension<LoginSlots>,
+    extensions: axum::http::Extensions,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
@@ -278,23 +327,23 @@ async fn login(
         )
             .into_response();
     };
-    // A bounded queue, not a lockout: when every slot is taken the answer is "retry", and
-    // the token is not even compared.
-    let Ok(_slot) = slots.0.try_acquire() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(axum::http::header::RETRY_AFTER, "1")],
-            Json(serde_json::json!({
-                "error": { "code": "too_many_requests",
-                           "message": "too many logins in flight; retry shortly" }
-            })),
-        )
-            .into_response();
+    // Per-address guessing budget (throttle.rs): taken before the token is compared, so
+    // a throttled address can't learn whether a guess was right; a right token gives it
+    // back. Another address's flood never touches this one's budget.
+    let Some(guard) = extensions.get::<throttle::Guard>() else {
+        tracing::error!("invariant: routes() installs the credential guard");
+        return ApiError::Corrupt.into_response();
+    };
+    let attempt = match guard.throttle.admit(guard.client(&extensions, &headers)) {
+        Ok(attempt) => attempt,
+        Err(wait) => return throttle::too_many(wait),
     };
     if !auth::digests_match(body.token.as_bytes(), admin.as_bytes()) {
-        // The delay is paid while holding the slot — that is what bounds the guess rate.
-        // The digest compare itself already runs in constant time.
-        tokio::time::sleep(WRONG_TOKEN_DELAY).await;
+        drop(attempt); // stays spent
+        // A courtesy delay, bounded across all addresses; the buckets bound the rate.
+        if let Ok(_penalty) = guard.penalties.try_acquire() {
+            tokio::time::sleep(WRONG_TOKEN_DELAY).await;
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -303,14 +352,16 @@ async fn login(
         )
             .into_response();
     }
+    attempt.succeeded();
 
     // The cookie gets the id; the store only its token-bound digest (D-016).
     let id = Uuid::new_v4().simple().to_string();
-    let expires = OffsetDateTime::now_utc()
+    let now = (state.clock)();
+    let expires = now
         + time::Duration::seconds(i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX));
     if let Err(error) = state
         .db
-        .create_session(&auth::session_key(admin, &id), expires)
+        .create_session_at(&auth::session_key(admin, &id), now, expires)
         .await
     {
         tracing::error!(%error, "session insert failed");
@@ -362,7 +413,19 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
 /// while the writer is dead — the vitals verdict is the truth about the engine, never a
 /// green that frozen statuses would contradict.
 async fn readyz(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    state.db.ping().await?;
+    if let Err(error) = state.db.ping().await {
+        // Public endpoint: fixed text, the detail in the log only.
+        tracing::error!(%error, "readiness: the store does not answer");
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": vitals::Availability::Unavailable,
+                "reason": "store unavailable",
+                "faults": ["store unavailable"],
+            })),
+        )
+            .into_response());
+    }
     let verdict = state.vitals.verdict();
     if verdict.status == vitals::Availability::Degraded {
         // Still observing and serving: ready, with the faults named (D-011). Only a
@@ -963,7 +1026,9 @@ pub enum ApiError {
     Validation(#[from] ValidationError),
     #[error("stored data violates the contract")]
     Corrupt,
-    #[error(transparent)]
+    /// The store failed. Clients get fixed text; the detail (SQLite and sqlx messages:
+    /// table names, pool state) goes to the log only.
+    #[error("internal error")]
     Db(#[from] QueryError),
 }
 
@@ -1000,7 +1065,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status();
         if status.is_server_error() {
-            tracing::error!(code = self.code(), error = %self, "request failed");
+            let detail = std::error::Error::source(&self).map(ToString::to_string);
+            tracing::error!(code = self.code(), error = %self, ?detail, "request failed");
         }
         let body =
             serde_json::json!({ "error": { "code": self.code(), "message": self.to_string() } });

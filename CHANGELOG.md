@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Security review follow-ups (2026-11-16, second round) — behaviour changes
+
+- **Failed credentials are throttled per client address, not globally.** Every login or
+  `Authorization: Bearer` attempt takes a token from its address's bucket (five back to
+  back, one more every 2 s; a right credential gives it back), so one client's flood no
+  longer locks the owner out; past it the answer is 429 with `Retry-After`, *before* the
+  credential is compared. Wrong bearer tokens are now counted too. Behind a reverse proxy
+  set **`SMON_TRUSTED_PROXY`** to its address, or every client shares the proxy's budget.
+- **The listener bounds what a client can hold:** a request header must arrive within
+  10 s, an idle keep-alive is closed after 10 s, and at most **`SMON_MAX_CONNECTIONS`**
+  (default 1024) connections are served at once — the rest wait in the backlog. Serving
+  is HTTP/1.1 on hyper directly (as before, no HTTP/2).
+- **Tokenless dev mode serves only loopback `Host` values**, and a present `Origin` must
+  match `Host` in every mode (403 `host_not_allowed` / `origin_mismatch`).
+- **Store failures answer fixed text**: `internal error` on the API, and `/readyz` gives
+  503 `"store unavailable"` when the store doesn't answer (the detail is logged).
+- **Every response carries `x-request-id`**, and the static routes (`/status.json`, the
+  dashboard) run under the same timeout and trace as the API.
+- **An existing store is made owner-only (0600) when opened**, with its `-wal`/`-shm`,
+  and each change is logged.
+- RUNBOOK: back up before an upgrade; a rollback across migrations restores that backup
+  (sqlx's `_sqlx_migrations` refuses an older binary). D-017: the webhook URL is
+  operator configuration, not SSRF-guarded — a P0 gate before tenants set webhook URLs.
+- Dependencies: uuid 1.29.3; hmac 0.13 and sha2 0.11 (signatures and session keys
+  unchanged, pinned by known-answer tests); the dashboard's npm group (#3, TypeScript 7,
+  tailwind-variants 4, Playwright 1.65 — run `npx playwright install chromium` once).
+
 ### Security verification (2026-11-16) — behaviour changes for existing users
 
 - **Everyone signs in to the dashboard again once.** Session rows now hold a digest

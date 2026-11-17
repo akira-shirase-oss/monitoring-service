@@ -41,6 +41,8 @@ async fn app() -> anyhow::Result<(
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -764,6 +766,8 @@ async fn auth_denies_without_a_valid_bearer_token() {
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -836,6 +840,8 @@ async fn authed_with(
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1145,6 +1151,8 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1220,6 +1228,8 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 2,
         allow_local_targets: false,
@@ -1382,6 +1392,8 @@ async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: true,
@@ -1414,6 +1426,8 @@ async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1451,6 +1465,8 @@ async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1481,6 +1497,8 @@ fn authed_on(db: &Db, token: &str) -> Router {
         admin_token: Some(Arc::from(token)),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1579,8 +1597,9 @@ async fn the_store_and_its_backups_hold_no_usable_session_id() -> anyhow::Result
 }
 
 /// D-016: a dashboard session also ends when it goes unused for `SMON_SESSION_IDLE_S`,
-/// inside its 12 h lifetime; use keeps it alive. (A 1 s idle limit here; the config floor
-/// is 60 s.)
+/// inside its 12 h lifetime; use keeps it alive. L8: this used wall-clock sleeps (a 1 s
+/// limit, use every 0.6 s) and failed on a loaded CI runner; the clock is injected now and
+/// moved by hand.
 #[tokio::test]
 async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -1591,6 +1610,17 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
     .await?;
     db.migrate().await?;
     let token = "idle-token-0123456789abcdef0123456789abcd";
+    let offset_s = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let clock: monitor_server::Clock = {
+        let offset_s = Arc::clone(&offset_s);
+        Arc::new(move || {
+            time::OffsetDateTime::now_utc()
+                + time::Duration::seconds(offset_s.load(std::sync::atomic::Ordering::Relaxed))
+        })
+    };
+    let advance = |seconds: i64| {
+        offset_s.fetch_add(seconds, std::sync::atomic::Ordering::Relaxed);
+    };
     let app = monitor_server::router(monitor_server::AppState {
         db: db.clone(),
         statuses: Arc::new(RwLock::new(HashMap::new())),
@@ -1598,26 +1628,28 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
         vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
         admin_token: Some(Arc::from(token)),
         session_ttl: Duration::from_hours(12),
-        session_idle: Duration::from_secs(1),
+        session_idle: Duration::from_secs(60),
+        clock,
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
         version: "test",
     });
     let cookie = login_cookie(&app, token).await?;
-    for _ in 0..3 {
-        tokio::time::sleep(Duration::from_millis(600)).await;
+    for _ in 0..4 {
+        advance(40);
         assert_eq!(
             read_with_cookie(&app, &cookie).await?,
             StatusCode::OK,
-            "used every 0.6 s: alive past the 1 s limit"
+            "used every 40 s: alive past the 60 s limit"
         );
     }
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    advance(61);
     assert_eq!(
         read_with_cookie(&app, &cookie).await?,
         StatusCode::UNAUTHORIZED,
-        "unused for 1.3 s: ended"
+        "unused for 61 s: ended"
     );
     Ok(())
 }
@@ -1640,5 +1672,136 @@ async fn a_backup_onto_an_existing_file_is_refused_and_leaves_it_alone() -> anyh
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "invalid_request");
     assert_eq!(std::fs::read(&taken)?, b"not yours");
+    Ok(())
+}
+
+async fn status_with(
+    app: &Router,
+    method: &str,
+    headers: &[(&str, &str)],
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<StatusCode> {
+    let mut request = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let body = match body {
+        Some(json) => {
+            request = request.header("content-type", "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    Ok(app.clone().oneshot(request.body(body)?).await?.status())
+}
+
+/// M3: tokenless dev mode is open to whoever reaches the loopback listener — which, by DNS
+/// rebinding, includes any web page the operator visits. It skipped the Origin and Host
+/// checks entirely: a rebound `Host` read the monitors and wrote a backup. Tokenless mode
+/// now serves only loopback `Host` values, and a present `Origin` must match `Host` in
+/// every mode.
+#[tokio::test]
+async fn tokenless_mode_serves_only_loopback_hosts_and_same_origin_browsers() -> anyhow::Result<()>
+{
+    let (app, _statuses, _db, _wh, _tmp) = app().await?;
+    let out = tempfile::tempdir()?;
+    let backup = out.path().join("exfil.db");
+    let backup_body = || Some(serde_json::json!({ "path": backup.display().to_string() }));
+
+    // A rebound hostname, with the Origin a rebound page really sends: refused.
+    let rebound = [
+        ("host", "rebound.attacker.example:58465"),
+        ("origin", "http://rebound.attacker.example:58465"),
+    ];
+    assert_eq!(
+        status_with(&app, "GET", &rebound, "/api/monitors", None).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status_with(&app, "POST", &rebound, "/api/backup", backup_body()).await?,
+        StatusCode::FORBIDDEN
+    );
+    // A cross-site page posting to the loopback address: refused.
+    let cross_site = [
+        ("host", "127.0.0.1:58465"),
+        ("origin", "https://evil.example"),
+    ];
+    assert_eq!(
+        status_with(&app, "POST", &cross_site, "/api/backup", backup_body()).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!backup.exists(), "a forged request wrote a backup");
+
+    // The CLI (no Origin) and the dashboard (same origin) on loopback still work.
+    for host in ["127.0.0.1:58465", "localhost:58465", "[::1]:58465"] {
+        assert_eq!(
+            status_with(&app, "GET", &[("host", host)], "/api/monitors", None).await?,
+            StatusCode::OK,
+            "{host}"
+        );
+    }
+    let same_origin = [
+        ("host", "localhost:58465"),
+        ("origin", "http://localhost:58465"),
+    ];
+    assert_eq!(
+        status_with(
+            &app,
+            "POST",
+            &same_origin,
+            "/api/monitors",
+            Some(serde_json::json!({ "name": "m", "url": "https://example.com/" })),
+        )
+        .await?,
+        StatusCode::CREATED
+    );
+    Ok(())
+}
+
+/// L2: a store failure answered with the database's own text — sqlx/SQLite messages
+/// (table names, pool state) reached clients, including unauthenticated ones through
+/// `/readyz` and `POST /api/logout`. Every 5xx body is now fixed text; the detail goes to
+/// the log only.
+#[tokio::test]
+async fn store_failures_answer_fixed_text_never_the_databases_own() -> anyhow::Result<()> {
+    let leaks = |body: &serde_json::Value| {
+        let text = body.to_string().to_ascii_lowercase();
+        [
+            "pool",
+            "sqlite",
+            "database",
+            "table",
+            "connection",
+            "closed",
+        ]
+        .into_iter()
+        .find(|word| text.contains(word))
+    };
+
+    let (app, _statuses, db, _wh, _tmp) = app().await?;
+    db.close().await;
+    let (status, body) = send(&app, "GET", "/api/monitors", None).await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(leaks(&body), None, "{body}");
+
+    let (status, body) = send(&app, "GET", "/readyz", None).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["status"], "unavailable");
+    assert_eq!(leaks(&body), None, "{body}");
+
+    let (authed_app, authed_db, _tmp2) = authed("s3cret", Duration::from_secs(3600)).await?;
+    authed_db.close().await;
+    let response = authed_app
+        .oneshot(
+            Request::post("/api/logout")
+                .header("cookie", "smon_session=whatever")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json_body(response).await?;
+    assert_eq!(leaks(&body), None, "{body}");
     Ok(())
 }

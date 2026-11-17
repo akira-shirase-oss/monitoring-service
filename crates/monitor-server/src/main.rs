@@ -16,12 +16,11 @@ use monitor_server::config::Config;
 use monitor_server::deliver::{Config as DelivererConfig, Deliverer, Sink};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config as CoordinatorConfig, Coordinator};
-use monitor_server::serve::{Stopped, serve};
+use monitor_server::serve::{Limits, Stopped, serve};
 use monitor_server::vitals::{Role, Supervisor, Vitals};
-use monitor_server::{AppState, load_registry, rebuild_health, record_downtime, router};
+use monitor_server::{AppState, load_registry, rebuild_health, record_downtime};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
 /// Writer channel depth: the coordinator parks behind a full queue instead of dropping
@@ -183,21 +182,15 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
 
     let snapshot_db = db.clone();
     let snapshot_statuses = Arc::clone(&statuses);
-    let app = router(AppState {
+    let state = app_state(
+        &config,
         db,
         statuses,
-        registry: registry_tx,
-        vitals: vitals.clone(),
+        registry_tx,
+        vitals.clone(),
         admin_token,
-        session_ttl: config.session_ttl,
-        session_idle: config.session_idle,
-        cookie_secure: config.cookie_secure,
-        max_monitors: config.max_monitors,
-        allow_local_targets: config.lab,
-        version: env!("CARGO_PKG_VERSION"),
-    });
-
-    let app = hardened(app, &config).await?;
+    );
+    let app = assemble(state, &config).await?;
 
     // Install the stop signals before serving: a registration failure is a boot error,
     // not a detached panic that would look like a clean shutdown (rust-mastery ch. 12).
@@ -219,6 +212,10 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         shutdown,
         vitals,
         HTTP_DRAIN,
+        Limits {
+            max_connections: config.max_connections,
+            ..Limits::default()
+        },
     )
     .await?;
     finish(
@@ -270,34 +267,53 @@ async fn finish(
     }
 }
 
-/// The public snapshot served unmodified at /status.json — outside /api, so public viewers
-/// never touch the management surface; expiry is the file's own claim. Then the dashboard
-/// build as the fallback, when it has been built.
-fn with_static_files(app: axum::Router, status_dir: &str, dashboard_dir: &str) -> axum::Router {
-    let app = app.route_service(
-        "/status.json",
-        ServeFile::new(Path::new(status_dir).join("status.json")),
-    );
-    if Path::new(dashboard_dir).is_dir() {
-        let index = ServeFile::new(format!("{dashboard_dir}/200.html"));
-        tracing::info!(dir = %dashboard_dir, "serving the dashboard build");
-        app.fallback_service(ServeDir::new(dashboard_dir).fallback(index))
-    } else {
-        tracing::info!(dir = %dashboard_dir, "dashboard not built; API only");
-        app
+/// The management API's state: the shared engine handles plus the settings it reads.
+fn app_state(
+    config: &Config,
+    db: monitor_db::Db,
+    statuses: SharedStatuses,
+    registry: watch::Sender<Arc<Vec<monitor_domain::Monitor>>>,
+    vitals: Vitals,
+    admin_token: monitor_server::auth::AdminToken,
+) -> AppState {
+    AppState {
+        db,
+        statuses,
+        registry,
+        vitals,
+        admin_token,
+        session_ttl: config.session_ttl,
+        session_idle: config.session_idle,
+        clock: monitor_server::system_clock(),
+        trusted_proxy: config.trusted_proxy,
+        cookie_secure: config.cookie_secure,
+        max_monitors: config.max_monitors,
+        allow_local_targets: config.lab,
+        version: env!("CARGO_PKG_VERSION"),
     }
 }
 
-/// The API plus the static files, with browser hardening on every response (headers.rs):
-/// the CSP allows the dashboard build's inline bootstrap by hash, read from the build once,
-/// on a blocking thread.
-async fn hardened(app: axum::Router, config: &Config) -> anyhow::Result<axum::Router> {
-    let app = with_static_files(app, &config.status_dir, &config.dashboard_dir);
+/// The whole HTTP surface (`monitor_server::app`: the API, the public snapshot, the
+/// dashboard build, the browser hardening headers). The CSP allows the dashboard build's
+/// inline bootstrap by hash, read from the build once, on a blocking thread. No route is
+/// added here — the auth inventory reads lib.rs (`tests/auth_inventory.rs`).
+async fn assemble(state: AppState, config: &Config) -> anyhow::Result<axum::Router> {
     let dir = std::path::PathBuf::from(&config.dashboard_dir);
     let csp = tokio::task::spawn_blocking(move || monitor_server::headers::dashboard_csp(&dir))
         .await
         .context("reading the dashboard build for its CSP")?;
-    Ok(monitor_server::headers::harden(app, &csp))
+    let dashboard = Path::new(&config.dashboard_dir);
+    if dashboard.is_dir() {
+        tracing::info!(dir = %config.dashboard_dir, "serving the dashboard build");
+    } else {
+        tracing::info!(dir = %config.dashboard_dir, "dashboard not built; API only");
+    }
+    Ok(monitor_server::app(
+        state,
+        Path::new(&config.status_dir),
+        dashboard,
+        &csp,
+    ))
 }
 
 /// The coordinator and its probe client (the SSRF policy follows `SMON_PROFILE`), owned

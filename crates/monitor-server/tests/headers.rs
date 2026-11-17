@@ -158,6 +158,11 @@ async fn every_response_carries_the_csp_and_hardening_headers() -> anyhow::Resul
             );
         }
         assert_eq!(header("x-content-type-options"), "nosniff", "{path}");
+        // The static routes run under the same stack as the API (L7): ids, trace, timeout.
+        assert!(
+            !header("x-request-id").is_empty(),
+            "{path}: no x-request-id"
+        );
         assert_eq!(header("x-frame-options"), "DENY", "{path}");
         assert_eq!(header("referrer-policy"), "same-origin", "{path}");
     }

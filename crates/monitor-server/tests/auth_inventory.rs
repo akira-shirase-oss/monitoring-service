@@ -2,14 +2,16 @@
 //! whole inventory, not for one sample route.
 //!
 //! The inventory comes from the router itself, so a new route can't be missed:
-//! - **paths** are read from `router()`'s source (every `.route("…")` literal, inside and
-//!   outside the auth layer); a route added outside the layer that isn't on the short
-//!   public list fails here;
+//! - **paths** are read from `routes()`'s source (every `.route("…")` literal, inside and
+//!   outside the auth layer) and `app()`'s (the snapshot and the dashboard fallback); a
+//!   route added outside the layer that isn't on the short public list fails here, and a
+//!   routing call anywhere else in the crate fails `routes_are_assembled_only_in_routes_and_app`;
 //! - **methods** come from the live router: an authorized request with a method nobody
 //!   routes gets axum's 405 with an `Allow` header naming every method routed on that
 //!   path (without a credential even that 405 is a 401 — the route list isn't public).
 //!
-//! Then every (path, method) is sent with no credential, a wrong bearer, a malformed one
+//! Then every (path, method) is sent to the assembled `app()` — exactly what `main.rs`
+//! serves — with no credential, a wrong bearer, a malformed one
 //! and an unknown session cookie, each carrying a body that would act if it got through.
 //! Each must be 401 `unauthenticated`, and nothing may have happened in the store or on
 //! disk.
@@ -25,7 +27,6 @@ use monitor_db::Db;
 use tower::ServiceExt;
 
 const ROUTER_SOURCE: &str = include_str!("../src/lib.rs");
-const MAIN_SOURCE: &str = include_str!("../src/main.rs");
 const TOKEN: &str = "inventory-token-0123456789abcdef0123456789";
 
 /// The routes that are public by design: health, the build version, and the two
@@ -44,21 +45,21 @@ fn literals_after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// (protected paths, public paths) as `router()` declares them.
+/// (protected paths, public paths) as `routes()` declares them.
 #[expect(
     clippy::expect_used,
     reason = "test helper: a source it can't read is a failed test"
 )]
 fn declared_routes() -> (Vec<String>, Vec<String>) {
     let start = ROUTER_SOURCE
-        .find("pub fn router(")
-        .expect("router() exists in lib.rs");
+        .find("fn routes(")
+        .expect("routes() exists in lib.rs");
     let body = &ROUTER_SOURCE[start..];
-    let body = &body[..body.find("\n}\n").expect("router() ends")];
+    let body = &body[..body.find("\n}\n").expect("routes() ends")];
     for unsupported in [".merge(", ".nest_service(", ".route_service(", ".fallback"] {
         assert!(
             !body.contains(unsupported),
-            "router() uses `{unsupported}`: teach this inventory test about it first"
+            "routes() uses `{unsupported}`: teach this inventory test about it first"
         );
     }
     let (api, outer) = body
@@ -141,7 +142,9 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
     let url = format!("sqlite:{}", dir.join("inventory.db").display());
     let db = Db::connect(&url, 1).await.expect("connect");
     db.migrate().await.expect("migrate");
-    let app = monitor_server::router(monitor_server::AppState {
+    std::fs::create_dir_all(dir.join("dashboard")).expect("dashboard dir");
+    std::fs::write(dir.join("dashboard/200.html"), "<!doctype html>").expect("fallback page");
+    let state = monitor_server::AppState {
         db: db.clone(),
         statuses: Arc::new(RwLock::new(HashMap::new())),
         registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
@@ -149,12 +152,29 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::from_hours(1),
         session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
         version: "test",
-    });
+    };
+    // The assembled app, exactly as main.rs serves it (snapshot route, dashboard fallback,
+    // hardening headers).
+    let app = monitor_server::app(
+        state,
+        &dir.join("status"),
+        &dir.join("dashboard"),
+        &monitor_server::headers::dashboard_csp(&dir.join("dashboard")),
+    );
     (app, db)
+}
+
+/// A fresh client address for every probe.
+fn next_peer() -> std::net::SocketAddr {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::net::SocketAddr::from((std::net::Ipv4Addr::from(0x0A00_0000 + n), 40000))
 }
 
 /// `method path` with each kind of missing or bad credential: 401 `unauthenticated`.
@@ -177,11 +197,13 @@ async fn assert_denied(app: &axum::Router, method: &str, template: &str, path: &
         if let Some((name, value)) = header {
             request = request.header(name, value);
         }
-        let response = app
-            .clone()
-            .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
-            .await
-            .expect("infallible");
+        let mut request = request.body(Body::from(body.to_owned())).expect("request");
+        // Each probe from its own address: what is under test here is the credential
+        // check, not the per-address guessing budget (that is limits.rs).
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(next_peer()));
+        let response = app.clone().oneshot(request).await.expect("infallible");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,
@@ -215,11 +237,11 @@ async fn every_api_route_and_method_denies_a_request_without_a_valid_credential(
         PUBLIC.into_iter().collect::<BTreeSet<_>>(),
         "a route outside the auth layer must be added to PUBLIC on purpose"
     );
-    let main_public = literals_after(MAIN_SOURCE, ".route_service(");
+    let (_, app_body) = fn_body(ROUTER_SOURCE, "app").expect("lib.rs app()");
     assert_eq!(
-        main_public,
+        literals_after(app_body, ".route_service("),
         ["/status.json"],
-        "main.rs adds only the public snapshot outside the API"
+        "app() adds only the public snapshot (and the dashboard fallback) outside the API"
     );
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -285,4 +307,68 @@ async fn every_api_route_and_method_denies_a_request_without_a_valid_credential(
         .await
         .expect("infallible");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// Calls that add a route, a nested router or a fallback.
+const ROUTING: [&str; 8] = [
+    ".route(",
+    ".route_service(",
+    ".nest(",
+    ".nest_service(",
+    ".merge(",
+    ".fallback(",
+    ".fallback_service(",
+    ".method_not_allowed_fallback(",
+];
+
+/// The body of `fn <name>(` in `source`, up to the closing brace at column 0.
+fn fn_body<'a>(source: &'a str, name: &str) -> Option<(usize, &'a str)> {
+    let start = source.find(&format!("fn {name}("))?;
+    let len = source[start..].find("\n}\n")?;
+    Some((start, &source[start..start + len]))
+}
+
+/// L3: the inventory read `router()` only, so a route added where the app is assembled
+/// (a `.route` in `main.rs`) was public and went unnoticed. Every routing call in the
+/// crate — any file under `src/`, found by listing it — must sit in `routes()` or `app()`
+/// in lib.rs, which is what the inventory reads and what `main.rs` serves.
+#[test]
+fn routes_are_assembled_only_in_routes_and_app() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files: Vec<_> = std::fs::read_dir(&src)
+        .unwrap_or_else(|e| panic!("read src/: {e}"))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+    let allowed: Vec<(usize, usize)> = ["routes", "app"]
+        .iter()
+        .filter_map(|name| fn_body(ROUTER_SOURCE, name).map(|(at, body)| (at, at + body.len())))
+        .collect();
+    assert_eq!(allowed.len(), 2, "lib.rs defines routes() and app()");
+    for path in files {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let full = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // Unit-test modules (at the end of a file, by convention) build fixture routers of
+        // their own; they are not served.
+        let text = full
+            .find("#[cfg(test)]\nmod tests")
+            .map_or(full.as_str(), |at| &full[..at]);
+        for call in ROUTING {
+            for (at, _) in text.match_indices(call) {
+                let line = text[..at].lines().count();
+                let inside =
+                    name == "lib.rs" && allowed.iter().any(|(s, e)| (*s..*e).contains(&at));
+                assert!(
+                    inside,
+                    "{name}:{line}: `{call}` outside lib.rs routes()/app() escapes the auth inventory"
+                );
+            }
+        }
+    }
 }

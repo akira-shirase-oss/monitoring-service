@@ -28,8 +28,9 @@ Decisions already made (2026-11-13, by the maintainer):
 - Alerts: one global webhook (`SMON_WEBHOOK_URL`, HMAC-signed) and one SMTP destination (`SMON_SMTP_*`).
 - Dashboard: a small SvelteKit app (`apps/dashboard`: overview, monitor detail, status, guide) and a static status
   page (`apps/status`).
-- Already multi-tenant-safe in one important way: the SSRF guard refuses private, loopback and link-local targets,
-  validates DNS answers and revalidates every redirect hop.
+- Probe targets are SSRF-guarded: the guard refuses private, loopback and link-local targets, validates DNS
+  answers and revalidates every redirect hop. The alert webhook URL is **not** (D-017): today only the operator sets
+  it, which is not a privilege boundary; once tenants set webhook URLs it is.
 - Deploy: `deploy/monitor-server.service` (systemd), launchd plist, `deploy/RUNBOOK.md`.
 - Readiness: feature-complete (M0–M7); the 24-hour soak is still owed.
 
@@ -40,7 +41,7 @@ Decisions already made (2026-11-13, by the maintainer):
 | Accounts | Signup (invite-code gated for the beta), email verification, sign-in, password reset, sessions per user. |
 | Workspaces | Every monitor, check, incident, maintenance window, alert channel and status page belongs to a workspace; every query is scoped by it. Members and roles (owner, member, viewer). |
 | Tokens | Per-workspace API tokens replace the single admin token for scripts and integrations (Colophon uses one). |
-| Alert channels | Per-workspace webhooks and email recipients, with a "send test alert" button, replacing the global env channels. |
+| Alert channels | Per-workspace webhooks and email recipients, with a "send test alert" button, replacing the global env channels. **P0 gate (D-017):** a tenant's webhook URL goes through `ProbePolicy` and the validating resolver when saved and at every send, no redirects — otherwise a tenant points alerts at loopback, the VPC or the metadata address. |
 | Status pages | One public status page per workspace, at its own path or subdomain. |
 | Limits | Free plan: number of monitors, minimum interval (e.g. 60 s), alert channels, retention days. Per-workspace caps on top of the existing global and per-origin concurrency, so one tenant cannot crowd the probe workers or use the service to hammer a third-party site. |
 | Dashboard | Rebuilt on a copy of Colophon's `@colophon/ui` (Tailwind v4 + shadcn-svelte), which this repo then owns: shell, auth forms, onboarding, settings (members, tokens, alert channels), monitors, incidents, maintenance, status page editor. Own accent and logo. |

@@ -285,3 +285,91 @@ fn the_docs_are_honest_about_a_volume_that_attaches_late() {
         assert!(flat.contains(needle), "the RUNBOOK lacks `{needle}`");
     }
 }
+
+/// L5: an upgrade that adds migrations can't be rolled back by repointing `current` — the
+/// old binary refuses the migrated store (`an_older_binary_refuses_a_store_a_newer_one_migrated`).
+/// The RUNBOOK must say to back up first, how to roll back with that backup, and name the
+/// real guard (`_sqlx_migrations`, not `user_version`).
+#[test]
+fn the_runbook_backs_up_before_an_upgrade_and_rolls_back_with_that_backup() {
+    let flat = RUNBOOK.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !flat.contains("user_version"),
+        "the RUNBOOK credits user_version"
+    );
+    assert!(flat.contains("_sqlx_migrations"), "name the real guard");
+    let upgrade = &flat[flat.find("## Upgrade").expect("Upgrade section")..];
+    let deploy = upgrade
+        .find("scripts/deploy.sh --prefix /opt/smon")
+        .expect("the upgrade runs deploy.sh");
+    assert!(
+        upgrade[..deploy].contains("/api/backup"),
+        "back up before deploying the new release"
+    );
+    let rollback = &flat[flat.find("## Rollback").expect("Rollback section")..];
+    for needle in ["restore", "-wal", "migration"] {
+        assert!(rollback.contains(needle), "the rollback lacks `{needle}`");
+    }
+}
+
+const SAAS_PLAN: &str = include_str!("../../../docs/SAAS_PLAN.md");
+const NOTIFICATIONS: &str = include_str!("../../../docs/modules/04-incidents-notifications.md");
+const DECISIONS: &str = include_str!("../../../docs/DECISIONS.md");
+
+/// L4: the webhook URL is not run through the SSRF guard (only http(s) and a host are
+/// checked). For one operator writing their own `env` that is not a privilege boundary,
+/// but it was written down nowhere, and `SAAS_PLAN.md` called the product SSRF-safe and
+/// planned tenant-set webhooks without the guard. The gap is stated, and tenant webhooks
+/// are gated on it.
+#[test]
+fn the_webhook_url_ssrf_gap_is_stated_and_gates_tenant_webhooks() {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decisions = flat(DECISIONS);
+    assert!(decisions.contains("## D-017"), "a decision records the gap");
+    let notifications = flat(NOTIFICATIONS);
+    assert!(
+        notifications.contains("not SSRF-guarded"),
+        "module 04 states the webhook URL is not SSRF-guarded"
+    );
+    let plan = flat(SAAS_PLAN);
+    assert!(
+        !plan.contains("Already multi-tenant-safe"),
+        "the plan overstates SSRF safety"
+    );
+    let channels = plan
+        .split("| Alert channels |")
+        .nth(1)
+        .and_then(|rest| rest.split("| Status pages |").next())
+        .unwrap_or_default();
+    assert!(
+        channels.contains("ProbePolicy") && channels.contains("P0"),
+        "tenant webhooks must go through the probe SSRF guard first: {channels}"
+    );
+}
+
+/// L9: two behaviours were stated as fact while the drill that would prove them had not
+/// been run — the 130 s SIGSTOP catch-up (F2, unit-tested only) and the late-volume
+/// recovery (F3, no systemd host). The docs say so until each is exercised.
+#[test]
+fn unverified_behaviours_are_marked_as_such() {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decisions = flat(DECISIONS);
+    let d011 = decisions
+        .split("## D-011")
+        .nth(1)
+        .and_then(|rest| rest.split("## D-010").next())
+        .unwrap_or_default();
+    assert!(
+        d011.contains("130 s SIGSTOP drill not re-run"),
+        "D-011 must say the freeze drill was not re-run"
+    );
+    let runbook = flat(RUNBOOK);
+    let late_volume = runbook
+        .split("### The data volume attached late")
+        .nth(1)
+        .unwrap_or_default();
+    assert!(
+        late_volume.contains("not yet exercised on a systemd host"),
+        "the late-volume section must say it is unverified"
+    );
+}

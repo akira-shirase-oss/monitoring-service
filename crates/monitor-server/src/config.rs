@@ -30,6 +30,7 @@ pub const KNOWN: &[&str] = &[
     "SMON_LISTEN",
     "SMON_LOG_FILE",
     "SMON_LOG_MAX_BYTES",
+    "SMON_MAX_CONNECTIONS",
     "SMON_MAX_DB_BYTES",
     "SMON_MAX_MONITORS",
     "SMON_OUTBOX_RETENTION_S",
@@ -45,6 +46,7 @@ pub const KNOWN: &[&str] = &[
     "SMON_STATUS_DIR",
     "SMON_STATUS_INTERVAL_S",
     "SMON_STATUS_TTL_S",
+    "SMON_TRUSTED_PROXY",
     "SMON_WEBHOOK_SECRET",
     "SMON_WEBHOOK_URL",
 ];
@@ -91,8 +93,14 @@ pub struct Config {
     pub smtp: Option<SmtpSettings>,
     pub session_ttl: Duration,
     pub session_idle: Duration,
+    /// `SMON_TRUSTED_PROXY`: the reverse proxy's address, whose right-most
+    /// `X-Forwarded-For` entry names the client for credential throttling.
+    pub trusted_proxy: Option<std::net::IpAddr>,
     pub cookie_secure: crate::auth::CookieSecure,
     pub max_monitors: u64,
+    /// `SMON_MAX_CONNECTIONS`: HTTP connections served at once (serve.rs); past it new
+    /// connections wait in the backlog. Keep it well below the file-descriptor limit.
+    pub max_connections: usize,
 }
 
 impl fmt::Debug for Config {
@@ -370,6 +378,15 @@ impl Config {
             Duration::from_hours(12),
             60..=MAX_HORIZON_S,
         );
+        let trusted_proxy = env.raw("SMON_TRUSTED_PROXY").and_then(|value| {
+            let parsed = value.trim().parse::<std::net::IpAddr>().ok();
+            if parsed.is_none() {
+                env.problems.push(format!(
+                    "SMON_TRUSTED_PROXY must be the proxy's IP address (e.g. 127.0.0.1), got {value:?}"
+                ));
+            }
+            parsed
+        });
         let session_idle = env.seconds(
             "SMON_SESSION_IDLE_S",
             Duration::from_hours(1),
@@ -386,6 +403,8 @@ impl Config {
             }
         };
         let max_monitors = env.ranged("SMON_MAX_MONITORS", 100, 1..=100_000);
+        let max_connections =
+            usize::try_from(env.ranged("SMON_MAX_CONNECTIONS", 1024, 8..=65_535)).unwrap_or(1024);
 
         if !env.problems.is_empty() {
             return Err(ConfigError {
@@ -411,8 +430,10 @@ impl Config {
             smtp,
             session_ttl,
             session_idle,
+            trusted_proxy,
             cookie_secure,
             max_monitors,
+            max_connections,
         })
     }
 
@@ -449,6 +470,8 @@ mod tests {
         assert_eq!(config.status_ttl, Duration::from_secs(90));
         assert_eq!(config.session_ttl, Duration::from_hours(12));
         assert_eq!(config.session_idle, Duration::from_hours(1));
+        assert_eq!(config.trusted_proxy, None);
+        assert_eq!(config.max_connections, 1024);
         assert_eq!(config.max_monitors, 100);
         assert!(!config.lab);
         assert!(config.smtp.is_none() && config.webhook_url.is_none());
@@ -468,6 +491,8 @@ mod tests {
             ("SMON_LOG_MAX_BYTES", "lots"),
             ("SMON_SESSION_TTL_S", "12h"),
             ("SMON_SESSION_IDLE_S", "1h"),
+            ("SMON_TRUSTED_PROXY", "caddy"),
+            ("SMON_MAX_CONNECTIONS", "4"),
             ("SMON_MAX_MONITORS", "0"),
             ("SMON_LISTEN", "localhost"),
             ("SMON_PROFILE", "Lab"),

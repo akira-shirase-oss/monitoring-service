@@ -21,15 +21,20 @@ monitor-db = { path = "crates/monitor-db" }
 anyhow = "1.0.104"
 axum = "0.8.9"
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
-hmac = "0.12.1"
+hmac = "0.13.0"
 http-body-util = "0.1.5"
+# Serving directly on hyper (serve.rs): a header-read timeout needs hyper's timer, which
+# axum::serve does not set. http1 + server only; hyper-util for TokioIo/TokioTimer and the
+# tower bridge — both already in the graph through axum and reqwest.
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
 # SMTP for the email alert channel — rustls + tokio only, matching the single-TLS-stack rule.
 # `tokio1-rustls` + `webpki-roots` + `aws-lc-rs` gives the rustls connector and Mozilla
 # roots with the workspace's existing provider; lettre's `rustls-tls` bundle would force
 # `ring` on top and rustls refuses an ambiguous process provider.
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1-rustls", "webpki-roots", "aws-lc-rs"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "uuid", "time"] }

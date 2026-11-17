@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-17T03:29:08.965Z",
+  "scenario": "connection-limits",
+  "cap": 16,
+  "slow_header_closed_ms": 10002,
+  "idle_keep_alive_closed_ms": 10003,
+  "idle_keep_alive_was_answered": true,
+  "answered_while_full_ms": null,
+  "answered_after_slots_free_ms": 8199,
+  "silent_holders_closed": 16,
+  "still_healthy": true,
+  "commit": "90b19d3",
+  "machine": "Darwin arm64",
+  "gates": {
+    "slow_header_closed": true,
+    "idle_keep_alive_closed": true,
+    "cap_holds": true,
+    "served_once_a_slot_frees": true,
+    "silent_holders_closed": true,
+    "still_healthy": true
+  },
+  "passed": true
+}

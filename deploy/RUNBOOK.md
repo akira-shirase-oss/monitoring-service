@@ -23,6 +23,14 @@ rolling back the binary cannot roll back evidence.
 
 ## Install
 
+**Exposure.** The listener closes a request whose header hasn't arrived within 10 s and an
+idle keep-alive after 10 s, and serves at most `SMON_MAX_CONNECTIONS` (default 1024)
+connections at once — the rest wait in the backlog, so a flood of idle sockets can't take
+the file descriptors probes and SQLite need (`perf/connections.mjs` drills it). It speaks
+plain HTTP: put a TLS proxy (Caddy) in front of anything reachable from the internet, and
+set `SMON_TRUSTED_PROXY` to that proxy's address so failed credentials are throttled per
+real client rather than all under the proxy's address.
+
 **Direct egress is required.** Probes and alerts dial their targets and receivers directly
 and ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (a proxied probe would bypass the SSRF
 guard). On a network that only allows egress through a proxy, every probe fails `connect`
@@ -75,6 +83,8 @@ monitor-server && sudo systemctl start monitor-server`. `degraded` with a delive
 snapshot or retention fault means checks still run but that duty has stopped.
 
 ### The data volume attached late
+
+*(This follows from `systemd.unit(5)`; not yet exercised on a systemd host.)*
 
 The unit waits for the mounts of `data/` and `status/` (`RequiresMountsFor`). If the
 volume's device has not appeared by its mount's `x-systemd.device-timeout` (90 s by
@@ -133,6 +143,15 @@ sudo systemctl daemon-reload
 Then check `env` against the strict parser (inline comments above; an admin token of at
 least 32 bytes) and continue:
 
+**Back up first.** A release that adds migrations can't be rolled back by repointing
+`current` (see Rollback), so take a backup with the *running* release before deploying:
+
+```sh
+curl -X POST .../api/backup -H "authorization: Bearer $SMON_ADMIN_TOKEN" \
+    -H 'content-type: application/json' \
+    -d "{\"path\":\"/opt/smon/data/backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ).db\"}"
+```
+
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # new release dir, repoints current
 sudo systemctl restart monitor-server           # or: launchctl kickstart -k system/com.shirase.smon
@@ -143,6 +162,9 @@ curl -sf .../readyz && curl -sf .../version     # the version must match the new
 sessions are dropped once — sign in again. After that, rotating `SMON_ADMIN_TOKEN` (edit
 `env`, restart) ends every dashboard session, and sessions unused for
 `SMON_SESSION_IDLE_S` (default 1 h) end on their own. Backup targets must be new paths.
+The store, its `-wal` and `-shm` are made owner-only (0600) when the server opens them, and
+logged when they weren't; make the directory private too, once:
+`sudo chmod 700 /opt/smon/data && sudo chmod 600 /opt/smon/data/monitor.db*`.
 
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
 `down`, never fabricates a recovery. If the monitor was down for longer than a check
@@ -163,9 +185,14 @@ sudo systemctl restart monitor-server
 curl -sf .../readyz
 ```
 
-Forward-only migrations: a rollback across a schema change means the old binary reads
-a newer schema. SQLite's `user_version` guards that — an old binary on a too-new schema
-fails the migration check at boot and stays down, which is the honest failure.
+Repointing is enough only when the newer release added no migration. Migrations are
+forward-only and recorded in sqlx's `_sqlx_migrations` table: an older binary on a store
+a newer one migrated refuses to start ("migration N was previously applied but is missing
+in the resolved migrations"), which is the honest failure — it never reads a schema it
+doesn't know. To roll back across a migration (for example 0008/0009 of the 2026-11-16
+security release), restore the backup taken before the upgrade: stop the server, copy that
+backup over `data/monitor.db`, delete `monitor.db-wal`/`-shm`, repoint `current`, start.
+Evidence written after the upgrade is lost; there is no downgrade migration.
 
 ## Backup / restore
 

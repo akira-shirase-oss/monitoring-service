@@ -217,6 +217,26 @@ fn dependabot_watches_cargo_npm_and_the_action_pins() {
         "each ecosystem updates weekly"
     );
     assert!(text.matches("groups:").count() >= 3, "updates are grouped");
+    // A semver-major in a group of patches held the patches hostage (#2: hmac 0.13 didn't
+    // compile, so the uuid patch couldn't land). Groups take minor and patch updates
+    // only; each major comes as a pull request of its own.
+    assert_eq!(
+        text.matches("update-types: [minor, patch]").count(),
+        3,
+        "every group excludes majors"
+    );
+}
+
+/// Dependabot's branches get the `pull_request` run; a push run on the same SHA only
+/// doubled the work (and the flakes).
+#[test]
+fn ci_skips_push_runs_on_dependabot_branches() {
+    let text = std::fs::read_to_string(repo().join(".github/workflows/ci.yml"))
+        .expect("read .github/workflows/ci.yml");
+    assert!(
+        text.contains("branches-ignore: ['dependabot/**']"),
+        "push runs on dependabot/** duplicate the pull_request run"
+    );
 }
 
 /// The lint itself, against a workflow that breaks every rule once.
