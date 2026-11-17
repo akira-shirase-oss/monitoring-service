@@ -302,3 +302,45 @@ fn an_unknown_argument_never_starts_a_server() {
         "and nothing is created"
     );
 }
+
+/// Without `SMON_ADMIN_TOKEN` the whole `/api` is open — honest only on loopback (dev
+/// mode). A wildcard or public listen with no token must stop the boot before anything
+/// runs: no listener, no snapshot, no engine. The store exists (made by `--init`), so the
+/// token is the only thing that can stop it.
+#[test]
+fn a_tokenless_non_loopback_listen_refuses_to_boot_and_binds_nothing() {
+    for listen in ["0.0.0.0:0", "[::]:0"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = server(dir.path(), &[])
+            .arg("--init")
+            .output()
+            .expect("--init");
+        assert!(init.status.success(), "--init: {init:?}");
+
+        let mut child = server(dir.path(), &[("SMON_LISTEN", listen)])
+            .spawn()
+            .expect("spawn monitor-server");
+        let status = wait_exit(&mut child, Duration::from_secs(20)).unwrap_or_else(|| {
+            panic!("{listen}: a tokenless public listen must stop the boot, not serve")
+        });
+        assert!(!status.success(), "{listen}: exit status {status}");
+        let stderr = stderr_of(&mut child);
+        assert!(
+            stderr.contains("SMON_ADMIN_TOKEN is required"),
+            "{listen}: the cause is named: {stderr}"
+        );
+        let mut stdout = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            use std::io::Read;
+            let _ = out.read_to_string(&mut stdout);
+        }
+        assert!(
+            !stdout.contains("monitor-server listening"),
+            "{listen}: nothing may be bound: {stdout}"
+        );
+        assert!(
+            !dir.path().join("status").exists(),
+            "{listen}: no engine task may have run (the snapshot writer creates status/)"
+        );
+    }
+}
