@@ -17,7 +17,8 @@ it to the writer — without ever letting a slow target stall the schedule.
 - **Probe bounds:** total deadline 5 s (per-monitor `timeout_s`, whole attempt including DNS,
   connect, TLS, headers and the bounded body read); response body capped at 64 KiB then the
   connection is dropped; `GET` only in v1 (`HEAD` opt-in later).
-- **Concurrency bounds:** global probe semaphore 20, per-origin semaphore 2 (keyed by
+- **Phase (D-018):** each monitor's slots sit at a fixed phase within its interval, from its id, so monitors created together never fall due on one tick.
+- **Concurrency bounds:** global probe semaphore sized to the schedule, `Σ (tick + timeout)/interval`, 20 to 512 (D-018; a schedule past it, or past 2 starts a tick on one origin, is refused at write time with 409 `capacity_exceeded`), per-origin semaphore 2 (keyed by
   `host:port`), one in-flight probe per monitor. Bounds are `try_acquire` — contention means
   `missed`, not a queue.
 - **Classification:** `Pass` = acceptable status (2xx in v1; assertions later);

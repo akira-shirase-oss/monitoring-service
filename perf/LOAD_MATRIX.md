@@ -10,7 +10,7 @@ fixtures; never on a public bind.
 
 | Module | Scenario | What it proves | Evidence status |
 |---|---|---|---|
-| Probe engine | `perf/lab-profile.mjs` | 100 monitors @ 15s phase-locked, 10 fixture origins — bounded pools, counted misses, commit lag | committed (4000 checks, 0 missed, p95 lag 4.9s); 2026-11-17 ceiling probe (200 `/ok` monitors, release, `304edd5`): 800 pass + 800 missed — see below; **≥1M checks not run** |
+| Probe engine | `perf/lab-profile.mjs` | 100 monitors @ 15s phase-locked, 10 fixture origins — bounded pools, counted misses, commit lag | committed (4000 checks, 0 missed, p95 lag 4.9s); 2026-11-17 ceiling probe (200 `/ok` monitors, release, `304edd5`): 800 pass + 800 missed — see below; **≥1M checks not run**; **fixed in D-018** (phase spread, schedule-sized budget, named refusal): re-run pending a quiet machine |
 | End-to-end truth | `perf/real-app.mjs` + `real-app-load.mjs` | real Node app under rising load with `__ctl` degradation — monitor's readings vs app's own ground truth | committed (3.84M requests, 0 missed, incident times honest, both alert channels) |
 | Failure/incident storm | mass-failure drill (define) | N targets fail together → N incidents + outbox rows in bounded transactions; delivery pool never starves probes | gap — define + run |
 | API read surface | `perf/api-load.mjs` (k6 `perf/k6/api-reads.js`) | `/api/**` reads at sustained rate while probes run — token auth, RLS-free SQLite reads | **committed 2026-11-17, release, `304edd5`: 1,000,000/1,000,000 answered 200 (gate passed), 1,647 rps @32 VUs, p50 15.7 / p95 30.9 / p99 32.6 ms; probes beneath: 4,000 checks, 0 missed, commit-lag p95 5.14 s (over the 5 s target)** |

@@ -13,8 +13,9 @@ pass?) are separate numbers everywhere.
 **M0–M7 built and verified.** Every milestone landed with a live drill or a measured
 run; what exists is what the commits show. Highlights:
 
-- **Observing loop:** one attempt per scheduled slot, bounded global + per-origin
-  concurrency, counted `missed` slots, generation invalidation (edits kill stale
+- **Observing loop:** one attempt per scheduled slot, each monitor on its own phase
+  within its interval, a global probe budget sized to the schedule (up to 512; a schedule
+  past it is refused with 409 `capacity_exceeded`, D-018) plus per-origin bounds, counted `missed` slots, generation invalidation (edits kill stale
   in-flight probes), restart rebuild from committed evidence.
 - **Honest classification:** pass / http_fail / transport / timeout / missed — a
   redirect, a refused socket and a hung target never collapse into each other; TLS
@@ -58,7 +59,7 @@ run; what exists is what the commits show. Highlights:
 - **Public status:** self-expiring `status.json` heartbeat + static renderer +
   independent checker — an expired snapshot reads "monitoring unavailable," never
   "all down."
-- **Evidence:** 275 Rust tests run by hosted CI on every push (`.github/workflows/ci.yml`,
+- **Evidence:** 283 Rust tests run by hosted CI on every push (`.github/workflows/ci.yml`,
   pinned actions, read-only token, daily advisory sweep; Dependabot weekly), a
   Playwright suite against the real server, a
   mutation-tested domain (48 mutants → 42 caught, 0 missed), pinned CLI exit codes,

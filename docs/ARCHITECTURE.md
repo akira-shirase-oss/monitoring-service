@@ -54,8 +54,8 @@ three writes or none.
 - **Uncertainty is data:** `unknown` (missing coverage), `uncertain` (delivery without ack) and
   open incidents are all first-class. Retries may duplicate an external delivery but never a
   logical event.
-- **Bounds (lab profile, all adjustable):** 100 monitors @ 60 s, 20 global probe slots,
-  2 per origin, 1 in-flight per monitor, 64 KiB max probe body, 16 KiB max API body,
+- **Bounds (lab profile, all adjustable):** 100 monitors @ 60 s, global probe slots sized
+  to the schedule (20 to 512, D-018; a schedule past it is refused), 2 per origin, 1 in-flight per monitor, 64 KiB max probe body, 16 KiB max API body,
   10 s API deadline, 5 s probe deadline, 7-day raw check retention, ~2 GiB storage guardrail.
 
 ## Repo layout

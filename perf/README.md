@@ -3,8 +3,9 @@
 Load evidence (module 09). The monitor is its own load generator — external drivers like
 k6 would only exercise the management API — so the harness is `perf/lab-profile.mjs`:
 it spawns N fault-fixture origins plus a `lab`-profile monitor-server, registers 100
-monitors in one wave (a phase-locked 100-slot burst every 15 s — the required "burst"
-is inherent), samples RSS and outbox depth, then writes a results JSON here.
+monitors in one go (each falls due at its own phase within the 15 s interval since
+D-018; before, that was a phase-locked 100-slot burst every 15 s), samples RSS and outbox
+depth, then writes a results JSON here.
 
     node perf/lab-profile.mjs --duration-s 600 --monitors 100 [--origins 10]
 

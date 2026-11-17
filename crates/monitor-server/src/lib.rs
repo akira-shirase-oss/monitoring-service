@@ -226,6 +226,37 @@ fn routes(state: AppState) -> Router {
         .nest("/api", api)
         .with_state(state)
         .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
+        .layer(axum::Extension(ScheduleLock::default()))
+}
+
+/// Serializes the writes that change the schedule (create, edit, pause), so the capacity
+/// check and the write it guards can't interleave with another such write (D-018).
+#[derive(Clone, Default)]
+struct ScheduleLock(Arc<tokio::sync::Mutex<()>>);
+
+/// D-018: refuse a write whose resulting schedule the coordinator can't serve — named,
+/// instead of accepted and then silently missed. `change` turns the stored monitors into
+/// the proposed set.
+async fn check_capacity(
+    state: &AppState,
+    change: impl FnOnce(&mut Vec<Monitor>),
+) -> Result<(), ApiError> {
+    let mut monitors = load_registry(&state.db).await?;
+    change(&mut monitors);
+    let config = schedule::Config::default();
+    match schedule::capacity(&monitors, &config) {
+        None => Ok(()),
+        Some(schedule::Overload::Global { required }) => Err(ApiError::Capacity(format!(
+            "this schedule would need {required:.0} probes in flight; the monitor runs at most {} \
+             at once. Lengthen intervals or shorten timeouts",
+            schedule::MAX_GLOBAL_SLOTS
+        ))),
+        Some(schedule::Overload::Origin { origin, per_tick }) => Err(ApiError::Capacity(format!(
+            "{origin} would need {per_tick:.1} probe starts a second; one origin gets at most {}. \
+             Lengthen the intervals of its monitors",
+            config.per_origin_slots
+        ))),
+    }
 }
 
 /// The service stack, as one `ServiceBuilder` — its *first* layer is the outermost
@@ -510,6 +541,7 @@ pub struct CreateMonitor {
 
 async fn create_monitor(
     State(state): State<AppState>,
+    axum::Extension(lock): axum::Extension<ScheduleLock>,
     Json(input): Json<CreateMonitor>,
 ) -> Result<impl IntoResponse, ApiError> {
     let url = url::Url::parse(&input.url).map_err(|_| ApiError::BadUrl)?;
@@ -534,6 +566,8 @@ async fn create_monitor(
             .map_err(ApiError::Validation)?,
     };
     let monitor = new.into_monitor();
+    let _schedule = lock.0.lock().await;
+    check_capacity(&state, |monitors| monitors.push(monitor.clone())).await?;
     if !state
         .db
         .insert_monitor_within(&monitor, state.max_monitors)
@@ -567,6 +601,7 @@ pub struct PatchMonitor {
 /// same committed fact.
 async fn patch_monitor(
     State(state): State<AppState>,
+    axum::Extension(lock): axum::Extension<ScheduleLock>,
     Path(id): Path<String>,
     Json(input): Json<PatchMonitor>,
 ) -> Result<Json<MonitorView>, ApiError> {
@@ -597,6 +632,13 @@ async fn patch_monitor(
         check_target(&state, url)?;
     }
     let merged = patch.apply(&monitor).map_err(ApiError::Validation)?;
+    let _schedule = lock.0.lock().await;
+    check_capacity(&state, |monitors| {
+        for stored in monitors.iter_mut().filter(|stored| stored.id == merged.id) {
+            *stored = merged.clone();
+        }
+    })
+    .await?;
     if state
         .db
         .update_monitor(&merged, monitor.generation)
@@ -1017,6 +1059,9 @@ pub enum ApiError {
     Conflict(String),
     #[error("monitor limit reached ({0}); delete an unused monitor first")]
     LimitReached(u64),
+    /// D-018: the schedule, with this write, is more than the coordinator can start.
+    #[error("{0}")]
+    Capacity(String),
     #[error(
         "the monitor refuses to probe local, private or reserved addresses (SSRF policy); \
          SMON_PROFILE=lab allows them for local fixtures"
@@ -1041,6 +1086,7 @@ impl ApiError {
             }
             Self::Conflict(_) => "conflict",
             Self::LimitReached(_) => "limit_reached",
+            Self::Capacity(_) => "capacity_exceeded",
             Self::RefusedTarget => "refused_target",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
@@ -1055,7 +1101,7 @@ impl ApiError {
             | Self::Validation(_)
             | Self::Invalid(_)
             | Self::RefusedTarget => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Conflict(_) | Self::LimitReached(_) => StatusCode::CONFLICT,
+            Self::Conflict(_) | Self::LimitReached(_) | Self::Capacity(_) => StatusCode::CONFLICT,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

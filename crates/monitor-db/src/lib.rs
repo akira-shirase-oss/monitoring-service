@@ -260,6 +260,8 @@ pub struct Db {
     /// The `SMON_MAX_DB_BYTES` ceiling every connection carries, if any — retention lifts
     /// it by `RETENTION_RESERVE_PAGES` for its own transaction and restores it after.
     max_db_bytes: Option<u64>,
+    /// An in-memory store exists only inside this pool; no second handle can reach it.
+    in_memory: bool,
 }
 
 impl Db {
@@ -347,7 +349,34 @@ impl Db {
             });
         }
         let pool = pool.connect_with(options).await?;
-        Ok(Self { pool, max_db_bytes })
+        Ok(Self {
+            pool,
+            max_db_bytes,
+            in_memory: url.contains(":memory:") || url.contains("mode=memory"),
+        })
+    }
+
+    /// A second handle on the same store with one connection of its own, for the single
+    /// writer: its commits never queue behind API reads for one of the pooled connections
+    /// (measured: 70-96 ms a commit with 32 concurrent readers on a shared 4-connection
+    /// pool, 1-3 ms on its own). Same options, the same byte cap on its connection. An
+    /// in-memory store exists only in this pool, so it is shared.
+    pub async fn writer_connection(&self) -> Result<Self, DbError> {
+        if self.in_memory {
+            return Ok(self.clone());
+        }
+        let options = (*self.pool.connect_options()).clone();
+        let mut pool = SqlitePoolOptions::new().max_connections(1);
+        if let Some(bytes) = self.max_db_bytes {
+            pool = pool.after_connect(move |conn, _meta| {
+                Box::pin(async move { apply_max_bytes(conn, bytes).await })
+            });
+        }
+        Ok(Self {
+            pool: pool.connect_with(options).await?,
+            max_db_bytes: self.max_db_bytes,
+            in_memory: false,
+        })
     }
 
     /// Bytes the database file currently occupies (`page_count * page_size`).
