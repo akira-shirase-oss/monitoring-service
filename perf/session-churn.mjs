@@ -44,10 +44,16 @@ try {
 	await waitOwnServer(BASE, server);
 
 	// A live monitor on its own origin — churn must never starve its slots.
+	// Logins are evaluated a few at a time (429 + Retry-After beyond that): back off and
+	// retry — a throttled login is backpressure, counted, never a failure.
+	let throttled = 0;
 	const login = async () => {
-		const r = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
-		const cookie = r.headers.get('set-cookie')?.split(';')[0];
-		return r.status === 204 && cookie?.startsWith('smon_session=') ? cookie : null;
+		for (;;) {
+			const r = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
+			if (r.status === 429) { throttled++; await sleep(20 + Math.random() * 30); continue; }
+			const cookie = r.headers.get('set-cookie')?.split(';')[0];
+			return r.status === 204 && cookie?.startsWith('smon_session=') ? cookie : null;
+		}
 	};
 	const c = await login();
 	const r = await fetch(`${BASE}/api/monitors`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: c, origin: BASE },
@@ -67,7 +73,7 @@ try {
 			await fetch(`${BASE}/api/logout`, { method: 'POST', headers: { cookie, origin: BASE } });
 			if (w === 0) { // worker 0 also probes the negative paths at a slower cadence
 				const bad = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'wrong' }) });
-				if (bad.status === 401) badLogins++;
+				if (bad.status === 401 || bad.status === 429) badLogins++;
 				const bare = await fetch(`${BASE}/api/monitors`);
 				if (bare.status === 401 || bare.status === 403) refused++;
 			}
@@ -78,7 +84,7 @@ try {
 	const checks = JSON.parse(sqlite(`SELECT COUNT(*) n FROM checks WHERE monitor_id = '${survivor}'`))[0]?.n ?? 0;
 	const result = {
 		date: new Date().toISOString(), scenario: 'session-churn', duration_s: DURATION_S,
-		logins, login_fails: loginFails, authed_reads: reads, read_fails: readFails,
+		logins, login_fails: loginFails, logins_throttled: throttled, authed_reads: reads, read_fails: readFails,
 		bad_token_401s: badLogins, unauthed_refusals: refused,
 		sessions_rows: sessions, survivor_checks: checks,
 		machine: 'apple-m2-pro-12c',

@@ -140,3 +140,58 @@ async fn a_request_whose_body_never_finishes_is_408_at_the_deadline() -> anyhow:
     assert_eq!(db.sweep_expired_sessions().await?, 0, "no session row");
     Ok(())
 }
+
+/// `POST /api/login` is the one unauthenticated credential check. A fixed 300 ms delay per
+/// wrong token slowed each guess but not the number in flight: 50 connections guessed 50
+/// at a time. Logins are now evaluated a few at a time — a failed one keeps its slot for
+/// the delay — and the rest are refused with 429 before the token is compared, so the
+/// guess rate is bounded however many connections are opened.
+#[tokio::test]
+async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Result<()> {
+    let (app, db, _tmp) = app().await?;
+    let mut guesses = tokio::task::JoinSet::new();
+    for n in 0..50 {
+        let app = app.clone();
+        guesses.spawn(async move {
+            let response = app
+                .oneshot(
+                    Request::post("/api/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"token":"guess-{n}"}}"#)))?,
+                )
+                .await?;
+            let retry_after = response.headers().get("retry-after").cloned();
+            anyhow::Ok((response.status(), retry_after))
+        });
+    }
+    let (mut evaluated, mut refused) = (0, 0);
+    while let Some(outcome) = guesses.join_next().await {
+        let (status, retry_after) = outcome??;
+        match status {
+            StatusCode::UNAUTHORIZED => evaluated += 1,
+            StatusCode::TOO_MANY_REQUESTS => {
+                refused += 1;
+                assert!(retry_after.is_some(), "429 says when to retry");
+            }
+            other => anyhow::bail!("unexpected {other}"),
+        }
+    }
+    assert!(
+        (1..=4).contains(&evaluated),
+        "at most 4 guesses evaluated at once, got {evaluated}"
+    );
+    assert_eq!(evaluated + refused, 50);
+
+    // The bound is a queue limit, not a lockout: once the flood is over, the operator's
+    // correct token logs in.
+    let response = app
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"token":"{TOKEN}"}}"#)))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(db.sweep_expired_sessions().await?, 1);
+    Ok(())
+}

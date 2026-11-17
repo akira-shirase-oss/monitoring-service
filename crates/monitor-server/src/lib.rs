@@ -42,6 +42,18 @@ use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, Valid
 const BODY_LIMIT: usize = 16 * 1024;
 /// Every handler answers inside this; probes run on their own deadlines elsewhere.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Logins evaluated at once. `POST /api/login` is the one unauthenticated credential
+/// check: a wrong token keeps its slot for [`WRONG_TOKEN_DELAY`], so guesses are bounded
+/// to about `LOGIN_SLOTS / 0.3 s` however many connections are opened; the rest get 429
+/// before the token is compared. The bearer token (CLI) never queues here.
+const LOGIN_SLOTS: usize = 4;
+/// The penalty a wrong token pays while holding its login slot.
+const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
+
+/// The login slots ([`LOGIN_SLOTS`]): one set per router, so each server (and each test
+/// router) has its own.
+#[derive(Clone)]
+struct LoginSlots(Arc<tokio::sync::Semaphore>);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -195,6 +207,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logout", post(logout))
         .nest("/api", api)
         .with_state(state)
+        .layer(axum::Extension(LoginSlots(Arc::new(
+            tokio::sync::Semaphore::new(LOGIN_SLOTS),
+        ))))
         // Order matters: request id first, then tracing, panic catch, timeout, body limit.
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -228,6 +243,7 @@ pub struct LoginBody {
 /// without a stray copy in localStorage.
 async fn login(
     State(state): State<AppState>,
+    axum::Extension(slots): axum::Extension<LoginSlots>,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
@@ -258,10 +274,23 @@ async fn login(
         )
             .into_response();
     };
+    // A bounded queue, not a lockout: when every slot is taken the answer is "retry", and
+    // the token is not even compared.
+    let Ok(_slot) = slots.0.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            Json(serde_json::json!({
+                "error": { "code": "too_many_requests",
+                           "message": "too many logins in flight; retry shortly" }
+            })),
+        )
+            .into_response();
+    };
     if !auth::digests_match(body.token.as_bytes(), admin.as_bytes()) {
-        // A small fixed delay blunts online guessing without needing lockout state —
-        // the digest compare itself already runs in constant time.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The delay is paid while holding the slot — that is what bounds the guess rate.
+        // The digest compare itself already runs in constant time.
+        tokio::time::sleep(WRONG_TOKEN_DELAY).await;
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
