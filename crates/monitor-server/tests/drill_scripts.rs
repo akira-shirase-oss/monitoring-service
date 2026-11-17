@@ -89,3 +89,149 @@ fn a_script_refuses_a_port_that_is_already_in_use_and_kills_nothing() {
         );
     }
 }
+
+fn perf_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../perf")
+}
+
+/// Every `perf/*.mjs` that starts its own monitor-server — found by listing the directory,
+/// so a new harness can't slip past the guard by not being named here.
+fn perf_harnesses() -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = std::fs::read_dir(perf_dir())
+        .unwrap_or_else(|e| panic!("read perf/: {e}"))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "mjs"))
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            js_code(&text)
+                .iter()
+                .any(|line| line.contains("target/debug/monitor-server"))
+                .then_some((name, text))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// JavaScript lines that run (`//` comments stripped).
+fn js_code(script: &str) -> Vec<&str> {
+    script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect()
+}
+
+/// `perf/lab-profile.mjs` defaulted to `--server-port 58400`: next to an installed monitor
+/// its own server could not bind, and the harness then drove the installed one — 401s with
+/// a token, 100 lab monitors registered into a tokenless loopback install's store. Every
+/// harness now has its own default port, refuses a busy one before starting anything, and
+/// checks that what answers `/livez` is the server it started.
+#[test]
+fn the_perf_harnesses_never_target_the_default_port_and_guard_their_own() {
+    let harnesses = perf_harnesses();
+    let names: Vec<&str> = harnesses.iter().map(|(name, _)| name.as_str()).collect();
+    for expected in [
+        "lab-profile.mjs",
+        "real-app-load.mjs",
+        "session-churn.mjs",
+        "storm.mjs",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "{expected} not found among {names:?}"
+        );
+    }
+    for (name, text) in &harnesses {
+        for line in js_code(text) {
+            assert!(!line.contains("58400"), "{name} targets :58400: {line}");
+        }
+        assert!(
+            text.contains("from './lib-ports.mjs'"),
+            "{name} must use perf/lib-ports.mjs"
+        );
+        assert!(
+            text.contains("await requireFreePorts("),
+            "{name} must refuse busy ports before starting anything"
+        );
+        assert!(
+            text.contains("await waitOwnServer("),
+            "{name} must check that /livez is answered by the server it started"
+        );
+        assert!(
+            text.contains("arg('server-port'"),
+            "{name} must take its server port from --server-port"
+        );
+    }
+}
+
+/// Run `command` in its own process group; past `deadline`, kill the whole group (a
+/// harness that failed to refuse has started fixtures and a server of its own).
+fn output_within(command: &mut Command, deadline: Duration) -> Option<std::process::Output> {
+    use std::os::unix::process::CommandExt;
+    let child = command
+        .process_group(0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {command:?} (the perf harnesses need node): {e}"));
+    let group = child.id().to_string();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(child.wait_with_output());
+    });
+    if let Ok(output) = done_rx.recv_timeout(deadline) {
+        Some(output.unwrap_or_else(|e| panic!("wait for the harness: {e}")))
+    } else {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{group}")])
+            .status();
+        None
+    }
+}
+
+/// Hold a port and hand it to each harness as its server port: it must refuse at once
+/// (before any fixture, `--init` or server starts) and leave the holder alone.
+#[test]
+fn a_perf_harness_refuses_a_port_that_is_already_in_use_and_kills_nothing() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = held.local_addr().expect("addr").port().to_string();
+    let out = tempfile::tempdir().expect("tempdir");
+    for (name, _) in perf_harnesses() {
+        let started = Instant::now();
+        let output = output_within(
+            Command::new("node")
+                .arg(perf_dir().join(&name))
+                .args(["--server-port", &port, "--duration-s", "1"])
+                .arg("--out")
+                .arg(out.path()),
+            Duration::from_secs(15),
+        )
+        .unwrap_or_else(|| panic!("{name} did not refuse within 15 s (its group was killed)"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{name} must refuse an occupied port"
+        );
+        assert!(stderr.contains("in use"), "{name}: {stderr}");
+        assert!(
+            stderr.contains("--server-port"),
+            "{name} names the override: {stderr}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{name} must refuse before starting anything"
+        );
+        assert!(
+            std::net::TcpStream::connect(held.local_addr().expect("addr")).is_ok(),
+            "{name} must not touch the process holding the port"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(out.path()).expect("read out").count(),
+        0,
+        "a refused run writes no results"
+    );
+}

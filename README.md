@@ -147,7 +147,9 @@ warnings`, `cargo test`, `scripts/check-advisories.sh` (`cargo deny check adviso
 required when `CI` is set; each `deny.toml` exception must carry a re-check date that has
 not passed), the architecture rule, `svelte-check` and a dashboard build. Plus the
 drills: `scripts/e2e.sh` (Playwright), `scripts/backup-drill.sh` (backup → destroy →
-restore), `perf/lab-profile.mjs` (load baseline).
+restore), `perf/lab-profile.mjs` (load baseline). Every drill and harness runs on its own
+ports (never 58400, an installed monitor's), refuses a busy one, and stops only what it
+started.
 
 ## License
 

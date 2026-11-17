@@ -13,6 +13,11 @@
 // receiver's delivered events — never from log scraping or timing luck.
 //
 //   node perf/real-app-load.mjs [--ramp-s 210] [--degrade-s 120] [--recover-s 90]
+//                               [--server-port 58450] [--app-port 58800] [--sink-port 58740]
+//
+// Its own ports — never 58400, where an installed monitor listens. A busy port refuses
+// the run before anything starts, and the harness only drives the server it started
+// (perf/lib-ports.mjs).
 //
 // Numbers are development observations on this machine — never public capacity claims.
 
@@ -21,6 +26,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import { requireFreePorts, waitOwnServer } from './lib-ports.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const arg = (name, dflt) => {
@@ -100,6 +106,11 @@ function setConcurrency(n) {
 }
 
 async function main() {
+	await requireFreePorts([
+		[SERVER_PORT, '--server-port'],
+		[APP_PORT, '--app-port'],
+		[SINK_PORT, '--sink-port'],
+	]);
 	mkdirSync(OUT_DIR, { recursive: true });
 	const started = new Date();
 	run('node', [`${ROOT}/perf/real-app.mjs`, String(APP_PORT)]);
@@ -120,10 +131,7 @@ async function main() {
 		stdio: 'ignore',
 	});
 	const server = run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
-	for (let i = 0; i < 60; i++) {
-		try { if ((await fetch(`${BASE}/livez`)).ok) break; } catch {}
-		await sleep(250);
-	}
+	await waitOwnServer(BASE, server);
 
 	const monitors = {};
 	for (const [key, path, thresholds] of [
