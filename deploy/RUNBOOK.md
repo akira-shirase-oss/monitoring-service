@@ -77,9 +77,9 @@ fault means checks still run but that duty has stopped.
 
 `/readyz` answers `store writes failing` and the log shows `database or disk is full`.
 The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) can run at the
-cap: it deletes expired rows before writing their daily summaries, and its own
-transaction may use up to 256 pages (1 MiB at 4 KiB pages) past the cap for those
-summaries. Observation commits land again only once that pass has freed room for them —
+cap: it deletes expired rows before writing their daily summaries, and may use up to
+256 pages (1 MiB at 4 KiB pages) past the cap for those summaries — in total, across all
+passes, not per pass. Observation commits land again only once that pass has freed room for them —
 which happens when the expired rows filled whole pages. If the store is full of
 evidence that has not expired yet (or the expired slice is too thin to free a page),
 retention cannot make room for new checks: raise `SMON_MAX_DB_BYTES` (or shorten the

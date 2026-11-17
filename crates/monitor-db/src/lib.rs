@@ -134,11 +134,13 @@ pub struct RetentionPolicy {
     pub delivered_outbox: std::time::Duration,
 }
 
-/// Pages a retention transaction may allocate past `SMON_MAX_DB_BYTES` (1 MiB at the default
-/// 4 KiB page size). Deleting a thin slice of expired rows scattered among unexpired
-/// evidence frees no whole page, while its daily summaries need new ones; without a
-/// reserve such a pass fails `SQLITE_FULL` at the cap every time. The file can exceed the
-/// cap by at most this much per pass, and only by what the summaries actually use.
+/// Pages retention may allocate past `SMON_MAX_DB_BYTES` for its daily summaries (1 MiB at
+/// the default 4 KiB page size). Deleting a thin slice of expired rows scattered among
+/// unexpired evidence frees no whole page, while its summaries need new ones; without a
+/// reserve such a pass fails `SQLITE_FULL` at the cap every time. The allowance is absolute
+/// (`reserve_ceiling`): across all passes together the file exceeds the cap by at most this
+/// much, and only by what summaries actually used — once it is spent, retention at the cap
+/// fails again and the remedy is a larger cap.
 pub const RETENTION_RESERVE_PAGES: u64 = 256;
 
 const DAY: std::time::Duration = std::time::Duration::from_hours(24);
@@ -807,7 +809,12 @@ impl Db {
         let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
             .fetch_one(&mut *conn)
             .await?;
-        let lifted = pages.saturating_add(i64::try_from(RETENTION_RESERVE_PAGES).unwrap_or(0));
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&mut *conn)
+            .await?;
+        let cap_pages = i64::try_from(cap / u64::try_from(page_size.max(1)).unwrap_or(4096))
+            .unwrap_or(i64::MAX);
+        let lifted = reserve_ceiling(cap_pages, pages);
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "PRAGMA max_page_count = {lifted}"
         )))
@@ -1031,6 +1038,16 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// The ceiling (in pages) a retention batch runs under: the configured cap plus the
+/// reserve — an absolute allowance, so passes that each use some of it can't ratchet the
+/// effective cap upward — and never below the file's current size (SQLite would clamp up
+/// anyway) nor, below the cap, under the cap.
+fn reserve_ceiling(cap_pages: i64, page_count: i64) -> i64 {
+    cap_pages
+        .saturating_add(i64::try_from(RETENTION_RESERVE_PAGES).unwrap_or(0))
+        .max(page_count)
 }
 
 /// One bounded retention batch, in one transaction on `conn` (see `Db::retain`).
@@ -1379,6 +1396,36 @@ pub struct DeliveryRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reserve is an absolute allowance above the configured cap, not a fresh 256
+    /// pages on top of whatever size earlier passes reached: repeated passes that each need
+    /// new pages must not ratchet the effective cap upward. Below the cap the batch's
+    /// ceiling is never *lowered* under the cap.
+    #[test]
+    fn the_retention_reserve_is_bounded_by_the_cap_not_the_current_size() {
+        let reserve = i64::try_from(RETENTION_RESERVE_PAGES).expect("small");
+        let cap = 1_000;
+        assert_eq!(
+            reserve_ceiling(cap, 500),
+            cap + reserve,
+            "below the cap: never lowered"
+        );
+        assert_eq!(
+            reserve_ceiling(cap, cap),
+            cap + reserve,
+            "at the cap: the reserve"
+        );
+        assert_eq!(
+            reserve_ceiling(cap, cap + 100),
+            cap + reserve,
+            "part of the reserve used: only the rest is left — no ratchet"
+        );
+        assert_eq!(
+            reserve_ceiling(cap, cap + reserve + 7),
+            cap + reserve + 7,
+            "never below the file's own size"
+        );
+    }
 
     const POOL: u32 = 4;
 

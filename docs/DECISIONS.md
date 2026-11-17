@@ -83,7 +83,9 @@ out. A pass is a series of bounded transactions through the single writer (at mo
 outbox rows first (FK), and every delete runs before the aggregates are written (the
 expiring rows wait in a `TEMP` table), and its transaction may allocate up to 256 pages
 past the cap for the summaries (restored on the same connection afterwards), so a pass
-can run in a store already at `SMON_MAX_DB_BYTES`. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
+can run in a store already at `SMON_MAX_DB_BYTES`. The 256 pages are an absolute
+allowance above the cap (`max(cap + 256, size)`), not 256 more on every pass, so the
+effective cap cannot ratchet upward. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
 concurrent creates cannot overshoot it; paused monitors count (they keep history).
 
 ## D-011 — One engine verdict: a monitor that is not observing serves `unknown`
