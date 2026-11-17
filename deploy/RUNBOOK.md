@@ -23,6 +23,11 @@ rolling back the binary cannot roll back evidence.
 
 ## Install
 
+**Direct egress is required.** Probes and alerts dial their targets and receivers directly
+and ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (a proxied probe would bypass the SSRF
+guard). On a network that only allows egress through a proxy, every probe fails `connect`
+(every monitor opens an incident) and no alert can leave.
+
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # builds --release, installs, links
 $EDITOR /opt/smon/env                            # at minimum SMON_DATABASE_URL, SMON_STATUS_DIR

@@ -232,3 +232,18 @@ fn restarts_back_off_and_a_slow_dependency_is_retried() {
         restart * burst
     );
 }
+
+/// Probes and alerts ignore proxy variables (round-3 hardening). On a proxy-only network
+/// every probe fails `connect` and no alert leaves — the install section must say so.
+#[test]
+fn the_runbook_install_says_egress_must_be_direct() {
+    let install = RUNBOOK
+        .split("## Install")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("RUNBOOK has an Install section");
+    assert!(
+        install.contains("HTTP_PROXY") && install.contains("direct"),
+        "Install must state that egress is direct and proxy variables are ignored"
+    );
+}
