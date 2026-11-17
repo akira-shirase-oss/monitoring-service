@@ -2,6 +2,23 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-015 — A normal start requires an existing store; only `--init` creates one
+
+The store is meant to live on its own volume (the SaaS droplet uses a DigitalOcean volume).
+If the server starts before that volume is mounted, `/opt/smon/data` is just the bare
+mountpoint directory, and `create_if_missing` used to create a fresh, empty store there:
+the monitor booted "healthy" with no monitors and no history, and wrote new evidence onto
+the root disk, hidden under the volume once it mounted.
+
+`monitor-server` (no arguments) now opens the store without creating it and refuses to
+boot if the file is missing or has no tables, naming the path and the likely cause (the
+volume is not mounted). `monitor-server --init` is the only way to create a store: it
+creates and migrates it, then exits without serving — the install step (RUNBOOK) and the
+first step of every harness that starts from scratch. `--version` prints the version;
+any other argument is a usage error (exit 2), so a mistyped flag never starts a server
+with default settings. The unit's `RequiresMountsFor=` covers the ordering; this covers
+a mount that is configured differently, or not at all.
+
 ## D-014 — Downtime is one stored `missed` row per monitor
 
 D-007 made every slot a stored row so rebuilds replay gaps as gaps — but slots that

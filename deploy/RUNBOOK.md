@@ -29,6 +29,9 @@ $EDITOR /opt/smon/env                            # at minimum SMON_DATABASE_URL,
 
 # systemd — the unit runs as the unprivileged system user `smon`, never root
 sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
+# Create the store once (D-015: a normal start refuses a missing or empty store, so a
+# volume that isn't mounted yet can never be mistaken for a new install):
+sudo sh -c 'set -a; . /opt/smon/env; set +a; exec /opt/smon/current/bin/monitor-server --init'
 sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # the only paths it writes
 sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env  # systemd reads it as root
 sudo cp deploy/monitor-server.service /etc/systemd/system/
@@ -43,6 +46,10 @@ sudo launchctl load /Library/LaunchDaemons/com.shirase.smon.plist
 If the unit fails to start, read its log first: an invalid or blank `SMON_*` value stops
 the boot with every problem listed (`invalid configuration (N problem(s)): …`) — the
 server never runs on a silently substituted default.
+
+If the log says `no store at …`: the data volume is not mounted (check `findmnt
+/opt/smon/data`), or this is a new install that skipped `--init`. Never run `--init` to
+"fix" a store that should exist — mount the volume instead.
 
 Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
 `curl -sf $SMON_LISTEN/version` → the expected release. `/readyz` answers 200 with

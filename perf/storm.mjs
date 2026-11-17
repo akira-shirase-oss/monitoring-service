@@ -26,11 +26,17 @@ const DEAD = 40, ORIGINS = 10, SURVIVOR_PORT = FIXTURE_PORT + ORIGINS;
 try {
 	mkdirSync(OUT_DIR, { recursive: true });
 	for (let o = 0; o <= ORIGINS; o++) run('node', [`${ROOT}/fixtures/fault-server.mjs`, String(FIXTURE_PORT + o)]);
-	const server = run(`${ROOT}/target/debug/monitor-server`, [], {
+	// D-015: a normal start needs an existing store — create this run's fresh one first.
+	const serverEnv = {
 		SMON_PROFILE: 'lab', SMON_DATABASE_URL: `sqlite:${DB}`, SMON_LISTEN: `127.0.0.1:${SERVER_PORT}`,
 		SMON_WEBHOOK_URL: `http://127.0.0.1:${FIXTURE_PORT}/sink`, SMON_WEBHOOK_SECRET: 'storm-secret',
 		SMON_LOG_FILE: LOG, SMON_LOG_MAX_BYTES: String(8 * 1024 * 1024), RUST_LOG: 'monitor_server=info',
+	};
+	execFileSync(`${ROOT}/target/debug/monitor-server`, ['--init'], {
+		env: { ...process.env, ...serverEnv },
+		stdio: 'ignore',
 	});
+	const server = run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
 	for (let i = 0; i < 50; i++) { try { if ((await fetch(`${BASE}/livez`)).ok) break; } catch {} await sleep(200); }
 
 	// One survivor (healthy) + DEAD dead monitors, all at the minimum interval.

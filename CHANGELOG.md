@@ -45,6 +45,11 @@
 - **Configuration details:** a value may start with `#` (only whitespace followed by `#`
   is an inline comment); a failed retention pass shows on `/readyz` as
   `retention failing (see the server log)`, never with its error text.
+- **A normal start requires an existing store (D-015).** A missing or empty store —
+  usually a data volume that isn't mounted — stops the boot instead of silently creating
+  a fresh one. Create a new install's store once with `monitor-server --init` (RUNBOOK,
+  Install; `scripts/dev.sh` and the harnesses do it for you). `--version` prints the
+  version; any other argument is a usage error (exit 2).
 - **Licence:** MIT.
 
 - M7.3 real-app load drill: `perf/real-app.mjs` — a dependency-free Node app doing

@@ -22,7 +22,8 @@ trap cleanup EXIT
 
 node fixtures/fault-server.mjs >/dev/null 2>&1 &
 sleep 1
-./target/debug/monitor-server >/tmp/smon-drill-server.log 2>&1 &
+./target/debug/monitor-server --init >/tmp/smon-drill-server.log 2>&1   # D-015: a new store
+./target/debug/monitor-server >>/tmp/smon-drill-server.log 2>&1 &
 sleep 2
 
 MONITOR=$(curl -s -X POST http://127.0.0.1:58400/api/monitors \

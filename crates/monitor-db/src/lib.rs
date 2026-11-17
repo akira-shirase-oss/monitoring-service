@@ -30,6 +30,20 @@ pub enum DbError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error(transparent)]
     Query(#[from] QueryError),
+    /// A normal start found no store (D-015).
+    #[error(
+        "no store at {}. If it lives on a separate volume, the volume is not mounted (yet). \
+         For a new install, create it once with `monitor-server --init`.",
+        path.display()
+    )]
+    NoStore { path: std::path::PathBuf },
+    /// A normal start found a file with no tables where the store should be (D-015).
+    #[error(
+        "the store at {} is empty (no tables): refusing to start on a fresh store where one is \
+         expected. For a new install, run `monitor-server --init`.",
+        path.display()
+    )]
+    EmptyStore { path: std::path::PathBuf },
 }
 
 #[derive(Debug, Error)]
@@ -209,8 +223,48 @@ impl Db {
         max_connections: u32,
         max_db_bytes: Option<u64>,
     ) -> Result<Self, DbError> {
+        Self::open(url, max_connections, max_db_bytes, true).await
+    }
+
+    /// `connect_opts` for a normal start (D-015): the store must already exist and hold a
+    /// schema. A missing file — typically a volume that isn't mounted, leaving the bare
+    /// mountpoint — or a file with no tables is an error, never a silently created fresh
+    /// store that would serve "no evidence" as if none had ever existed. In-memory URLs
+    /// have no file and are opened as usual.
+    pub async fn connect_existing(
+        url: &str,
+        max_connections: u32,
+        max_db_bytes: Option<u64>,
+    ) -> Result<Self, DbError> {
+        let options = SqliteConnectOptions::from_str(url)?;
+        let path = options.get_filename().to_path_buf();
+        let in_memory = path.as_os_str() == ":memory:" || url.contains("mode=memory");
+        if !in_memory && !path.exists() {
+            return Err(DbError::NoStore { path });
+        }
+        let db = Self::open(url, max_connections, max_db_bytes, false).await?;
+        if !in_memory {
+            let tables: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'")
+                    .fetch_one(&db.pool)
+                    .await
+                    .map_err(QueryError::from)?;
+            if tables == 0 {
+                db.close().await;
+                return Err(DbError::EmptyStore { path });
+            }
+        }
+        Ok(db)
+    }
+
+    async fn open(
+        url: &str,
+        max_connections: u32,
+        max_db_bytes: Option<u64>,
+        create: bool,
+    ) -> Result<Self, DbError> {
         let options = SqliteConnectOptions::from_str(url)?
-            .create_if_missing(true)
+            .create_if_missing(create)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
         let mut pool = SqlitePoolOptions::new().max_connections(max_connections);

@@ -111,6 +111,15 @@ fn start_logged(
     dir: &std::path::Path,
 ) -> anyhow::Result<(Child, std::sync::mpsc::Receiver<String>)> {
     use std::io::BufRead;
+    // A normal start needs a store (D-015): create it the way an install does.
+    if !dir.join("boot.db").exists() {
+        let init = server(dir, &[]).arg("--init").output()?;
+        anyhow::ensure!(
+            init.status.success(),
+            "--init: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+    }
     let mut child = server(dir, &[]).spawn()?;
     let stdout = child
         .stdout
@@ -192,4 +201,104 @@ fn sigterm_and_sigint_drain_the_engine_and_exit_cleanly() {
             "{signal}: the engine drain did not complete: {shutdown:?}"
         );
     }
+}
+
+/// The store lives on a volume. If the volume isn't mounted yet, the bare mountpoint is
+/// an empty directory — and `create_if_missing` used to boot a fresh, empty store there,
+/// serving "no monitors" as if evidence never existed. A normal start now requires the
+/// store; only `--init` (a new install) may create one.
+#[test]
+fn a_missing_store_refuses_to_boot_and_creates_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut child = server(dir.path(), &[])
+        .spawn()
+        .expect("spawn monitor-server");
+    let status = wait_exit(&mut child, Duration::from_secs(20))
+        .expect("a missing store must stop the boot, not serve an empty one");
+    assert!(!status.success(), "exit status {status}");
+    let stderr = stderr_of(&mut child);
+    assert!(
+        stderr.contains("boot.db") && stderr.contains("--init"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("mounted"),
+        "the likely cause is named: {stderr}"
+    );
+    assert!(
+        !dir.path().join("boot.db").exists(),
+        "no store may be created"
+    );
+}
+
+/// An empty file where the store should be (a stray `touch`, a half-restored copy) is not
+/// a store either.
+#[test]
+fn an_empty_store_file_refuses_to_boot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("boot.db"), b"").expect("touch");
+    let mut child = server(dir.path(), &[])
+        .spawn()
+        .expect("spawn monitor-server");
+    let status = wait_exit(&mut child, Duration::from_secs(20)).expect("must stop the boot");
+    assert!(!status.success());
+    assert!(stderr_of(&mut child).contains("empty"));
+}
+
+/// `--init` is the one way to make a new store: it creates and migrates it, then exits
+/// without serving; the next normal start finds it and serves.
+#[test]
+fn init_creates_the_store_and_a_normal_start_then_serves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut init = server(dir.path(), &[])
+        .arg("--init")
+        .spawn()
+        .expect("spawn --init");
+    let status = wait_exit(&mut init, Duration::from_secs(30)).expect("--init exits");
+    assert!(status.success(), "--init failed: {}", stderr_of(&mut init));
+    assert!(
+        dir.path().join("boot.db").exists(),
+        "--init creates the store"
+    );
+
+    let (mut child, lines) = start_logged(dir.path()).expect("start monitor-server");
+    let boot = read_until(&lines, "monitor-server listening", Duration::from_secs(30));
+    assert!(
+        boot.iter().any(|l| l.contains("monitor-server listening")),
+        "an initialized store boots: {boot:?}"
+    );
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let _ = wait_exit(&mut child, Duration::from_secs(40));
+}
+
+/// An argument the server doesn't know never starts a server: an old binary run as
+/// `monitor-server --version` once booted with defaults and created a store in the cwd.
+#[test]
+fn an_unknown_argument_never_starts_a_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut version = server(dir.path(), &[])
+        .arg("--version")
+        .spawn()
+        .expect("spawn");
+    let status = wait_exit(&mut version, Duration::from_secs(20)).expect("--version exits");
+    assert!(status.success());
+    let mut out = String::new();
+    if let Some(mut stdout) = version.stdout.take() {
+        use std::io::Read;
+        let _ = stdout.read_to_string(&mut out);
+    }
+    assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
+
+    let mut bogus = server(dir.path(), &[])
+        .arg("--frobnicate")
+        .spawn()
+        .expect("spawn");
+    let status = wait_exit(&mut bogus, Duration::from_secs(20)).expect("must exit");
+    assert_eq!(status.code(), Some(2), "a usage error");
+    assert!(
+        !dir.path().join("boot.db").exists(),
+        "and nothing is created"
+    );
 }
