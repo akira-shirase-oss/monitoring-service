@@ -29,7 +29,8 @@ pub struct Config {
     pub tick: Duration,
     /// How late a slot may start before it is counted `missed` (capped at the interval).
     pub dispatch_grace: Duration,
-    /// Global in-flight probe bound.
+    /// Global in-flight probe bound's floor; the coordinator raises it to what the
+    /// schedule needs, up to [`MAX_GLOBAL_SLOTS`] (D-018).
     pub global_slots: usize,
     /// In-flight probes per `host:port`.
     pub per_origin_slots: usize,
@@ -87,6 +88,74 @@ impl Runtime {
     fn advance(&mut self) {
         self.next_slot += self.monitor.interval;
         self.next_slot_at += self.monitor.interval;
+    }
+}
+
+/// The most probes one coordinator keeps in flight (D-018): outbound sockets, well inside
+/// the unit's 4096 file descriptors beside `SMON_MAX_CONNECTIONS` inbound ones.
+pub const MAX_GLOBAL_SLOTS: usize = 512;
+
+/// Probe slots a schedule needs (D-018). Each tick starts `Σ tick/interval` probes, and
+/// each holds its slot until it ends — at worst its whole timeout — so the bound is
+/// `Σ (tick + timeout) / interval` over the unpaused monitors.
+pub fn required_slots<'a>(monitors: impl IntoIterator<Item = &'a Monitor>, tick: Duration) -> f64 {
+    monitors
+        .into_iter()
+        .filter(|monitor| !monitor.paused)
+        .map(|monitor| {
+            let interval = monitor.interval.as_secs_f64().max(f64::EPSILON);
+            (tick.as_secs_f64() + monitor.timeout.min(monitor.interval).as_secs_f64()) / interval
+        })
+        .sum()
+}
+
+/// A slot count as `f64` (slot counts are small; anything past `u32::MAX` saturates).
+fn slots_f64(slots: usize) -> f64 {
+    f64::from(u32::try_from(slots).unwrap_or(u32::MAX))
+}
+
+/// Global in-flight probe slots for a schedule: what it needs, never below the configured
+/// floor (`Config::global_slots`) nor above [`MAX_GLOBAL_SLOTS`].
+fn global_budget(monitors: &[Monitor], config: &Config) -> usize {
+    let needed = required_slots(monitors, config.tick).ceil();
+    let needed = if needed.is_finite() && needed > 0.0 {
+        // Bounded above by the ceiling, so the cast can't truncate meaningfully.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "finite, positive, and clamped to MAX_GLOBAL_SLOTS next"
+        )]
+        let needed = needed.min(slots_f64(MAX_GLOBAL_SLOTS)) as usize;
+        needed
+    } else {
+        0
+    };
+    needed.clamp(config.global_slots.min(MAX_GLOBAL_SLOTS), MAX_GLOBAL_SLOTS)
+}
+
+/// The global semaphore, resized to the schedule's budget whenever the registry changes.
+/// Growing adds permits; shrinking forgets the free ones (permits held by probes in
+/// flight are forgotten on a later resize).
+struct GlobalSlots {
+    semaphore: Arc<Semaphore>,
+    total: usize,
+}
+
+impl GlobalSlots {
+    fn new(total: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(total)),
+            total,
+        }
+    }
+
+    fn resize(&mut self, target: usize) {
+        if target > self.total {
+            self.semaphore.add_permits(target - self.total);
+            self.total = target;
+        } else if target < self.total {
+            self.total -= self.semaphore.forget_permits(self.total - target);
+        }
     }
 }
 
@@ -163,25 +232,24 @@ async fn run(
     shutdown: CancellationToken,
 ) {
     let (results_tx, mut results_rx) = mpsc::channel::<Observation>(config.results_bound);
-    let global = Arc::new(Semaphore::new(config.global_slots));
+    let mut global = GlobalSlots::new(config.global_slots);
     let mut origins: HashMap<String, Arc<Semaphore>> = HashMap::new();
     let mut runtimes: HashMap<MonitorId, Runtime> = HashMap::new();
     let tracker = TaskTracker::new();
     let mut ticker = tokio::time::interval(config.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    reconcile(
-        &mut runtimes,
-        &mut origins,
-        &registry.borrow_and_update(),
-        &config,
-    );
+    {
+        let monitors = Arc::clone(&registry.borrow_and_update());
+        reconcile(&mut runtimes, &mut origins, &monitors, &config);
+        global.resize(global_budget(&monitors, &config));
+    }
 
     loop {
         vitals.coordinator_beat();
         tokio::select! {
             _ = ticker.tick() => {
-                plan_due(&mut runtimes, &mut origins, &global, &config)
+                plan_due(&mut runtimes, &mut origins, &global.semaphore, &config)
                     .dispatch(&probes, &writer, &results_tx, &tracker, &vitals)
                     .await;
             }
@@ -204,15 +272,12 @@ async fn run(
                 }
             }
             changed = registry.changed() => {
-                match changed {
-                    Ok(()) => reconcile(
-                        &mut runtimes,
-                        &mut origins,
-                        &registry.borrow_and_update(),
-                        &config,
-                    ),
-                    Err(_) => break,
+                if changed.is_err() {
+                    break;
                 }
+                let monitors = Arc::clone(&registry.borrow_and_update());
+                reconcile(&mut runtimes, &mut origins, &monitors, &config);
+                global.resize(global_budget(&monitors, &config));
             }
             () = shutdown.cancelled() => break,
         }
@@ -650,5 +715,33 @@ mod tests {
         let first = &runtimes[&monitors[0].id];
         let drift = first.next_slot_at - again.next_slot_at;
         assert!(drift.abs() < time::Duration::milliseconds(50), "{drift}");
+    }
+
+    /// The load probe's finding, as a test: 1,600 monitors on one 15 s interval (spread
+    /// over 200 origins, instant probes) must miss nothing for two whole intervals. With
+    /// a fixed 20 slots a tick, about 107 fall due each second and most were missed.
+    #[tokio::test(start_paused = true)]
+    async fn sixteen_hundred_monitors_on_one_interval_miss_nothing() {
+        let config = Config::default();
+        let monitors = fleet(1600, 200, Duration::from_secs(15), Duration::from_secs(3));
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config);
+        let global = Arc::new(Semaphore::new(global_budget(&monitors, &config)));
+        let (mut missed, mut dispatched) = (0, 0);
+        for _ in 0..32 {
+            tokio::time::advance(config.tick).await;
+            let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
+            missed += plan.misses.len();
+            dispatched += plan.dispatches.len();
+            for dispatch in plan.dispatches {
+                // An instant probe: its result releases the slot before the next tick.
+                if let Some(entry) = runtimes.get_mut(&dispatch.monitor_id) {
+                    entry.in_flight = false;
+                }
+            }
+        }
+        assert_eq!(missed, 0, "{missed} slots missed ({dispatched} started)");
+        assert!(dispatched >= 3200, "every monitor ran twice: {dispatched}");
     }
 }
