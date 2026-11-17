@@ -423,3 +423,29 @@ fn the_store_is_owner_only_and_the_snapshot_public_whatever_the_umask() {
         assert_eq!(wal_mode, 0o600, "the WAL");
     }
 }
+
+/// F5: asking for help is not a usage error. `--help` and `-h` print the usage on stdout
+/// and exit 0, without starting a server or creating anything; an unknown argument is
+/// still exit 2.
+#[test]
+fn help_prints_usage_and_exits_zero() {
+    for flag in ["--help", "-h"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = server(dir.path(), &[])
+            .arg(flag)
+            .output()
+            .expect("run --help");
+        assert_eq!(output.status.code(), Some(0), "{flag}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for word in ["usage:", "--init", "--version", "--help"] {
+            assert!(
+                stdout.contains(word),
+                "{flag}: {word} missing from {stdout}"
+            );
+        }
+        assert!(
+            !dir.path().join("boot.db").exists(),
+            "{flag} creates nothing"
+        );
+    }
+}

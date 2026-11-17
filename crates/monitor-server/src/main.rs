@@ -34,9 +34,15 @@ enum Mode {
     Init,
 }
 
+const USAGE: &str = "usage: monitor-server            serve (the store must exist)
+       monitor-server --init     create and migrate the store of a new install, then exit
+       monitor-server --version  print the version
+       monitor-server --help     print this help
+configuration: SMON_* environment variables (README, Configuration)";
+
 /// Arguments: none to serve; `--init` to create the store of a new install (D-015);
-/// `--version`. Anything else is a usage error (exit 2) — never a server started by
-/// accident with default settings.
+/// `--version`; `--help`. Anything else is a usage error (exit 2) — never a server started
+/// by accident with default settings.
 fn parse_mode() -> Result<Mode, std::process::ExitCode> {
     match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
         [] => Ok(Mode::Serve),
@@ -45,13 +51,12 @@ fn parse_mode() -> Result<Mode, std::process::ExitCode> {
             println!("monitor-server {}", env!("CARGO_PKG_VERSION"));
             Err(std::process::ExitCode::SUCCESS)
         }
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!("{USAGE}");
+            Err(std::process::ExitCode::SUCCESS)
+        }
         other => {
-            eprintln!(
-                "monitor-server: unknown arguments {other:?}\n\
-                 usage: monitor-server            serve (the store must exist)\n       \
-                 monitor-server --init     create and migrate the store of a new install, then exit\n       \
-                 monitor-server --version"
-            );
+            eprintln!("monitor-server: unknown arguments {other:?}\n{USAGE}");
             Err(std::process::ExitCode::from(2))
         }
     }

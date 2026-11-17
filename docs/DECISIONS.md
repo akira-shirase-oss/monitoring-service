@@ -38,8 +38,8 @@ the root disk, hidden under the volume once it mounted.
 boot if the file is missing or has no tables, naming the path and the likely cause (the
 volume is not mounted). `monitor-server --init` is the only way to create a store: it
 creates and migrates it, then exits without serving — the install step (RUNBOOK) and the
-first step of every harness that starts from scratch. `--version` prints the version;
-any other argument is a usage error (exit 2), so a mistyped flag never starts a server
+first step of every harness that starts from scratch. `--version` prints the version and
+`--help` the usage (both exit 0); any other argument is a usage error (exit 2), so a mistyped flag never starts a server
 with default settings. The unit's `RequiresMountsFor=` covers the ordering; this covers
 a mount that is configured differently, or not at all.
 
