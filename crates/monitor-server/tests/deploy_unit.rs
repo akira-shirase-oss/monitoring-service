@@ -285,3 +285,29 @@ fn the_docs_are_honest_about_a_volume_that_attaches_late() {
         assert!(flat.contains(needle), "the RUNBOOK lacks `{needle}`");
     }
 }
+
+/// L5: an upgrade that adds migrations can't be rolled back by repointing `current` — the
+/// old binary refuses the migrated store (`an_older_binary_refuses_a_store_a_newer_one_migrated`).
+/// The RUNBOOK must say to back up first, how to roll back with that backup, and name the
+/// real guard (`_sqlx_migrations`, not `user_version`).
+#[test]
+fn the_runbook_backs_up_before_an_upgrade_and_rolls_back_with_that_backup() {
+    let flat = RUNBOOK.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !flat.contains("user_version"),
+        "the RUNBOOK credits user_version"
+    );
+    assert!(flat.contains("_sqlx_migrations"), "name the real guard");
+    let upgrade = &flat[flat.find("## Upgrade").expect("Upgrade section")..];
+    let deploy = upgrade
+        .find("scripts/deploy.sh --prefix /opt/smon")
+        .expect("the upgrade runs deploy.sh");
+    assert!(
+        upgrade[..deploy].contains("/api/backup"),
+        "back up before deploying the new release"
+    );
+    let rollback = &flat[flat.find("## Rollback").expect("Rollback section")..];
+    for needle in ["restore", "-wal", "migration"] {
+        assert!(rollback.contains(needle), "the rollback lacks `{needle}`");
+    }
+}

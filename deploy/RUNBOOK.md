@@ -141,6 +141,15 @@ sudo systemctl daemon-reload
 Then check `env` against the strict parser (inline comments above; an admin token of at
 least 32 bytes) and continue:
 
+**Back up first.** A release that adds migrations can't be rolled back by repointing
+`current` (see Rollback), so take a backup with the *running* release before deploying:
+
+```sh
+curl -X POST .../api/backup -H "authorization: Bearer $SMON_ADMIN_TOKEN" \
+    -H 'content-type: application/json' \
+    -d "{\"path\":\"/opt/smon/data/backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ).db\"}"
+```
+
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # new release dir, repoints current
 sudo systemctl restart monitor-server           # or: launchctl kickstart -k system/com.shirase.smon
@@ -174,9 +183,14 @@ sudo systemctl restart monitor-server
 curl -sf .../readyz
 ```
 
-Forward-only migrations: a rollback across a schema change means the old binary reads
-a newer schema. SQLite's `user_version` guards that — an old binary on a too-new schema
-fails the migration check at boot and stays down, which is the honest failure.
+Repointing is enough only when the newer release added no migration. Migrations are
+forward-only and recorded in sqlx's `_sqlx_migrations` table: an older binary on a store
+a newer one migrated refuses to start ("migration N was previously applied but is missing
+in the resolved migrations"), which is the honest failure — it never reads a schema it
+doesn't know. To roll back across a migration (for example 0008/0009 of the 2026-11-16
+security release), restore the backup taken before the upgrade: stop the server, copy that
+backup over `data/monitor.db`, delete `monitor.db-wal`/`-shm`, repoint `current`, start.
+Evidence written after the upgrade is lost; there is no downgrade migration.
 
 ## Backup / restore
 

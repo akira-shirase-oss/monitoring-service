@@ -1510,3 +1510,40 @@ async fn opening_an_existing_store_makes_it_and_its_sidecars_owner_only() -> any
     assert_eq!(db.list_monitors().await?.len(), 1, "the store is untouched");
     Ok(())
 }
+
+/// L5: what the RUNBOOK's rollback rests on. Migrations are forward-only and recorded in
+/// sqlx's `_sqlx_migrations` table (not SQLite's `user_version`): a binary that doesn't
+/// know a migration the store has applied refuses to start on it. Rolling back across a
+/// migration therefore means restoring the backup taken before the upgrade.
+#[tokio::test]
+async fn an_older_binary_refuses_a_store_a_newer_one_migrated() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("newer.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    db.close().await;
+    // A newer binary's migration, as it would have been recorded.
+    let raw = sqlx::SqlitePool::connect(&url).await?;
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (9999, 'from a newer release', TRUE, X'00', 0)",
+    )
+    .execute(&raw)
+    .await?;
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&raw)
+        .await?;
+    raw.close().await;
+    assert_eq!(user_version, 0, "user_version is not what guards this");
+
+    let db = Db::connect_existing(&url, 1, None).await?;
+    let refused = db
+        .migrate()
+        .await
+        .expect_err("an unknown applied migration must refuse");
+    assert!(
+        refused.to_string().contains("9999"),
+        "the error names the migration: {refused}"
+    );
+    Ok(())
+}
