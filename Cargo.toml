@@ -23,6 +23,11 @@ axum = "0.8.9"
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
 hmac = "0.12.1"
 http-body-util = "0.1.5"
+# Serving directly on hyper (serve.rs): a header-read timeout needs hyper's timer, which
+# axum::serve does not set. http1 + server only; hyper-util for TokioIo/TokioTimer and the
+# tower bridge — both already in the graph through axum and reqwest.
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
 # SMTP for the email alert channel — rustls + tokio only, matching the single-TLS-stack rule.
 # `tokio1-rustls` + `webpki-roots` + `aws-lc-rs` gives the rustls connector and Mozilla
 # roots with the workspace's existing provider; lettre's `rustls-tls` bundle would force

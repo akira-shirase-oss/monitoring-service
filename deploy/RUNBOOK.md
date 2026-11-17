@@ -23,6 +23,14 @@ rolling back the binary cannot roll back evidence.
 
 ## Install
 
+**Exposure.** The listener closes a request whose header hasn't arrived within 10 s and an
+idle keep-alive after 10 s, and serves at most `SMON_MAX_CONNECTIONS` (default 1024)
+connections at once — the rest wait in the backlog, so a flood of idle sockets can't take
+the file descriptors probes and SQLite need (`perf/connections.mjs` drills it). It speaks
+plain HTTP: put a TLS proxy (Caddy) in front of anything reachable from the internet, and
+set `SMON_TRUSTED_PROXY` to that proxy's address so failed credentials are throttled per
+real client rather than all under the proxy's address.
+
 **Direct egress is required.** Probes and alerts dial their targets and receivers directly
 and ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (a proxied probe would bypass the SSRF
 guard). On a network that only allows egress through a proxy, every probe fails `connect`

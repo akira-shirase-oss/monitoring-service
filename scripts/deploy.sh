@@ -67,6 +67,8 @@ ln -sfn "$DEST" "$PREFIX/current"
 # Behind a reverse proxy (Caddy) on this host: the proxy's address, so failed credentials
 # are throttled per real client (X-Forwarded-For) instead of all sharing the proxy's.
 # SMON_TRUSTED_PROXY=127.0.0.1
+# HTTP connections served at once; keep well below the unit's LimitNOFILE (4096).
+# SMON_MAX_CONNECTIONS=1024
 # auto: the session cookie is Secure when the TLS proxy says so; always: every cookie.
 # SMON_COOKIE_SECURE=auto
 ENV

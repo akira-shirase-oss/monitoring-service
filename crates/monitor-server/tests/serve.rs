@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
-use monitor_server::serve::{Stopped, serve};
+use monitor_server::serve::{Limits, Stopped, serve};
 use monitor_server::vitals::{Role, Supervisor, Vitals};
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +54,7 @@ async fn an_observing_task_stopping_ends_serving_as_an_engine_failure() -> anyho
             rig.shutdown.clone(),
             rig.vitals,
             Duration::from_secs(2),
+            Limits::default(),
         ),
     )
     .await
@@ -81,6 +82,7 @@ async fn a_supporting_task_stopping_keeps_serving() -> anyhow::Result<()> {
         rig.shutdown.clone(),
         rig.vitals,
         Duration::from_secs(2),
+        Limits::default(),
     ));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
@@ -118,6 +120,7 @@ async fn a_coordinator_stalled_past_the_limit_ends_serving_as_an_engine_failure(
             shutdown,
             vitals,
             Duration::from_secs(2),
+            Limits::default(),
         ),
     )
     .await
@@ -194,4 +197,110 @@ async fn a_process_freeze_is_not_mistaken_for_a_stalled_coordinator() {
         raised.is_err(),
         "a freeze of the whole process must not read as a stall"
     );
+}
+
+/// Serve `app()` with `limits` on an ephemeral port; returns the address and a stop handle.
+async fn serving(
+    limits: Limits,
+) -> anyhow::Result<(std::net::SocketAddr, tokio::sync::oneshot::Sender<()>)> {
+    let rig = rig().await?;
+    let addr = rig.listener.local_addr()?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(serve(
+        rig.listener,
+        app(),
+        async move {
+            let _ = stop_rx.await;
+            "SIGTERM"
+        },
+        rig.supervisor.engine_failure(),
+        rig.shutdown.clone(),
+        rig.vitals,
+        Duration::from_secs(2),
+        limits,
+    ));
+    Ok((addr, stop_tx))
+}
+
+/// Write `bytes`, then wait (up to `limit`) for the server to close the connection.
+/// Returns what it sent back and whether it closed.
+async fn closed_within(
+    addr: std::net::SocketAddr,
+    bytes: &[u8],
+    limit: Duration,
+) -> anyhow::Result<(String, bool)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+    stream.write_all(bytes).await?;
+    let mut received = Vec::new();
+    let closed = tokio::time::timeout(limit, async {
+        let mut buf = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await
+    .is_ok();
+    Ok((String::from_utf8_lossy(&received).into_owned(), closed))
+}
+
+/// M2: an anonymous client could hold sockets for ever — `axum::serve` set no header-read
+/// timeout, no idle timeout and no cap (a half-sent header and an idle keep-alive both
+/// stayed open 45 s+). Now a header that doesn't finish in time is closed, an idle
+/// keep-alive is closed after the same deadline, and past the cap new connections wait.
+#[tokio::test]
+async fn a_slow_header_and_an_idle_keep_alive_are_closed_and_the_cap_holds() -> anyhow::Result<()> {
+    let limits = Limits {
+        header_read_timeout: Duration::from_millis(500),
+        max_connections: 2,
+    };
+    let (addr, _stop) = serving(limits).await?;
+
+    let (received, closed) = closed_within(
+        addr,
+        b"GET /livez HTTP/1.1\r\nHost: x\r\nX-Slow: ",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(closed, "a header that never finishes must be closed");
+    assert!(!received.contains("alive"), "and never served: {received}");
+
+    let (received, closed) = closed_within(
+        addr,
+        b"GET /livez HTTP/1.1\r\nHost: x\r\n\r\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(received.starts_with("HTTP/1.1 200"), "{received}");
+    assert!(
+        closed,
+        "an idle keep-alive must be closed after the deadline"
+    );
+
+    // Two silent connections fill the cap: a third is not served until one is closed.
+    let holders = [
+        tokio::net::TcpStream::connect(addr).await?,
+        tokio::net::TcpStream::connect(addr).await?,
+    ];
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (received, _) = closed_within(
+        addr,
+        b"GET /livez HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(300),
+    )
+    .await?;
+    assert!(received.is_empty(), "served past the cap: {received}");
+    // The holders' header deadline frees their slots; then the next one is served.
+    let (received, _) = closed_within(
+        addr,
+        b"GET /livez HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(received.starts_with("HTTP/1.1 200"), "{received}");
+    drop(holders);
+    Ok(())
 }

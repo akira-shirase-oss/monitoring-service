@@ -16,7 +16,7 @@ use monitor_server::config::Config;
 use monitor_server::deliver::{Config as DelivererConfig, Deliverer, Sink};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config as CoordinatorConfig, Coordinator};
-use monitor_server::serve::{Stopped, serve};
+use monitor_server::serve::{Limits, Stopped, serve};
 use monitor_server::vitals::{Role, Supervisor, Vitals};
 use monitor_server::{AppState, load_registry, rebuild_health, record_downtime};
 use tokio::sync::watch;
@@ -212,6 +212,10 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         shutdown,
         vitals,
         HTTP_DRAIN,
+        Limits {
+            max_connections: config.max_connections,
+            ..Limits::default()
+        },
     )
     .await?;
     finish(

@@ -143,6 +143,9 @@ echoed in those messages.
 email channel; a partial set fails the boot.
 `SMON_SESSION_TTL_S` — dashboard session lifetime in seconds (default 43200).
 `SMON_SESSION_IDLE_S` — a session unused this long ends, in seconds (default 3600).
+`SMON_MAX_CONNECTIONS` — HTTP connections served at once (default 1024; keep it well below
+the file-descriptor limit). Past it new connections wait in the backlog. A request header
+must arrive within 10 s, and an idle keep-alive connection is closed after 10 s.
 `SMON_TRUSTED_PROXY` — the reverse proxy's IP address. Failed credentials (login or bearer)
 are throttled per client address — five back to back, then one every 2 s; a right token
 costs nothing — and behind a proxy every client shares its address unless this names it

@@ -30,6 +30,7 @@ pub const KNOWN: &[&str] = &[
     "SMON_LISTEN",
     "SMON_LOG_FILE",
     "SMON_LOG_MAX_BYTES",
+    "SMON_MAX_CONNECTIONS",
     "SMON_MAX_DB_BYTES",
     "SMON_MAX_MONITORS",
     "SMON_OUTBOX_RETENTION_S",
@@ -97,6 +98,9 @@ pub struct Config {
     pub trusted_proxy: Option<std::net::IpAddr>,
     pub cookie_secure: crate::auth::CookieSecure,
     pub max_monitors: u64,
+    /// `SMON_MAX_CONNECTIONS`: HTTP connections served at once (serve.rs); past it new
+    /// connections wait in the backlog. Keep it well below the file-descriptor limit.
+    pub max_connections: usize,
 }
 
 impl fmt::Debug for Config {
@@ -399,6 +403,8 @@ impl Config {
             }
         };
         let max_monitors = env.ranged("SMON_MAX_MONITORS", 100, 1..=100_000);
+        let max_connections =
+            usize::try_from(env.ranged("SMON_MAX_CONNECTIONS", 1024, 8..=65_535)).unwrap_or(1024);
 
         if !env.problems.is_empty() {
             return Err(ConfigError {
@@ -427,6 +433,7 @@ impl Config {
             trusted_proxy,
             cookie_secure,
             max_monitors,
+            max_connections,
         })
     }
 
@@ -464,6 +471,7 @@ mod tests {
         assert_eq!(config.session_ttl, Duration::from_hours(12));
         assert_eq!(config.session_idle, Duration::from_hours(1));
         assert_eq!(config.trusted_proxy, None);
+        assert_eq!(config.max_connections, 1024);
         assert_eq!(config.max_monitors, 100);
         assert!(!config.lab);
         assert!(config.smtp.is_none() && config.webhook_url.is_none());
@@ -484,6 +492,7 @@ mod tests {
             ("SMON_SESSION_TTL_S", "12h"),
             ("SMON_SESSION_IDLE_S", "1h"),
             ("SMON_TRUSTED_PROXY", "caddy"),
+            ("SMON_MAX_CONNECTIONS", "4"),
             ("SMON_MAX_MONITORS", "0"),
             ("SMON_LISTEN", "localhost"),
             ("SMON_PROFILE", "Lab"),
