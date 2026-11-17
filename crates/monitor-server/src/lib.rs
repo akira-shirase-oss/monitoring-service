@@ -9,6 +9,7 @@ pub mod config;
 pub mod deliver;
 pub mod headers;
 pub mod logfile;
+pub mod origin;
 pub mod probe;
 pub mod redact;
 pub mod schedule;
@@ -243,6 +244,13 @@ async fn check_capacity(
 ) -> Result<(), ApiError> {
     let mut monitors = load_registry(&state.db).await?;
     change(&mut monitors);
+    // Per-origin capacity counts resolved addresses (origin.rs): resolve the names not
+    // known yet — the one being written above all — within a bound the request can afford.
+    origin::refresh(
+        monitors.iter().map(|monitor| monitor.url.clone()),
+        Duration::from_secs(3),
+    )
+    .await;
     let config = schedule::Config::default();
     match schedule::capacity(&monitors, &config) {
         None => Ok(()),

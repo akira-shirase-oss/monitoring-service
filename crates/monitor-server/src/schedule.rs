@@ -287,6 +287,9 @@ async fn run(
     let (results_tx, mut results_rx) = mpsc::channel::<Observation>(config.results_bound);
     let mut global = GlobalSlots::new(config.global_slots);
     let clock = SlotClock::start();
+    // Background name lookups for the per-origin keys; aborted when the loop ends.
+    let mut lookups = tokio::task::JoinSet::new();
+    let mut ticks_since_refresh = 0_u32;
     let mut origins: HashMap<String, Arc<Semaphore>> = HashMap::new();
     let mut runtimes: HashMap<MonitorId, Runtime> = HashMap::new();
     let tracker = TaskTracker::new();
@@ -297,12 +300,21 @@ async fn run(
         let monitors = Arc::clone(&registry.borrow_and_update());
         reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
         global.resize(global_budget(&monitors, &config));
+        refresh_origins(&mut lookups, &runtimes);
     }
 
     loop {
         vitals.coordinator_beat();
         tokio::select! {
             _ = ticker.tick() => {
+                if lookups.try_join_next().is_some() {
+                    prune_origins(&mut origins, &runtimes); // names may have been re-keyed
+                }
+                ticks_since_refresh += 1;
+                if ticks_since_refresh >= ORIGIN_REFRESH_TICKS {
+                    ticks_since_refresh = 0;
+                    refresh_origins(&mut lookups, &runtimes);
+                }
                 plan_due(&mut runtimes, &mut origins, &global.semaphore, &config)
                     .dispatch(&probes, &writer, &results_tx, &tracker, &vitals)
                     .await;
@@ -332,6 +344,7 @@ async fn run(
                 let monitors = Arc::clone(&registry.borrow_and_update());
                 reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
                 global.resize(global_budget(&monitors, &config));
+                refresh_origins(&mut lookups, &runtimes);
             }
             () = shutdown.cancelled() => break,
         }
@@ -491,11 +504,7 @@ fn reconcile(
             .iter()
             .any(|monitor| monitor.id == entry.monitor.id && !monitor.paused)
     });
-    origins.retain(|origin, _| {
-        runtimes
-            .values()
-            .any(|entry| origin_key(&entry.monitor.url) == *origin)
-    });
+    prune_origins(origins, runtimes);
 
     for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
         match runtimes.get_mut(&monitor.id) {
@@ -521,10 +530,38 @@ fn reconcile(
     }
 }
 
+/// The per-origin bound's key: the resolved address and port (origin.rs), so aliases of
+/// one server share it.
 fn origin_key(url: &Url) -> String {
-    let host = url.host_str().unwrap_or_default();
-    let port = url.port_or_known_default().unwrap_or_default();
-    format!("{host}:{port}")
+    crate::origin::key(url)
+}
+
+/// Drop the per-origin semaphores no runtime keys to any more (after a registry change, or
+/// after a refresh re-keyed a name).
+fn prune_origins(
+    origins: &mut HashMap<String, Arc<Semaphore>>,
+    runtimes: &HashMap<MonitorId, Runtime>,
+) {
+    let in_use: std::collections::HashSet<String> = runtimes
+        .values()
+        .map(|entry| origin_key(&entry.monitor.url))
+        .collect();
+    origins.retain(|origin, _| in_use.contains(origin));
+}
+
+/// How often the coordinator re-resolves its monitors' names (ticks).
+const ORIGIN_REFRESH_TICKS: u32 = 60;
+
+/// Re-resolve every monitor's name in the background (at most one refresh at a time).
+fn refresh_origins(lookups: &mut tokio::task::JoinSet<()>, runtimes: &HashMap<MonitorId, Runtime>) {
+    if !lookups.is_empty() {
+        return;
+    }
+    let urls: Vec<Url> = runtimes
+        .values()
+        .map(|entry| entry.monitor.url.clone())
+        .collect();
+    lookups.spawn(crate::origin::refresh(urls, Duration::from_secs(30)));
 }
 
 #[cfg(test)]
@@ -850,6 +887,35 @@ mod tests {
             drift < time::Duration::milliseconds(50),
             "the slot due at {due_at} moved to {} without a missed row",
             edited.next_slot_at
+        );
+    }
+
+    /// Hostname aliases of one address are one origin: `localhost` and `127.0.0.1` on the
+    /// same port share the per-origin bound once the name is resolved, so spelling a host
+    /// two ways can't double what one server receives.
+    #[tokio::test(start_paused = true)]
+    async fn aliases_of_one_address_share_the_per_origin_bound() {
+        let config = Config {
+            per_origin_slots: 1,
+            ..Config::default()
+        };
+        let mut monitors = fleet(2, 1, Duration::from_secs(15), Duration::from_secs(3));
+        monitors[0].url = Url::parse("http://localhost:9/a").expect("url");
+        monitors[1].url = Url::parse("http://127.0.0.1:9/b").expect("url");
+        crate::origin::resolve(&monitors[0].url).await;
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        let clock = SlotClock::start();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
+        for entry in runtimes.values_mut() {
+            entry.next_slot = Instant::now(); // both due on this tick
+        }
+        let global = Arc::new(Semaphore::new(16));
+        let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
+        assert_eq!(
+            plan.dispatches.len(),
+            1,
+            "two spellings of one address got two per-origin slots"
         );
     }
 }

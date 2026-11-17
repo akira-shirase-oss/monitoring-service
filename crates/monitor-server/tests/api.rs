@@ -1920,3 +1920,54 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     assert_eq!(body["error"]["code"], "capacity_exceeded");
     Ok(())
 }
+
+/// Per origin, spelling a host another way is not another origin: 30 monitors at 15 s on
+/// `127.0.0.1:9` fill its 2 starts a tick, so a 31st spelled `localhost:9` is refused; a
+/// different address on the same port fits. (Lab profile, so loopback is allowed.)
+#[tokio::test]
+async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::connect(
+        &format!("sqlite:{}", tmp.path().join("alias.db").display()),
+        1,
+    )
+    .await?;
+    db.migrate().await?;
+    for i in 0..30 {
+        let monitor = monitor_domain::NewMonitor::with_schedule(
+            format!("l{i}"),
+            url::Url::parse(&format!("http://127.0.0.1:9/{i}"))?,
+            Duration::from_secs(15),
+            Duration::from_secs(3),
+        )?
+        .into_monitor();
+        db.insert_monitor(&monitor).await?;
+    }
+    let app = monitor_server::router(monitor_server::AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100_000,
+        allow_local_targets: true,
+        version: "test",
+    });
+    let alias = serde_json::json!({
+        "name": "alias", "url": "http://localhost:9/30", "interval_s": 15, "timeout_s": 3
+    });
+    let (status, body) = send(&app, "POST", "/api/monitors", Some(alias)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded");
+    let other_address = serde_json::json!({
+        "name": "other", "url": "http://127.0.0.2:9/", "interval_s": 15, "timeout_s": 3
+    });
+    let (status, body) = send(&app, "POST", "/api/monitors", Some(other_address)).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    Ok(())
+}
