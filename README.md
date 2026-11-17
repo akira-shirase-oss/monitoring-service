@@ -42,16 +42,23 @@ run; what exists is what the commits show. Highlights:
   `openssl rand -hex 32`; a weaker value refuses to boot) → `Bearer` for CLI/scripts, or the HttpOnly
   `smon_session` cookie the dashboard earns at `POST /api/login` (store-side
   expiry, `SMON_SESSION_TTL_S`; `Origin` must match `Host`, mandatory on
-  cookie-authed writes). Tokenless loopback is dev mode, tokenless public bind
-  refuses to boot.
+  cookie-authed writes). Sessions are stored as token-bound digests and end when
+  the token rotates or after `SMON_SESSION_IDLE_S` unused (D-016); logins are
+  evaluated four at a time (429 beyond). Every `/api` route and method is proven to
+  refuse a missing credential, and bodies are capped at 16 KiB with a 10 s deadline.
+  Tokenless loopback is dev mode, tokenless public bind refuses to boot.
 - **Dashboard:** add/edit/pause/delete without leaving the UI, an uptime strip that
   renders unobserved slots as gaps (never interpolated green), a 15 s auto-refresh
   with atomic swaps, the public status rendered in-app, and a guide page whose
   words are drift-checked against the real wire vocabulary in both directions.
+  Every response carries a CSP (scripts from this origin plus the build's inline
+  bootstrap by hash, no framing), `nosniff` and `no-referrer`.
 - **Public status:** self-expiring `status.json` heartbeat + static renderer +
   independent checker — an expired snapshot reads "monitoring unavailable," never
   "all down."
-- **Evidence:** 90+ Rust tests, a Playwright suite against the real server, a
+- **Evidence:** 253 Rust tests run by hosted CI on every push (`.github/workflows/ci.yml`,
+  pinned actions, read-only token, daily advisory sweep; Dependabot weekly), a
+  Playwright suite against the real server, a
   mutation-tested domain (48 mutants → 42 caught, 0 missed), pinned CLI exit codes,
   a measured load baseline and a 3.84M-request real-app drill (`perf/results/`,
   0 missed slots, honest incident times, both alert channels delivered) — and the
@@ -147,7 +154,9 @@ proxy in front reports `X-Forwarded-Proto: https` or `Forwarded: proto=https`) o
 build/runtime artifacts may be git-ignored), `cargo fmt --check`, `cargo clippy -- -D
 warnings`, `cargo test`, `scripts/check-advisories.sh` (`cargo deny check advisories bans licenses sources`,
 required when `CI` is set; each `deny.toml` exception must carry a re-check date that has
-not passed), the architecture rule, `svelte-check` and a dashboard build. Plus the
+not passed), the architecture rule, `svelte-check`, a dashboard build and `npm audit
+--omit=dev --audit-level=moderate`. CI runs the same script on every push and pull request
+(ubuntu-latest). Plus the
 drills: `scripts/e2e.sh` (Playwright), `scripts/backup-drill.sh` (backup → destroy →
 restore), `perf/lab-profile.mjs` (load baseline). Every drill and harness runs on its own
 ports (never 58400, an installed monitor's), refuses a busy one, and stops only what it

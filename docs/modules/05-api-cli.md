@@ -40,7 +40,11 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `expires_at` is the authority — the cookie's Max-Age is a browser hint. The token
   itself never lands in browser storage; it can be rotated without stranding copies.
   `POST /api/logout` deletes the row and expires the cookie — idempotent. A wrong
-  token gets a fixed ~300 ms delay + 401 (no lockout state to game); a session-store
+  token gets a fixed ~300 ms delay + 401 (no lockout state to game), paid while holding
+  one of four login slots: a fifth login in flight gets 429 + `Retry-After: 1` before the
+  token is compared. The row is keyed by a token-bound digest of the cookie's id, never
+  the id (D-016): rotating the token ends every session, and a session unused for
+  `SMON_SESSION_IDLE_S` (default 3600) ends too. A session-store
   failure answers 503, never a false 401. With no admin token configured, login
   answers 404 `auth_disabled` — dev mode has no credential to exchange.
 - **CSRF contract:** an `Origin` header that doesn't match `Host` (host:port —

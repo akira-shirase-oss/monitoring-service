@@ -139,6 +139,11 @@ sudo systemctl restart monitor-server           # or: launchctl kickstart -k sys
 curl -sf .../readyz && curl -sf .../version     # the version must match the new release
 ```
 
+**Upgrading across the 2026-11-16 security release** (migrations 0008/0009): dashboard
+sessions are dropped once — sign in again. After that, rotating `SMON_ADMIN_TOKEN` (edit
+`env`, restart) ends every dashboard session, and sessions unused for
+`SMON_SESSION_IDLE_S` (default 1 h) end on their own. Backup targets must be new paths.
+
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
 `down`, never fabricates a recovery. If the monitor was down for longer than a check
 interval, boot records that gap (one `missed` row per monitor, D-014): statuses read
