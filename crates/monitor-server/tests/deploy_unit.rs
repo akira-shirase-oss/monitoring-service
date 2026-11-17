@@ -194,14 +194,15 @@ fn the_unit_waits_for_the_data_and_status_mounts() {
     }
 }
 
-/// Restarts back off, and the start limit is out of reach of a backed-off loop: a slow
-/// dependency keeps being retried (no permanent `failed` after ~20 s, which is what 5
+/// Restarts back off, and the start limit is out of reach of a backed-off loop: a crash
+/// that clears keeps being retried (no permanent `failed` after ~20 s, which is what 5
 /// starts in 600 s at `RestartSec=3s` produced), while a crash loop is spaced out to
 /// `RestartMaxDelaySec` instead of hammering every few seconds. On systemd < 254, which
 /// ignores `RestartSteps`/`RestartMaxDelaySec`, the fixed `RestartSec` still takes minutes
-/// to reach the limit.
+/// to reach the limit. (A failed *mount* dependency is not a crash and is not retried —
+/// `the_docs_are_honest_about_a_volume_that_attaches_late`.)
 #[test]
-fn restarts_back_off_and_a_slow_dependency_is_retried() {
+fn restarts_back_off_and_a_crash_is_retried() {
     let restart = service_setting("RestartSec")
         .and_then(seconds)
         .expect("RestartSec");
@@ -258,4 +259,29 @@ fn the_unit_creates_owner_only_files_and_data_is_private() {
         RUNBOOK.contains("chmod 700 /opt/smon/data"),
         "the RUNBOOK install makes data/ owner-only"
     );
+}
+
+/// F3: `RequiresMountsFor=` turns a mount whose job *fails* (the volume attached after
+/// `x-systemd.device-timeout`) into a dependency failure, and `Restart=` does not apply to
+/// that: the unit stays inactive until someone starts it. The docs used to promise "a slow
+/// dependency recovers on its own". They must say what actually happens and what to do.
+#[test]
+fn the_docs_are_honest_about_a_volume_that_attaches_late() {
+    let unit_and_docs = [("RUNBOOK.md", RUNBOOK), ("monitor-server.service", UNIT)];
+    for (name, text) in unit_and_docs {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !flat.contains("recovers on its own") && !flat.contains("keeps being retried"),
+            "{name} still promises a late volume is retried"
+        );
+    }
+    let flat = RUNBOOK.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "dependency failure",
+        "x-systemd.device-timeout",
+        "sudo systemctl start monitor-server",
+        "findmnt /opt/smon/data",
+    ] {
+        assert!(flat.contains(needle), "the RUNBOOK lacks `{needle}`");
+    }
 }

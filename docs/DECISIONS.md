@@ -160,8 +160,11 @@ progress, and a long catch-up is never read as a wedged loop (a writer that stop
 commits stops the beats). Supporting tasks stay *degraded*, with
 no exit. The systemd unit backs restarts off from 15 s to 10 minutes (`RestartSteps`,
 systemd ≥ 254) under a start limit of 10 in 30 minutes that a backed-off loop never
-reaches: a slow dependency (a late volume) is retried until it appears, and a
-deterministic crash is spaced out instead of looping every few seconds. Older systemd
+reaches: a deterministic crash is spaced out instead of looping every few seconds.
+*Corrected 2026-11-16:* this used to say a late volume is retried until it appears. It
+is not — a `RequiresMountsFor=` mount whose job fails is a dependency failure, outside
+`Restart=`, and the unit waits for a manual start (RUNBOOK, "The data volume attached
+late"). Older systemd
 keeps the fixed 15 s and leaves the unit `failed` after ~2.5 minutes of failures. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
 and `a_supporting_task_stopping_keeps_serving`.
 

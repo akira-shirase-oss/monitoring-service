@@ -67,12 +67,30 @@ the cause in `faults` (D-011): `store writes failing (N consecutive)` means the 
 process then writes one "monitoring unavailable" beat and exits non-zero on its own, and
 the service manager restarts it (D-011; a coordinator stalled for 2 minutes does the
 same); repeated restarts mean the log's task error needs fixing. Restarts back off from
-15 s to 10 minutes (systemd ≥ 254), so a slow dependency recovers on its own and a crash
-loop never hammers. On older systemd (fixed 15 s) 10 starts within 30 minutes leave the
-unit `failed` (`start request repeated too quickly`): fix the cause, then `sudo systemctl
-reset-failed monitor-server && sudo systemctl start monitor-server`. The unit also waits
-for the mounts of `data/` and `status/` (`RequiresMountsFor`); `degraded` with a deliverer, snapshot or retention
-fault means checks still run but that duty has stopped.
+15 s to 10 minutes (systemd ≥ 254), so a crash that clears (a dependency the process
+itself retries, a store that comes back) is retried and a crash loop never hammers. On
+older systemd (fixed 15 s) 10 starts within 30 minutes leave the unit `failed` (`start
+request repeated too quickly`): fix the cause, then `sudo systemctl reset-failed
+monitor-server && sudo systemctl start monitor-server`. `degraded` with a deliverer,
+snapshot or retention fault means checks still run but that duty has stopped.
+
+### The data volume attached late
+
+The unit waits for the mounts of `data/` and `status/` (`RequiresMountsFor`). If the
+volume's device has not appeared by its mount's `x-systemd.device-timeout` (90 s by
+default), the mount job **fails**, and to systemd that is a *dependency failure* of
+`monitor-server`, not a crash: `Restart=` does not apply, so the unit stays inactive — the
+public heartbeat expires and the status page says "monitoring unavailable" — until it is
+started by hand. Nothing retries it on its own. Once the volume is there:
+
+```sh
+findmnt /opt/smon/data || sudo mount /opt/smon/data   # the volume, not the bare mountpoint
+sudo systemctl start monitor-server
+```
+
+To make this rarer, give the volume's fstab entry a longer wait (for example
+`nofail,x-systemd.device-timeout=10min`); never remove `RequiresMountsFor` — D-015 would
+refuse the bare mountpoint anyway, but the unit is what keeps the order right.
 
 ### The store is at its cap (`SMON_MAX_DB_BYTES`)
 
