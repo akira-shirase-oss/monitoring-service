@@ -64,6 +64,9 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_SESSION_TTL_S=43200
 # A session unused this long ends too, in seconds (default 1 h).
 # SMON_SESSION_IDLE_S=3600
+# Behind a reverse proxy (Caddy) on this host: the proxy's address, so failed credentials
+# are throttled per real client (X-Forwarded-For) instead of all sharing the proxy's.
+# SMON_TRUSTED_PROXY=127.0.0.1
 # auto: the session cookie is Secure when the TLS proxy says so; always: every cookie.
 # SMON_COOKIE_SECURE=auto
 ENV

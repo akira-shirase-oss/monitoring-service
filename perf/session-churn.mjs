@@ -35,6 +35,9 @@ try {
 	const serverEnv = {
 		SMON_PROFILE: 'lab', SMON_DATABASE_URL: `sqlite:${DB}`, SMON_LISTEN: `127.0.0.1:${SERVER_PORT}`,
 		SMON_ADMIN_TOKEN: TOKEN, SMON_LOG_FILE: LOG, RUST_LOG: 'monitor_server=info',
+		// Worker 0's wrong logins arrive "through the proxy" as another client, so its
+		// per-address guessing budget (throttle.rs) is not the good workers' budget.
+		SMON_TRUSTED_PROXY: '127.0.0.1',
 	};
 	execFileSync(`${ROOT}/target/debug/monitor-server`, ['--init'], {
 		env: { ...process.env, ...serverEnv },
@@ -72,7 +75,7 @@ try {
 			mr.ok ? reads++ : readFails++;
 			await fetch(`${BASE}/api/logout`, { method: 'POST', headers: { cookie, origin: BASE } });
 			if (w === 0) { // worker 0 also probes the negative paths at a slower cadence
-				const bad = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'wrong' }) });
+				const bad = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': '198.51.100.1' }, body: JSON.stringify({ token: 'wrong' }) });
 				if (bad.status === 401 || bad.status === 429) badLogins++;
 				const bare = await fetch(`${BASE}/api/monitors`);
 				if (bare.status === 401 || bare.status === 403) refused++;

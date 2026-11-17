@@ -14,6 +14,7 @@ pub mod redact;
 pub mod schedule;
 pub mod serve;
 pub mod snapshot;
+pub mod throttle;
 pub mod vitals;
 
 use std::sync::Arc;
@@ -43,18 +44,8 @@ use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, Valid
 const BODY_LIMIT: usize = 16 * 1024;
 /// Every handler answers inside this; probes run on their own deadlines elsewhere.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Logins evaluated at once. `POST /api/login` is the one unauthenticated credential
-/// check: a wrong token keeps its slot for [`WRONG_TOKEN_DELAY`], so guesses are bounded
-/// to about `LOGIN_SLOTS / 0.3 s` however many connections are opened; the rest get 429
-/// before the token is compared. The bearer token (CLI) never queues here.
-const LOGIN_SLOTS: usize = 4;
-/// The penalty a wrong token pays while holding its login slot.
+/// The penalty a wrong login token pays (`throttle::PENALTY_SLOTS` at once at most).
 const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
-
-/// The login slots ([`LOGIN_SLOTS`]): one set per router, so each server (and each test
-/// router) has its own.
-#[derive(Clone)]
-struct LoginSlots(Arc<tokio::sync::Semaphore>);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -82,6 +73,9 @@ pub struct AppState {
     /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
     /// they keep history). Bounds the schedule and every per-monitor table (D-012).
     pub max_monitors: u64,
+    /// `SMON_TRUSTED_PROXY`: the reverse proxy whose right-most `X-Forwarded-For` entry
+    /// names the client for credential throttling (`throttle.rs`). `None`: the TCP peer.
+    pub trusted_proxy: Option<std::net::IpAddr>,
     /// `SMON_PROFILE=lab`: local/private targets may be registered (fixtures). Otherwise
     /// a URL the SSRF guard would refuse is refused at registration (D-013).
     pub allow_local_targets: bool,
@@ -187,6 +181,7 @@ pub fn router(state: AppState) -> Router {
 /// Every API and health route, unlayered. With [`app`], the only place a route is added
 /// (`tests/auth_inventory.rs`).
 fn routes(state: AppState) -> Router {
+    let trusted_proxy = state.trusted_proxy;
     let api = Router::new()
         .route("/monitors", get(list_monitors).post(create_monitor))
         .route(
@@ -219,9 +214,7 @@ fn routes(state: AppState) -> Router {
         .route("/api/logout", post(logout))
         .nest("/api", api)
         .with_state(state)
-        .layer(axum::Extension(LoginSlots(Arc::new(
-            tokio::sync::Semaphore::new(LOGIN_SLOTS),
-        ))))
+        .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
 }
 
 /// The service stack, as one `ServiceBuilder` — its *first* layer is the outermost
@@ -292,7 +285,7 @@ pub struct LoginBody {
 /// without a stray copy in localStorage.
 async fn login(
     State(state): State<AppState>,
-    axum::Extension(slots): axum::Extension<LoginSlots>,
+    extensions: axum::http::Extensions,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
@@ -323,23 +316,23 @@ async fn login(
         )
             .into_response();
     };
-    // A bounded queue, not a lockout: when every slot is taken the answer is "retry", and
-    // the token is not even compared.
-    let Ok(_slot) = slots.0.try_acquire() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(axum::http::header::RETRY_AFTER, "1")],
-            Json(serde_json::json!({
-                "error": { "code": "too_many_requests",
-                           "message": "too many logins in flight; retry shortly" }
-            })),
-        )
-            .into_response();
+    // Per-address guessing budget (throttle.rs): taken before the token is compared, so
+    // a throttled address can't learn whether a guess was right; a right token gives it
+    // back. Another address's flood never touches this one's budget.
+    let Some(guard) = extensions.get::<throttle::Guard>() else {
+        tracing::error!("invariant: routes() installs the credential guard");
+        return ApiError::Corrupt.into_response();
+    };
+    let attempt = match guard.throttle.admit(guard.client(&extensions, &headers)) {
+        Ok(attempt) => attempt,
+        Err(wait) => return throttle::too_many(wait),
     };
     if !auth::digests_match(body.token.as_bytes(), admin.as_bytes()) {
-        // The delay is paid while holding the slot — that is what bounds the guess rate.
-        // The digest compare itself already runs in constant time.
-        tokio::time::sleep(WRONG_TOKEN_DELAY).await;
+        drop(attempt); // stays spent
+        // A courtesy delay, bounded across all addresses; the buckets bound the rate.
+        if let Ok(_penalty) = guard.penalties.try_acquire() {
+            tokio::time::sleep(WRONG_TOKEN_DELAY).await;
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -348,6 +341,7 @@ async fn login(
         )
             .into_response();
     }
+    attempt.succeeded();
 
     // The cookie gets the id; the store only its token-bound digest (D-016).
     let id = Uuid::new_v4().simple().to_string();

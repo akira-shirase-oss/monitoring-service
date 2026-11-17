@@ -43,9 +43,9 @@ run; what exists is what the commits show. Highlights:
   `smon_session` cookie the dashboard earns at `POST /api/login` (store-side
   expiry, `SMON_SESSION_TTL_S`; `Origin` must match `Host`, mandatory on
   cookie-authed writes). Sessions are stored as token-bound digests and end when
-  the token rotates or after `SMON_SESSION_IDLE_S` unused (D-016); logins are
-  evaluated four at a time (429 beyond). Every `/api` route and method is proven to
-  refuse a missing credential, and bodies are capped at 16 KiB with a 10 s deadline.
+  the token rotates or after `SMON_SESSION_IDLE_S` unused (D-016). Every `/api` route and method is proven to
+  refuse a missing credential, failed credentials are throttled per client address
+  (`SMON_TRUSTED_PROXY` behind a proxy), and bodies are capped at 16 KiB with a 10 s deadline.
   Tokenless loopback is dev mode, tokenless public bind refuses to boot.
 - **Dashboard:** add/edit/pause/delete without leaving the UI, an uptime strip that
   renders unobserved slots as gaps (never interpolated green), a 15 s auto-refresh
@@ -142,7 +142,11 @@ echoed in those messages.
 `SMON_SMTP_DSN` `SMON_SMTP_FROM` `SMON_SMTP_TO` — all three required together for the
 email channel; a partial set fails the boot.
 `SMON_SESSION_TTL_S` — dashboard session lifetime in seconds (default 43200).
-`SMON_SESSION_IDLE_S` — a session unused this long ends, in seconds (default 3600). Rotating
+`SMON_SESSION_IDLE_S` — a session unused this long ends, in seconds (default 3600).
+`SMON_TRUSTED_PROXY` — the reverse proxy's IP address. Failed credentials (login or bearer)
+are throttled per client address — five back to back, then one every 2 s; a right token
+costs nothing — and behind a proxy every client shares its address unless this names it
+(then the right-most `X-Forwarded-For` entry is the client). Rotating
 `SMON_ADMIN_TOKEN` ends every session at once (D-016).
 `SMON_COOKIE_SECURE` — `auto` (default: the session cookie is `Secure` whenever the TLS
 proxy in front reports `X-Forwarded-Proto: https` or `Forwarded: proto=https`) or

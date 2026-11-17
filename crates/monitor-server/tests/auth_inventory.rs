@@ -152,6 +152,7 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::from_hours(1),
         session_idle: Duration::from_hours(1),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -166,6 +167,13 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         &monitor_server::headers::dashboard_csp(&dir.join("dashboard")),
     );
     (app, db)
+}
+
+/// A fresh client address for every probe.
+fn next_peer() -> std::net::SocketAddr {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::net::SocketAddr::from((std::net::Ipv4Addr::from(0x0A00_0000 + n), 40000))
 }
 
 /// `method path` with each kind of missing or bad credential: 401 `unauthenticated`.
@@ -188,11 +196,13 @@ async fn assert_denied(app: &axum::Router, method: &str, template: &str, path: &
         if let Some((name, value)) = header {
             request = request.header(name, value);
         }
-        let response = app
-            .clone()
-            .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
-            .await
-            .expect("infallible");
+        let mut request = request.body(Body::from(body.to_owned())).expect("request");
+        // Each probe from its own address: what is under test here is the credential
+        // check, not the per-address guessing budget (that is limits.rs).
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(next_peer()));
+        let response = app.clone().oneshot(request).await.expect("infallible");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,

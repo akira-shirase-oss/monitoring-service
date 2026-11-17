@@ -30,6 +30,7 @@ async fn app() -> anyhow::Result<(axum::Router, Db, tempfile::TempDir)> {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::ZERO,
         session_idle: Duration::from_hours(1),
+        trusted_proxy: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -144,9 +145,8 @@ async fn a_request_whose_body_never_finishes_is_408_at_the_deadline() -> anyhow:
 
 /// `POST /api/login` is the one unauthenticated credential check. A fixed 300 ms delay per
 /// wrong token slowed each guess but not the number in flight: 50 connections guessed 50
-/// at a time. Logins are now evaluated a few at a time — a failed one keeps its slot for
-/// the delay — and the rest are refused with 429 before the token is compared, so the
-/// guess rate is bounded however many connections are opened.
+/// at a time. Now one address gets a burst of five guesses and the rest are refused with
+/// 429 before the token is compared, however many connections it opens (throttle.rs).
 #[tokio::test]
 async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Result<()> {
     let (app, db, _tmp) = app().await?;
@@ -178,21 +178,17 @@ async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Res
         }
     }
     assert!(
-        (1..=4).contains(&evaluated),
-        "at most 4 guesses evaluated at once, got {evaluated}"
+        (1..=5).contains(&evaluated),
+        "at most 5 guesses evaluated for one address, got {evaluated}"
     );
     assert_eq!(evaluated + refused, 50);
 
-    // The bound is a queue limit, not a lockout: once the flood is over, the operator's
-    // correct token logs in.
-    let response = app
-        .oneshot(
-            Request::post("/api/login")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(r#"{{"token":"{TOKEN}"}}"#)))?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // Not a lockout for anyone else: the operator's correct token, from their own address,
+    // logs in during and after the flood.
+    assert_eq!(
+        login_from(&app, OWNER, TOKEN).await?.0,
+        StatusCode::NO_CONTENT
+    );
     assert_eq!(db.sweep_expired_sessions().await?, 1);
     Ok(())
 }
@@ -232,5 +228,145 @@ async fn every_response_carries_a_request_id_even_a_timeout() -> anyhow::Result<
         response.headers().get("x-request-id").is_some(),
         "the 408 carries an id"
     );
+    Ok(())
+}
+
+const OWNER: &str = "203.0.113.10:50000";
+const ATTACKER: &str = "198.51.100.66:40000";
+
+/// A login as the client at `peer` would send it (the server records the peer address in
+/// `ConnectInfo`). Returns the status and `Retry-After`.
+async fn login_from(
+    app: &axum::Router,
+    peer: &str,
+    token: &str,
+) -> anyhow::Result<(StatusCode, Option<String>)> {
+    let mut request = Request::post("/api/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "token": token }).to_string(),
+        ))?;
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>()?,
+    ));
+    let response = app.clone().oneshot(request).await?;
+    let retry = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    Ok((response.status(), retry))
+}
+
+/// M1: the login throttle was one global pool of four slots, so an anonymous client that
+/// kept four wrong logins in flight locked the owner out of the dashboard (19 of 20 correct
+/// logins got 429). Throttling is per client address now: the attacker's guesses are its
+/// own problem.
+#[tokio::test]
+async fn an_attackers_wrong_logins_never_lock_the_owner_out() -> anyhow::Result<()> {
+    let (app, _db, _tmp) = app().await?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut attackers = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        let stop = Arc::clone(&stop);
+        attackers.spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = login_from(&app, ATTACKER, "wrong-guess").await;
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut accepted = 0;
+    for _ in 0..20 {
+        if login_from(&app, OWNER, TOKEN).await?.0 == StatusCode::NO_CONTENT {
+            accepted += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    while attackers.join_next().await.is_some() {}
+    assert_eq!(accepted, 20, "the owner's correct logins were refused");
+    Ok(())
+}
+
+/// One address gets a short burst of guesses, then 429 (with `Retry-After`) — before its
+/// token is even compared, so a throttled address can't learn whether a guess was right —
+/// and one more guess per refill period after that. Other addresses are unaffected.
+#[tokio::test]
+async fn one_address_gets_a_short_burst_of_guesses_then_429_until_it_refills() -> anyhow::Result<()>
+{
+    let (app, _db, _tmp) = app().await?;
+    tokio::time::pause();
+    for n in 0..5 {
+        assert_eq!(
+            login_from(&app, ATTACKER, "wrong").await?.0,
+            StatusCode::UNAUTHORIZED,
+            "guess {n}"
+        );
+    }
+    let (status, retry) = login_from(&app, ATTACKER, "wrong").await?;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(retry.is_some_and(|s| s.parse::<u64>().is_ok_and(|s| (1..=2).contains(&s))));
+    assert_eq!(
+        login_from(&app, ATTACKER, TOKEN).await?.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a throttled address is not told whether its token is right"
+    );
+    assert_eq!(
+        login_from(&app, "198.51.100.67:1", "wrong").await?.0,
+        StatusCode::UNAUTHORIZED,
+        "another address has its own budget"
+    );
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(
+        login_from(&app, ATTACKER, "wrong").await?.0,
+        StatusCode::UNAUTHORIZED,
+        "a guess comes back per refill period"
+    );
+    // ...and only about one: the next few run dry again (each wrong guess's 300 ms
+    // penalty refills a little while it sleeps).
+    let mut more = 0;
+    while login_from(&app, ATTACKER, "wrong").await?.0 == StatusCode::UNAUTHORIZED {
+        more += 1;
+        assert!(more <= 1, "the refill gave back more than it earned");
+    }
+    Ok(())
+}
+
+/// L1: a wrong `Authorization: Bearer` was never slowed or counted — 200 parallel guesses
+/// were all evaluated in a few milliseconds. Bearer guesses draw on the same per-address
+/// budget as logins.
+#[tokio::test]
+async fn wrong_bearer_tokens_are_throttled_per_address_too() -> anyhow::Result<()> {
+    let (app, _db, _tmp) = app().await?;
+    let bearer_from = |peer: &'static str, token: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::get("/api/monitors")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?;
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>()?,
+            ));
+            anyhow::Ok(app.oneshot(request).await?.status())
+        }
+    };
+    let mut guesses = tokio::task::JoinSet::new();
+    for _ in 0..200 {
+        guesses.spawn(bearer_from(ATTACKER, "wrong"));
+    }
+    let (mut evaluated, mut refused) = (0, 0);
+    while let Some(status) = guesses.join_next().await {
+        match status?? {
+            StatusCode::UNAUTHORIZED => evaluated += 1,
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => anyhow::bail!("unexpected {other}"),
+        }
+    }
+    assert!(evaluated <= 5, "{evaluated} bearer guesses evaluated");
+    assert_eq!(evaluated + refused, 200);
+    assert_eq!(bearer_from(OWNER, TOKEN).await?, StatusCode::OK);
     Ok(())
 }

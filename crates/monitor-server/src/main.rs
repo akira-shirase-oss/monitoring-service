@@ -182,19 +182,14 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
 
     let snapshot_db = db.clone();
     let snapshot_statuses = Arc::clone(&statuses);
-    let state = AppState {
+    let state = app_state(
+        &config,
         db,
         statuses,
-        registry: registry_tx,
-        vitals: vitals.clone(),
+        registry_tx,
+        vitals.clone(),
         admin_token,
-        session_ttl: config.session_ttl,
-        session_idle: config.session_idle,
-        cookie_secure: config.cookie_secure,
-        max_monitors: config.max_monitors,
-        allow_local_targets: config.lab,
-        version: env!("CARGO_PKG_VERSION"),
-    };
+    );
     let app = assemble(state, &config).await?;
 
     // Install the stop signals before serving: a registration failure is a boot error,
@@ -265,6 +260,31 @@ async fn finish(
         Stopped::EngineFailed(cause) => Err(anyhow::anyhow!(
             "monitoring engine failed ({cause}); exiting so the service manager restarts it"
         )),
+    }
+}
+
+/// The management API's state: the shared engine handles plus the settings it reads.
+fn app_state(
+    config: &Config,
+    db: monitor_db::Db,
+    statuses: SharedStatuses,
+    registry: watch::Sender<Arc<Vec<monitor_domain::Monitor>>>,
+    vitals: Vitals,
+    admin_token: monitor_server::auth::AdminToken,
+) -> AppState {
+    AppState {
+        db,
+        statuses,
+        registry,
+        vitals,
+        admin_token,
+        session_ttl: config.session_ttl,
+        session_idle: config.session_idle,
+        trusted_proxy: config.trusted_proxy,
+        cookie_secure: config.cookie_secure,
+        max_monitors: config.max_monitors,
+        allow_local_targets: config.lab,
+        version: env!("CARGO_PKG_VERSION"),
     }
 }
 

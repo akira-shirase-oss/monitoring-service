@@ -58,9 +58,14 @@ pub async fn serve(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stopped);
         let _ = stopping_tx.send(());
     };
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(graceful)
-        .into_future();
+    // Each request carries its peer address (`ConnectInfo`): credential throttling is
+    // per client (throttle.rs).
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(graceful)
+    .into_future();
     let deadline = async move {
         if stopping_rx.await.is_err() {
             std::future::pending::<()>().await;

@@ -129,7 +129,31 @@ pub async fn require_auth(
         return next.run(request).await;
     };
 
-    let credential = if bearer_matches(request.headers().get(header::AUTHORIZATION), token) {
+    // A presented bearer draws on its address's guessing budget before it is compared
+    // (throttle.rs, L1); a right one gives the token back.
+    let bearer_ok = match request.headers().get(header::AUTHORIZATION) {
+        None => false,
+        Some(presented) => {
+            let Some(guard) = request.extensions().get::<crate::throttle::Guard>() else {
+                tracing::error!("invariant: routes() installs the credential guard");
+                return deny(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "internal error",
+                );
+            };
+            let key = guard.client(request.extensions(), request.headers());
+            match guard.throttle.admit(key) {
+                Err(wait) => return crate::throttle::too_many(wait),
+                Ok(attempt) if bearer_matches(Some(presented), token) => {
+                    attempt.succeeded();
+                    true
+                }
+                Ok(_spent) => false,
+            }
+        }
+    };
+    let credential = if bearer_ok {
         Some(Credential::Bearer)
     } else if let Some(session) = session_cookie(request.headers().get(header::COOKIE)) {
         match state
