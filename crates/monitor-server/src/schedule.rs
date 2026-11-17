@@ -63,10 +63,22 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(monitor: Monitor, delay: Duration) -> Self {
+    /// The first slot at least `min_delay` from now on the monitor's own phase grid (D-018):
+    /// slot times are `phase (mod interval)` in Unix milliseconds, with the phase fixed by
+    /// the monitor's id. Monitors created together therefore spread across their interval
+    /// instead of falling due on the same tick, and a restart or an edit keeps the grid.
+    fn new(monitor: Monitor, min_delay: Duration) -> Self {
+        let now = Instant::now();
+        let now_wall = OffsetDateTime::now_utc();
+        let delay = delay_to_phase(
+            now_wall,
+            min_delay,
+            phase(monitor.id, monitor.interval),
+            monitor.interval,
+        );
         Self {
-            next_slot: Instant::now() + delay,
-            next_slot_at: OffsetDateTime::now_utc() + delay,
+            next_slot: now + delay,
+            next_slot_at: now_wall + delay,
             monitor,
             in_flight: false,
         }
@@ -76,6 +88,40 @@ impl Runtime {
         self.next_slot += self.monitor.interval;
         self.next_slot_at += self.monitor.interval;
     }
+}
+
+/// A monitor's phase: a fixed offset within its interval, derived from its id. Both halves
+/// of the id are mixed (`splitmix64`): a `UUIDv7` starts with a timestamp, so ids minted
+/// together share their high bits.
+fn phase(id: MonitorId, interval: Duration) -> Duration {
+    let interval_ms = u64::try_from(interval.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let (high, low) = id.0.as_u64_pair();
+    let mut x = high ^ low.rotate_left(29);
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    Duration::from_millis(x % interval_ms)
+}
+
+/// How long from `now` until the first grid point (`phase` mod `interval`, in Unix ms)
+/// that is at least `min_delay` away.
+fn delay_to_phase(
+    now: OffsetDateTime,
+    min_delay: Duration,
+    phase: Duration,
+    interval: Duration,
+) -> Duration {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let interval_ms = ms(interval).max(1);
+    let now_ms = u64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0);
+    let earliest = now_ms.saturating_add(ms(min_delay));
+    let into = earliest % interval_ms;
+    let phase_ms = ms(phase) % interval_ms;
+    let next = earliest - into + phase_ms + if phase_ms < into { interval_ms } else { 0 };
+    Duration::from_millis(next - now_ms)
 }
 
 /// What the coordinator hands to a spawned probe worker.
@@ -310,8 +356,8 @@ impl Plan {
     }
 }
 
-/// Rebuild runtimes from a new registry snapshot: new and changed monitors re-anchor one
-/// tick out (a fast first check, then the steady grid); removed and paused monitors stop
+/// Rebuild runtimes from a new registry snapshot: new and changed monitors re-anchor on
+/// their phase grid, at least one tick out (D-018); removed and paused monitors stop
 /// scheduling. A changed monitor's stale in-flight probe still completes — its generation
 /// mismatch makes the writer drop it.
 fn reconcile(
@@ -560,5 +606,49 @@ mod tests {
             db.list_checks(monitor.id, 500).await.expect("checks").len(),
             200
         );
+    }
+
+    /// `n` monitors of `interval`/`timeout`, created together, spread over `origins`
+    /// origins (so the per-origin bound is not what is under test).
+    fn fleet(n: usize, origins: usize, interval: Duration, timeout: Duration) -> Vec<Monitor> {
+        (0..n)
+            .map(|i| {
+                let url =
+                    Url::parse(&format!("http://o{}.example/health", i % origins)).expect("url");
+                let mut monitor = NewMonitor::new(format!("m{i}"), url)
+                    .expect("monitor")
+                    .into_monitor();
+                monitor.interval = interval;
+                monitor.timeout = timeout;
+                monitor
+            })
+            .collect()
+    }
+
+    /// Monitors created together used to share a phase: every one fell due on the same
+    /// tick, a wave the global bound could only partly start. Each monitor's slots now sit
+    /// at a deterministic offset (from its id) within its interval, so they spread evenly.
+    #[tokio::test(start_paused = true)]
+    async fn monitors_created_together_fall_due_spread_across_their_interval() {
+        let config = Config::default();
+        let interval = Duration::from_secs(15);
+        let monitors = fleet(1500, 300, interval, Duration::from_secs(3));
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config);
+        let mut per_second = vec![0_usize; 16];
+        let start = Instant::now();
+        for entry in runtimes.values() {
+            let offset = entry.next_slot.duration_since(start).as_secs();
+            per_second[usize::try_from(offset).unwrap_or(15).min(15)] += 1;
+        }
+        // 1500 over 15 s is 100 a second; allow sampling noise, never a wave.
+        let busiest = per_second.iter().copied().max().unwrap_or(0);
+        assert!(busiest <= 160, "a wave formed: {per_second:?}");
+        // Deterministic: the same id gets the same phase again (a restart, an edit).
+        let again = Runtime::new(monitors[0].clone(), config.tick);
+        let first = &runtimes[&monitors[0].id];
+        let drift = first.next_slot_at - again.next_slot_at;
+        assert!(drift.abs() < time::Duration::milliseconds(50), "{drift}");
     }
 }
