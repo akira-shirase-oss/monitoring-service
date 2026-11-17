@@ -392,8 +392,8 @@ async fn deliver_webhook(
     )
 }
 
-/// One plaintext message per event. The subject is sanitized of CR/LF so a monitor name can
-/// never inject a header line; `Message-ID` carries the `event_id` so a retry threads onto
+/// One plaintext message per event. The monitor name is made one line ([`one_line`]) in
+/// the subject and the body, so it can never inject a header or a line; `Message-ID` carries the `event_id` so a retry threads onto
 /// the same logical event at the receiver.
 async fn deliver_email(
     mailer: &AsyncSmtpTransport<Tokio1Executor>,
@@ -407,10 +407,7 @@ async fn deliver_email(
         message = message.to(recipient.clone());
     }
     let kind = row.kind.replace('_', " ");
-    let subject = format!(
-        "[service-monitor] {}: {kind}",
-        row.monitor_name.replace(['\r', '\n'], " ")
-    );
+    let subject = format!("[service-monitor] {}: {kind}", one_line(&row.monitor_name));
     let body = email_body(row, &kind);
     let message = match message
         .subject(subject)
@@ -432,12 +429,21 @@ async fn deliver_email(
     )
 }
 
+/// Operator text (a monitor name) as one line: every control character — CR and LF
+/// above all — becomes a space, so it can neither start a header in the Subject nor fake a
+/// line in the body.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn email_body(row: &DeliveryRow, kind: &str) -> String {
     use std::fmt::Write;
     let mut body = format!(
         "Service Monitor: {kind}\n\nEvent:    {}\nMonitor:  {} <{}>\nIncident: #{}\nOpened:   {}",
         row.event_id,
-        row.monitor_name,
+        one_line(&row.monitor_name),
         crate::redact::for_alert_str(&row.monitor_url),
         row.incident_id,
         row.opened_at

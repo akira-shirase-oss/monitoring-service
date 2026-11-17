@@ -264,3 +264,100 @@ async fn a_rejected_email_is_a_scheduled_retry() -> anyhow::Result<()> {
     task.await?;
     Ok(())
 }
+
+/// A monitor name is operator text that lands in the email's Subject header and body. One
+/// carrying CR/LF must stay one Subject line and one body line: no injected header (an
+/// extra `Bcc:` would silently copy every alert to a stranger), no extra recipient.
+#[tokio::test]
+async fn a_name_with_line_breaks_cannot_inject_a_header_or_a_line() -> anyhow::Result<()> {
+    let (db, writer) = rig().await?;
+    let name = "web\r\nBcc: attacker@example.net\nX-Injected: 1";
+    let monitor = NewMonitor::new(name, url::Url::parse("https://example.com")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+    for _ in 0..3 {
+        writer
+            .record(Observation {
+                monitor_id: monitor.id,
+                generation: monitor.generation,
+                slot_at: OffsetDateTime::now_utc(),
+                slot: SlotObservation::Probe(CheckOutcome::Transport),
+                http_status: None,
+                latency_ms: None,
+                detail: None,
+            })
+            .await?;
+    }
+    let (port, mut wire) = smtp_stub(0).await?;
+    let shutdown = CancellationToken::new();
+    let task = Deliverer::spawn(
+        db.clone(),
+        writer,
+        fast_config(),
+        email_sink(port)?,
+        shutdown.clone(),
+    );
+    let mut lines = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !lines.iter().any(|line: &String| line == ".") && std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), wire.recv()).await {
+            Ok(Some(line)) => lines.push(line),
+            _ => break,
+        }
+    }
+    shutdown.cancel();
+    task.await?;
+
+    let data = lines
+        .iter()
+        .position(|line| line.eq_ignore_ascii_case("DATA"))
+        .ok_or_else(|| anyhow::anyhow!("no DATA on the wire: {lines:?}"))?;
+    let message = &lines[data + 1..];
+    let blank = message
+        .iter()
+        .position(String::is_empty)
+        .ok_or_else(|| anyhow::anyhow!("no header/body separator: {message:?}"))?;
+    let (headers, body) = message.split_at(blank);
+    let header_names: Vec<&str> = headers
+        .iter()
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+        .collect();
+    for injected in ["Bcc", "X-Injected"] {
+        assert!(
+            !header_names
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(injected)),
+            "{injected} header injected: {headers:?}"
+        );
+    }
+    assert_eq!(
+        header_names
+            .iter()
+            .filter(|h| h.eq_ignore_ascii_case("Subject"))
+            .count(),
+        1
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("attacker@example.net")
+                && line.to_ascii_uppercase().starts_with("RCPT")),
+        "no extra recipient: {lines:?}"
+    );
+    // The body names the monitor on one line too.
+    let monitor_line = body
+        .iter()
+        .find(|line| line.starts_with("Monitor:"))
+        .ok_or_else(|| anyhow::anyhow!("no Monitor line: {body:?}"))?;
+    assert!(
+        monitor_line.contains("Bcc: attacker@example.net") && monitor_line.contains("X-Injected"),
+        "the whole name stays on the Monitor line: {body:?}"
+    );
+    assert!(
+        !body
+            .iter()
+            .any(|line| line.starts_with("Bcc:") || line.starts_with("X-Injected")),
+        "no line of the body starts with the injected text: {body:?}"
+    );
+    Ok(())
+}
