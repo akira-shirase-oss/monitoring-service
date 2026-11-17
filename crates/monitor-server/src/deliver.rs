@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lettre::message::{Mailbox, header};
 use lettre::transport::smtp::AsyncSmtpTransport;
 use lettre::{AsyncTransport, Message, Tokio1Executor};
@@ -548,6 +548,18 @@ mod tests {
         assert_eq!(parsed["monitor"]["name"], "fixture");
         assert_eq!(parsed["incident"]["id"], 7);
         assert!(parsed["incident"]["resolved_at"].is_null());
+    }
+
+    /// Known answer, RFC 4231 test case 2: what every receiver verifies against. Pinned so
+    /// a crate upgrade (hmac, sha2) can never change a signature silently.
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        let mut mac = HmacSha256::new_from_slice(b"Jefe").expect("key");
+        mac.update(b"what do ya want for nothing?");
+        assert_eq!(
+            hex_lower(&mac.finalize().into_bytes()),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
     }
 
     #[test]

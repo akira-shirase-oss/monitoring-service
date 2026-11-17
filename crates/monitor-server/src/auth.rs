@@ -386,6 +386,16 @@ mod tests {
         assert_eq!(session_cookie(None), None);
     }
 
+    /// Known answer (computed independently with Python's hashlib): a sha2 upgrade that
+    /// changed this would sign every dashboard user out.
+    #[test]
+    fn a_session_key_has_a_fixed_known_value() {
+        assert_eq!(
+            session_key("token-a", "cookie-id"),
+            "a5bc5ec481ea1ded6473443e073ea2fd423d4829b600bf00bcb1175f3737835c"
+        );
+    }
+
     #[test]
     fn a_session_key_is_one_way_and_bound_to_the_token() {
         let key = session_key("token-a", "cookie-id");
