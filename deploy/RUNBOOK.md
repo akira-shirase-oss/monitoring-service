@@ -23,12 +23,20 @@ rolling back the binary cannot roll back evidence.
 
 ## Install
 
+**Direct egress is required.** Probes and alerts dial their targets and receivers directly
+and ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (a proxied probe would bypass the SSRF
+guard). On a network that only allows egress through a proxy, every probe fails `connect`
+(every monitor opens an incident) and no alert can leave.
+
 ```sh
 scripts/deploy.sh --prefix /opt/smon            # builds --release, installs, links
 $EDITOR /opt/smon/env                            # at minimum SMON_DATABASE_URL, SMON_STATUS_DIR
 
 # systemd — the unit runs as the unprivileged system user `smon`, never root
 sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
+# Create the store once (D-015: a normal start refuses a missing or empty store, so a
+# volume that isn't mounted yet can never be mistaken for a new install):
+sudo sh -c 'set -a; . /opt/smon/env; set +a; exec /opt/smon/current/bin/monitor-server --init'
 sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # the only paths it writes
 sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env  # systemd reads it as root
 sudo cp deploy/monitor-server.service /etc/systemd/system/
@@ -44,6 +52,10 @@ If the unit fails to start, read its log first: an invalid or blank `SMON_*` val
 the boot with every problem listed (`invalid configuration (N problem(s)): …`) — the
 server never runs on a silently substituted default.
 
+If the log says `no store at …`: the data volume is not mounted (check `findmnt
+/opt/smon/data`), or this is a new install that skipped `--init`. Never run `--init` to
+"fix" a store that should exist — mount the volume instead.
+
 Verify: `curl -sf $SMON_LISTEN/readyz` → `{"status":"ready"}` and
 `curl -sf $SMON_LISTEN/version` → the expected release. `/readyz` answers 200 with
 `{"status":"degraded","faults":[…]}` when checks run but a supporting duty has stopped
@@ -53,19 +65,21 @@ the cause in `faults` (D-011): `store writes failing (N consecutive)` means the 
 `coordinator …` means the monitor is not observing (statuses read `unknown`) — the
 process then writes one "monitoring unavailable" beat and exits non-zero on its own, and
 the service manager restarts it (D-011; a coordinator stalled for 2 minutes does the
-same); repeated restarts mean the log's task error needs fixing. After 5 starts in 10
-minutes systemd stops trying and the unit is `failed` (`start request repeated too
-quickly`): fix the cause, then `sudo systemctl reset-failed monitor-server && sudo
-systemctl start monitor-server`; `degraded` with a deliverer, snapshot or retention
+same); repeated restarts mean the log's task error needs fixing. Restarts back off from
+15 s to 10 minutes (systemd ≥ 254), so a slow dependency recovers on its own and a crash
+loop never hammers. On older systemd (fixed 15 s) 10 starts within 30 minutes leave the
+unit `failed` (`start request repeated too quickly`): fix the cause, then `sudo systemctl
+reset-failed monitor-server && sudo systemctl start monitor-server`. The unit also waits
+for the mounts of `data/` and `status/` (`RequiresMountsFor`); `degraded` with a deliverer, snapshot or retention
 fault means checks still run but that duty has stopped.
 
 ### The store is at its cap (`SMON_MAX_DB_BYTES`)
 
 `/readyz` answers `store writes failing` and the log shows `database or disk is full`.
 The retention pass (every `SMON_RETENTION_INTERVAL_S`, default hourly) can run at the
-cap: it deletes expired rows before writing their daily summaries, and its own
-transaction may use up to 256 pages (1 MiB at 4 KiB pages) past the cap for those
-summaries. Observation commits land again only once that pass has freed room for them —
+cap: it deletes expired rows before writing their daily summaries, and may use up to
+256 pages (1 MiB at 4 KiB pages) past the cap for those summaries — in total, across all
+passes, not per pass. Observation commits land again only once that pass has freed room for them —
 which happens when the expired rows filled whole pages. If the store is full of
 evidence that has not expired yet (or the expired slice is too thin to free a page),
 retention cannot make room for new checks: raise `SMON_MAX_DB_BYTES` (or shorten the

@@ -76,5 +76,5 @@ installed $RELEASE → $DEST
   current → $PREFIX/current
   env     → $PREFIX/env  (edit SMON_* before starting)
 data lives in $PREFIX/data (outside releases — upgrades and rollbacks don't touch it)
-next: create the smon system user, then install deploy/monitor-server.service (see deploy/RUNBOOK.md)
+next: create the smon user, run 'monitor-server --init' once for a new store, then install deploy/monitor-server.service (deploy/RUNBOOK.md)
 DONE

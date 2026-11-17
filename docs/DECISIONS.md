@@ -2,6 +2,23 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-015 — A normal start requires an existing store; only `--init` creates one
+
+The store is meant to live on its own volume (the SaaS droplet uses a DigitalOcean volume).
+If the server starts before that volume is mounted, `/opt/smon/data` is just the bare
+mountpoint directory, and `create_if_missing` used to create a fresh, empty store there:
+the monitor booted "healthy" with no monitors and no history, and wrote new evidence onto
+the root disk, hidden under the volume once it mounted.
+
+`monitor-server` (no arguments) now opens the store without creating it and refuses to
+boot if the file is missing or has no tables, naming the path and the likely cause (the
+volume is not mounted). `monitor-server --init` is the only way to create a store: it
+creates and migrates it, then exits without serving — the install step (RUNBOOK) and the
+first step of every harness that starts from scratch. `--version` prints the version;
+any other argument is a usage error (exit 2), so a mistyped flag never starts a server
+with default settings. The unit's `RequiresMountsFor=` covers the ordering; this covers
+a mount that is configured differently, or not at all.
+
 ## D-014 — Downtime is one stored `missed` row per monitor
 
 D-007 made every slot a stored row so rebuilds replay gaps as gaps — but slots that
@@ -66,7 +83,9 @@ out. A pass is a series of bounded transactions through the single writer (at mo
 outbox rows first (FK), and every delete runs before the aggregates are written (the
 expiring rows wait in a `TEMP` table), and its transaction may allocate up to 256 pages
 past the cap for the summaries (restored on the same connection afterwards), so a pass
-can run in a store already at `SMON_MAX_DB_BYTES`. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
+can run in a store already at `SMON_MAX_DB_BYTES`. The 256 pages are an absolute
+allowance above the cap (`max(cap + 256, size)`), not 256 more on every pass, so the
+effective cap cannot ratchet upward. The cap is one conditional `INSERT … WHERE COUNT(*) < cap`, so
 concurrent creates cannot overshoot it; paused monitors count (they keep history).
 
 ## D-011 — One engine verdict: a monitor that is not observing serves `unknown`
@@ -108,9 +127,14 @@ serving stops, one born-expired `monitoring: unavailable` beat is written at onc
 engine drains, and the process exits non-zero, so systemd `Restart=on-failure` or launchd
 `KeepAlive` restarts it and the boot records the gap (D-014). A coordinator that is alive
 but makes no loop pass for 2 minutes (4 × the 30 s stall threshold) is treated the same
-way — a stall that long will not clear by itself. Supporting tasks stay *degraded*, with
-no exit. The systemd unit's start limit (5 starts in 10 minutes) turns a deterministic
-crash into a visible `failed` unit rather than an endless 3-second loop. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
+way — a stall that long will not clear by itself. A freeze of the whole process
+(SIGSTOP, a VM pause) is not a stall: when the watchdog's own previous check is more than
+the limit ago, it skips that round and lets the coordinator make its first pass. Supporting tasks stay *degraded*, with
+no exit. The systemd unit backs restarts off from 15 s to 10 minutes (`RestartSteps`,
+systemd ≥ 254) under a start limit of 10 in 30 minutes that a backed-off loop never
+reaches: a slow dependency (a late volume) is retried until it appears, and a
+deterministic crash is spaced out instead of looping every few seconds. Older systemd
+keeps the fixed 15 s and leaves the unit `failed` after ~2.5 minutes of failures. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
 and `a_supporting_task_stopping_keeps_serving`.
 
 ## D-010 — Certificate trust is deterministic: webpki-roots, never the local store

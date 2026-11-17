@@ -171,3 +171,79 @@ fn the_unit_stops_restarting_a_crash_loop() {
         "{burst} starts in {interval}s"
     );
 }
+
+fn seconds(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Some(minutes) = value.strip_suffix("min") {
+        return minutes.trim().parse::<u64>().ok().map(|m| m * 60);
+    }
+    value.trim_end_matches('s').parse().ok()
+}
+
+/// The store lives on a volume that may attach after boot. Without a mount dependency the
+/// unit starts against the bare mountpoint (226/NAMESPACE from `ReadWritePaths`, or an empty
+/// directory) and fails.
+#[test]
+fn the_unit_waits_for_the_data_and_status_mounts() {
+    let mounts = unit_setting("RequiresMountsFor").expect("[Unit] must set RequiresMountsFor");
+    for path in ["/opt/smon/data", "/opt/smon/status"] {
+        assert!(
+            mounts.split_whitespace().any(|m| m == path),
+            "RequiresMountsFor lacks {path}"
+        );
+    }
+}
+
+/// Restarts back off, and the start limit is out of reach of a backed-off loop: a slow
+/// dependency keeps being retried (no permanent `failed` after ~20 s, which is what 5
+/// starts in 600 s at `RestartSec=3s` produced), while a crash loop is spaced out to
+/// `RestartMaxDelaySec` instead of hammering every few seconds. On systemd < 254, which
+/// ignores `RestartSteps`/`RestartMaxDelaySec`, the fixed `RestartSec` still takes minutes
+/// to reach the limit.
+#[test]
+fn restarts_back_off_and_a_slow_dependency_is_retried() {
+    let restart = service_setting("RestartSec")
+        .and_then(seconds)
+        .expect("RestartSec");
+    let steps: u64 = service_setting("RestartSteps")
+        .and_then(|value| value.parse().ok())
+        .expect("RestartSteps");
+    let max_delay = service_setting("RestartMaxDelaySec")
+        .and_then(seconds)
+        .expect("RestartMaxDelaySec");
+    let interval = unit_setting("StartLimitIntervalSec")
+        .and_then(seconds)
+        .expect("interval");
+    let burst: u64 = unit_setting("StartLimitBurst")
+        .and_then(|value| value.parse().ok())
+        .expect("burst");
+    assert!(restart >= 10, "RestartSec={restart}s retries too fast");
+    assert!(
+        steps >= 3 && max_delay >= 300,
+        "backoff {steps} steps to {max_delay}s"
+    );
+    assert!(
+        max_delay * burst > interval,
+        "at the backed-off delay a crash loop must never reach the start limit"
+    );
+    assert!(
+        restart * burst >= 120,
+        "without backoff support the limit must still take minutes, not {}s",
+        restart * burst
+    );
+}
+
+/// Probes and alerts ignore proxy variables (round-3 hardening). On a proxy-only network
+/// every probe fails `connect` and no alert leaves — the install section must say so.
+#[test]
+fn the_runbook_install_says_egress_must_be_direct() {
+    let install = RUNBOOK
+        .split("## Install")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("RUNBOOK has an Install section");
+    assert!(
+        install.contains("HTTP_PROXY") && install.contains("direct"),
+        "Install must state that egress is direct and proxy variables are ignored"
+    );
+}

@@ -27,6 +27,56 @@ use tracing_subscriber::EnvFilter;
 /// Writer channel depth: the coordinator parks behind a full queue instead of dropping
 /// evidence — a bounded queue is the honest backpressure point.
 const WRITER_BOUND: usize = 64;
+/// What this process was started to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Serve,
+    Init,
+}
+
+/// Arguments: none to serve; `--init` to create the store of a new install (D-015);
+/// `--version`. Anything else is a usage error (exit 2) — never a server started by
+/// accident with default settings.
+fn parse_mode() -> Result<Mode, std::process::ExitCode> {
+    match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => Ok(Mode::Serve),
+        [flag] if flag == "--init" => Ok(Mode::Init),
+        [flag] if flag == "--version" || flag == "-V" => {
+            println!("monitor-server {}", env!("CARGO_PKG_VERSION"));
+            Err(std::process::ExitCode::SUCCESS)
+        }
+        other => {
+            eprintln!(
+                "monitor-server: unknown arguments {other:?}\n\
+                 usage: monitor-server            serve (the store must exist)\n       \
+                 monitor-server --init     create and migrate the store of a new install, then exit\n       \
+                 monitor-server --version"
+            );
+            Err(std::process::ExitCode::from(2))
+        }
+    }
+}
+
+/// D-015: a normal start requires the store — a missing or empty one usually means the
+/// data volume isn't mounted, not that history should start over. Only `--init` creates
+/// one; it migrates and returns `None` (nothing to serve). The size ceiling applies to
+/// every pooled connection either way (M4.2).
+async fn open_store(config: &Config, mode: Mode) -> anyhow::Result<Option<monitor_db::Db>> {
+    let cap = Some(config.max_db_bytes);
+    let db = match mode {
+        Mode::Init => monitor_db::Db::connect_opts(&config.database_url, 4, cap).await?,
+        Mode::Serve => monitor_db::Db::connect_existing(&config.database_url, 4, cap).await?,
+    };
+    db.migrate().await?;
+    if mode == Mode::Init {
+        tracing::info!(database = %redact_sqlite(&config.database_url), "store ready");
+        println!("store ready: {}", redact_sqlite(&config.database_url));
+        db.close().await;
+        return Ok(None);
+    }
+    Ok(Some(db))
+}
+
 /// A coordinator that makes no loop pass for this long is stalled: its statuses are frozen,
 /// so the engine reports unavailable. The loop ticks every second when healthy.
 const COORDINATOR_STALL: Duration = Duration::from_secs(30);
@@ -41,17 +91,16 @@ const ENGINE_DRAIN: Duration = Duration::from_secs(15);
 const HTTP_DRAIN: Duration = Duration::from_secs(12);
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<std::process::ExitCode> {
+    let mode = match parse_mode() {
+        Ok(mode) => mode,
+        Err(exit) => return Ok(exit),
+    };
+
     // Configuration first, before logging or any work: every invalid `SMON_*` value is
     // reported at once and the boot stops (defaults: `config.rs`, README).
     let config = Config::from_env().context("loading SMON_* configuration")?;
     init_logging(&config)?;
-    let unknown = Config::unknown_keys(
-        std::env::vars_os().map(|(key, _)| key.to_string_lossy().into_owned()),
-    );
-    if !unknown.is_empty() {
-        tracing::warn!(?unknown, "SMON_* variables nothing reads (typo?)");
-    }
 
     // Management auth (M5.1): a token guards /api. Without one the server is dev-mode —
     // allowed on loopback only, and loudly, never quietly on a public bind. Resolved
@@ -59,11 +108,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = config.listen;
     let admin_token = resolve_admin_token(&addr, config.admin_token.as_deref())?;
 
-    // Storage guardrail (M4.2): the database is bounded — writes past the ceiling fail
-    // cleanly instead of silently eating the disk.
-    let db =
-        monitor_db::Db::connect_opts(&config.database_url, 4, Some(config.max_db_bytes)).await?;
-    db.migrate().await?;
+    let Some(db) = open_store(&config, mode).await? else {
+        return Ok(std::process::ExitCode::SUCCESS); // `--init` done
+    };
 
     // Boot rebuild: streaks and incidents come back from the store, never from memory.
     let monitors = load_registry(&db)
@@ -177,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         &config,
     )
     .await
+    .map(|()| std::process::ExitCode::SUCCESS)
 }
 
 /// After serving stops: on an engine failure, one honest "monitoring unavailable" beat
@@ -322,6 +370,13 @@ fn init_logging(config: &Config) -> anyhow::Result<()> {
                 .json()
                 .init();
         }
+    }
+    // Typos in variable names can't be validated, only noticed.
+    let unknown = Config::unknown_keys(
+        std::env::vars_os().map(|(key, _)| key.to_string_lossy().into_owned()),
+    );
+    if !unknown.is_empty() {
+        tracing::warn!(?unknown, "SMON_* variables nothing reads (typo?)");
     }
     Ok(())
 }

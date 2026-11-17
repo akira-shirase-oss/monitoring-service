@@ -25,10 +25,16 @@ const WORKERS = 8;
 try {
 	mkdirSync(OUT_DIR, { recursive: true });
 	run('node', [`${ROOT}/fixtures/fault-server.mjs`, String(FIXTURE_PORT)]);
-	run(`${ROOT}/target/debug/monitor-server`, [], {
+	// D-015: a normal start needs an existing store — create this run's fresh one first.
+	const serverEnv = {
 		SMON_PROFILE: 'lab', SMON_DATABASE_URL: `sqlite:${DB}`, SMON_LISTEN: `127.0.0.1:${SERVER_PORT}`,
 		SMON_ADMIN_TOKEN: TOKEN, SMON_LOG_FILE: LOG, RUST_LOG: 'monitor_server=info',
+	};
+	execFileSync(`${ROOT}/target/debug/monitor-server`, ['--init'], {
+		env: { ...process.env, ...serverEnv },
+		stdio: 'ignore',
 	});
+	run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
 	for (let i = 0; i < 50; i++) { try { if ((await fetch(`${BASE}/livez`)).ok) break; } catch {} await sleep(200); }
 
 	// A live monitor on its own origin — churn must never starve its slots.

@@ -104,6 +104,7 @@ export PATH="$(brew --prefix rustup)/bin:$PATH"
 cargo build --release -p monitor-server -p monitor-cli
 npm run build --workspace @service-monitor/dashboard
 scripts/deploy.sh --prefix /opt/smon        # releases/<sha>/bin + current symlink
+# a new install creates its store once: monitor-server --init (RUNBOOK, Install)
 # edit /opt/smon/env, then install deploy/monitor-server.service (systemd) or
 # deploy/com.shirase.smon.plist (launchd); see deploy/RUNBOOK.md
 ```

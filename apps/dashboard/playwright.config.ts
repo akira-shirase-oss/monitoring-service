@@ -31,7 +31,8 @@ export default defineConfig({
 			timeout: 15_000
 		},
 		{
-			command: `${repo}target/debug/monitor-server`,
+			// D-015: a normal start needs an existing store — create the run's fresh one first.
+			command: `sh -c '"${repo}target/debug/monitor-server" --init && exec "${repo}target/debug/monitor-server"'`,
 			env: {
 				SMON_DATABASE_URL: database,
 				SMON_LISTEN: `127.0.0.1:${SERVER_PORT}`,
