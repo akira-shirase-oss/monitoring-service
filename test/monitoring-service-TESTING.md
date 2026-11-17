@@ -135,7 +135,10 @@ monitor maintenance add|list|rm
 
 - On loopback with no token, `/api` is open (dev mode). Set `SMON_ADMIN_TOKEN` and confirm a missing/wrong bearer is denied (CLI exit 4) — on every `/api` route and method, not just `GET /api/monitors` (`tests/auth_inventory.rs` walks them all).
 - Binding a non-loopback address without `SMON_ADMIN_TOKEN` should refuse to boot and bind nothing.
-- Many parallel wrong `POST /api/login` calls: at most four are evaluated at once; the rest get 429 with `Retry-After`. The right token still works afterwards.
+- Many parallel wrong `POST /api/login` calls (or wrong `Authorization: Bearer` calls) from one address: five are evaluated, the rest get 429 with `Retry-After`, one more every 2 s. The owner's right token from another address is never refused. Behind a proxy set `SMON_TRUSTED_PROXY`, or every client shares the proxy's budget.
+- Without `SMON_ADMIN_TOKEN` (dev mode) a non-loopback `Host` (a DNS-rebound page) gets 403, and a cross-site `Origin` gets 403.
+- A request whose header never finishes, and an idle keep-alive, are closed after 10 s; past `SMON_MAX_CONNECTIONS` new connections wait (`perf/connections.mjs`).
+- A store failure answers fixed text (`internal error`, `/readyz` → 503 `store unavailable`), never SQLite's message.
 - A login body over 16 KiB gets 413 (even with the right token inside it); a request whose body never finishes gets 408 after 10 s.
 - Sign in on the dashboard, then restart the server with a different `SMON_ADMIN_TOKEN`: the old session cookie must get 401. A session left unused for `SMON_SESSION_IDLE_S` ends too. The `sessions` table (and any backup) holds digests, never the cookie's value.
 - `POST /api/backup` onto an existing file is 422 and leaves it alone; a new backup file is mode 0600.

@@ -40,9 +40,13 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `expires_at` is the authority — the cookie's Max-Age is a browser hint. The token
   itself never lands in browser storage; it can be rotated without stranding copies.
   `POST /api/logout` deletes the row and expires the cookie — idempotent. A wrong
-  token gets a fixed ~300 ms delay + 401 (no lockout state to game), paid while holding
-  one of four login slots: a fifth login in flight gets 429 + `Retry-After: 1` before the
-  token is compared. The row is keyed by a token-bound digest of the cookie's id, never
+  token gets 401 after a ~300 ms courtesy delay (at most 16 sleeping at once). Every
+  presented credential — a login or a bearer — first takes a token from its client
+  address's bucket (`throttle.rs`: IPv4, or IPv6 by /64; 5 back to back, one more every
+  2 s; the right credential gives it back), so a throttled address gets 429 +
+  `Retry-After` before the token is compared and one client's flood never locks another
+  out. Behind a proxy, `SMON_TRUSTED_PROXY` names it so the right-most
+  `X-Forwarded-For` entry is the client. The row is keyed by a token-bound digest of the cookie's id, never
   the id (D-016): rotating the token ends every session, and a session unused for
   `SMON_SESSION_IDLE_S` (default 3600) ends too. A session-store
   failure answers 503, never a false 401. With no admin token configured, login
