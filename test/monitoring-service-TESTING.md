@@ -139,7 +139,7 @@ monitor maintenance add|list|rm
 - A login body over 16 KiB gets 413 (even with the right token inside it); a request whose body never finishes gets 408 after 10 s.
 - Sign in on the dashboard, then restart the server with a different `SMON_ADMIN_TOKEN`: the old session cookie must get 401. A session left unused for `SMON_SESSION_IDLE_S` ends too. The `sessions` table (and any backup) holds digests, never the cookie's value.
 - `POST /api/backup` onto an existing file is 422 and leaves it alone; a new backup file is mode 0600.
-- Responses carry `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`; framing the dashboard should be refused by the browser.
+- Responses carry `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: same-origin`; framing the dashboard should be refused by the browser.
 - A webhook receiver that answers 307 to somewhere else: the alert is not re-sent there, and the outbox row stays pending.
 
 ## How to report a bug

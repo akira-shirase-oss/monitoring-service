@@ -1,8 +1,8 @@
 //! Browser-facing hardening, against the real binary serving a dashboard build: every
 //! response — dashboard pages, the SPA fallback, the API and the public snapshot — carries
 //! a Content-Security-Policy that allows only this origin's scripts plus the build's own
-//! inline bootstrap (by hash, never `'unsafe-inline'`), refuses framing, and turns off
-//! MIME sniffing and referrers. And the public status page builds its rows as text, never
+//! inline bootstrap (by hash, never `'unsafe-inline'`), refuses framing, turns off MIME
+//! sniffing and sends no referrer to other origins. And the public status page builds its rows as text, never
 //! as HTML, under a CSP of its own.
 
 use std::io::BufRead;
@@ -159,7 +159,7 @@ async fn every_response_carries_the_csp_and_hardening_headers() -> anyhow::Resul
         }
         assert_eq!(header("x-content-type-options"), "nosniff", "{path}");
         assert_eq!(header("x-frame-options"), "DENY", "{path}");
-        assert_eq!(header("referrer-policy"), "no-referrer", "{path}");
+        assert_eq!(header("referrer-policy"), "same-origin", "{path}");
     }
     Ok(())
 }

@@ -52,7 +52,7 @@ run; what exists is what the commits show. Highlights:
   with atomic swaps, the public status rendered in-app, and a guide page whose
   words are drift-checked against the real wire vocabulary in both directions.
   Every response carries a CSP (scripts from this origin plus the build's inline
-  bootstrap by hash, no framing), `nosniff` and `no-referrer`.
+  bootstrap by hash, no framing), `nosniff` and `Referrer-Policy: same-origin`.
 - **Public status:** self-expiring `status.json` heartbeat + static renderer +
   independent checker — an expired snapshot reads "monitoring unavailable," never
   "all down."

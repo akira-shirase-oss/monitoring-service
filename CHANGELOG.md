@@ -23,7 +23,7 @@
   (the Subject already did).
 - **Every response carries a Content-Security-Policy** (scripts from this origin plus the
   dashboard build's inline bootstrap by hash; no framing), `X-Content-Type-Options:
-  nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. A dashboard
+  nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: same-origin` (no referrer leaves the origin). A dashboard
   served from another build is hashed at boot. The public status page builds its rows as
   text and carries its own CSP: editing its script means updating the pinned hash
   (`cargo test -p monitor-server --test headers` prints it).

@@ -7,7 +7,10 @@
 //!   framing (`frame-ancestors 'none'`). Styles keep `'unsafe-inline'`: the build sets
 //!   inline `style` attributes, and a style can't run code.
 //! - `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` (older browsers),
-//!   `Referrer-Policy: no-referrer`.
+//!   `Referrer-Policy: same-origin` — no referrer leaves the origin. Not `no-referrer`:
+//!   under it the Fetch spec sends `Origin: null` on same-origin POSTs, and cookie-authed
+//!   writes must carry a matching `Origin` (auth.rs) — Chromium keeps the real one,
+//!   stricter browsers would not.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -146,7 +149,7 @@ async fn add_headers(State(csp): State<HeaderValue>, mut response: Response) -> 
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     response
 }
