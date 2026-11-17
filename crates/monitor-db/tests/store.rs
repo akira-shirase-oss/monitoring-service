@@ -1472,3 +1472,41 @@ async fn a_backup_path_with_quotes_writes_exactly_that_file() -> anyhow::Result<
     assert!(db.list_monitors().await.is_ok(), "the store is intact");
     Ok(())
 }
+
+/// L6: a store created before stores were owner-only (or copied in with `cp`) kept its old
+/// mode — `-rw-r--r--` for the store, its `-wal` and `-shm` after the upgrade — and the
+/// RUSTSEC-2026-0459 assessment relies on owner-only files. Opening a store now tightens
+/// it and its sidecars to 0600.
+#[cfg(unix)]
+#[tokio::test]
+async fn opening_an_existing_store_makes_it_and_its_sidecars_owner_only() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("old.db");
+    let url = format!("sqlite:{}", path.display());
+    {
+        let db = Db::connect(&url, 1).await?;
+        db.migrate().await?;
+        let monitor =
+            NewMonitor::new("old", url::Url::parse("https://example.com/")?)?.into_monitor();
+        db.insert_monitor(&monitor).await?;
+        db.close().await;
+    }
+    let files: Vec<_> = ["old.db", "old.db-wal", "old.db-shm"]
+        .iter()
+        .map(|name| tmp.path().join(name))
+        .collect();
+    for file in &files {
+        if !file.exists() {
+            std::fs::write(file, b"")?; // a sidecar left beside it
+        }
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644))?;
+    }
+    let db = Db::connect_existing(&url, 1, None).await?;
+    for file in &files {
+        let mode = std::fs::metadata(file)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}", file.display());
+    }
+    assert_eq!(db.list_monitors().await?.len(), 1, "the store is untouched");
+    Ok(())
+}

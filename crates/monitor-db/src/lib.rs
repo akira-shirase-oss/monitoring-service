@@ -213,6 +213,46 @@ async fn create_owner_only(path: std::path::PathBuf) -> Result<(), DbError> {
     .map_err(DbError::from)
 }
 
+/// Make an existing store and its `-wal`/`-shm` owner-only (0600) when they are readable
+/// or writable by anyone else — a store from before stores were created 0600, or copied in
+/// by hand. Logs each file it tightens; a file that can't be changed is logged, not fatal
+/// (the boot still reports what it serves from).
+#[cfg(unix)]
+async fn tighten_owner_only(path: std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut sidecars = [path.clone(), path.clone(), path];
+        sidecars[1].as_mut_os_string().push("-wal");
+        sidecars[2].as_mut_os_string().push("-shm");
+        for file in &sidecars {
+            let Ok(meta) = std::fs::metadata(file) else {
+                continue; // not there: nothing to tighten
+            };
+            let mode = meta.permissions().mode() & 0o777;
+            let group_or_other = mode & 0o077;
+            if group_or_other == 0 {
+                continue;
+            }
+            match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => tracing::warn!(
+                    file = %file.display(),
+                    was = format!("{mode:o}"),
+                    "store file was readable by others; made it owner-only (0600)"
+                ),
+                Err(error) => tracing::error!(
+                    file = %file.display(),
+                    %error,
+                    "store file is readable by others and could not be made owner-only"
+                ),
+            }
+        }
+    })
+    .await;
+}
+
+#[cfg(not(unix))]
+async fn tighten_owner_only(_path: std::path::PathBuf) {}
+
 /// A handle to the monitor's SQLite store.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -292,8 +332,13 @@ impl Db {
         // sqlx renames an in-memory database to a shared-cache `file:` name — decide from
         // the URL the caller wrote, never from that name.
         let in_memory = url.contains(":memory:") || url.contains("mode=memory");
-        if create && !in_memory {
-            create_owner_only(options.get_filename().to_path_buf()).await?;
+        if !in_memory {
+            let path = options.get_filename().to_path_buf();
+            if create {
+                create_owner_only(path.clone()).await?;
+            }
+            // Before SQLite opens it: sidecars it creates later take the store's mode.
+            tighten_owner_only(path).await;
         }
         let mut pool = SqlitePoolOptions::new().max_connections(max_connections);
         if let Some(bytes) = max_db_bytes {

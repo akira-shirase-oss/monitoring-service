@@ -151,6 +151,9 @@ curl -sf .../readyz && curl -sf .../version     # the version must match the new
 sessions are dropped once — sign in again. After that, rotating `SMON_ADMIN_TOKEN` (edit
 `env`, restart) ends every dashboard session, and sessions unused for
 `SMON_SESSION_IDLE_S` (default 1 h) end on their own. Backup targets must be new paths.
+The store, its `-wal` and `-shm` are made owner-only (0600) when the server opens them, and
+logged when they weren't; make the directory private too, once:
+`sudo chmod 700 /opt/smon/data && sudo chmod 600 /opt/smon/data/monitor.db*`.
 
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
 `down`, never fabricates a recovery. If the monitor was down for longer than a check
