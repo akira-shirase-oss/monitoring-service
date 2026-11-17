@@ -148,6 +148,9 @@ email channel; a partial set fails the boot.
 `SMON_MAX_CONNECTIONS` — HTTP connections served at once (default 1024; keep it well below
 the file-descriptor limit). Past it new connections wait in the backlog. A request header
 must arrive within 10 s, and an idle keep-alive connection is closed after 10 s.
+`SMON_WRITE_STALL_MS` — a response write that makes no progress this long closes the
+connection (default 10000), so a client that never reads can't hold a slot. A connection is
+also closed after 1000 requests or 5 minutes, after its current response.
 `SMON_TRUSTED_PROXY` — the reverse proxy's IP address. Failed credentials (login or bearer)
 are throttled per client address — five back to back, then one every 2 s; a right token
 costs nothing — and behind a proxy every client shares its address unless this names it

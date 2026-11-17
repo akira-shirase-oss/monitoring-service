@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Final-check follow-ups (2026-11-16)
+
+- **A client that never reads loses its connection:** a response write (or flush) that
+  makes no progress for `SMON_WRITE_STALL_MS` (default 10 s) closes it, and every
+  connection closes after 1000 requests or 5 minutes, after its current response —
+  pipelining can't keep one busy for ever.
+- **`SMON_TRUSTED_PROXY`:** only the proxy's own right-most `X-Forwarded-For` hop is
+  believed; if it doesn't parse, the client is the peer, never a client-written entry.
+
 ### Security review follow-ups (2026-11-16, second round) — behaviour changes
 
 - **Failed credentials are throttled per client address, not globally.** Every login or

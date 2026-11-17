@@ -30,7 +30,11 @@ async fn rig() -> anyhow::Result<Rig> {
 }
 
 fn app() -> Router {
-    Router::new().route("/livez", get(|| async { "alive" }))
+    Router::new()
+        .route("/livez", get(|| async { "alive" }))
+        // A response far larger than the socket buffers: a client that doesn't read it
+        // leaves the server's write pending.
+        .route("/big", get(|| async { vec![b'x'; 4 * 1024 * 1024] }))
 }
 
 #[tokio::test]
@@ -256,6 +260,7 @@ async fn a_slow_header_and_an_idle_keep_alive_are_closed_and_the_cap_holds() -> 
     let limits = Limits {
         header_read_timeout: Duration::from_millis(500),
         max_connections: 2,
+        ..Limits::default()
     };
     let (addr, _stop) = serving(limits).await?;
 
@@ -302,5 +307,100 @@ async fn a_slow_header_and_an_idle_keep_alive_are_closed_and_the_cap_holds() -> 
     .await?;
     assert!(received.starts_with("HTTP/1.1 200"), "{received}");
     drop(holders);
+    Ok(())
+}
+
+/// W1: a response write had no deadline. Clients that pipeline requests and never read
+/// kept their connections — and every slot under the cap — for as long as they liked, so
+/// nobody else was served. A write that makes no progress for `write_stall` now closes the
+/// connection.
+#[tokio::test]
+async fn a_client_that_never_reads_loses_its_slot_after_the_write_stall() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let limits = Limits {
+        header_read_timeout: Duration::from_secs(5),
+        max_connections: 2,
+        write_stall: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (addr, _stop) = serving(limits).await?;
+    let mut stallers = Vec::new();
+    for _ in 0..2 {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream
+            .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\nGET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await?;
+        stallers.push(stream); // never read
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (received, _) = closed_within(
+        addr,
+        b"GET /livez HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(
+        received.starts_with("HTTP/1.1 200"),
+        "two non-reading clients still hold every slot: {received:?}"
+    );
+    drop(stallers);
+    Ok(())
+}
+
+/// W1: pipelining kept one connection busy without stalling a write — so the stall
+/// deadline alone isn't enough. A connection is closed after `max_requests_per_connection`.
+#[tokio::test]
+async fn a_connection_is_closed_after_its_request_cap() -> anyhow::Result<()> {
+    let limits = Limits {
+        max_requests_per_connection: 5,
+        ..Limits::default()
+    };
+    let (addr, _stop) = serving(limits).await?;
+    let burst = "GET /livez HTTP/1.1\r\nHost: x\r\n\r\n".repeat(20);
+    let (received, closed) = closed_within(addr, burst.as_bytes(), Duration::from_secs(3)).await?;
+    assert!(closed, "the connection stays open past its request cap");
+    assert_eq!(received.matches("HTTP/1.1 200").count(), 5, "{received}");
+    Ok(())
+}
+
+/// W1: a connection that keeps sending requests one by one never trips the header or the
+/// write deadline; `max_connection_age` closes it anyway, after the current response.
+#[tokio::test]
+async fn a_busy_connection_is_closed_at_its_maximum_age() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let limits = Limits {
+        max_connection_age: Duration::from_millis(800),
+        ..Limits::default()
+    };
+    let (addr, _stop) = serving(limits).await?;
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+    let started = std::time::Instant::now();
+    let mut served = 0;
+    let closed = loop {
+        if started.elapsed() > Duration::from_secs(4) {
+            break false;
+        }
+        if stream
+            .write_all(b"GET /livez HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .is_err()
+        {
+            break true;
+        }
+        let mut buf = [0_u8; 512];
+        match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) => break true,
+            Ok(Ok(_)) => served += 1,
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(closed, "a busy connection lived past its maximum age");
+    assert!(served >= 3, "it was served until then ({served})");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "closed at about its age, not later: {:?}",
+        started.elapsed()
+    );
     Ok(())
 }

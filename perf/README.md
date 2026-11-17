@@ -17,7 +17,7 @@ Ports: every harness starts its own server and fixtures on its own defaults — 
 | `storm.mjs` | `--server-port 58420` | `--fixture-port 58720` (… +10) |
 | `session-churn.mjs` | `--server-port 58440` | `--fixture-port 58740` |
 | `real-app-load.mjs` | `--server-port 58450` | `--app-port 58800`, `--sink-port 58740` |
-| `connections.mjs` | `--server-port 58462` | — (`--cap 16`; ~25 s: slow header, idle keep-alive, connection cap) |
+| `connections.mjs` | `--server-port 58462` | — (`--cap 16`; ~40 s: slow header, idle keep-alive, connection cap, non-reading clients, request cap) |
 
 A port that already answers refuses the run before anything starts, and a harness only
 drives the server it started: if that child has exited when `/livez` answers, the run
