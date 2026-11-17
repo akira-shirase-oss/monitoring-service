@@ -2,6 +2,23 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-017 — The webhook URL is operator configuration, not SSRF-guarded (P0 before tenants)
+
+Probes go through the SSRF guard (`ProbePolicy` plus the validating resolver): http(s)
+only, every non-global address refused, DNS answers checked, every redirect hop
+rechecked. The alert webhook does not. `SMON_WEBHOOK_URL` only has to be http(s) with a
+host, so loopback, private, link-local and metadata addresses are accepted, and its DNS
+answer is not validated (redirects are not followed). That is deliberate
+for a self-hosted monitor: only the operator writes `env`, they can reach those addresses
+anyway, and an internal alert relay is a normal receiver — so it is not a privilege
+boundary today.
+
+It becomes one the moment someone other than the operator can set a webhook URL. **Before
+tenants can (SaaS S1/S2, per-workspace alert channels), this is a P0 gate:** a tenant's
+URL goes through `ProbePolicy` and the validating resolver when it is saved and again at
+every send, with no redirects, exactly as a probe target does (docs/SAAS_PLAN.md, Alert
+channels).
+
 ## D-016 — Session rows hold a token-bound digest, never the cookie's id
 
 The `sessions` table used to store the cookie's id as is, so the store — and every

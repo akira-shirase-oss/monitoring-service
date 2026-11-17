@@ -311,3 +311,38 @@ fn the_runbook_backs_up_before_an_upgrade_and_rolls_back_with_that_backup() {
         assert!(rollback.contains(needle), "the rollback lacks `{needle}`");
     }
 }
+
+const SAAS_PLAN: &str = include_str!("../../../docs/SAAS_PLAN.md");
+const NOTIFICATIONS: &str = include_str!("../../../docs/modules/04-incidents-notifications.md");
+const DECISIONS: &str = include_str!("../../../docs/DECISIONS.md");
+
+/// L4: the webhook URL is not run through the SSRF guard (only http(s) and a host are
+/// checked). For one operator writing their own `env` that is not a privilege boundary,
+/// but it was written down nowhere, and the SaaS plan called the product SSRF-safe and
+/// planned tenant-set webhooks without the guard. The gap is stated, and tenant webhooks
+/// are gated on it.
+#[test]
+fn the_webhook_url_ssrf_gap_is_stated_and_gates_tenant_webhooks() {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decisions = flat(DECISIONS);
+    assert!(decisions.contains("## D-017"), "a decision records the gap");
+    let notifications = flat(NOTIFICATIONS);
+    assert!(
+        notifications.contains("not SSRF-guarded"),
+        "module 04 states the webhook URL is not SSRF-guarded"
+    );
+    let plan = flat(SAAS_PLAN);
+    assert!(
+        !plan.contains("Already multi-tenant-safe"),
+        "the plan overstates SSRF safety"
+    );
+    let channels = plan
+        .split("| Alert channels |")
+        .nth(1)
+        .and_then(|rest| rest.split("| Status pages |").next())
+        .unwrap_or_default();
+    assert!(
+        channels.contains("ProbePolicy") && channels.contains("P0"),
+        "tenant webhooks must go through the probe SSRF guard first: {channels}"
+    );
+}

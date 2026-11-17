@@ -45,6 +45,10 @@ at-least-once to a receiver — without alerting ever being able to stall observ
   reports the recipient count, not addresses.
 - **No proxies:** the webhook client ignores proxy environment variables and dials the
   receiver directly; SMTP (lettre) never used them. Egress proxies are not supported.
+- **The webhook URL is not SSRF-guarded** (D-017): it is operator configuration —
+  `SMON_WEBHOOK_URL` must be http(s) with a host, nothing more, so an internal relay
+  works. It is a P0 gate before tenants can set webhook URLs: then they go through
+  `ProbePolicy` and the validating resolver at save and at send.
 - **No redirects:** the webhook client follows none. A 307/308 would re-send the payload
   and its signature wherever the receiver points; a 3xx is a failed attempt, retried with
   backoff like a 5xx (`a_receivers_redirect_is_not_followed_and_nothing_is_re_sent`).
