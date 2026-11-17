@@ -205,8 +205,12 @@ async fn run(
             // Direct to the configured receiver: proxy environment variables must not
             // silently route alert payloads (monitor names, incident times) through a
             // third host. Egress proxies are not supported (module 04).
+            // Redirects are not followed: a 307/308 would re-send the payload and its
+            // signature to wherever the receiver points — another host, or one inside our
+            // network. A 3xx is a failed attempt, retried like any other.
             let client = match reqwest::Client::builder()
                 .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
                 .build()
             {
