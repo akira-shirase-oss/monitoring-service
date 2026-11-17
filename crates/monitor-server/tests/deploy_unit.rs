@@ -318,7 +318,7 @@ const DECISIONS: &str = include_str!("../../../docs/DECISIONS.md");
 
 /// L4: the webhook URL is not run through the SSRF guard (only http(s) and a host are
 /// checked). For one operator writing their own `env` that is not a privilege boundary,
-/// but it was written down nowhere, and the SaaS plan called the product SSRF-safe and
+/// but it was written down nowhere, and `SAAS_PLAN.md` called the product SSRF-safe and
 /// planned tenant-set webhooks without the guard. The gap is stated, and tenant webhooks
 /// are gated on it.
 #[test]
