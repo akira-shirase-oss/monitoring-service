@@ -259,3 +259,89 @@ fn the_restore_drill_removes_the_wal_and_shm_before_restarting() {
         "-wal/-shm must be removed before the restored store is opened"
     );
 }
+
+/// Run `body` in bash with `scripts/lib-ports.sh` sourced.
+fn with_lib(body: &str) -> std::process::Output {
+    let lib = script("lib-ports.sh");
+    Command::new("bash")
+        .arg("-c")
+        .arg(format!(". '{}'\n{body}", lib.display()))
+        .output()
+        .unwrap_or_else(|e| panic!("run bash: {e}"))
+}
+
+/// F4: `stop_own` signalled whatever PID it was handed once `kill -0` said it existed. A
+/// child that died on its own and was reaped leaves its PID free for reuse (PIDs wrap
+/// under heavy build load), and cleanup then SIGTERMs — then SIGKILLs — a stranger. It now
+/// signals only a live child of the calling shell.
+#[test]
+fn stop_own_never_signals_a_process_that_is_not_its_child() {
+    // A process this test started, so its parent is the test, not the script's shell.
+    let mut stranger = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn sleep: {e}"));
+    let output = with_lib(&format!("stop_own {}", stranger.id()));
+    let alive = stranger.try_wait().ok().flatten().is_none();
+    let _ = stranger.kill();
+    let _ = stranger.wait();
+    assert!(output.status.success(), "{output:?}");
+    assert!(alive, "stop_own killed a process it did not start");
+
+    // Its own child it does stop.
+    let output = with_lib(
+        "sleep 30 & child=$!\nstop_own \"$child\"\nif kill -0 \"$child\" 2>/dev/null; then exit 1; fi",
+    );
+    assert!(output.status.success(), "own child not stopped: {output:?}");
+}
+
+/// F4: a script that waits for its own server must not settle for *a* server: if the child
+/// it started has exited (it lost a bind race, say), whatever answers on that port is
+/// someone else's — `wait_own_http` fails instead of driving it.
+#[test]
+fn wait_own_http_fails_when_its_child_died_even_if_the_url_answers() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            use std::io::{Read, Write};
+            let mut stream = stream;
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+        }
+    });
+    let output = with_lib(&format!(
+        "true & child=$!\nwait \"$child\"\nwait_own_http http://127.0.0.1:{port}/livez \"$child\""
+    ));
+    assert!(
+        !output.status.success(),
+        "a dead child must fail the wait: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exited"),
+        "{output:?}"
+    );
+    // A live child and an answering URL pass.
+    let output = with_lib(&format!(
+        "sleep 30 & child=$!\nwait_own_http http://127.0.0.1:{port}/livez \"$child\"\nstatus=$?\nstop_own \"$child\"\nexit $status"
+    ));
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// The drill uses the guarded wait for every process it starts.
+#[test]
+fn the_drill_waits_only_on_its_own_processes() {
+    let lines = code(DRILL);
+    assert!(
+        !lines.iter().any(|line| line.starts_with("wait_http ")),
+        "the drill must use wait_own_http, which also checks the child is alive"
+    );
+    assert!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("wait_own_http "))
+            .count()
+            >= 3
+    );
+}
