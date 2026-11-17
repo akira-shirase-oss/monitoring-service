@@ -226,6 +226,32 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
 }
 
+/// Everything the server answers: [`router`] plus the public snapshot at `/status.json`
+/// (outside `/api`, so public viewers never touch the management surface; expiry is the
+/// file's own claim) and the dashboard build as the fallback when it has been built, all
+/// under the browser hardening headers (`csp` from [`headers::dashboard_csp`]). This is
+/// what `main.rs` serves; every route in the crate is added here or in [`router`]
+/// (`tests/auth_inventory.rs` holds the crate to it).
+pub fn app(
+    state: AppState,
+    status_dir: &std::path::Path,
+    dashboard_dir: &std::path::Path,
+    csp: &str,
+) -> Router {
+    use tower_http::services::{ServeDir, ServeFile};
+    let app = router(state).route_service(
+        "/status.json",
+        ServeFile::new(status_dir.join("status.json")),
+    );
+    let app = if dashboard_dir.is_dir() {
+        let index = ServeFile::new(dashboard_dir.join("200.html"));
+        app.fallback_service(ServeDir::new(dashboard_dir).fallback(index))
+    } else {
+        app
+    };
+    headers::harden(app, csp)
+}
+
 async fn livez() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "alive" }))
 }
