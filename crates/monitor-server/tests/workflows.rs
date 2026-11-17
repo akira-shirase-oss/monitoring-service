@@ -227,7 +227,7 @@ fn dependabot_watches_cargo_npm_and_the_action_pins() {
     );
 }
 
-/// Dependabot's branches get the pull_request run; a push run on the same SHA only
+/// Dependabot's branches get the `pull_request` run; a push run on the same SHA only
 /// doubled the work (and the flakes).
 #[test]
 fn ci_skips_push_runs_on_dependabot_branches() {
