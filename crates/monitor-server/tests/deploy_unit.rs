@@ -346,3 +346,30 @@ fn the_webhook_url_ssrf_gap_is_stated_and_gates_tenant_webhooks() {
         "tenant webhooks must go through the probe SSRF guard first: {channels}"
     );
 }
+
+/// L9: two behaviours were stated as fact while the drill that would prove them had not
+/// been run — the 130 s SIGSTOP catch-up (F2, unit-tested only) and the late-volume
+/// recovery (F3, no systemd host). The docs say so until each is exercised.
+#[test]
+fn unverified_behaviours_are_marked_as_such() {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decisions = flat(DECISIONS);
+    let d011 = decisions
+        .split("## D-011")
+        .nth(1)
+        .and_then(|rest| rest.split("## D-010").next())
+        .unwrap_or_default();
+    assert!(
+        d011.contains("130 s SIGSTOP drill not re-run"),
+        "D-011 must say the freeze drill was not re-run"
+    );
+    let runbook = flat(RUNBOOK);
+    let late_volume = runbook
+        .split("### The data volume attached late")
+        .nth(1)
+        .unwrap_or_default();
+    assert!(
+        late_volume.contains("not yet exercised on a systemd host"),
+        "the late-volume section must say it is unverified"
+    );
+}

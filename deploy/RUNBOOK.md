@@ -84,6 +84,8 @@ snapshot or retention fault means checks still run but that duty has stopped.
 
 ### The data volume attached late
 
+*(This follows from `systemd.unit(5)`; not yet exercised on a systemd host.)*
+
 The unit waits for the mounts of `data/` and `status/` (`RequiresMountsFor`). If the
 volume's device has not appeared by its mount's `x-systemd.device-timeout` (90 s by
 default), the mount job **fails**, and to systemd that is a *dependency failure* of
