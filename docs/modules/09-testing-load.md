@@ -36,8 +36,9 @@ failure demo must be repeatable.
 - **Harness:** `perf/lab-profile.mjs`. The monitor generates its own load (an external
   driver would only exercise the API), so the harness orchestrates: N fixture origins,
   one monitor-server in `lab` profile, 100 monitors registered inside ~130 ms — all at
-  the minimum 15 s interval so every wave is a phase-locked 100-slot burst on the 20
-  global slots (the "5× burst" is built in, every 15 s, for the whole run).
+  the minimum 15 s interval. Until D-018 that made every wave a phase-locked 100-slot
+  burst on 20 global slots; since then each monitor has its own phase and the budget
+  follows the schedule, so the same registration spreads across the interval.
 - **Mix:** 50 `/ok`, 20 `/flaky` (varied patterns so phases decorrelate), 15 `/slow` (2 s
   inside a 3 s deadline), 10 `/status/500` (permanent), 5 `/hang` (timeout every slot).
 - **Measured** (`perf/results/2026-11-06T01-18-54.904Z-33656f5.json`, Darwin arm64,
@@ -64,6 +65,12 @@ failure demo must be repeatable.
   run needs ≥13.9 h on one server — not run; see `perf/LOAD_MATRIX.md`.
 - **API:** `perf/api-load.mjs` — 1,000,000 bearer-authed reads, all 200, 1,647 rps, p99
   32.6 ms; the probes beneath had 0 missed but commit-lag p95 5.14 s, over the 5 s target.
+- **Fixed (D-018):** phases spread per monitor, the global budget sized to the schedule
+  (up to 512, past it a named refusal), and the writer on a connection of its own (it had
+  queued behind API reads in the shared pool). Pinned by
+  `sixteen_hundred_monitors_on_one_interval_miss_nothing` and
+  `the_writers_commits_never_queue_behind_api_reads`; the ceiling probe and the API-read
+  smoke are to be re-run on a quiet machine (see `perf/LOAD_MATRIX.md`).
 
 ## Real-app rising-load drill (M7.3)
 

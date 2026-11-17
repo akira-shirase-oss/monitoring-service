@@ -2,6 +2,39 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-018 — Slots are spread by phase; the probe budget follows the schedule, up to 512
+
+The coordinator starts probes on its 1 s tick within a global bound. That bound was a
+fixed 20, and every new monitor was anchored one tick out, so monitors created together
+fell due on the same tick for ever: a wave of 200 got about 100 starts inside the 5 s grace
+and the rest were missed (the 2026-11-17 ceiling probe: 800 pass, 800 missed), and the
+starts it got were up to 5 s late — most of the measured commit lag.
+
+- **Phase.** Each monitor's slots sit at `phase (mod interval)` in Unix milliseconds; the
+  phase comes from its id (`splitmix64` over the UUID's halves). New and edited monitors
+  start on that grid at least one tick out — so a new monitor's first check comes within
+  one interval, not one tick — and a restart keeps the grid.
+- **Budget.** Global slots = `Σ (tick + timeout) / interval` over unpaused monitors (per
+  tick `Σ tick/interval` starts, each holding its slot at worst for its timeout), never
+  below the configured floor (20) nor above **`MAX_GLOBAL_SLOTS` = 512** — outbound
+  sockets, well inside the unit's 4096 descriptors beside `SMON_MAX_CONNECTIONS`. The
+  coordinator resizes its semaphore whenever the registry changes. At 15 s/3 s that is
+  1,920 monitors; at the 60 s/10 s defaults, about 2,790.
+- **Refusal.** A create or edit whose resulting schedule needs more than 512 slots, or
+  more starts per tick on one origin than its 2 per-origin slots (more than 30 monitors
+  at 15 s on one host:port), is refused with 409 `capacity_exceeded` naming the bound —
+  never accepted and then missed in silence. The check and its write run under one lock.
+  Slow targets can still miss slots (a probe holds its slot up to its timeout); those
+  misses are counted, as always.
+- **Writer connection.** The single writer commits on a connection of its own instead
+  of drawing from the API's 4-connection pool, where under concurrent reads each commit
+  queued for a connection (70-96 ms with 32 readers against 1-3 ms on its own).
+
+Pinned by `monitors_created_together_fall_due_spread_across_their_interval`,
+`sixteen_hundred_monitors_on_one_interval_miss_nothing`,
+`a_schedule_the_coordinator_cannot_serve_is_refused_by_name` and
+`the_writers_commits_never_queue_behind_api_reads`.
+
 ## D-017 — The webhook URL is operator configuration, not SSRF-guarded (P0 before tenants)
 
 Probes go through the SSRF guard (`ProbePolicy` plus the validating resolver): http(s)

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Scheduler capacity (2026-11-17, D-018) — behaviour changes
+
+- **Monitors no longer fall due together.** Each monitor's slots sit at a fixed phase
+  (from its id) within its interval, so a new or edited monitor's first check comes
+  within one interval rather than after one second.
+- **The global probe budget follows the schedule** (20 to 512 slots) instead of a fixed
+  20, so 1,600 monitors at 15 s miss nothing.
+- **A schedule the coordinator can't serve is refused**: a create or edit that would need
+  more than 512 probe slots, or more than 2 starts a second on one origin (more than 30
+  monitors at 15 s on one host:port), answers 409 `capacity_exceeded`.
+- **The writer commits on a connection of its own**, no longer queued behind API reads.
+
 ### Final-check follow-ups (2026-11-16)
 
 - **A client that never reads loses its connection:** a response write (or flush) that

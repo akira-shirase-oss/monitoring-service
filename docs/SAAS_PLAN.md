@@ -94,4 +94,4 @@ Monitor token, Colophon registers its sites in that user's workspace through the
 2. Status pages on a path (`/s/<workspace>`) or on subdomains?
 3. Email provider for alerts and verification?
 4. Free-plan limits: monitors, minimum interval, retention?
-5. S4's ≥1M checks: one server dispatches at most 20 probes per 1 s tick (≤20 checks/s, ≥13.9 h for 1M; 100 per phase-locked wave). Run it for ~14 h, spread phases, or dispatch on probe completion too? (`perf/LOAD_MATRIX.md`, 2026-11-17.)
+5. ~~S4's ≥1M checks: one server dispatches at most 20 probes per 1 s tick.~~ Decided (D-018): phases are spread per monitor and the global budget follows the schedule up to 512 slots, with a named refusal past it. One server now serves up to ~1,900 monitors at 15 s (~128 checks/s, ≈2.2 h for 1M checks); the long run itself is still to do.
