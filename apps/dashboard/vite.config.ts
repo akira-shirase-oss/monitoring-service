@@ -25,9 +25,13 @@ export default defineConfig({
 		host: '127.0.0.1',
 		port: 58600,
 		strictPort: true,
-		// In development, the API is a monitor-server on its default port (58400).
+		// In development, the API is `scripts/dev.sh`'s monitor-server on SMON_DEV_PORT
+		// (default 58465) — never 58400, where an installed monitor listens.
 		proxy: Object.fromEntries(
-			['/api', '/livez', '/readyz'].map((path) => [path, 'http://127.0.0.1:58400'])
+			['/api', '/livez', '/readyz'].map((path) => [
+				path,
+				`http://127.0.0.1:${process.env['SMON_DEV_PORT'] ?? 58465}`
+			])
 		)
 	},
 	preview: { host: '127.0.0.1', port: 58600, strictPort: true }

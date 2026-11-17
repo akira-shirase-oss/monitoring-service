@@ -65,7 +65,7 @@ run; what exists is what the commits show. Highlights:
 | `crates/monitor-db` | SQLite persistence (`sqlx`, WAL + foreign keys) and the single-writer task. Migrations in `crates/monitor-db/migrations/`. |
 | `crates/monitor-server` | The `monitor-server` binary: Axum management API, coordinator + probe workers, alert deliverer, snapshot writer. |
 | `crates/monitor-cli` | The `monitor` binary: talks to the HTTP API, same path as the dashboard. |
-| `apps/dashboard` | SvelteKit static app (Tailwind v4, shadcn-svelte). Vite dev on :58600 proxies the API to :58400. |
+| `apps/dashboard` | SvelteKit static app (Tailwind v4, shadcn-svelte). Vite dev on :58600 proxies the API to `scripts/dev.sh` on :58465. |
 | `apps/status` | Static status-page renderer for the public snapshot. |
 | `docs/END_GOAL.md` | What done means; in/out of scope; the ship gate. |
 | `docs/ARCHITECTURE.md` | Sources of truth, process model, data paths, bounds. |
@@ -82,18 +82,19 @@ export PATH="$(brew --prefix rustup)/bin:$PATH"
 
 npm install                 # once
 cargo build                 # once (generates Cargo.lock)
-scripts/dev.sh              # serves the API on 127.0.0.1:58400 (+ dashboard if built)
+scripts/dev.sh              # serves the API on 127.0.0.1:58465 (+ dashboard if built);
+                            # SMON_DEV_PORT overrides; never 58400 (an installed monitor's)
 
-# in another shell
-monitor() { cargo run -q -p monitor-cli -- "$@"; }
+# in another shell — point the CLI at the dev server, not an installed monitor on :58400
+monitor() { SMON_SERVER=http://127.0.0.1:58465 cargo run -q -p monitor-cli -- "$@"; }
 monitor ping
 monitor monitors add example https://example.com/health
 monitor monitors list
 
-# dashboard dev server (hot reload, proxies /api to 58400)
+# dashboard dev server (hot reload, proxies /api to the dev server on 58465)
 npm run dev --workspace @service-monitor/dashboard   # http://127.0.0.1:58600
 
-# or build it once and let monitor-server serve it at 127.0.0.1:58400
+# or build it once and let the dev server serve it at 127.0.0.1:58465
 npm run build --workspace @service-monitor/dashboard
 ```
 

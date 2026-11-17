@@ -27,13 +27,13 @@ cd monitoring-service
 
 npm install                 # once
 cargo build --locked        # Cargo.lock is already in the repo
-scripts/dev.sh              # API on 127.0.0.1:58400; serves the dashboard if it has been built
+scripts/dev.sh              # API on 127.0.0.1:58465 (SMON_DEV_PORT); serves the dashboard if built
 ```
 
 In another shell:
 
 ```sh
-monitor() { cargo run -q -p monitor-cli -- "$@"; }
+monitor() { SMON_SERVER=http://127.0.0.1:58465 cargo run -q -p monitor-cli -- "$@"; }
 monitor ping
 # Loopback / private targets need the lab profile on the *server*, not the CLI.
 # Start the server with: SMON_PROFILE=lab scripts/dev.sh
@@ -44,10 +44,10 @@ monitor monitors list
 Dashboard options:
 
 ```sh
-# hot reload; Vite on :58600 proxies /api, /livez, /readyz to :58400
+# hot reload; Vite on :58600 proxies /api, /livez, /readyz to the dev server on :58465
 npm run dev --workspace @service-monitor/dashboard
 
-# or build once and let monitor-server serve it at 127.0.0.1:58400
+# or build once and let the dev server serve it at 127.0.0.1:58465
 npm run build --workspace @service-monitor/dashboard
 ```
 
@@ -94,7 +94,7 @@ and add monitors with short intervals, e.g. `monitor monitors add ok http://127.
 
 - [ ] `monitor ping` sees `/livez` and `/readyz`: exit 0 when ready, 5 when degraded (`/readyz` 200 `"status":"degraded"` with `faults`), 1 when unavailable (`/readyz` 503).
 - [ ] Add a monitor, `monitor monitors list` / `show <id>` shows it, and checks start landing (default interval is 60s unless you pass `--interval_s`).
-- [ ] The dashboard loads (dev server on :58600, or the built app on :58400), lists the monitor, and the uptime strip leaves unobserved slots as gaps rather than filling them in green.
+- [ ] The dashboard loads (dev server on :58600, or the built app on :58465), lists the monitor, and the uptime strip leaves unobserved slots as gaps rather than filling them in green.
 - [ ] Pause / unpause works; editing a field bumps the generation (`monitor monitors show` / the API).
 - [ ] Optional: `scripts/check.sh` is green.
 

@@ -182,6 +182,13 @@ total rows.
 `SMON_LISTEN` defaults to `127.0.0.1:58400`; vite dev runs on `127.0.0.1:58600` and proxies
 `/api`, `/livez`, `/readyz`. Picked adjacent to Colophon's 58000/58200 block without colliding.
 
+*Amended 2026-11-16.* 58400 belongs to an installed monitor. Scripts that start their own
+server use their own ports so they can run beside one: `scripts/dev.sh` on `SMON_DEV_PORT`
+(default 58465; vite proxies there), `scripts/backup-drill.sh` on `SMON_DRILL_PORT` /
+`SMON_DRILL_FIXTURE_PORT` (58460/58461). Each refuses to start if its port already answers
+and stops only processes it started itself, by PID (`scripts/lib-ports.sh`) — the drill
+once `kill -9`ed whatever held :58400.
+
 ## D-005 — Provisional status semantics (the `Health` state machine)
 
 Implemented in `monitor-domain`: three consecutive failures open an incident, two fresh passes
