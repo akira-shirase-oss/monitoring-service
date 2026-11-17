@@ -24,7 +24,9 @@ rolling back the binary cannot roll back evidence.
 ## Install
 
 **Exposure.** The listener closes a request whose header hasn't arrived within 10 s and an
-idle keep-alive after 10 s, and serves at most `SMON_MAX_CONNECTIONS` (default 1024)
+idle keep-alive after 10 s, a connection whose response write makes no progress for
+`SMON_WRITE_STALL_MS` (default 10 s — a client that never reads), and any connection after
+1000 requests or 5 minutes; it serves at most `SMON_MAX_CONNECTIONS` (default 1024)
 connections at once — the rest wait in the backlog, so a flood of idle sockets can't take
 the file descriptors probes and SQLite need (`perf/connections.mjs` drills it). It speaks
 plain HTTP: put a TLS proxy (Caddy) in front of anything reachable from the internet, and

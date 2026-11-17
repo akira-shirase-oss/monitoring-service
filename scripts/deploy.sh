@@ -69,6 +69,8 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_TRUSTED_PROXY=127.0.0.1
 # HTTP connections served at once; keep well below the unit's LimitNOFILE (4096).
 # SMON_MAX_CONNECTIONS=1024
+# A response write with no progress for this long closes the connection (ms).
+# SMON_WRITE_STALL_MS=10000
 # auto: the session cookie is Secure when the TLS proxy says so; always: every cookie.
 # SMON_COOKIE_SECURE=auto
 ENV

@@ -68,18 +68,17 @@ impl ClientKey {
         let Some(peer) = peer else {
             return Self::Unknown;
         };
+        // Only the right-most hop: the one our proxy appended. If it doesn't parse, the
+        // client is the peer — never an entry further left, which the client wrote.
         if trusted_proxy.is_some_and(|proxy| proxy == peer.ip())
-            && let Some(forwarded) = headers
-                .get_all("x-forwarded-for")
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .flat_map(|value| value.rsplit(','))
-                .find_map(|hop| hop.trim().parse::<IpAddr>().ok())
+            && let Some(last_line) = headers.get_all("x-forwarded-for").iter().next_back()
+            && let Some(hop) = last_line
+                .to_str()
+                .ok()
+                .and_then(|line| line.rsplit(',').next())
+            && let Ok(client) = hop.trim().parse::<IpAddr>()
         {
-            return Self::of(forwarded);
+            return Self::of(client);
         }
         Self::of(peer.ip())
     }
@@ -298,6 +297,31 @@ mod tests {
             ClientKey::from_request(None, &headers, trusted),
             ClientKey::Unknown
         );
+    }
+
+    /// Only the right-most hop — the one our proxy appended — is believed. If it doesn't
+    /// parse (a proxy that writes `ip:port`, a mangled header), the client is the peer:
+    /// never an entry to its left, which the client wrote itself.
+    #[test]
+    fn an_unparseable_proxy_hop_falls_back_to_the_peer_not_to_client_entries() {
+        let proxy: SocketAddr = "127.0.0.1:5000".parse().expect("addr");
+        let trusted = Some(proxy.ip());
+        for forwarded in [
+            vec!["6.6.6.6, 198.51.100.9:443"],
+            vec!["6.6.6.6, not-an-ip"],
+            vec!["6.6.6.6,"],
+            vec!["6.6.6.6", "garbage"], // the last header line holds the proxy's hop
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in &forwarded {
+                headers.append("x-forwarded-for", value.parse().expect("hv"));
+            }
+            assert_eq!(
+                ClientKey::from_request(Some(proxy), &headers, trusted),
+                key("127.0.0.1"),
+                "{forwarded:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

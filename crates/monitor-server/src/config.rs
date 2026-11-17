@@ -47,6 +47,7 @@ pub const KNOWN: &[&str] = &[
     "SMON_STATUS_INTERVAL_S",
     "SMON_STATUS_TTL_S",
     "SMON_TRUSTED_PROXY",
+    "SMON_WRITE_STALL_MS",
     "SMON_WEBHOOK_SECRET",
     "SMON_WEBHOOK_URL",
 ];
@@ -101,6 +102,9 @@ pub struct Config {
     /// `SMON_MAX_CONNECTIONS`: HTTP connections served at once (serve.rs); past it new
     /// connections wait in the backlog. Keep it well below the file-descriptor limit.
     pub max_connections: usize,
+    /// `SMON_WRITE_STALL_MS`: a response write making no progress this long closes the
+    /// connection (serve.rs).
+    pub write_stall: Duration,
 }
 
 impl fmt::Debug for Config {
@@ -405,6 +409,8 @@ impl Config {
         let max_monitors = env.ranged("SMON_MAX_MONITORS", 100, 1..=100_000);
         let max_connections =
             usize::try_from(env.ranged("SMON_MAX_CONNECTIONS", 1024, 8..=65_535)).unwrap_or(1024);
+        let write_stall =
+            Duration::from_millis(env.ranged("SMON_WRITE_STALL_MS", 10_000, 100..=600_000));
 
         if !env.problems.is_empty() {
             return Err(ConfigError {
@@ -434,6 +440,7 @@ impl Config {
             cookie_secure,
             max_monitors,
             max_connections,
+            write_stall,
         })
     }
 
@@ -472,6 +479,7 @@ mod tests {
         assert_eq!(config.session_idle, Duration::from_hours(1));
         assert_eq!(config.trusted_proxy, None);
         assert_eq!(config.max_connections, 1024);
+        assert_eq!(config.write_stall, Duration::from_secs(10));
         assert_eq!(config.max_monitors, 100);
         assert!(!config.lab);
         assert!(config.smtp.is_none() && config.webhook_url.is_none());
@@ -493,6 +501,7 @@ mod tests {
             ("SMON_SESSION_IDLE_S", "1h"),
             ("SMON_TRUSTED_PROXY", "caddy"),
             ("SMON_MAX_CONNECTIONS", "4"),
+            ("SMON_WRITE_STALL_MS", "10s"),
             ("SMON_MAX_MONITORS", "0"),
             ("SMON_LISTEN", "localhost"),
             ("SMON_PROFILE", "Lab"),

@@ -214,6 +214,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         HTTP_DRAIN,
         Limits {
             max_connections: config.max_connections,
+            write_stall: config.write_stall,
             ..Limits::default()
         },
     )

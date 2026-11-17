@@ -1,0 +1,29 @@
+{
+  "date": "2026-11-17T04:10:44.843Z",
+  "scenario": "connection-limits",
+  "cap": 16,
+  "write_stall_ms": 3000,
+  "slow_header_closed_ms": 10004,
+  "idle_keep_alive_closed_ms": 10003,
+  "idle_keep_alive_was_answered": true,
+  "answered_while_full_ms": null,
+  "answered_after_slots_free_ms": 8201,
+  "silent_holders_closed": 16,
+  "answered_past_non_readers_ms": 2507,
+  "pipelined_responses_before_close": 1000,
+  "pipelined_connection_closed": true,
+  "still_healthy": true,
+  "commit": "5f68cb7",
+  "machine": "Darwin arm64",
+  "gates": {
+    "slow_header_closed": true,
+    "idle_keep_alive_closed": true,
+    "cap_holds": true,
+    "served_once_a_slot_frees": true,
+    "silent_holders_closed": true,
+    "non_readers_lose_their_slots": true,
+    "request_cap_closes_the_connection": true,
+    "still_healthy": true
+  },
+  "passed": true
+}
