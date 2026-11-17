@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod config;
 pub mod deliver;
+pub mod headers;
 pub mod logfile;
 pub mod probe;
 pub mod redact;

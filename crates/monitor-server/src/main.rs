@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
-    let app = with_static_files(app, &config.status_dir, &config.dashboard_dir);
+    let app = hardened(app, &config).await?;
 
     // Install the stop signals before serving: a registration failure is a boot error,
     // not a detached panic that would look like a clean shutdown (rust-mastery ch. 12).
@@ -281,6 +281,18 @@ fn with_static_files(app: axum::Router, status_dir: &str, dashboard_dir: &str) -
         tracing::info!(dir = %dashboard_dir, "dashboard not built; API only");
         app
     }
+}
+
+/// The API plus the static files, with browser hardening on every response (headers.rs):
+/// the CSP allows the dashboard build's inline bootstrap by hash, read from the build once,
+/// on a blocking thread.
+async fn hardened(app: axum::Router, config: &Config) -> anyhow::Result<axum::Router> {
+    let app = with_static_files(app, &config.status_dir, &config.dashboard_dir);
+    let dir = std::path::PathBuf::from(&config.dashboard_dir);
+    let csp = tokio::task::spawn_blocking(move || monitor_server::headers::dashboard_csp(&dir))
+        .await
+        .context("reading the dashboard build for its CSP")?;
+    Ok(monitor_server::headers::harden(app, &csp))
 }
 
 /// The coordinator and its probe client (the SSRF policy follows `SMON_PROFILE`), owned
