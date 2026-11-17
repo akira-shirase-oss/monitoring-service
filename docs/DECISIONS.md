@@ -109,8 +109,11 @@ engine drains, and the process exits non-zero, so systemd `Restart=on-failure` o
 `KeepAlive` restarts it and the boot records the gap (D-014). A coordinator that is alive
 but makes no loop pass for 2 minutes (4 × the 30 s stall threshold) is treated the same
 way — a stall that long will not clear by itself. Supporting tasks stay *degraded*, with
-no exit. The systemd unit's start limit (5 starts in 10 minutes) turns a deterministic
-crash into a visible `failed` unit rather than an endless 3-second loop. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
+no exit. The systemd unit backs restarts off from 15 s to 10 minutes (`RestartSteps`,
+systemd ≥ 254) under a start limit of 10 in 30 minutes that a backed-off loop never
+reaches: a slow dependency (a late volume) is retried until it appears, and a
+deterministic crash is spaced out instead of looping every few seconds. Older systemd
+keeps the fixed 15 s and leaves the unit `failed` after ~2.5 minutes of failures. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
 and `a_supporting_task_stopping_keeps_serving`.
 
 ## D-010 — Certificate trust is deterministic: webpki-roots, never the local store

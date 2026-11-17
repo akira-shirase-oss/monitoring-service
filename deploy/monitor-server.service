@@ -3,13 +3,18 @@
 Description=Service Monitor (monitor-server)
 After=network-online.target
 Wants=network-online.target
-# A deterministic crash (an engine task failing on every boot) must not loop forever:
-# after 5 starts within 10 minutes systemd stops restarting and leaves the unit `failed`
-# ("start request repeated too quickly"). The public heartbeat then expires, so the status
-# page says "monitoring unavailable". Fix the cause from the log, then
-# `systemctl reset-failed monitor-server && systemctl start monitor-server`.
-StartLimitIntervalSec=600
-StartLimitBurst=5
+# The store and the snapshot may live on a volume that attaches after boot: don't start
+# against a bare mountpoint (the server also refuses a missing or empty store, D-015).
+RequiresMountsFor=/opt/smon/data /opt/smon/status
+# Restart policy (with the backoff in [Service]): a slow dependency keeps being retried and
+# recovers on its own; a deterministic crash is retried at most every 10 minutes instead
+# of every few seconds. With the backoff, 10 starts in 30 minutes is out of reach. On
+# systemd < 254 (no RestartSteps) the fixed 15 s delay reaches it after ~2.5 minutes of
+# failures and the unit is left `failed` ("start request repeated too quickly"); then fix
+# the cause and `systemctl reset-failed monitor-server && systemctl start monitor-server`.
+# Either way the public heartbeat expires, so the status page says "monitoring unavailable".
+StartLimitIntervalSec=1800
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -22,7 +27,11 @@ Group=smon
 EnvironmentFile=/opt/smon/env
 ExecStart=/opt/smon/current/bin/monitor-server
 Restart=on-failure
-RestartSec=3s
+# Back off 15 s → 10 min over 8 steps (systemd ≥ 254; older versions log and ignore the
+# two Step/Max keys and keep the fixed 15 s).
+RestartSec=15s
+RestartSteps=8
+RestartMaxDelaySec=600s
 # Stop sends SIGTERM (the server drains: HTTP <= 12 s, engine <= 15 s), then SIGKILL after
 # this — longer than the drain, so a graceful stop is never cut short.
 TimeoutStopSec=40s

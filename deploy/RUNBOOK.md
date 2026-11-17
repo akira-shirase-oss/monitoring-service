@@ -53,10 +53,12 @@ the cause in `faults` (D-011): `store writes failing (N consecutive)` means the 
 `coordinator …` means the monitor is not observing (statuses read `unknown`) — the
 process then writes one "monitoring unavailable" beat and exits non-zero on its own, and
 the service manager restarts it (D-011; a coordinator stalled for 2 minutes does the
-same); repeated restarts mean the log's task error needs fixing. After 5 starts in 10
-minutes systemd stops trying and the unit is `failed` (`start request repeated too
-quickly`): fix the cause, then `sudo systemctl reset-failed monitor-server && sudo
-systemctl start monitor-server`; `degraded` with a deliverer, snapshot or retention
+same); repeated restarts mean the log's task error needs fixing. Restarts back off from
+15 s to 10 minutes (systemd ≥ 254), so a slow dependency recovers on its own and a crash
+loop never hammers. On older systemd (fixed 15 s) 10 starts within 30 minutes leave the
+unit `failed` (`start request repeated too quickly`): fix the cause, then `sudo systemctl
+reset-failed monitor-server && sudo systemctl start monitor-server`. The unit also waits
+for the mounts of `data/` and `status/` (`RequiresMountsFor`); `degraded` with a deliverer, snapshot or retention
 fault means checks still run but that duty has stopped.
 
 ### The store is at its cap (`SMON_MAX_DB_BYTES`)

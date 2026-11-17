@@ -29,7 +29,8 @@
   (no schedule pass) for 30 s, reports "monitoring unavailable" (`/readyz` 503, statuses
   `unknown`, a born-expired public beat). A dead task — or a stall that lasts 2 minutes —
   makes the process exit non-zero so the service manager restarts it; the systemd unit
-  stops after 5 starts in 10 minutes and stays `failed` (RUNBOOK). A stopped supporting
+  waits for its data/status mounts and backs restarts off from 15 s to 10 minutes
+  (RUNBOOK covers older systemd, where 10 starts in 30 minutes leave it `failed`). A stopped supporting
   duty is `degraded` (`/readyz` 200 with `faults`, `monitor ping` exits 5).
   `/api/monitors` and `status.json` gain a `monitoring` field (additive).
 - **Restart after downtime (D-014)** writes one `missed` row per monitor and resets
