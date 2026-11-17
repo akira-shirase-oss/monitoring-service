@@ -136,7 +136,7 @@ async fn run(
         tokio::select! {
             _ = ticker.tick() => {
                 plan_due(&mut runtimes, &mut origins, &global, &config)
-                    .dispatch(&probes, &writer, &results_tx, &tracker)
+                    .dispatch(&probes, &writer, &results_tx, &tracker, &vitals)
                     .await;
             }
             received = results_rx.recv() => {
@@ -256,7 +256,8 @@ fn missed_slot(entry: &Runtime) -> Observation {
     }
 }
 
-/// The sync pass's product: commit every miss, then spawn every dispatch.
+/// The sync pass's product: commit every miss (beating the heartbeat after each — F2),
+/// then spawn every dispatch.
 #[derive(Default)]
 struct Plan {
     misses: Vec<Observation>,
@@ -270,11 +271,17 @@ impl Plan {
         writer: &WriterHandle,
         results: &mpsc::Sender<Observation>,
         tracker: &TaskTracker,
+        vitals: &Vitals,
     ) {
         for miss in self.misses {
             if let Err(error) = writer.record(miss).await {
                 warn!(%error, "missed slot not recorded");
             }
+            // Staleness is judged by progress, not by loop passes: every miss the writer
+            // has taken is progress, so a long catch-up after a freeze (962 commits for
+            // 100 monitors after 130 s) never reads as a wedged loop. A writer that stops
+            // taking commits stops these beats, and the stall is caught as before.
+            vitals.coordinator_beat();
         }
         for dispatch in self.dispatches {
             let probes = probes.clone();
@@ -491,5 +498,67 @@ mod tests {
     async fn a_name_that_resolves_to_a_local_address_is_a_failure_that_pages() {
         let (rows, open) = observe_strict("http://localhost:9/health", &[]).await;
         assert_refusals_page(&rows, open, "name resolving to loopback");
+    }
+
+    /// F2: after a long freeze (SIGSTOP, a VM pause) the first pass commits every lost
+    /// slot as `missed` — 962 commits for 100 monitors after 130 s. The watchdog judges
+    /// the coordinator by heartbeat silence, and the coordinator used to beat only once per
+    /// loop pass, so a backlog that took longer than the watchdog's next check read as a
+    /// wedged loop and the process exited. Each committed miss is progress: the heartbeat
+    /// must stay fresh through the backlog, measured right after it.
+    #[tokio::test]
+    async fn committing_a_backlog_of_misses_keeps_the_heartbeat_fresh() {
+        let db = Db::connect("sqlite::memory:", 1).await.expect("db");
+        db.migrate().await.expect("migrate");
+        let monitor = NewMonitor::new("backlog", Url::parse("https://example.com/").expect("url"))
+            .expect("monitor")
+            .into_monitor();
+        db.insert_monitor(&monitor).await.expect("insert");
+        let (writer, _task) = writer::spawn(
+            db.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            HashMap::new(),
+            Arc::default(),
+            32,
+            false,
+        );
+        let vitals = Vitals::new(Arc::default(), Duration::from_secs(30));
+        vitals.coordinator_beat();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let start = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let mut plan = Plan::default();
+        for n in 0..200 {
+            plan.misses.push(Observation {
+                monitor_id: monitor.id,
+                generation: monitor.generation,
+                slot_at: start + time::Duration::seconds(15 * n),
+                slot: SlotObservation::Missed,
+                http_status: None,
+                latency_ms: None,
+                detail: None,
+            });
+        }
+        let probes = ProbeClient::new(
+            ProbePolicy {
+                allow_local_targets: false,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+        )
+        .expect("probe client");
+        let (results, _results_rx) = mpsc::channel(8);
+        plan.dispatch(&probes, &writer, &results, &TaskTracker::new(), &vitals)
+            .await;
+
+        let silence = vitals.coordinator_silence().expect("armed");
+        assert!(
+            silence < Duration::from_millis(100),
+            "the heartbeat went {silence:?} without a beat while the backlog committed"
+        );
+        assert_eq!(
+            db.list_checks(monitor.id, 500).await.expect("checks").len(),
+            200
+        );
     }
 }
