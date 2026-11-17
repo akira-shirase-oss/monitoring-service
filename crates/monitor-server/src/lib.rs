@@ -362,7 +362,19 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
 /// while the writer is dead — the vitals verdict is the truth about the engine, never a
 /// green that frozen statuses would contradict.
 async fn readyz(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    state.db.ping().await?;
+    if let Err(error) = state.db.ping().await {
+        // Public endpoint: fixed text, the detail in the log only.
+        tracing::error!(%error, "readiness: the store does not answer");
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": vitals::Availability::Unavailable,
+                "reason": "store unavailable",
+                "faults": ["store unavailable"],
+            })),
+        )
+            .into_response());
+    }
     let verdict = state.vitals.verdict();
     if verdict.status == vitals::Availability::Degraded {
         // Still observing and serving: ready, with the faults named (D-011). Only a
@@ -963,7 +975,9 @@ pub enum ApiError {
     Validation(#[from] ValidationError),
     #[error("stored data violates the contract")]
     Corrupt,
-    #[error(transparent)]
+    /// The store failed. Clients get fixed text; the detail (SQLite and sqlx messages:
+    /// table names, pool state) goes to the log only.
+    #[error("internal error")]
     Db(#[from] QueryError),
 }
 
@@ -1000,7 +1014,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status();
         if status.is_server_error() {
-            tracing::error!(code = self.code(), error = %self, "request failed");
+            let detail = std::error::Error::source(&self).map(ToString::to_string);
+            tracing::error!(code = self.code(), error = %self, ?detail, "request failed");
         }
         let body =
             serde_json::json!({ "error": { "code": self.code(), "message": self.to_string() } });

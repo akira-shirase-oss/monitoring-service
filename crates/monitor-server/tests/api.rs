@@ -1726,3 +1726,50 @@ async fn tokenless_mode_serves_only_loopback_hosts_and_same_origin_browsers() ->
     );
     Ok(())
 }
+
+/// L2: a store failure answered with the database's own text — sqlx/SQLite messages
+/// (table names, pool state) reached clients, including unauthenticated ones through
+/// `/readyz` and `POST /api/logout`. Every 5xx body is now fixed text; the detail goes to
+/// the log only.
+#[tokio::test]
+async fn store_failures_answer_fixed_text_never_the_databases_own() -> anyhow::Result<()> {
+    let leaks = |body: &serde_json::Value| {
+        let text = body.to_string().to_ascii_lowercase();
+        [
+            "pool",
+            "sqlite",
+            "database",
+            "table",
+            "connection",
+            "closed",
+        ]
+        .into_iter()
+        .find(|word| text.contains(word))
+    };
+
+    let (app, _statuses, db, _wh, _tmp) = app().await?;
+    db.close().await;
+    let (status, body) = send(&app, "GET", "/api/monitors", None).await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(leaks(&body), None, "{body}");
+
+    let (status, body) = send(&app, "GET", "/readyz", None).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["status"], "unavailable");
+    assert_eq!(leaks(&body), None, "{body}");
+
+    let (authed_app, authed_db, _tmp2) = authed("s3cret", Duration::from_secs(3600)).await?;
+    authed_db.close().await;
+    let response = authed_app
+        .oneshot(
+            Request::post("/api/logout")
+                .header("cookie", "smon_session=whatever")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json_body(response).await?;
+    assert_eq!(leaks(&body), None, "{body}");
+    Ok(())
+}
