@@ -1805,3 +1805,118 @@ async fn store_failures_answer_fixed_text_never_the_databases_own() -> anyhow::R
     assert_eq!(leaks(&body), None, "{body}");
     Ok(())
 }
+
+/// A router whose monitor cap is out of the way, so the schedule's capacity is what is
+/// tested.
+fn uncapped(db: &Db) -> Router {
+    monitor_server::router(monitor_server::AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100_000,
+        allow_local_targets: false,
+        version: "test",
+    })
+}
+
+/// D-018: a schedule past what the coordinator can start is refused when it is written —
+/// 409 `capacity_exceeded`, naming the bound — instead of being accepted and then missing
+/// slots in silence. Globally: 480 monitors at 15 s whose probes may each take the full
+/// 15 s would fill the 512 slots; the 480th is refused. Per origin: 30 monitors at 15 s are the
+/// 2 starts a tick one origin allows; a 31st on that origin is refused, elsewhere it fits.
+#[tokio::test]
+async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::connect(
+        &format!("sqlite:{}", tmp.path().join("cap.db").display()),
+        1,
+    )
+    .await?;
+    db.migrate().await?;
+    let slow = |name: String, url: &str| -> anyhow::Result<monitor_domain::Monitor> {
+        Ok(monitor_domain::NewMonitor::with_schedule(
+            name,
+            url::Url::parse(url)?,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+        )?
+        .into_monitor())
+    };
+    for i in 0..479 {
+        db.insert_monitor(&slow(format!("m{i}"), &format!("https://o{i}.example/"))?)
+            .await?;
+    }
+    let app = uncapped(&db);
+    // 479 × 16/15 ≈ 510.9 slots: a cheap hourly monitor still fits ...
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({ "name": "hourly", "url": "https://another.example/", "interval_s": 3600 })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // ... one more 15 s monitor that may take its full 15 s does not.
+    let one_more = serde_json::json!({
+        "name": "one-more", "url": "https://another.example/", "interval_s": 15, "timeout_s": 15
+    });
+    let (status, body) = send(&app, "POST", "/api/monitors", Some(one_more)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded");
+    assert_eq!(db.list_monitors().await?.len(), 480, "nothing was stored");
+
+    // Per origin, in a fresh store.
+    let tmp2 = tempfile::tempdir()?;
+    let db = Db::connect(&format!("sqlite:{}", tmp2.path().join("o.db").display()), 1).await?;
+    db.migrate().await?;
+    for i in 0..30 {
+        let mut monitor = slow(format!("p{i}"), &format!("https://api.example/{i}"))?;
+        monitor.timeout = Duration::from_secs(3);
+        db.insert_monitor(&monitor).await?;
+    }
+    let app = uncapped(&db);
+    let same_origin = serde_json::json!({
+        "name": "p30", "url": "https://api.example/30", "interval_s": 15, "timeout_s": 3
+    });
+    let (status, body) = send(&app, "POST", "/api/monitors", Some(same_origin)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("api.example")),
+        "the refusal names the origin: {body}"
+    );
+    let elsewhere = serde_json::json!({
+        "name": "q", "url": "https://other.example/", "interval_s": 15, "timeout_s": 3
+    });
+    let (status, _) = send(&app, "POST", "/api/monitors", Some(elsewhere)).await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // An edit that would overload the origin is refused the same way.
+    let faster = serde_json::json!({ "interval_s": 15, "url": "https://api.example/again" });
+    let other_id = db
+        .list_monitors()
+        .await?
+        .into_iter()
+        .find(|row| row.url.contains("other.example"))
+        .map(|row| row.id)
+        .ok_or_else(|| anyhow::anyhow!("the other monitor"))?;
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{other_id}"),
+        Some(faster),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded");
+    Ok(())
+}

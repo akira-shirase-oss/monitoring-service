@@ -92,7 +92,8 @@ impl Runtime {
 }
 
 /// The most probes one coordinator keeps in flight (D-018): outbound sockets, well inside
-/// the unit's 4096 file descriptors beside `SMON_MAX_CONNECTIONS` inbound ones.
+/// the unit's 4096 file descriptors beside `SMON_MAX_CONNECTIONS` inbound ones. A
+/// schedule that would need more is refused when it is written ([`capacity`]).
 pub const MAX_GLOBAL_SLOTS: usize = 512;
 
 /// Probe slots a schedule needs (D-018). Each tick starts `Σ tick/interval` probes, and
@@ -131,6 +132,36 @@ fn global_budget(monitors: &[Monitor], config: &Config) -> usize {
         0
     };
     needed.clamp(config.global_slots.min(MAX_GLOBAL_SLOTS), MAX_GLOBAL_SLOTS)
+}
+
+/// What a schedule can't be served by, if anything — checked when monitors are written,
+/// so an impossible schedule is a named refusal instead of slots silently missed (D-018).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Overload {
+    /// More probe slots than [`MAX_GLOBAL_SLOTS`] at these intervals and timeouts.
+    Global { required: f64 },
+    /// More starts per tick on one origin than its per-origin bound allows, even if every
+    /// probe were instant.
+    Origin { origin: String, per_tick: f64 },
+}
+
+/// Check a whole schedule (the stored monitors with a proposed change applied).
+pub fn capacity(monitors: &[Monitor], config: &Config) -> Option<Overload> {
+    let required = required_slots(monitors, config.tick);
+    if required > slots_f64(MAX_GLOBAL_SLOTS) {
+        return Some(Overload::Global { required });
+    }
+    let mut per_origin: HashMap<String, f64> = HashMap::new();
+    for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
+        *per_origin.entry(origin_key(&monitor.url)).or_default() +=
+            config.tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
+    }
+    let origin_limit = slots_f64(config.per_origin_slots);
+    per_origin
+        .into_iter()
+        .filter(|(_, per_tick)| *per_tick > origin_limit)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(origin, per_tick)| Overload::Origin { origin, per_tick })
 }
 
 /// The global semaphore, resized to the schedule's budget whenever the registry changes.
