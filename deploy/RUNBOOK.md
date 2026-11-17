@@ -152,7 +152,7 @@ wrote (deny.toml records the assessment and the re-check date).
 ```sh
 curl -X POST .../api/backup -d '{"path":"/opt/smon/data/backups/monitor.db"}'
 # restore: stop, copy the snapshot over data/monitor.db (remove -wal/-shm), start
-scripts/backup-drill.sh   # the drill that proves it — run it before trusting it
+scripts/backup-drill.sh   # the drill that proves it (own ports 58460/58461; safe beside a live monitor)
 ```
 
 ## Watch the monitor
