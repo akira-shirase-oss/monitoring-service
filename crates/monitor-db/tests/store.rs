@@ -1449,3 +1449,26 @@ async fn a_new_store_and_its_backups_are_owner_only() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `VACUUM INTO` takes no bound parameters, so the backup path is an SQL string literal
+/// with `'` doubled. A path containing quotes (and the SQL they could smuggle) must write
+/// exactly that file and nothing else.
+#[tokio::test]
+async fn a_backup_path_with_quotes_writes_exactly_that_file() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::connect(&format!("sqlite:{}", tmp.path().join("q.db").display()), 1).await?;
+    db.migrate().await?;
+    let name = "it's a backup'; DROP TABLE monitors; --.db";
+    let path = tmp.path().join(name);
+    assert!(db.backup(&path).await? > 0);
+    assert!(path.is_file(), "the file is named exactly {name:?}");
+    let mut names: Vec<String> = std::fs::read_dir(tmp.path())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|file| !file.starts_with("q.db"))
+        .collect();
+    names.sort();
+    assert_eq!(names, [name], "and nothing else was written");
+    assert!(db.list_monitors().await.is_ok(), "the store is intact");
+    Ok(())
+}
