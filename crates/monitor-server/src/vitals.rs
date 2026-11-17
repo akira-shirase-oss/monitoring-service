@@ -324,6 +324,11 @@ impl Supervisor {
     /// unavailable forever. Past the limit it is an engine failure like a dead task — the
     /// process exits and the service manager restarts it (D-011). Checked every `every`;
     /// ends on shutdown.
+    ///
+    /// A check that comes more than `limit` after the previous one means the watchdog
+    /// itself was frozen — the whole process was (SIGSTOP, a VM pause, a cgroup freezer) —
+    /// so the coordinator's silence says nothing about the coordinator. That check is
+    /// skipped; the coordinator gets its first pass after the freeze before it is judged.
     pub fn watch_stall(&self, limit: Duration, every: Duration) {
         let vitals = self.vitals.clone();
         let shutdown = self.shutdown.clone();
@@ -331,10 +336,20 @@ impl Supervisor {
         self.tracker.spawn(async move {
             let mut ticks = tokio::time::interval(every);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_check = Instant::now();
             loop {
                 tokio::select! {
                     _ = ticks.tick() => {}
                     () = shutdown.cancelled() => return,
+                }
+                let watchdog_gap = last_check.elapsed();
+                last_check = Instant::now();
+                if watchdog_gap > limit {
+                    tracing::warn!(
+                        paused_s = watchdog_gap.as_secs(),
+                        "the process was frozen; not judging the coordinator this round"
+                    );
+                    continue;
                 }
                 if let Some(silent) = vitals.coordinator_silence()
                     && silent > limit

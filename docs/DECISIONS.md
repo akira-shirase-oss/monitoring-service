@@ -125,7 +125,9 @@ serving stops, one born-expired `monitoring: unavailable` beat is written at onc
 engine drains, and the process exits non-zero, so systemd `Restart=on-failure` or launchd
 `KeepAlive` restarts it and the boot records the gap (D-014). A coordinator that is alive
 but makes no loop pass for 2 minutes (4 × the 30 s stall threshold) is treated the same
-way — a stall that long will not clear by itself. Supporting tasks stay *degraded*, with
+way — a stall that long will not clear by itself. A freeze of the whole process
+(SIGSTOP, a VM pause) is not a stall: when the watchdog's own previous check is more than
+the limit ago, it skips that round and lets the coordinator make its first pass. Supporting tasks stay *degraded*, with
 no exit. The systemd unit backs restarts off from 15 s to 10 minutes (`RestartSteps`,
 systemd ≥ 254) under a start limit of 10 in 30 minutes that a backed-off loop never
 reaches: a slow dependency (a late volume) is retried until it appears, and a

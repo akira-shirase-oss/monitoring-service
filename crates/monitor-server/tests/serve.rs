@@ -150,3 +150,48 @@ async fn a_beating_coordinator_is_never_called_stalled() -> anyhow::Result<()> {
     assert!(supervisor.drain(Duration::from_secs(2)).await);
     Ok(())
 }
+
+/// A frozen *process* (SIGSTOP, a VM pause, a cgroup freezer) is not a stalled
+/// coordinator. On resume the watchdog used to fire before the healthy coordinator could
+/// beat (SIGSTOP for 130 s → exit 1 within 1 s). Here the whole runtime is blocked — every
+/// task frozen at once, like SIGSTOP — past the stall limit, then resumes; the coordinator
+/// keeps beating and no failure may be raised.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_freeze_is_not_mistaken_for_a_stalled_coordinator() {
+    let vitals = Vitals::new(Arc::default(), Duration::from_millis(50));
+    let shutdown = CancellationToken::new();
+    let supervisor = Supervisor::new(vitals.clone(), shutdown.clone());
+    let failure = supervisor.engine_failure();
+    // The coordinator: a pass every 100 ms — its next deadline after the freeze falls
+    // *after* the watchdog's, so the watchdog judges first on resume.
+    vitals.coordinator_beat();
+    let beating = {
+        let vitals = vitals.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => vitals.coordinator_beat(),
+                    () = shutdown.cancelled() => return,
+                }
+            }
+        })
+    };
+    supervisor.watch_stall(Duration::from_millis(150), Duration::from_millis(20));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Freeze everything for 400 ms (> the 150 ms limit).
+    // Blocking the runtime thread is the point here: it freezes every task at once.
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Resume and give both a few rounds.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let raised = tokio::time::timeout(Duration::from_millis(1), failure.wait()).await;
+    shutdown.cancel();
+    let _ = beating.await;
+    assert!(
+        raised.is_err(),
+        "a freeze of the whole process must not read as a stall"
+    );
+}
