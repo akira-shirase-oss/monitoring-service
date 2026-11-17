@@ -11,6 +11,9 @@ name: ci
 
 on:
   push:
+    # Dependabot's branches get the pull_request run; a push run on the same SHA is a
+    # duplicate.
+    branches-ignore: ['dependabot/**']
   pull_request:
   schedule:
     - cron: '23 6 * * *'

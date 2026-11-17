@@ -1,6 +1,8 @@
 # Weekly, grouped version updates for every ecosystem the build pulls from: Rust crates
 # (Cargo.lock), npm (package-lock.json, covers apps/dashboard) and the SHA-pinned actions
 # in .github/workflows. A cooldown lets a fresh release age a week before it is proposed.
+# Groups take minor and patch updates only: a semver-major comes as its own pull request,
+# so one that needs a code change can't hold the patches back.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -12,6 +14,7 @@ updates:
     groups:
       cargo:
         patterns: ['*']
+        update-types: [minor, patch]
   - package-ecosystem: npm
     directory: /
     schedule:
@@ -21,6 +24,7 @@ updates:
     groups:
       npm:
         patterns: ['*']
+        update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -30,3 +34,4 @@ updates:
     groups:
       actions:
         patterns: ['*']
+        update-types: [minor, patch]
