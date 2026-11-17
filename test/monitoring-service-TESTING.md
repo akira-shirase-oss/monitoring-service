@@ -147,7 +147,7 @@ monitor maintenance add|list|rm
 
 ## How to report a bug
 
-Send Vinay (`akira-shirase-oss` / @404humandev) a note, or open a GitHub issue on **`monitoring-service`** (not `service-monitor`), including:
+Send a note to `akira-shirase-oss` (@404humandev), or open a GitHub issue on **`monitoring-service`** (not `service-monitor`), including:
 
 - Commit SHA (`git rev-parse HEAD`).
 - OS, `rustc --version`, `node --version`.

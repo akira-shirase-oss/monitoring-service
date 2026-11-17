@@ -2,8 +2,8 @@
     at Object.spawnSync (node:internal/child_process:1143:20)
     at spawnSync (node:child_process:911:24)
     at execFileSync (node:child_process:954:15)
-    at sqlite (file:///Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/service-monitor/perf/lab-profile.mjs:58:2)
-    at main (file:///Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/service-monitor/perf/lab-profile.mjs:144:3) {
+    at sqlite (file://~/Desktop/Learning/akira-shirase-oss/projects/service-monitor/perf/lab-profile.mjs:58:2)
+    at main (file://~/Desktop/Learning/akira-shirase-oss/projects/service-monitor/perf/lab-profile.mjs:144:3) {
   errno: -55,
   code: 'ENOBUFS',
   syscall: 'spawnSync sqlite3',
