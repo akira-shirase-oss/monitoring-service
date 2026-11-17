@@ -53,6 +53,28 @@ impl Default for Config {
     }
 }
 
+/// Wall time read off the monotonic clock from one epoch, so the two clocks the schedule
+/// keeps (`Instant` decides, the wall-clock copy is recorded) can't drift apart — and move
+/// together under paused time in tests.
+#[derive(Debug, Clone, Copy)]
+struct SlotClock {
+    instant: Instant,
+    wall: OffsetDateTime,
+}
+
+impl SlotClock {
+    fn start() -> Self {
+        Self {
+            instant: Instant::now(),
+            wall: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn wall_at(self, at: Instant) -> OffsetDateTime {
+        self.wall + at.saturating_duration_since(self.instant)
+    }
+}
+
 /// A monitor's schedule state — the two clocks stay in lockstep: `Instant` decides, the
 /// wall-clock copy is what gets recorded.
 struct Runtime {
@@ -68,9 +90,9 @@ impl Runtime {
     /// slot times are `phase (mod interval)` in Unix milliseconds, with the phase fixed by
     /// the monitor's id. Monitors created together therefore spread across their interval
     /// instead of falling due on the same tick, and a restart or an edit keeps the grid.
-    fn new(monitor: Monitor, min_delay: Duration) -> Self {
+    fn new(monitor: Monitor, min_delay: Duration, clock: &SlotClock) -> Self {
         let now = Instant::now();
-        let now_wall = OffsetDateTime::now_utc();
+        let now_wall = clock.wall_at(now);
         let delay = delay_to_phase(
             now_wall,
             min_delay,
@@ -264,6 +286,7 @@ async fn run(
 ) {
     let (results_tx, mut results_rx) = mpsc::channel::<Observation>(config.results_bound);
     let mut global = GlobalSlots::new(config.global_slots);
+    let clock = SlotClock::start();
     let mut origins: HashMap<String, Arc<Semaphore>> = HashMap::new();
     let mut runtimes: HashMap<MonitorId, Runtime> = HashMap::new();
     let tracker = TaskTracker::new();
@@ -272,7 +295,7 @@ async fn run(
 
     {
         let monitors = Arc::clone(&registry.borrow_and_update());
-        reconcile(&mut runtimes, &mut origins, &monitors, &config);
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
         global.resize(global_budget(&monitors, &config));
     }
 
@@ -307,7 +330,7 @@ async fn run(
                     break;
                 }
                 let monitors = Arc::clone(&registry.borrow_and_update());
-                reconcile(&mut runtimes, &mut origins, &monitors, &config);
+                reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
                 global.resize(global_budget(&monitors, &config));
             }
             () = shutdown.cancelled() => break,
@@ -461,6 +484,7 @@ fn reconcile(
     origins: &mut HashMap<String, Arc<Semaphore>>,
     monitors: &[Monitor],
     config: &Config,
+    clock: &SlotClock,
 ) {
     runtimes.retain(|_, entry| {
         monitors
@@ -481,11 +505,17 @@ fn reconcile(
                     || entry.monitor.timeout != monitor.timeout
                     || entry.monitor.url != monitor.url =>
             {
-                *entry = Runtime::new(monitor.clone(), config.tick);
+                // No minimum delay: on the same grid the pending slot stays exactly where
+                // it was (an edit just before it no longer skips it a whole interval); a
+                // slot already passed is not run twice, the grid's next one is.
+                *entry = Runtime::new(monitor.clone(), Duration::ZERO, clock);
             }
             Some(_) => {}
             None => {
-                runtimes.insert(monitor.id, Runtime::new(monitor.clone(), config.tick));
+                runtimes.insert(
+                    monitor.id,
+                    Runtime::new(monitor.clone(), config.tick, clock),
+                );
             }
         }
     }
@@ -731,7 +761,8 @@ mod tests {
         let monitors = fleet(1500, 300, interval, Duration::from_secs(3));
         let mut runtimes = HashMap::new();
         let mut origins = HashMap::new();
-        reconcile(&mut runtimes, &mut origins, &monitors, &config);
+        let clock = SlotClock::start();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
         let mut per_second = vec![0_usize; 16];
         let start = Instant::now();
         for entry in runtimes.values() {
@@ -742,7 +773,7 @@ mod tests {
         let busiest = per_second.iter().copied().max().unwrap_or(0);
         assert!(busiest <= 160, "a wave formed: {per_second:?}");
         // Deterministic: the same id gets the same phase again (a restart, an edit).
-        let again = Runtime::new(monitors[0].clone(), config.tick);
+        let again = Runtime::new(monitors[0].clone(), config.tick, &clock);
         let first = &runtimes[&monitors[0].id];
         let drift = first.next_slot_at - again.next_slot_at;
         assert!(drift.abs() < time::Duration::milliseconds(50), "{drift}");
@@ -757,7 +788,8 @@ mod tests {
         let monitors = fleet(1600, 200, Duration::from_secs(15), Duration::from_secs(3));
         let mut runtimes = HashMap::new();
         let mut origins = HashMap::new();
-        reconcile(&mut runtimes, &mut origins, &monitors, &config);
+        let clock = SlotClock::start();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
         let global = Arc::new(Semaphore::new(global_budget(&monitors, &config)));
         let (mut missed, mut dispatched) = (0, 0);
         for _ in 0..32 {
@@ -774,5 +806,50 @@ mod tests {
         }
         assert_eq!(missed, 0, "{missed} slots missed ({dispatched} started)");
         assert!(dispatched >= 3200, "every monitor ran twice: {dispatched}");
+    }
+
+    /// An edit re-anchors the runtime. With a one-tick minimum delay, an edit made less
+    /// than a tick before a due slot pushed it a whole interval later, and no `missed` row
+    /// said so. The pending slot is kept: same grid, so it still runs on time.
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_just_before_a_due_slot_keeps_that_slot() {
+        let config = Config::default();
+        let mut monitor = fleet(1, 1, Duration::from_secs(15), Duration::from_secs(3)).remove(0);
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        let clock = SlotClock::start();
+        reconcile(
+            &mut runtimes,
+            &mut origins,
+            std::slice::from_ref(&monitor),
+            &config,
+            &clock,
+        );
+        let due = runtimes[&monitor.id].next_slot;
+        let due_at = runtimes[&monitor.id].next_slot_at;
+        // Half a tick before the slot, the operator edits the name.
+        let until_due = due.saturating_duration_since(Instant::now());
+        tokio::time::advance(until_due.saturating_sub(config.tick / 2)).await;
+        monitor.name = "renamed".into();
+        monitor.generation += 1;
+        reconcile(
+            &mut runtimes,
+            &mut origins,
+            std::slice::from_ref(&monitor),
+            &config,
+            &clock,
+        );
+        let edited = &runtimes[&monitor.id];
+        assert_eq!(
+            edited.next_slot.saturating_duration_since(due),
+            Duration::ZERO,
+            "the slot was pushed later"
+        );
+        let drift = (edited.next_slot_at - due_at).abs();
+        assert!(
+            drift < time::Duration::milliseconds(50),
+            "the slot due at {due_at} moved to {} without a missed row",
+            edited.next_slot_at
+        );
     }
 }
