@@ -454,3 +454,63 @@ async fn alert_payloads_strip_credentials_from_the_monitor_url() -> anyhow::Resu
     );
     Ok(())
 }
+
+/// A webhook receiver that answers `307 Temporary Redirect` to another origin must not get
+/// the payload and its signature re-sent there (307 keeps the method and body): the alert
+/// goes only to the configured receiver, and a redirect is a failed attempt.
+#[tokio::test]
+async fn a_receivers_redirect_is_not_followed_and_nothing_is_re_sent() -> anyhow::Result<()> {
+    let (db, writer) = rig().await?;
+    let (monitor, _event) = monitor_with_event(&db, &writer, "fixture").await?;
+    let (elsewhere, mut elsewhere_hits) = stub(0, vec![]).await?;
+    let redirects = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&redirects);
+    let redirecting = Router::new().route(
+        "/",
+        post(move || {
+            let counted = Arc::clone(&counted);
+            let elsewhere = elsewhere.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+                if let Ok(location) = axum::http::HeaderValue::from_str(&elsewhere) {
+                    response.headers_mut().insert("location", location);
+                }
+                response
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let target = format!("http://127.0.0.1:{}/", listener.local_addr()?.port());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, redirecting).await;
+    });
+
+    let shutdown = CancellationToken::new();
+    let task = Deliverer::spawn(
+        db.clone(),
+        writer,
+        fast_config(),
+        webhook_sink(&target, Some(b"the-secret"))?,
+        shutdown.clone(),
+    );
+    let row = wait_row(&db, &monitor, |row| row.attempts >= 2).await?;
+    assert!(
+        redirects.load(Ordering::SeqCst) >= 1,
+        "the receiver was tried"
+    );
+    assert!(
+        row.delivered_at.is_none(),
+        "a redirect is not a delivery: {row:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), elsewhere_hits.recv())
+            .await
+            .is_err(),
+        "the payload and signature must not reach the redirect target"
+    );
+    shutdown.cancel();
+    task.await?;
+    Ok(())
+}

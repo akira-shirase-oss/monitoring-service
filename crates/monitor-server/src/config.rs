@@ -37,6 +37,7 @@ pub const KNOWN: &[&str] = &[
     "SMON_RETENTION_INTERVAL_S",
     "SMON_RETENTION_S",
     "SMON_SERVER",
+    "SMON_SESSION_IDLE_S",
     "SMON_SESSION_TTL_S",
     "SMON_SMTP_DSN",
     "SMON_SMTP_FROM",
@@ -89,6 +90,7 @@ pub struct Config {
     pub webhook_secret: Option<String>,
     pub smtp: Option<SmtpSettings>,
     pub session_ttl: Duration,
+    pub session_idle: Duration,
     pub cookie_secure: crate::auth::CookieSecure,
     pub max_monitors: u64,
 }
@@ -368,6 +370,11 @@ impl Config {
             Duration::from_hours(12),
             60..=MAX_HORIZON_S,
         );
+        let session_idle = env.seconds(
+            "SMON_SESSION_IDLE_S",
+            Duration::from_hours(1),
+            60..=MAX_HORIZON_S,
+        );
         let cookie_secure = match env.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
             None | Some("auto") => crate::auth::CookieSecure::Auto,
             Some("always") => crate::auth::CookieSecure::Always,
@@ -403,6 +410,7 @@ impl Config {
             webhook_secret,
             smtp,
             session_ttl,
+            session_idle,
             cookie_secure,
             max_monitors,
         })
@@ -440,6 +448,7 @@ mod tests {
         assert_eq!(config.retention, RetentionPolicy::default());
         assert_eq!(config.status_ttl, Duration::from_secs(90));
         assert_eq!(config.session_ttl, Duration::from_hours(12));
+        assert_eq!(config.session_idle, Duration::from_hours(1));
         assert_eq!(config.max_monitors, 100);
         assert!(!config.lab);
         assert!(config.smtp.is_none() && config.webhook_url.is_none());
@@ -458,6 +467,7 @@ mod tests {
             ("SMON_STATUS_TTL_S", "90s"),
             ("SMON_LOG_MAX_BYTES", "lots"),
             ("SMON_SESSION_TTL_S", "12h"),
+            ("SMON_SESSION_IDLE_S", "1h"),
             ("SMON_MAX_MONITORS", "0"),
             ("SMON_LISTEN", "localhost"),
             ("SMON_PROFILE", "Lab"),

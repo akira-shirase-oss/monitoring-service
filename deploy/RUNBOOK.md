@@ -38,6 +38,7 @@ sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/no
 # volume that isn't mounted yet can never be mistaken for a new install):
 sudo sh -c 'set -a; . /opt/smon/env; set +a; exec /opt/smon/current/bin/monitor-server --init'
 sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # the only paths it writes
+sudo chmod 700 /opt/smon/data   # store, -wal/-shm, logs, backups: nobody else reads or plants files
 sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env  # systemd reads it as root
 sudo cp deploy/monitor-server.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now monitor-server
@@ -66,12 +67,30 @@ the cause in `faults` (D-011): `store writes failing (N consecutive)` means the 
 process then writes one "monitoring unavailable" beat and exits non-zero on its own, and
 the service manager restarts it (D-011; a coordinator stalled for 2 minutes does the
 same); repeated restarts mean the log's task error needs fixing. Restarts back off from
-15 s to 10 minutes (systemd ≥ 254), so a slow dependency recovers on its own and a crash
-loop never hammers. On older systemd (fixed 15 s) 10 starts within 30 minutes leave the
-unit `failed` (`start request repeated too quickly`): fix the cause, then `sudo systemctl
-reset-failed monitor-server && sudo systemctl start monitor-server`. The unit also waits
-for the mounts of `data/` and `status/` (`RequiresMountsFor`); `degraded` with a deliverer, snapshot or retention
-fault means checks still run but that duty has stopped.
+15 s to 10 minutes (systemd ≥ 254), so a crash that clears (a dependency the process
+itself retries, a store that comes back) is retried and a crash loop never hammers. On
+older systemd (fixed 15 s) 10 starts within 30 minutes leave the unit `failed` (`start
+request repeated too quickly`): fix the cause, then `sudo systemctl reset-failed
+monitor-server && sudo systemctl start monitor-server`. `degraded` with a deliverer,
+snapshot or retention fault means checks still run but that duty has stopped.
+
+### The data volume attached late
+
+The unit waits for the mounts of `data/` and `status/` (`RequiresMountsFor`). If the
+volume's device has not appeared by its mount's `x-systemd.device-timeout` (90 s by
+default), the mount job **fails**, and to systemd that is a *dependency failure* of
+`monitor-server`, not a crash: `Restart=` does not apply, so the unit stays inactive — the
+public heartbeat expires and the status page says "monitoring unavailable" — until it is
+started by hand. Nothing retries it on its own. Once the volume is there:
+
+```sh
+findmnt /opt/smon/data || sudo mount /opt/smon/data   # the volume, not the bare mountpoint
+sudo systemctl start monitor-server
+```
+
+To make this rarer, give the volume's fstab entry a longer wait (for example
+`nofail,x-systemd.device-timeout=10min`); never remove `RequiresMountsFor` — D-015 would
+refuse the bare mountpoint anyway, but the unit is what keeps the order right.
 
 ### The store is at its cap (`SMON_MAX_DB_BYTES`)
 
@@ -105,6 +124,7 @@ the ownership change SQLite cannot write `data/`. Once, before the normal steps 
 sudo systemctl stop monitor-server
 sudo useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
 sudo chown -R smon:smon /opt/smon/data /opt/smon/status   # store, -wal/-shm, logs, snapshot
+sudo chmod 700 /opt/smon/data && sudo chmod 600 /opt/smon/data/monitor.db*  # owner-only
 sudo chown root:root /opt/smon/env && sudo chmod 600 /opt/smon/env
 sudo cp deploy/monitor-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -118,6 +138,11 @@ scripts/deploy.sh --prefix /opt/smon            # new release dir, repoints curr
 sudo systemctl restart monitor-server           # or: launchctl kickstart -k system/com.shirase.smon
 curl -sf .../readyz && curl -sf .../version     # the version must match the new release
 ```
+
+**Upgrading across the 2026-11-16 security release** (migrations 0008/0009): dashboard
+sessions are dropped once — sign in again. After that, rotating `SMON_ADMIN_TOKEN` (edit
+`env`, restart) ends every dashboard session, and sessions unused for
+`SMON_SESSION_IDLE_S` (default 1 h) end on their own. Backup targets must be new paths.
 
 Boot rebuilds incidents and streaks from the store — an upgrade mid-incident resumes
 `down`, never fabricates a recovery. If the monitor was down for longer than a check
@@ -144,13 +169,20 @@ fails the migration check at boot and stays down, which is the honest failure.
 
 ## Backup / restore
 
+Backups are created new and owner-only (0600): the target path must not exist yet
+(an existing file is refused with 422, never overwritten). Keep them inside `data/` (0700)
+or another owner-only directory — they hold monitored URLs and alert history.
+
 Restore only into a stopped server, and delete any `monitor.db-wal`/`-shm` beside the
 restored file first: the bundled SQLite (`libsqlite3-sys` 0.37) is affected by
 RUSTSEC-2026-0459, which needs a database opened together with a `-wal` that someone else
 wrote (deny.toml records the assessment and the re-check date).
 
 ```sh
-curl -X POST .../api/backup -d '{"path":"/opt/smon/data/backups/monitor.db"}'
+# a new name each time (an existing file is refused); data/backups/ is owned by smon
+curl -X POST .../api/backup -H "authorization: Bearer $SMON_ADMIN_TOKEN" \
+    -H 'content-type: application/json' \
+    -d "{\"path\":\"/opt/smon/data/backups/monitor-$(date -u +%Y%m%dT%H%M%SZ).db\"}"
 # restore: stop, copy the snapshot over data/monitor.db (remove -wal/-shm), start
 scripts/backup-drill.sh   # the drill that proves it (own ports 58460/58461; safe beside a live monitor)
 ```

@@ -1,5 +1,6 @@
-# cargo-deny — `scripts/check-advisories.sh` (run by check.sh) runs `cargo deny check
-# advisories`; without cargo-deny it warns locally and fails when CI is set. Every RustSec
+# cargo-deny — `scripts/check-advisories.sh` (run by check.sh and CI) runs `cargo deny check
+# advisories bans licenses sources`; without cargo-deny it warns locally and fails when CI
+# is set. Every RustSec
 # advisory against a locked crate fails the gate unless it is listed below, and every entry
 # must carry `re-check YYYY-MM-DD` in its reason: the gate fails once that date has passed.
 
@@ -23,3 +24,39 @@ ignore = [
     # `sqlite-unbundled` instead — distro SQLite is likely older than 3.54.
     { id = "RUSTSEC-2026-0459", reason = "patched libsqlite3-sys 0.39 blocked by sqlx-sqlite 0.9.0 (<0.38); exposure negligible, see deny.toml; re-check 2026-12-16" },
 ]
+
+# Licences: every crate in the graph must be under one of these (an `OR` expression passes
+# when any branch is allowed). Permissive licences only — a copyleft-only crate fails the
+# gate and needs a decision first. Our own crates are unpublished and skipped.
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+# Sources: crates.io only — no git dependencies, no other registries.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Bans: no wildcard version requirements (our own path dependencies excepted). Duplicate
+# versions are allowed — several come from upstream crates and are not ours to fix.
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true

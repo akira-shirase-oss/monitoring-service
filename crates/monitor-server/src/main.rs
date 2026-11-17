@@ -34,9 +34,15 @@ enum Mode {
     Init,
 }
 
+const USAGE: &str = "usage: monitor-server            serve (the store must exist)
+       monitor-server --init     create and migrate the store of a new install, then exit
+       monitor-server --version  print the version
+       monitor-server --help     print this help
+configuration: SMON_* environment variables (README, Configuration)";
+
 /// Arguments: none to serve; `--init` to create the store of a new install (D-015);
-/// `--version`. Anything else is a usage error (exit 2) — never a server started by
-/// accident with default settings.
+/// `--version`; `--help`. Anything else is a usage error (exit 2) — never a server started
+/// by accident with default settings.
 fn parse_mode() -> Result<Mode, std::process::ExitCode> {
     match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
         [] => Ok(Mode::Serve),
@@ -45,13 +51,12 @@ fn parse_mode() -> Result<Mode, std::process::ExitCode> {
             println!("monitor-server {}", env!("CARGO_PKG_VERSION"));
             Err(std::process::ExitCode::SUCCESS)
         }
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!("{USAGE}");
+            Err(std::process::ExitCode::SUCCESS)
+        }
         other => {
-            eprintln!(
-                "monitor-server: unknown arguments {other:?}\n\
-                 usage: monitor-server            serve (the store must exist)\n       \
-                 monitor-server --init     create and migrate the store of a new install, then exit\n       \
-                 monitor-server --version"
-            );
+            eprintln!("monitor-server: unknown arguments {other:?}\n{USAGE}");
             Err(std::process::ExitCode::from(2))
         }
     }
@@ -185,13 +190,14 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         vitals: vitals.clone(),
         admin_token,
         session_ttl: config.session_ttl,
+        session_idle: config.session_idle,
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
         allow_local_targets: config.lab,
         version: env!("CARGO_PKG_VERSION"),
     });
 
-    let app = with_static_files(app, &config.status_dir, &config.dashboard_dir);
+    let app = hardened(app, &config).await?;
 
     // Install the stop signals before serving: a registration failure is a boot error,
     // not a detached panic that would look like a clean shutdown (rust-mastery ch. 12).
@@ -280,6 +286,18 @@ fn with_static_files(app: axum::Router, status_dir: &str, dashboard_dir: &str) -
         tracing::info!(dir = %dashboard_dir, "dashboard not built; API only");
         app
     }
+}
+
+/// The API plus the static files, with browser hardening on every response (headers.rs):
+/// the CSP allows the dashboard build's inline bootstrap by hash, read from the build once,
+/// on a blocking thread.
+async fn hardened(app: axum::Router, config: &Config) -> anyhow::Result<axum::Router> {
+    let app = with_static_files(app, &config.status_dir, &config.dashboard_dir);
+    let dir = std::path::PathBuf::from(&config.dashboard_dir);
+    let csp = tokio::task::spawn_blocking(move || monitor_server::headers::dashboard_csp(&dir))
+        .await
+        .context("reading the dashboard build for its CSP")?;
+    Ok(monitor_server::headers::harden(app, &csp))
 }
 
 /// The coordinator and its probe client (the SSRF policy follows `SMON_PROFILE`), owned

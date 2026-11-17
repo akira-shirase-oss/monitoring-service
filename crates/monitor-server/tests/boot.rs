@@ -302,3 +302,150 @@ fn an_unknown_argument_never_starts_a_server() {
         "and nothing is created"
     );
 }
+
+/// Without `SMON_ADMIN_TOKEN` the whole `/api` is open — honest only on loopback (dev
+/// mode). A wildcard or public listen with no token must stop the boot before anything
+/// runs: no listener, no snapshot, no engine. The store exists (made by `--init`), so the
+/// token is the only thing that can stop it.
+#[test]
+fn a_tokenless_non_loopback_listen_refuses_to_boot_and_binds_nothing() {
+    for listen in ["0.0.0.0:0", "[::]:0"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = server(dir.path(), &[])
+            .arg("--init")
+            .output()
+            .expect("--init");
+        assert!(init.status.success(), "--init: {init:?}");
+
+        let mut child = server(dir.path(), &[("SMON_LISTEN", listen)])
+            .spawn()
+            .expect("spawn monitor-server");
+        let status = wait_exit(&mut child, Duration::from_secs(20)).unwrap_or_else(|| {
+            panic!("{listen}: a tokenless public listen must stop the boot, not serve")
+        });
+        assert!(!status.success(), "{listen}: exit status {status}");
+        let stderr = stderr_of(&mut child);
+        assert!(
+            stderr.contains("SMON_ADMIN_TOKEN is required"),
+            "{listen}: the cause is named: {stderr}"
+        );
+        let mut stdout = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            use std::io::Read;
+            let _ = out.read_to_string(&mut stdout);
+        }
+        assert!(
+            !stdout.contains("monitor-server listening"),
+            "{listen}: nothing may be bound: {stdout}"
+        );
+        assert!(
+            !dir.path().join("status").exists(),
+            "{listen}: no engine task may have run (the snapshot writer creates status/)"
+        );
+    }
+}
+
+/// `server()`, started through `sh` with `umask` set first — the way a service manager
+/// hands the process its umask.
+#[cfg(unix)]
+fn server_with_umask(dir: &std::path::Path, umask: &str, args: &[&str]) -> Command {
+    let template = server(dir, &[]);
+    let mut shell = Command::new("sh");
+    shell
+        .arg("-c")
+        .arg(format!("umask {umask}; exec \"$@\""))
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_monitor-server"))
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            shell.env(key, value);
+        }
+    }
+    shell
+}
+
+/// The real binary, whatever umask its service manager hands it: under a permissive 022
+/// `--init` still creates an owner-only store, and under the unit's 077 the public
+/// snapshot is still readable by the static host that publishes it (0644) while the store
+/// and its WAL stay 0600.
+#[cfg(unix)]
+#[test]
+fn the_store_is_owner_only_and_the_snapshot_public_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path).map_or_else(
+            |e| panic!("{}: {e}", path.display()),
+            |meta| meta.permissions().mode() & 0o777,
+        )
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let init = server_with_umask(dir.path(), "022", &["--init"])
+        .output()
+        .expect("--init");
+    assert!(init.status.success(), "--init: {init:?}");
+    assert_eq!(
+        mode(&dir.path().join("boot.db")),
+        0o600,
+        "store under umask 022"
+    );
+
+    let mut child = server_with_umask(dir.path(), "077", &[])
+        .spawn()
+        .expect("serve");
+    let snapshot = dir.path().join("status/status.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !snapshot.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let snapshot_mode = snapshot.exists().then(|| mode(&snapshot));
+    let wal = dir.path().join("boot.db-wal");
+    let wal_mode = wal.exists().then(|| mode(&wal));
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let _ = wait_exit(&mut child, Duration::from_secs(40));
+    assert_eq!(
+        snapshot_mode,
+        Some(0o644),
+        "public snapshot under umask 077"
+    );
+    assert_eq!(
+        mode(&dir.path().join("boot.db")),
+        0o600,
+        "store under umask 077"
+    );
+    if let Some(wal_mode) = wal_mode {
+        assert_eq!(wal_mode, 0o600, "the WAL");
+    }
+}
+
+/// F5: asking for help is not a usage error. `--help` and `-h` print the usage on stdout
+/// and exit 0, without starting a server or creating anything; an unknown argument is
+/// still exit 2.
+#[test]
+fn help_prints_usage_and_exits_zero() {
+    for flag in ["--help", "-h"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = server(dir.path(), &[])
+            .arg(flag)
+            .output()
+            .expect("run --help");
+        assert_eq!(output.status.code(), Some(0), "{flag}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for word in ["usage:", "--init", "--version", "--help"] {
+            assert!(
+                stdout.contains(word),
+                "{flag}: {word} missing from {stdout}"
+            );
+        }
+        assert!(
+            !dir.path().join("boot.db").exists(),
+            "{flag} creates nothing"
+        );
+    }
+}

@@ -62,6 +62,8 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_SMTP_TO=oncall@example.com,backup@example.com
 # Dashboard session lifetime in seconds (default 12 h).
 # SMON_SESSION_TTL_S=43200
+# A session unused this long ends too, in seconds (default 1 h).
+# SMON_SESSION_IDLE_S=3600
 # auto: the session cookie is Secure when the TLS proxy says so; always: every cookie.
 # SMON_COOKIE_SECURE=auto
 ENV

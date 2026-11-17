@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod config;
 pub mod deliver;
+pub mod headers;
 pub mod logfile;
 pub mod probe;
 pub mod redact;
@@ -42,6 +43,18 @@ use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, Valid
 const BODY_LIMIT: usize = 16 * 1024;
 /// Every handler answers inside this; probes run on their own deadlines elsewhere.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Logins evaluated at once. `POST /api/login` is the one unauthenticated credential
+/// check: a wrong token keeps its slot for [`WRONG_TOKEN_DELAY`], so guesses are bounded
+/// to about `LOGIN_SLOTS / 0.3 s` however many connections are opened; the rest get 429
+/// before the token is compared. The bearer token (CLI) never queues here.
+const LOGIN_SLOTS: usize = 4;
+/// The penalty a wrong token pays while holding its login slot.
+const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
+
+/// The login slots ([`LOGIN_SLOTS`]): one set per router, so each server (and each test
+/// router) has its own.
+#[derive(Clone)]
+struct LoginSlots(Arc<tokio::sync::Semaphore>);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -61,6 +74,9 @@ pub struct AppState {
     /// `sessions` row and the cookie's `Max-Age`. Store-side expiry is the authority;
     /// the cookie's copy is a convenience for the browser.
     pub session_ttl: Duration,
+    /// `SMON_SESSION_IDLE_S`: a session unused for this long ends, inside its lifetime too
+    /// (D-016). The dashboard's 15 s refresh keeps an open tab's session in use.
+    pub session_idle: Duration,
     /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
     pub cookie_secure: auth::CookieSecure,
     /// `SMON_MAX_MONITORS`: creates past this count are refused (paused monitors count —
@@ -195,6 +211,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logout", post(logout))
         .nest("/api", api)
         .with_state(state)
+        .layer(axum::Extension(LoginSlots(Arc::new(
+            tokio::sync::Semaphore::new(LOGIN_SLOTS),
+        ))))
         // Order matters: request id first, then tracing, panic catch, timeout, body limit.
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -228,6 +247,7 @@ pub struct LoginBody {
 /// without a stray copy in localStorage.
 async fn login(
     State(state): State<AppState>,
+    axum::Extension(slots): axum::Extension<LoginSlots>,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
@@ -258,10 +278,23 @@ async fn login(
         )
             .into_response();
     };
+    // A bounded queue, not a lockout: when every slot is taken the answer is "retry", and
+    // the token is not even compared.
+    let Ok(_slot) = slots.0.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            Json(serde_json::json!({
+                "error": { "code": "too_many_requests",
+                           "message": "too many logins in flight; retry shortly" }
+            })),
+        )
+            .into_response();
+    };
     if !auth::digests_match(body.token.as_bytes(), admin.as_bytes()) {
-        // A small fixed delay blunts online guessing without needing lockout state —
-        // the digest compare itself already runs in constant time.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The delay is paid while holding the slot — that is what bounds the guess rate.
+        // The digest compare itself already runs in constant time.
+        tokio::time::sleep(WRONG_TOKEN_DELAY).await;
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -271,10 +304,15 @@ async fn login(
             .into_response();
     }
 
+    // The cookie gets the id; the store only its token-bound digest (D-016).
     let id = Uuid::new_v4().simple().to_string();
     let expires = OffsetDateTime::now_utc()
         + time::Duration::seconds(i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX));
-    if let Err(error) = state.db.create_session(&id, expires).await {
+    if let Err(error) = state
+        .db
+        .create_session(&auth::session_key(admin, &id), expires)
+        .await
+    {
         tracing::error!(%error, "session insert failed");
         return ApiError::Db(error).into_response();
     }
@@ -296,8 +334,10 @@ async fn login(
 /// Delete the session row and expire the cookie. Idempotent — clearing an already-gone
 /// session answers the same way, so a browser can always reset its own state.
 async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    // Tokenless dev mode never issues sessions, so there is no row to delete.
     if let Some(id) = auth::session_cookie(headers.get(axum::http::header::COOKIE))
-        && let Err(error) = state.db.delete_session(id).await
+        && let Some(admin) = &state.admin_token
+        && let Err(error) = state.db.delete_session(&auth::session_key(admin, id)).await
     {
         tracing::error!(%error, "session delete failed");
         return ApiError::Db(error).into_response();
@@ -831,7 +871,8 @@ async fn list_incidents(
 #[derive(Debug, Deserialize)]
 pub struct BackupRequest {
     /// Absolute path the snapshot is written to. Relative paths are rejected — where a
-    /// backup lands is an operator's explicit choice, not a cwd accident.
+    /// backup lands is an operator's explicit choice, not a cwd accident — and so is an
+    /// existing file: a backup is created new, owner-only (0600).
     pub path: String,
 }
 
@@ -845,7 +886,10 @@ async fn backup(
     if !path.is_absolute() {
         return Err(ApiError::BadId);
     }
-    let bytes = state.db.backup(&path).await?;
+    let bytes = state.db.backup(&path).await.map_err(|error| match error {
+        QueryError::Invalid(message) => ApiError::Invalid(message),
+        other => ApiError::Db(other),
+    })?;
     Ok(Json(serde_json::json!({
         "path": input.path,
         "bytes": bytes,

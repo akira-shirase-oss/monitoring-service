@@ -4,7 +4,7 @@ https://github.com/akira-shirase-oss/monitoring-service
 
 Service Monitor is a Rust HTTP uptime monitor with a local SQLite store, a CLI, and a static SvelteKit dashboard. It probes a small number of authorized HTTP services, keeps evidence (including missed slots), and can alert through signed webhooks and SMTP. `unknown` is a first-class status; coverage (did the slots run?) and success (did what ran pass?) are separate numbers, and missing data is not supposed to be painted green.
 
-Written against commit `fb3e966` (2026-11-07).
+Written against commit `fb3e966` (2026-11-07); auth, limits, CI and hardening notes updated for the 2026-11-16 security verification.
 
 ## Prerequisites
 
@@ -54,7 +54,7 @@ npm run build --workspace @service-monitor/dashboard
 Verify:
 
 ```sh
-scripts/check.sh          # toolchain, fmt, clippy -D warnings, cargo test, architecture, svelte-check, dashboard build
+scripts/check.sh          # toolchain, fmt, clippy -D warnings, cargo test, cargo-deny (advisories, bans, licences, sources), architecture, svelte-check, dashboard build, npm audit
 scripts/e2e.sh            # Playwright against the real server (separate; waits on a real 3-failure sequence)
 scripts/backup-drill.sh   # backup → destroy → restore
 ```
@@ -68,6 +68,7 @@ Defaults (all overridable with `SMON_*` env vars; listed in the README):
 | `SMON_DASHBOARD_DIR` | `apps/dashboard/build` |
 | `SMON_PROFILE` | unset or `production` (SSRF guard on). `lab` permits local targets for fixtures. Any other value refuses to boot. |
 | `SMON_ADMIN_TOKEN` | unset is allowed only on loopback; a tokenless public bind refuses to boot. When set: at least 32 bytes, no whitespace or `#`, or the boot refuses (`openssl rand -hex 32`) |
+| `SMON_SESSION_TTL_S` / `SMON_SESSION_IDLE_S` | `43200` / `3600` — a dashboard session's lifetime, and how long it may sit unused |
 
 A useful local lab:
 
@@ -130,10 +131,16 @@ monitor maintenance add|list|rm
 - A *name* that resolves to a local address is refused at probe time and recorded as `transport` + `rejected_local` — a failure that opens an incident and pages (D-013).
 - Redirects *are* followed, up to 5 hops, and every hop is revalidated (`docs` and the probe tests). A redirect to a private *literal* stops there and the 3xx stands as `http_fail`; a redirect to a local *name* (`http://localhost/…`) is refused at the resolver and recorded as `transport` + `rejected_local`, which pages. A redirect loop should end as `http_fail`. (Note: `fixtures/README.md` still says a 301 should prove the probe does *not* follow redirects — that disagrees with the main README and the tests.)
 
-**Auth**
+**Auth and request limits**
 
-- On loopback with no token, `/api` is open (dev mode). Set `SMON_ADMIN_TOKEN` and confirm a missing/wrong bearer is denied (CLI exit 4).
-- Binding a non-loopback address without `SMON_ADMIN_TOKEN` should refuse to boot.
+- On loopback with no token, `/api` is open (dev mode). Set `SMON_ADMIN_TOKEN` and confirm a missing/wrong bearer is denied (CLI exit 4) — on every `/api` route and method, not just `GET /api/monitors` (`tests/auth_inventory.rs` walks them all).
+- Binding a non-loopback address without `SMON_ADMIN_TOKEN` should refuse to boot and bind nothing.
+- Many parallel wrong `POST /api/login` calls: at most four are evaluated at once; the rest get 429 with `Retry-After`. The right token still works afterwards.
+- A login body over 16 KiB gets 413 (even with the right token inside it); a request whose body never finishes gets 408 after 10 s.
+- Sign in on the dashboard, then restart the server with a different `SMON_ADMIN_TOKEN`: the old session cookie must get 401. A session left unused for `SMON_SESSION_IDLE_S` ends too. The `sessions` table (and any backup) holds digests, never the cookie's value.
+- `POST /api/backup` onto an existing file is 422 and leaves it alone; a new backup file is mode 0600.
+- Responses carry `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: same-origin`; framing the dashboard should be refused by the browser.
+- A webhook receiver that answers 307 to somewhere else: the alert is not re-sent there, and the outbox row stays pending.
 
 ## How to report a bug
 
@@ -149,6 +156,7 @@ Send Vinay (`akira-shirase-oss` / @404humandev) a note, or open a GitHub issue o
 ## Setup notes we hit
 
 - Licensed MIT (`LICENSE`, 2026-11-16); the crates are not published to crates.io.
-- No CI (`.github/workflows` is absent).
+- CI: `.github/workflows/ci.yml` runs `scripts/check.sh` on ubuntu-latest for every push and pull request, plus a daily advisory sweep; `.github/dependabot.yml` covers cargo, npm and the action pins.
+- Every drill and perf harness uses its own ports (never 58400): `scripts/dev.sh` 58465, `scripts/backup-drill.sh` 58460/58461, Playwright 58410/58710 (`SMON_E2E_SERVER_PORT`/`SMON_E2E_FAULT_PORT`), `perf/*.mjs` per `perf/README.md`.
 - `Cargo.toml` `repository` points at `https://github.com/akira-shirase-oss/service-monitor`, which is not this repo.
 - `fixtures/README.md` is stale on redirects (see above).

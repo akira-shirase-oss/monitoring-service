@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Incident storm + API-read load — the two load gaps lab-profile doesn't cover.
-//   node perf/storm.mjs [--duration-s 300] [--out perf/results]
+//   node perf/storm.mjs [--duration-s 300] [--out perf/results] [--server-port 58420] [--fixture-port 58720]
 // Storm: 40 monitors die together -> mass incidents + outbox flood while a surviving
 // "ok" monitor must keep getting probe slots (delivery must never starve probes).
 // Reads: sustained GET /api/monitors + /status.json beside the storm.
@@ -9,12 +9,14 @@ import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { requireFreePorts, waitOwnServer } from './lib-ports.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i === -1 ? d : process.argv[i + 1]; };
 const DURATION_S = Number(arg('duration-s', 300));
 const OUT_DIR = resolve(ROOT, arg('out', 'perf/results'));
-const FIXTURE_PORT = 58720, SERVER_PORT = 58420;
+// Its own ports — never 58400, where an installed monitor listens (perf/lib-ports.mjs).
+const FIXTURE_PORT = Number(arg('fixture-port', 58720)), SERVER_PORT = Number(arg('server-port', 58420));
 const DB = `/tmp/smon-storm-${process.pid}.db`, LOG = `/tmp/smon-storm-${process.pid}.log`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -23,6 +25,10 @@ const children = [];
 const run = (cmd, args, env = {}) => { const p = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' }); children.push(p); return p; };
 const DEAD = 40, ORIGINS = 10, SURVIVOR_PORT = FIXTURE_PORT + ORIGINS;
 
+await requireFreePorts([
+	[SERVER_PORT, '--server-port'],
+	...Array.from({ length: ORIGINS + 1 }, (_, o) => [FIXTURE_PORT + o, '--fixture-port']),
+]);
 try {
 	mkdirSync(OUT_DIR, { recursive: true });
 	for (let o = 0; o <= ORIGINS; o++) run('node', [`${ROOT}/fixtures/fault-server.mjs`, String(FIXTURE_PORT + o)]);
@@ -37,7 +43,7 @@ try {
 		stdio: 'ignore',
 	});
 	const server = run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
-	for (let i = 0; i < 50; i++) { try { if ((await fetch(`${BASE}/livez`)).ok) break; } catch {} await sleep(200); }
+	await waitOwnServer(BASE, server);
 
 	// One survivor (healthy) + DEAD dead monitors, all at the minimum interval.
 	const add = async (name, url) => {

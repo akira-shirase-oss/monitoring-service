@@ -6,6 +6,11 @@
 // outbox backpressure, incident+delivery correctness, RSS growth, DB growth.
 //
 //   node perf/lab-profile.mjs [--duration-s 600] [--monitors 100] [--out perf/results]
+//                             [--server-port 58430] [--fixture-port 58700] [--origins 10]
+//
+// Its own ports (server 58430, fixtures 58700…58700+origins−1) — never 58400, where an
+// installed monitor listens. A busy port refuses the run before anything starts, and the
+// harness only drives the server it started (perf/lib-ports.mjs).
 //
 // Numbers are development observations on this machine — never public capacity claims.
 
@@ -13,6 +18,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { requireFreePorts, waitOwnServer } from './lib-ports.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const arg = (name, dflt) => {
@@ -27,7 +33,7 @@ const FIXTURE_PORT = Number(arg('fixture-port', 58700));
 // everything to a trickle (that bound is the product working — the harness must not
 // accidentally measure it). Spread monitors across ORIGINS fixture ports.
 const ORIGINS = Number(arg('origins', 10));
-const SERVER_PORT = Number(arg('server-port', 58400));
+const SERVER_PORT = Number(arg('server-port', 58430));
 const DB = `/tmp/smon-load-${process.pid}.db`;
 const LOG = `/tmp/smon-load-${process.pid}.log`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`;
@@ -81,6 +87,10 @@ function run(cmd, args, env = {}) {
 }
 
 async function main() {
+	await requireFreePorts([
+		[SERVER_PORT, '--server-port'],
+		...Array.from({ length: ORIGINS }, (_, o) => [FIXTURE_PORT + o, '--fixture-port']),
+	]);
 	mkdirSync(OUT_DIR, { recursive: true });
 	const started = new Date();
 	for (let o = 0; o < ORIGINS; o++) {
@@ -102,13 +112,7 @@ async function main() {
 		stdio: 'ignore',
 	});
 	const server = run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
-	for (let i = 0; i < 50; i++) {
-		try {
-			const r = await fetch(`${BASE}/livez`);
-			if (r.ok) break;
-		} catch {}
-		await sleep(200);
-	}
+	await waitOwnServer(BASE, server);
 
 	const t0 = Date.now();
 	const ids = await Promise.all(

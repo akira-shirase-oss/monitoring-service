@@ -38,11 +38,11 @@ trap cleanup EXIT
 
 node fixtures/fault-server.mjs "$FIXTURE_PORT" >/dev/null 2>&1 &
 FIXTURE_PID=$!
-wait_http "http://127.0.0.1:$FIXTURE_PORT/ok"
+wait_own_http "http://127.0.0.1:$FIXTURE_PORT/ok" "$FIXTURE_PID"
 ./target/debug/monitor-server --init >"$LOG" 2>&1   # D-015: a new store
 ./target/debug/monitor-server >>"$LOG" 2>&1 &
 SERVER_PID=$!
-wait_http "$BASE/livez"
+wait_own_http "$BASE/livez" "$SERVER_PID"
 
 MONITOR=$(curl -s -X POST "$BASE/api/monitors" \
     -H 'content-type: application/json' \
@@ -65,7 +65,7 @@ BYTES=$(wc -c <"$BACKUP" | tr -d ' ')
 [ "$BYTES" -gt 0 ] || { echo "FAIL: empty backup"; exit 1; }
 
 echo; echo "crashing the server (its own PID, SIGKILL) and destroying the live database…"
-kill -9 "$SERVER_PID"
+is_own_child "$SERVER_PID" && kill -9 "$SERVER_PID"
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
 cp "$BACKUP" "$DB"
@@ -73,7 +73,7 @@ rm -f "$DB-wal" "$DB-shm"
 
 ./target/debug/monitor-server >>"$LOG" 2>&1 &
 SERVER_PID=$!
-wait_http "$BASE/livez"
+wait_own_http "$BASE/livez" "$SERVER_PID"
 
 STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
 OPEN=$(curl -s "$BASE/api/incidents?state=open" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["incidents"]))')

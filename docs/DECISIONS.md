@@ -2,6 +2,30 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-016 — Session rows hold a token-bound digest, never the cookie's id
+
+The `sessions` table used to store the cookie's id as is, so the store — and every
+`VACUUM INTO` backup of it — held working credentials for up to `SMON_SESSION_TTL_S`, and
+rotating `SMON_ADMIN_TOKEN` (the operator's way to revoke access) left every dashboard
+session working until it expired.
+
+The cookie still carries a random id (UUIDv4); the row is keyed by
+`hex(SHA-256("smon-session-v1\0" ‖ SHA-256(SMON_ADMIN_TOKEN) ‖ id))`
+(`auth::session_key`). The digest is one-way, so a copied store or backup can't be
+replayed as cookies, and it is bound to the token, so after a rotation every outstanding
+cookie maps to a key no row has: each session ends at once, and the dashboard asks for
+the new token. Migration 0008 deletes the raw-id rows written before this (everyone signs
+in again once). Pinned by `rotating_the_admin_token_ends_every_session` and
+`the_store_and_its_backups_hold_no_usable_session_id`.
+
+A session also ends when it goes unused for `SMON_SESSION_IDLE_S` (default 1 h), inside
+its absolute lifetime (`SMON_SESSION_TTL_S`, 12 h). Use refreshes `last_seen_at`
+(migration 0009) at most once a minute, so the dashboard's 15 s refresh is not a write per
+request, and a failed refresh (a store at its byte cap) still authorizes. An open tab keeps
+its session alive; a forgotten one ends within the hour. Pinned by
+`an_idle_session_ends_and_use_keeps_it_alive` (store) and
+`an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive` (API).
+
 ## D-015 — A normal start requires an existing store; only `--init` creates one
 
 The store is meant to live on its own volume (the SaaS droplet uses a DigitalOcean volume).
@@ -14,8 +38,8 @@ the root disk, hidden under the volume once it mounted.
 boot if the file is missing or has no tables, naming the path and the likely cause (the
 volume is not mounted). `monitor-server --init` is the only way to create a store: it
 creates and migrates it, then exits without serving — the install step (RUNBOOK) and the
-first step of every harness that starts from scratch. `--version` prints the version;
-any other argument is a usage error (exit 2), so a mistyped flag never starts a server
+first step of every harness that starts from scratch. `--version` prints the version and
+`--help` the usage (both exit 0); any other argument is a usage error (exit 2), so a mistyped flag never starts a server
 with default settings. The unit's `RequiresMountsFor=` covers the ordering; this covers
 a mount that is configured differently, or not at all.
 
@@ -129,11 +153,18 @@ engine drains, and the process exits non-zero, so systemd `Restart=on-failure` o
 but makes no loop pass for 2 minutes (4 × the 30 s stall threshold) is treated the same
 way — a stall that long will not clear by itself. A freeze of the whole process
 (SIGSTOP, a VM pause) is not a stall: when the watchdog's own previous check is more than
-the limit ago, it skips that round and lets the coordinator make its first pass. Supporting tasks stay *degraded*, with
+the limit ago, it skips that round and lets the coordinator make its first pass. That
+first pass commits one `missed` row per lost slot (962 for 100 monitors after a 130 s
+freeze), so the coordinator also beats after every committed miss: staleness is judged by
+progress, and a long catch-up is never read as a wedged loop (a writer that stops taking
+commits stops the beats). Supporting tasks stay *degraded*, with
 no exit. The systemd unit backs restarts off from 15 s to 10 minutes (`RestartSteps`,
 systemd ≥ 254) under a start limit of 10 in 30 minutes that a backed-off loop never
-reaches: a slow dependency (a late volume) is retried until it appears, and a
-deterministic crash is spaced out instead of looping every few seconds. Older systemd
+reaches: a deterministic crash is spaced out instead of looping every few seconds.
+*Corrected 2026-11-16:* this used to say a late volume is retried until it appears. It
+is not — a `RequiresMountsFor=` mount whose job fails is a dependency failure, outside
+`Restart=`, and the unit waits for a manual start (RUNBOOK, "The data volume attached
+late"). Older systemd
 keeps the fixed 15 s and leaves the unit `failed` after ~2.5 minutes of failures. Pinned by `an_observing_task_stopping_ends_serving_as_an_engine_failure`
 and `a_supporting_task_stopping_keeps_serving`.
 

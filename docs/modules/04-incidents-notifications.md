@@ -45,6 +45,9 @@ at-least-once to a receiver — without alerting ever being able to stall observ
   reports the recipient count, not addresses.
 - **No proxies:** the webhook client ignores proxy environment variables and dials the
   receiver directly; SMTP (lettre) never used them. Egress proxies are not supported.
+- **No redirects:** the webhook client follows none. A 307/308 would re-send the payload
+  and its signature wherever the receiver points; a 3xx is a failed attempt, retried with
+  backoff like a 5xx (`a_receivers_redirect_is_not_followed_and_nothing_is_re_sent`).
 - **URL redaction (`redact.rs`):** chat webhooks carry their credential in the path
   (Slack `/services/T…/B…/<token>`, Discord `/api/webhooks/<id>/<token>`) or a query
   token, so stripping userinfo is not redaction. Anything logged shows the webhook as

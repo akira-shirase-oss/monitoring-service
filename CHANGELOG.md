@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Security verification (2026-11-16) — behaviour changes for existing users
+
+- **Everyone signs in to the dashboard again once.** Session rows now hold a digest
+  bound to `SMON_ADMIN_TOKEN`, never the cookie's id (D-016); migration 0008 deletes the
+  old raw-id rows. Rotating `SMON_ADMIN_TOKEN` now ends every dashboard session at once.
+- **Idle sessions end:** `SMON_SESSION_IDLE_S` (default 3600) ends a session unused that
+  long, inside its `SMON_SESSION_TTL_S` lifetime (migration 0009). An open dashboard tab
+  stays signed in (its 15 s refresh is use).
+- **Logins are evaluated four at a time.** Beyond that `POST /api/login` answers 429
+  `too_many_requests` with `Retry-After: 1` (the token is not compared); a wrong token
+  still pays 300 ms. Bearer-token calls are unaffected.
+- **Backups are created new and owner-only:** `POST /api/backup` to a path that already
+  exists answers 422 and leaves the file alone (it used to fail with a 500 or reuse an
+  empty file); every backup, and a store created by `--init`, is mode 0600. The systemd
+  unit sets `UMask=0077`; `status.json` is still written 0644. RUNBOOK: `chmod 700 data/`.
+- **Webhook redirects are not followed.** A 3xx from the receiver is a failed attempt,
+  retried like a 5xx; nothing is re-sent to the redirect target.
+- **Alert emails:** control characters in a monitor name become spaces in the body too
+  (the Subject already did).
+- **Every response carries a Content-Security-Policy** (scripts from this origin plus the
+  dashboard build's inline bootstrap by hash; no framing), `X-Content-Type-Options:
+  nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: same-origin` (no referrer leaves the origin). A dashboard
+  served from another build is hashed at boot. The public status page builds its rows as
+  text and carries its own CSP: editing its script means updating the pinned hash
+  (`cargo test -p monitor-server --test headers` prints it).
+- **`monitor-server --help`** prints the usage and exits 0 (was exit 2).
+- **Perf harness ports:** `perf/lab-profile.mjs` defaults to `--server-port 58430` (was
+  58400, an installed monitor's port); every harness takes `--server-port`, refuses a busy
+  port and drives only the server it started.
+- **Gates:** hosted CI (`.github/workflows/ci.yml`) runs `scripts/check.sh` on every push
+  and pull request plus a daily advisory sweep; Dependabot proposes weekly grouped
+  updates for cargo, npm and the actions. `check.sh` adds `npm audit --omit=dev
+  --audit-level=moderate`, and the cargo-deny gate now also checks bans, licences (a
+  permissive allow-list) and sources (crates.io only).
+
 ### Security and correctness fixes (2026-11-16) — behaviour changes for existing users
 
 - **Alert payloads: `monitor.url` no longer carries the query, fragment or userinfo.**

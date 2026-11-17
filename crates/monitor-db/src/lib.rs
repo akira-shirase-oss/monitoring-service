@@ -193,6 +193,26 @@ const BIRTH_STREAK_OF_OPEN_INCIDENT: &str = "EXISTS (
        AND checks.slot_at >= COALESCE(i.first_fail_at, i.opened_at)
        AND checks.slot_at <= i.opened_at)";
 
+/// Create a missing store file empty and owner-only (0600) before SQLite opens it: SQLite
+/// would create it with the process umask (usually 0644), and its `-wal`/`-shm` take the
+/// store's mode. An existing store is left as it is.
+async fn create_owner_only(path: std::path::PathBuf) -> Result<(), DbError> {
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(QueryError::io(&error)),
+        }
+    })
+    .await
+    .map_err(|error| QueryError::Io(error.to_string()))?
+    .map_err(DbError::from)
+}
+
 /// A handle to the monitor's SQLite store.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -269,6 +289,12 @@ impl Db {
             .create_if_missing(create)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
+        // sqlx renames an in-memory database to a shared-cache `file:` name — decide from
+        // the URL the caller wrote, never from that name.
+        let in_memory = url.contains(":memory:") || url.contains("mode=memory");
+        if create && !in_memory {
+            create_owner_only(options.get_filename().to_path_buf()).await?;
+        }
         let mut pool = SqlitePoolOptions::new().max_connections(max_connections);
         if let Some(bytes) = max_db_bytes {
             pool = pool.after_connect(move |conn, _meta| {
@@ -315,13 +341,42 @@ impl Db {
     /// way to copy a live database without quiescing it. This reads the store; it does
     /// not write it, so the single-writer invariant is untouched. Returns the backup's
     /// size in bytes — a zero-length "backup" is no backup at all.
+    ///
+    /// The target must not exist: it is created empty and owner-only (0600) first —
+    /// `VACUUM INTO` fills an empty file and keeps its mode — so a backup is never readable
+    /// by others, not even between creation and a chmod, and never overwrites or reuses a
+    /// file that was already there ([`QueryError::Invalid`]).
     pub async fn backup(&self, path: &std::path::Path) -> Result<u64, QueryError> {
+        let target = path.to_path_buf();
+        let created = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            options.open(&target).map(drop)
+        })
+        .await
+        .map_err(|error| QueryError::Io(error.to_string()))?;
+        match created {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(QueryError::Invalid(
+                    "the backup target already exists; choose a new path".into(),
+                ));
+            }
+            Err(error) => return Err(QueryError::io(&error)),
+        }
         // VACUUM INTO takes no bound parameters; the path is quoted as an SQL string
         // literal with '' escaping — never interpolated raw (AssertSqlSafe audited).
         let escaped = path.to_string_lossy().replace('\'', "''");
-        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{escaped}'")))
+        let vacuum = sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{escaped}'")))
             .execute(&self.pool)
-            .await?;
+            .await;
+        if let Err(error) = vacuum {
+            // Leave no empty "backup" behind to be mistaken for one.
+            let _ = std::fs::remove_file(path);
+            return Err(error.into());
+        }
         let bytes = std::fs::metadata(path)
             .map_err(|error| QueryError::io(&error))?
             .len();
@@ -576,26 +631,59 @@ impl Db {
         Ok(())
     }
 
-    /// A session authorizes only while `expires_at` is in the future. An expired row is
-    /// deleted on sight — the sweep in retention is the sweeper, this is the guard.
-    pub async fn session_valid(&self, id: &str) -> Result<bool, QueryError> {
-        let now = OffsetDateTime::now_utc();
-        let row: Option<(OffsetDateTime,)> =
-            sqlx::query_as("SELECT expires_at FROM sessions WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            Some((expires,)) if expires > now => Ok(true),
-            Some(_) => {
-                sqlx::query("DELETE FROM sessions WHERE id = ?")
-                    .bind(id)
+    /// A session authorizes only while `expires_at` is in the future and it was last used
+    /// less than `idle` ago (D-016). A row past either limit is deleted on sight — the
+    /// sweep in retention is the sweeper, this is the guard.
+    pub async fn session_valid(
+        &self,
+        key: &str,
+        idle: std::time::Duration,
+    ) -> Result<bool, QueryError> {
+        self.session_valid_at(key, OffsetDateTime::now_utc(), idle)
+            .await
+    }
+
+    /// [`Db::session_valid`] at an explicit `now` (tests drive the clock). A valid lookup
+    /// refreshes `last_seen_at` once `min(idle / 4, 60 s)` has passed since the last
+    /// refresh, so a dashboard polling every 15 s is not a write per request. A refresh
+    /// that fails (a store at its byte cap) is logged and the session still authorizes:
+    /// the full-disk moment is when the operator most needs the dashboard.
+    pub async fn session_valid_at(
+        &self,
+        key: &str,
+        now: OffsetDateTime,
+        idle: std::time::Duration,
+    ) -> Result<bool, QueryError> {
+        let row: Option<(OffsetDateTime, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
+            "SELECT expires_at, created_at, last_seen_at FROM sessions WHERE id = ?",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((expires, created, last_seen)) = row else {
+            return Ok(false);
+        };
+        let idle = time::Duration::try_from(idle).unwrap_or(time::Duration::MAX);
+        let unused = now - last_seen.unwrap_or(created);
+        if expires > now && unused < idle {
+            let refresh_every: time::Duration = (idle / 4_i32).min(time::Duration::minutes(1));
+            if unused >= refresh_every {
+                let touched = sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(key)
                     .execute(&self.pool)
-                    .await?;
-                Ok(false)
+                    .await;
+                if let Err(error) = touched {
+                    tracing::warn!(%error, "session last_seen refresh failed");
+                }
             }
-            None => Ok(false),
+            return Ok(true);
         }
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(false)
     }
 
     /// Logout deletes the row — an idempotent no-op on an already-gone session.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Session churn — login -> authed API calls -> logout at rate, beside live probes.
-//   node perf/session-churn.mjs [--duration-s 300] [--out perf/results]
+//   node perf/session-churn.mjs [--duration-s 300] [--out perf/results] [--server-port 58440] [--fixture-port 58740]
 // Auth profile: SMON_ADMIN_TOKEN set, so /api/* needs the session cookie — the lab's
 // unauthenticated mode can't measure this. Gates: logins succeed, authed reads clean,
 // unauthed refused, sessions table bounded by the sweep, probes never starved.
@@ -8,12 +8,14 @@ import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { requireFreePorts, waitOwnServer } from './lib-ports.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i === -1 ? d : process.argv[i + 1]; };
 const DURATION_S = Number(arg('duration-s', 300));
 const OUT_DIR = resolve(ROOT, arg('out', 'perf/results'));
-const FIXTURE_PORT = 58740, SERVER_PORT = 58440;
+// Its own ports — never 58400, where an installed monitor listens (perf/lib-ports.mjs).
+const FIXTURE_PORT = Number(arg('fixture-port', 58740)), SERVER_PORT = Number(arg('server-port', 58440));
 const DB = `/tmp/smon-churn-${process.pid}.db`, LOG = `/tmp/smon-churn-${process.pid}.log`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`, TOKEN = 'churn-secret-for-the-session-churn-run-01';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22,6 +24,10 @@ const children = [];
 const run = (cmd, args, env = {}) => { const p = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' }); children.push(p); return p; };
 const WORKERS = 8;
 
+await requireFreePorts([
+	[SERVER_PORT, '--server-port'],
+	[FIXTURE_PORT, '--fixture-port'],
+]);
 try {
 	mkdirSync(OUT_DIR, { recursive: true });
 	run('node', [`${ROOT}/fixtures/fault-server.mjs`, String(FIXTURE_PORT)]);
@@ -34,14 +40,20 @@ try {
 		env: { ...process.env, ...serverEnv },
 		stdio: 'ignore',
 	});
-	run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
-	for (let i = 0; i < 50; i++) { try { if ((await fetch(`${BASE}/livez`)).ok) break; } catch {} await sleep(200); }
+	const server = run(`${ROOT}/target/debug/monitor-server`, [], serverEnv);
+	await waitOwnServer(BASE, server);
 
 	// A live monitor on its own origin — churn must never starve its slots.
+	// Logins are evaluated a few at a time (429 + Retry-After beyond that): back off and
+	// retry — a throttled login is backpressure, counted, never a failure.
+	let throttled = 0;
 	const login = async () => {
-		const r = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
-		const cookie = r.headers.get('set-cookie')?.split(';')[0];
-		return r.status === 204 && cookie?.startsWith('smon_session=') ? cookie : null;
+		for (;;) {
+			const r = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
+			if (r.status === 429) { throttled++; await sleep(20 + Math.random() * 30); continue; }
+			const cookie = r.headers.get('set-cookie')?.split(';')[0];
+			return r.status === 204 && cookie?.startsWith('smon_session=') ? cookie : null;
+		}
 	};
 	const c = await login();
 	const r = await fetch(`${BASE}/api/monitors`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: c, origin: BASE },
@@ -61,7 +73,7 @@ try {
 			await fetch(`${BASE}/api/logout`, { method: 'POST', headers: { cookie, origin: BASE } });
 			if (w === 0) { // worker 0 also probes the negative paths at a slower cadence
 				const bad = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'wrong' }) });
-				if (bad.status === 401) badLogins++;
+				if (bad.status === 401 || bad.status === 429) badLogins++;
 				const bare = await fetch(`${BASE}/api/monitors`);
 				if (bare.status === 401 || bare.status === 403) refused++;
 			}
@@ -72,7 +84,7 @@ try {
 	const checks = JSON.parse(sqlite(`SELECT COUNT(*) n FROM checks WHERE monitor_id = '${survivor}'`))[0]?.n ?? 0;
 	const result = {
 		date: new Date().toISOString(), scenario: 'session-churn', duration_s: DURATION_S,
-		logins, login_fails: loginFails, authed_reads: reads, read_fails: readFails,
+		logins, login_fails: loginFails, logins_throttled: throttled, authed_reads: reads, read_fails: readFails,
 		bad_token_401s: badLogins, unauthed_refusals: refused,
 		sessions_rows: sessions, survivor_checks: checks,
 		machine: 'apple-m2-pro-12c',

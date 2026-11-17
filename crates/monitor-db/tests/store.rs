@@ -855,6 +855,8 @@ async fn an_incident_enqueues_one_row_per_configured_channel() -> anyhow::Result
     Ok(())
 }
 
+const IDLE: std::time::Duration = std::time::Duration::from_hours(1);
+
 /// M7.2: session rows are the cookie's authority — create, validate, expire, sweep.
 #[tokio::test]
 async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
@@ -866,10 +868,10 @@ async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
         .await?;
     db.create_session("dead", now - time::Duration::seconds(1))
         .await?;
-    assert!(db.session_valid("live").await?);
-    assert!(!db.session_valid("missing").await?);
+    assert!(db.session_valid("live", IDLE).await?);
+    assert!(!db.session_valid("missing", IDLE).await?);
     // An expired row is denied and deleted on sight — one lookup is the whole contract.
-    assert!(!db.session_valid("dead").await?);
+    assert!(!db.session_valid("dead", IDLE).await?);
 
     db.create_session("gone-soon", now - time::Duration::seconds(1))
         .await?;
@@ -880,11 +882,49 @@ async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
         "the untouched expired row swept"
     );
     assert!(
-        db.session_valid("live").await?,
+        db.session_valid("live", IDLE).await?,
         "the live session survives the sweep"
     );
     db.delete_session("live").await?;
-    assert!(!db.session_valid("live").await?);
+    assert!(!db.session_valid("live", IDLE).await?);
+    Ok(())
+}
+
+/// D-016: a session unused for longer than the idle limit ends, even inside its absolute
+/// lifetime; use keeps it alive (refreshing `last_seen_at`), up to that lifetime.
+#[tokio::test]
+async fn an_idle_session_ends_and_use_keeps_it_alive() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let t0 = OffsetDateTime::now_utc();
+    let min = time::Duration::minutes;
+    db.create_session("used", t0 + time::Duration::hours(12))
+        .await?;
+    db.create_session("idle", t0 + time::Duration::hours(12))
+        .await?;
+
+    // "used" is used every 40 minutes for 3 hours: always valid.
+    for step in 1..=4 {
+        assert!(
+            db.session_valid_at("used", t0 + min(40 * step), IDLE)
+                .await?,
+            "used at +{} min",
+            40 * step
+        );
+    }
+    // "idle" was last used at creation: past the hour it is gone, and stays gone.
+    assert!(db.session_valid_at("idle", t0 + min(59), IDLE).await?);
+    assert!(!db.session_valid_at("idle", t0 + min(59 + 61), IDLE).await?);
+    assert!(!db.session_valid_at("idle", t0 + min(59 + 62), IDLE).await?);
+    // And "used" ends the same way once its use stops.
+    assert!(
+        !db.session_valid_at("used", t0 + min(160 + 61), IDLE)
+            .await?
+    );
+    // The absolute lifetime still wins over use.
+    db.create_session("short", t0 + min(30)).await?;
+    assert!(db.session_valid_at("short", t0 + min(20), IDLE).await?);
+    assert!(!db.session_valid_at("short", t0 + min(31), IDLE).await?);
     Ok(())
 }
 
@@ -1369,5 +1409,66 @@ async fn retention_at_the_cap_has_room_for_summaries_of_a_thin_expired_slice() -
             "the cap is restored"
         );
     }
+    Ok(())
+}
+
+/// The store and its backups hold session digests, monitored URLs and alert history; the
+/// RUSTSEC-2026-0459 assessment in deny.toml relies on nobody but the service user being
+/// able to read or plant files beside them. A new store and every backup are created
+/// owner-only (0600) whatever the process umask, and the WAL inherits the store's mode.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_new_store_and_its_backups_are_owner_only() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &std::path::Path| -> anyhow::Result<u32> {
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+    };
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("private.db");
+    let db = Db::connect(&format!("sqlite:{}", path.display()), 1).await?;
+    db.migrate().await?;
+    let monitor =
+        NewMonitor::new("private", url::Url::parse("https://example.com/health")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+    assert_eq!(mode(&path)?, 0o600, "the store");
+    let wal = tmp.path().join("private.db-wal");
+    if wal.exists() {
+        assert_eq!(mode(&wal)?, 0o600, "the WAL takes the store's mode");
+    }
+
+    let backup = tmp.path().join("backup.db");
+    assert!(db.backup(&backup).await? > 0);
+    assert_eq!(mode(&backup)?, 0o600, "the backup");
+
+    // An existing file is never overwritten or reused (and keeps its own contents).
+    std::fs::write(tmp.path().join("taken.db"), b"someone else's file")?;
+    assert!(db.backup(&tmp.path().join("taken.db")).await.is_err());
+    assert_eq!(
+        std::fs::read(tmp.path().join("taken.db"))?,
+        b"someone else's file"
+    );
+    Ok(())
+}
+
+/// `VACUUM INTO` takes no bound parameters, so the backup path is an SQL string literal
+/// with `'` doubled. A path containing quotes (and the SQL they could smuggle) must write
+/// exactly that file and nothing else.
+#[tokio::test]
+async fn a_backup_path_with_quotes_writes_exactly_that_file() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::connect(&format!("sqlite:{}", tmp.path().join("q.db").display()), 1).await?;
+    db.migrate().await?;
+    let name = "it's a backup'; DROP TABLE monitors; --.db";
+    let path = tmp.path().join(name);
+    assert!(db.backup(&path).await? > 0);
+    assert!(path.is_file(), "the file is named exactly {name:?}");
+    let mut names: Vec<String> = std::fs::read_dir(tmp.path())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|file| !file.starts_with("q.db"))
+        .collect();
+    names.sort();
+    assert_eq!(names, [name], "and nothing else was written");
+    assert!(db.list_monitors().await.is_ok(), "the store is intact");
     Ok(())
 }

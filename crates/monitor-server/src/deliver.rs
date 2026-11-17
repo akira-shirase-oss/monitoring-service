@@ -205,8 +205,12 @@ async fn run(
             // Direct to the configured receiver: proxy environment variables must not
             // silently route alert payloads (monitor names, incident times) through a
             // third host. Egress proxies are not supported (module 04).
+            // Redirects are not followed: a 307/308 would re-send the payload and its
+            // signature to wherever the receiver points — another host, or one inside our
+            // network. A 3xx is a failed attempt, retried like any other.
             let client = match reqwest::Client::builder()
                 .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
                 .build()
             {
@@ -388,8 +392,8 @@ async fn deliver_webhook(
     )
 }
 
-/// One plaintext message per event. The subject is sanitized of CR/LF so a monitor name can
-/// never inject a header line; `Message-ID` carries the `event_id` so a retry threads onto
+/// One plaintext message per event. The monitor name is made one line ([`one_line`]) in
+/// the subject and the body, so it can never inject a header or a line; `Message-ID` carries the `event_id` so a retry threads onto
 /// the same logical event at the receiver.
 async fn deliver_email(
     mailer: &AsyncSmtpTransport<Tokio1Executor>,
@@ -403,10 +407,7 @@ async fn deliver_email(
         message = message.to(recipient.clone());
     }
     let kind = row.kind.replace('_', " ");
-    let subject = format!(
-        "[service-monitor] {}: {kind}",
-        row.monitor_name.replace(['\r', '\n'], " ")
-    );
+    let subject = format!("[service-monitor] {}: {kind}", one_line(&row.monitor_name));
     let body = email_body(row, &kind);
     let message = match message
         .subject(subject)
@@ -428,12 +429,21 @@ async fn deliver_email(
     )
 }
 
+/// Operator text (a monitor name) as one line: every control character — CR and LF
+/// above all — becomes a space, so it can neither start a header in the Subject nor fake a
+/// line in the body.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn email_body(row: &DeliveryRow, kind: &str) -> String {
     use std::fmt::Write;
     let mut body = format!(
         "Service Monitor: {kind}\n\nEvent:    {}\nMonitor:  {} <{}>\nIncident: #{}\nOpened:   {}",
         row.event_id,
-        row.monitor_name,
+        one_line(&row.monitor_name),
         crate::redact::for_alert_str(&row.monitor_url),
         row.incident_id,
         row.opened_at
@@ -451,7 +461,7 @@ fn email_body(row: &DeliveryRow, kind: &str) -> String {
     body
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
         .iter()

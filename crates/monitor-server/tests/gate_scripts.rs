@@ -114,3 +114,37 @@ fn a_missing_cargo_deny_fails_in_ci_and_warns_locally() {
     assert!(local.status.success(), "{}", stderr(&local));
     assert!(stderr(&local).contains("skipping"), "{}", stderr(&local));
 }
+
+/// Supply chain beyond advisories: the gate also runs cargo-deny's `bans`, `licenses` and
+/// `sources` checks — crates only from crates.io (no git or unknown registries), and only
+/// licences on an explicit permissive allow-list (a copyleft-only crate fails the gate).
+#[test]
+fn the_gate_checks_licences_sources_and_bans_too() {
+    let gate = std::fs::read_to_string(script("check-advisories.sh")).expect("read gate");
+    assert!(
+        gate.contains("check advisories bans licenses sources"),
+        "check-advisories.sh must run all four cargo-deny checks"
+    );
+    let deny = std::fs::read_to_string(script("../deny.toml")).expect("read deny.toml");
+    let section = |name: &str| -> String {
+        let start = deny
+            .find(&format!("\n[{name}]"))
+            .unwrap_or_else(|| panic!("deny.toml has no [{name}]"));
+        let rest = &deny[start + 1..];
+        let end = rest[1..].find("\n[").map_or(rest.len(), |at| at + 1);
+        rest[..end].to_owned()
+    };
+    let sources = section("sources");
+    assert!(sources.contains("unknown-registry = \"deny\""), "{sources}");
+    assert!(sources.contains("unknown-git = \"deny\""), "{sources}");
+    let licenses = section("licenses");
+    for permissive in ["\"MIT\"", "\"Apache-2.0\""] {
+        assert!(licenses.contains(permissive), "{licenses}");
+    }
+    for copyleft in ["GPL", "AGPL", "SSPL"] {
+        assert!(
+            !licenses.contains(&format!("\"{copyleft}")),
+            "{copyleft} on the allow-list: {licenses}"
+        );
+    }
+}

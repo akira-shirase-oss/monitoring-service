@@ -6,9 +6,11 @@ Wants=network-online.target
 # The store and the snapshot may live on a volume that attaches after boot: don't start
 # against a bare mountpoint (the server also refuses a missing or empty store, D-015).
 RequiresMountsFor=/opt/smon/data /opt/smon/status
-# Restart policy (with the backoff in [Service]): a slow dependency keeps being retried and
-# recovers on its own; a deterministic crash is retried at most every 10 minutes instead
-# of every few seconds. With the backoff, 10 starts in 30 minutes is out of reach. On
+# Restart policy (with the backoff in [Service]): a crash is retried, backing off to at
+# most every 10 minutes instead of every few seconds. A mount listed in RequiresMountsFor=
+# whose job fails (a volume attached after its device timeout) is a dependency failure,
+# which Restart= does not cover: start the unit by hand once the volume is there (RUNBOOK,
+# "The data volume attached late"). With the backoff, 10 starts in 30 minutes is out of reach. On
 # systemd < 254 (no RestartSteps) the fixed 15 s delay reaches it after ~2.5 minutes of
 # failures and the unit is left `failed` ("start request repeated too quickly"); then fix
 # the cause and `systemctl reset-failed monitor-server && systemctl start monitor-server`.
@@ -35,6 +37,10 @@ RestartMaxDelaySec=600s
 # Stop sends SIGTERM (the server drains: HTTP <= 12 s, engine <= 15 s), then SIGKILL after
 # this — longer than the drain, so a graceful stop is never cut short.
 TimeoutStopSec=40s
+# Files it creates (the store, its -wal/-shm, logs, backups) are owner-only. The public
+# status snapshot is widened to 0644 on purpose (snapshot.rs); data/ itself is 0700
+# (RUNBOOK, Install), so nobody else can read the store or plant a -wal beside it.
+UMask=0077
 # Hard stops consistent with the project's own bounds: the store is byte-capped by
 # SMON_MAX_DB_BYTES, logs by SMON_LOG_MAX_BYTES; the kernel adds its own here.
 LimitNOFILE=4096

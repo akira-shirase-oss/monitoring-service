@@ -7,6 +7,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- Its own CSP, since a static host adds no headers. The script hash must match the
+     inline script byte for byte: after editing it, run
+     `cargo test -p monitor-server --test headers` — a mismatch prints the hash to put here. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-iWT7NorRgTP/w7us2dp0RbIuPel6jvzAoDazKN+77t8='; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'" />
 <meta http-equiv="refresh" content="30" />
 <title>Service status</title>
 <style>
@@ -50,17 +54,42 @@ fetch('status.json', { cache: 'no-store' }).then(r => {
 			'The service states below were last observed ' + age(snap.generated_at) + '.';
 	}
 	const services = snap.services ?? [];
-	rows.innerHTML = services.length === 0
-		? '<tr><td colspan="3"><small>no services in this snapshot</small></td></tr>'
-		: services.map(s =>
-			'<tr><td>' + s.alias + '</td>' +
-			'<td class="' + s.status + '">' + s.status + '</td>' +
-			'<td><small>' + (s.incident_open_since
-				? 'incident since ' + new Date(s.incident_open_since).toLocaleString()
-				: '—') + '</small></td></tr>').join('');
+	// Rows are built as text, never as HTML: aliases are operator-written strings.
+	const cell = (text, className) => {
+		const td = document.createElement('td');
+		if (className) td.className = className;
+		td.textContent = text;
+		return td;
+	};
+	const small = (text) => {
+		const td = document.createElement('td');
+		const note = document.createElement('small');
+		note.textContent = text;
+		td.append(note);
+		return td;
+	};
+	if (services.length === 0) {
+		const tr = document.createElement('tr');
+		const td = small('no services in this snapshot');
+		td.colSpan = 3;
+		tr.append(td);
+		rows.replaceChildren(tr);
+	} else {
+		rows.replaceChildren(...services.map((s) => {
+			const tr = document.createElement('tr');
+			const known = ['up', 'down', 'unknown'].includes(s.status) ? s.status : 'unknown';
+			tr.append(
+				cell(String(s.alias)),
+				cell(String(s.status), known),
+				small(s.incident_open_since
+					? 'incident since ' + new Date(s.incident_open_since).toLocaleString()
+					: '—'));
+			return tr;
+		}));
+	}
 }).catch(() => {
 	verdict.textContent = 'Monitoring unavailable — no status snapshot could be read.';
-	rows.innerHTML = '';
+	rows.replaceChildren();
 	meta.textContent = '';
 });
 </script>
