@@ -1,0 +1,73 @@
+# Hosted CI: the same gate a developer runs before every push (scripts/check.sh: toolchain,
+# ignore rules, fmt, clippy, tests, cargo-deny advisories, npm audit, architecture rule,
+# svelte-check, dashboard build), plus a daily advisory sweep so a new RustSec or npm
+# advisory fails the build even when nothing was pushed.
+#
+# Hardening (crates/monitor-server/tests/workflows.rs enforces it): read-only token, every
+# action pinned to a full commit SHA, no pull_request_target/workflow_run, no expressions
+# inside run scripts, checkout keeps no credentials. Nothing here talks to an installed
+# monitor: every test and harness binds its own ports.
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: scripts/check.sh
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-deny@0.20.2
+      - run: npm ci
+      - run: scripts/check.sh
+
+  advisories:
+    name: advisories (cargo-deny, npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-deny@0.20.2
+      - name: RustSec advisories and deny.toml's dated exceptions
+        run: scripts/check-advisories.sh
+      - name: npm advisories for what the dashboard ships
+        run: npm audit --omit=dev --audit-level=moderate

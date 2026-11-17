@@ -1,0 +1,32 @@
+# Weekly, grouped version updates for every ecosystem the build pulls from: Rust crates
+# (Cargo.lock), npm (package-lock.json, covers apps/dashboard) and the SHA-pinned actions
+# in .github/workflows. A cooldown lets a fresh release age a week before it is proposed.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ['*']
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm:
+        patterns: ['*']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ['*']
