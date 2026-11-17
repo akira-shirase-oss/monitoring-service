@@ -55,6 +55,16 @@ failure demo must be repeatable.
 - **Comparisons:** identical fixtures, recorded commit + machine; laptop numbers are
   development observations, never public claims.
 
+## Dispatch ceiling and the 1M-request API run (2026-11-17)
+
+- **Ceiling:** dispatch happens only on the 1 s coordinator tick, at most `global_slots`
+  (20) per tick, so one server peaks at 20 checks/s; same-tick monitors share a phase, so
+  a phase-locked wave gets 100 dispatches (20 × the 5 s grace) and the rest are counted
+  missed. Measured with 200 `/ok` monitors: 800 pass + 800 missed in 120 s. A 1,000,000-check
+  run needs ≥13.9 h on one server — not run; see `perf/LOAD_MATRIX.md`.
+- **API:** `perf/api-load.mjs` — 1,000,000 bearer-authed reads, all 200, 1,647 rps, p99
+  32.6 ms; the probes beneath had 0 missed but commit-lag p95 5.14 s, over the 5 s target.
+
 ## Real-app rising-load drill (M7.3)
 
 The lab profile proves the monitor keeps bounded evidence under its own generated load;
