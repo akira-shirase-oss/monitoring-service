@@ -94,14 +94,9 @@ pub async fn require_auth(
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let Some(token) = &state.admin_token else {
-        // Dev-on-loopback mode: boot logged the warning; nothing here is a decision.
-        return next.run(request).await;
-    };
-
     // An Origin that doesn't match the Host is a cross-site browser request —
-    // rejected before the credential is even considered. `Host` may be absent on
-    // HTTP/2 — the URI's authority is the same information.
+    // rejected before the credential is even considered, in every mode. `Host` may be
+    // absent on HTTP/2 — the URI's authority is the same information.
     let authority = request
         .headers()
         .get(header::HOST)
@@ -117,6 +112,22 @@ pub async fn require_auth(
             "Origin does not match Host",
         );
     }
+
+    let Some(token) = &state.admin_token else {
+        // Dev-on-loopback mode (boot refuses it on any other listen). Whoever reaches the
+        // listener is trusted — so only a loopback `Host` is: a page that rebinds its own
+        // hostname to 127.0.0.1 is same-origin with us, but its `Host` is its own name.
+        if let Some(authority) = authority.as_deref()
+            && !is_loopback_authority(authority)
+        {
+            return deny(
+                StatusCode::FORBIDDEN,
+                "host_not_allowed",
+                "without SMON_ADMIN_TOKEN only a loopback Host is served",
+            );
+        }
+        return next.run(request).await;
+    };
 
     let credential = if bearer_matches(request.headers().get(header::AUTHORIZATION), token) {
         Some(Credential::Bearer)
@@ -182,6 +193,22 @@ pub fn origin_matches_host(origin: &header::HeaderValue, authority: Option<&str>
         && parsed
             .host_str()
             .is_some_and(|h| authority_matches(h, parsed.port(), authority))
+}
+
+/// `localhost`, `127.0.0.0/8` or `[::1]`, with any port. A request with no Host at all is
+/// not a browser (browsers always send one) and is decided by the caller.
+fn is_loopback_authority(authority: &str) -> bool {
+    match url::Url::parse(&format!("http://{authority}/")) {
+        Ok(url) => match url.host() {
+            Some(url::Host::Domain(name)) => {
+                name.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+            }
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        Err(_) => false,
+    }
 }
 
 /// `authority` is `host[:port]` from the URL; `host_header` is the raw Host value
@@ -343,6 +370,30 @@ mod tests {
             "bound to the token"
         );
         assert_ne!(key, session_key("token-a", "cookie-ie"), "bound to the id");
+    }
+
+    #[test]
+    fn only_loopback_authorities_are_loopback() {
+        for ok in [
+            "127.0.0.1:58465",
+            "127.1.2.3",
+            "localhost:1",
+            "LOCALHOST.:2",
+            "[::1]:3",
+        ] {
+            assert!(is_loopback_authority(ok), "{ok}");
+        }
+        for bad in [
+            "rebound.attacker.example",
+            "localhost.attacker.example",
+            "127.0.0.1.nip.io",
+            "10.0.0.1:58465",
+            "[::2]:1",
+            "",
+            "a b",
+        ] {
+            assert!(!is_loopback_authority(bad), "{bad}");
+        }
     }
 
     #[test]

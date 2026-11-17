@@ -1642,3 +1642,87 @@ async fn a_backup_onto_an_existing_file_is_refused_and_leaves_it_alone() -> anyh
     assert_eq!(std::fs::read(&taken)?, b"not yours");
     Ok(())
 }
+
+async fn status_with(
+    app: &Router,
+    method: &str,
+    headers: &[(&str, &str)],
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<StatusCode> {
+    let mut request = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let body = match body {
+        Some(json) => {
+            request = request.header("content-type", "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    Ok(app.clone().oneshot(request.body(body)?).await?.status())
+}
+
+/// M3: tokenless dev mode is open to whoever reaches the loopback listener — which, by DNS
+/// rebinding, includes any web page the operator visits. It skipped the Origin and Host
+/// checks entirely: a rebound `Host` read the monitors and wrote a backup. Tokenless mode
+/// now serves only loopback `Host` values, and a present `Origin` must match `Host` in
+/// every mode.
+#[tokio::test]
+async fn tokenless_mode_serves_only_loopback_hosts_and_same_origin_browsers() -> anyhow::Result<()>
+{
+    let (app, _statuses, _db, _wh, _tmp) = app().await?;
+    let out = tempfile::tempdir()?;
+    let backup = out.path().join("exfil.db");
+    let backup_body = || Some(serde_json::json!({ "path": backup.display().to_string() }));
+
+    // A rebound hostname, with the Origin a rebound page really sends: refused.
+    let rebound = [
+        ("host", "rebound.attacker.example:58465"),
+        ("origin", "http://rebound.attacker.example:58465"),
+    ];
+    assert_eq!(
+        status_with(&app, "GET", &rebound, "/api/monitors", None).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status_with(&app, "POST", &rebound, "/api/backup", backup_body()).await?,
+        StatusCode::FORBIDDEN
+    );
+    // A cross-site page posting to the loopback address: refused.
+    let cross_site = [
+        ("host", "127.0.0.1:58465"),
+        ("origin", "https://evil.example"),
+    ];
+    assert_eq!(
+        status_with(&app, "POST", &cross_site, "/api/backup", backup_body()).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!backup.exists(), "a forged request wrote a backup");
+
+    // The CLI (no Origin) and the dashboard (same origin) on loopback still work.
+    for host in ["127.0.0.1:58465", "localhost:58465", "[::1]:58465"] {
+        assert_eq!(
+            status_with(&app, "GET", &[("host", host)], "/api/monitors", None).await?,
+            StatusCode::OK,
+            "{host}"
+        );
+    }
+    let same_origin = [
+        ("host", "localhost:58465"),
+        ("origin", "http://localhost:58465"),
+    ];
+    assert_eq!(
+        status_with(
+            &app,
+            "POST",
+            &same_origin,
+            "/api/monitors",
+            Some(serde_json::json!({ "name": "m", "url": "https://example.com/" })),
+        )
+        .await?,
+        StatusCode::CREATED
+    );
+    Ok(())
+}
