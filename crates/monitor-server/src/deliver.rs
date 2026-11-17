@@ -451,7 +451,7 @@ fn email_body(row: &DeliveryRow, kind: &str) -> String {
     body
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
         .iter()

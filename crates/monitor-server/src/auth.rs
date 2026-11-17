@@ -8,6 +8,11 @@
 //! Comparison is done on SHA-256 digests: fixed-length, content-independent, so the
 //! compare can't leak the token's prefix or length through timing.
 //!
+//! Sessions (D-016): the cookie carries a random id; the `sessions` row is keyed by
+//! [`session_key`] — a digest of that id bound to the admin token. The store and its
+//! backups hold nothing that works as a cookie, and rotating `SMON_ADMIN_TOKEN` ends every
+//! session at once.
+//!
 //! CSRF contract (M7.2): a request that carries an `Origin` header must send one that
 //! matches the `Host` — a cross-site browser request is rejected no matter which
 //! credential it rides. A *cookie*-authed mutation must send `Origin` at all:
@@ -116,7 +121,7 @@ pub async fn require_auth(
     let credential = if bearer_matches(request.headers().get(header::AUTHORIZATION), token) {
         Some(Credential::Bearer)
     } else if let Some(session) = session_cookie(request.headers().get(header::COOKIE)) {
-        match state.db.session_valid(session).await {
+        match state.db.session_valid(&session_key(token, session)).await {
             Ok(true) => Some(Credential::Cookie),
             Ok(false) => None,
             Err(error) => {
@@ -221,6 +226,17 @@ fn deny(status: StatusCode, code: &'static str, message: &'static str) -> Respon
         .into_response()
 }
 
+/// The `sessions` row key for a cookie id: hex `SHA-256("smon-session-v1\0" ‖
+/// SHA-256(admin token) ‖ id)`. One-way, so a copied store can't be replayed as cookies;
+/// bound to the token, so a cookie earned under an old token maps to a key no row has.
+pub fn session_key(admin_token: &str, cookie_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"smon-session-v1\0");
+    digest.update(Sha256::digest(admin_token.as_bytes()));
+    digest.update(cookie_id.as_bytes());
+    crate::deliver::hex_lower(&digest.finalize())
+}
+
 /// Hash-then-compare: both sides are 32-byte digests, so the equality check runs in
 /// data-independent time and reveals nothing about *where* the inputs differ.
 pub fn digests_match(presented: &[u8], configured: &[u8]) -> bool {
@@ -309,6 +325,20 @@ mod tests {
             None
         );
         assert_eq!(session_cookie(None), None);
+    }
+
+    #[test]
+    fn a_session_key_is_one_way_and_bound_to_the_token() {
+        let key = session_key("token-a", "cookie-id");
+        assert_eq!(key.len(), 64, "hex SHA-256");
+        assert!(!key.contains("cookie-id"));
+        assert_eq!(key, session_key("token-a", "cookie-id"), "deterministic");
+        assert_ne!(
+            key,
+            session_key("token-b", "cookie-id"),
+            "bound to the token"
+        );
+        assert_ne!(key, session_key("token-a", "cookie-ie"), "bound to the id");
     }
 
     #[test]

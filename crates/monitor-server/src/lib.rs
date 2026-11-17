@@ -300,10 +300,15 @@ async fn login(
             .into_response();
     }
 
+    // The cookie gets the id; the store only its token-bound digest (D-016).
     let id = Uuid::new_v4().simple().to_string();
     let expires = OffsetDateTime::now_utc()
         + time::Duration::seconds(i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX));
-    if let Err(error) = state.db.create_session(&id, expires).await {
+    if let Err(error) = state
+        .db
+        .create_session(&auth::session_key(admin, &id), expires)
+        .await
+    {
         tracing::error!(%error, "session insert failed");
         return ApiError::Db(error).into_response();
     }
@@ -325,8 +330,10 @@ async fn login(
 /// Delete the session row and expire the cookie. Idempotent — clearing an already-gone
 /// session answers the same way, so a browser can always reset its own state.
 async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    // Tokenless dev mode never issues sessions, so there is no row to delete.
     if let Some(id) = auth::session_cookie(headers.get(axum::http::header::COOKIE))
-        && let Err(error) = state.db.delete_session(id).await
+        && let Some(admin) = &state.admin_token
+        && let Err(error) = state.db.delete_session(&auth::session_key(admin, id)).await
     {
         tracing::error!(%error, "session delete failed");
         return ApiError::Db(error).into_response();

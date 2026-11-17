@@ -2,6 +2,22 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-016 — Session rows hold a token-bound digest, never the cookie's id
+
+The `sessions` table used to store the cookie's id as is, so the store — and every
+`VACUUM INTO` backup of it — held working credentials for up to `SMON_SESSION_TTL_S`, and
+rotating `SMON_ADMIN_TOKEN` (the operator's way to revoke access) left every dashboard
+session working until it expired.
+
+The cookie still carries a random id (UUIDv4); the row is keyed by
+`hex(SHA-256("smon-session-v1\0" ‖ SHA-256(SMON_ADMIN_TOKEN) ‖ id))`
+(`auth::session_key`). The digest is one-way, so a copied store or backup can't be
+replayed as cookies, and it is bound to the token, so after a rotation every outstanding
+cookie maps to a key no row has: each session ends at once, and the dashboard asks for
+the new token. Migration 0008 deletes the raw-id rows written before this (everyone signs
+in again once). Pinned by `rotating_the_admin_token_ends_every_session` and
+`the_store_and_its_backups_hold_no_usable_session_id`.
+
 ## D-015 — A normal start requires an existing store; only `--init` creates one
 
 The store is meant to live on its own volume (the SaaS droplet uses a DigitalOcean volume).

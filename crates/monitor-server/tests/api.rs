@@ -1461,3 +1461,110 @@ async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
         "{text}"
     );
 }
+
+/// An authed router over an existing store — two of these on one store are "the same
+/// server restarted with a different `SMON_ADMIN_TOKEN`".
+fn authed_on(db: &Db, token: &str) -> Router {
+    monitor_server::router(monitor_server::AppState {
+        db: db.clone(),
+        statuses: Arc::new(RwLock::new(HashMap::new())),
+        registry: tokio::sync::watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(Arc::default(), Duration::from_secs(30)),
+        admin_token: Some(Arc::from(token)),
+        session_ttl: Duration::from_hours(12),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
+        version: "test",
+    })
+}
+
+async fn login_cookie(app: &Router, token: &str) -> anyhow::Result<String> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": token }).to_string(),
+                ))?,
+        )
+        .await?;
+    anyhow::ensure!(response.status() == StatusCode::NO_CONTENT, "login failed");
+    Ok(session_cookie_from(&response))
+}
+
+async fn read_with_cookie(app: &Router, cookie: &str) -> anyhow::Result<StatusCode> {
+    Ok(app
+        .clone()
+        .oneshot(
+            Request::get("/api/monitors")
+                .header("cookie", cookie)
+                .body(Body::empty())?,
+        )
+        .await?
+        .status())
+}
+
+/// Rotating `SMON_ADMIN_TOKEN` is how an operator revokes access — it must end every
+/// dashboard session too, not leave cookies earned with the old token working for their
+/// remaining 12 hours.
+#[tokio::test]
+async fn rotating_the_admin_token_ends_every_session() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::connect(
+        &format!("sqlite:{}", tmp.path().join("rotate.db").display()),
+        1,
+    )
+    .await?;
+    db.migrate().await?;
+    let old = authed_on(&db, "old-token-0123456789abcdef0123456789abcd");
+    let cookie = login_cookie(&old, "old-token-0123456789abcdef0123456789abcd").await?;
+    assert_eq!(read_with_cookie(&old, &cookie).await?, StatusCode::OK);
+
+    let rotated = authed_on(&db, "new-token-0123456789abcdef0123456789abcd");
+    assert_eq!(
+        read_with_cookie(&rotated, &cookie).await?,
+        StatusCode::UNAUTHORIZED,
+        "a cookie earned with the old token must not survive the rotation"
+    );
+    // The new token earns a session of its own.
+    let fresh = login_cookie(&rotated, "new-token-0123456789abcdef0123456789abcd").await?;
+    assert_eq!(read_with_cookie(&rotated, &fresh).await?, StatusCode::OK);
+    Ok(())
+}
+
+/// Session rows ride along in every backup. The store keeps only a digest of each session
+/// id, so a copied store or backup holds nothing that works as a cookie.
+#[tokio::test]
+async fn the_store_and_its_backups_hold_no_usable_session_id() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("digest.db");
+    let db = Db::connect(&format!("sqlite:{}", db_path.display()), 1).await?;
+    db.migrate().await?;
+    let app = authed_on(&db, "digest-token-0123456789abcdef0123456789ab");
+    let cookie = login_cookie(&app, "digest-token-0123456789abcdef0123456789ab").await?;
+    let id = cookie
+        .strip_prefix("smon_session=")
+        .ok_or_else(|| anyhow::anyhow!("cookie shape: {cookie}"))?;
+    assert_eq!(read_with_cookie(&app, &cookie).await?, StatusCode::OK);
+
+    let backup = tmp.path().join("backup.db");
+    db.backup(&backup).await?;
+    for file in [
+        backup.clone(),
+        db_path.clone(),
+        db_path.with_extension("db-wal"),
+    ] {
+        if let Ok(bytes) = std::fs::read(&file) {
+            assert!(
+                !bytes
+                    .windows(id.len())
+                    .any(|window| window == id.as_bytes()),
+                "{} holds the raw session id",
+                file.display()
+            );
+        }
+    }
+    Ok(())
+}
