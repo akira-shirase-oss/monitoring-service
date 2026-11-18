@@ -7,6 +7,10 @@ const SERVER_PORT = Number(process.env['SMON_E2E_SERVER_PORT'] ?? 58410);
 const FAULT_PORT = Number(process.env['SMON_E2E_FAULT_PORT'] ?? 58710);
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const database = `sqlite:/tmp/smon-e2e-${process.pid}.db`;
+// D-019: the e2e server confines backups here; specs read the same path to verify
+// the server-named file really landed.
+const backupDir = `/tmp/smon-e2e-backups-${process.pid}`;
+process.env['SMON_E2E_BACKUP_DIR'] ??= backupDir;
 
 export default defineConfig({
 	testDir: 'tests',
@@ -39,6 +43,7 @@ export default defineConfig({
 				SMON_PROFILE: 'lab',
 				SMON_DASHBOARD_DIR: `${repo}apps/dashboard/build`,
 				SMON_STATUS_DIR: `/tmp/smon-e2e-status-${process.pid}`,
+				SMON_BACKUP_DIR: backupDir,
 				// M7.2: e2e runs the real auth path — the dashboard earns its session
 				// cookie exactly like a deployed instance.
 				SMON_ADMIN_TOKEN: 'e2e-token-for-the-playwright-suite-0001'

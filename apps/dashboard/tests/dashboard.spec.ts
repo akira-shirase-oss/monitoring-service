@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext, type BrowserContext, type Page } from '@playwright/test';
+import * as fs from 'node:fs';
 
 const FAULT = process.env['SMON_E2E_FAULT_PORT'] ?? '58710';
 const TOKEN = 'e2e-token-for-the-playwright-suite-0001';
@@ -125,19 +126,35 @@ test('mutations through the real API: create in UI, pause, edit, delete', async 
 		})
 		.toBe(true);
 
-	// Edit: the form seeds current values; every management write bumps generation
-	// once — create(1) → pause(2) → edit(3).
+	// Edit: the form seeds every field, identity included; every management write bumps
+	// generation once — create(1) → pause(2) → edit(3).
 	await page.getByRole('button', { name: 'Edit' }).click();
+	const renamed = `${name}-renamed`;
+	await page.getByPlaceholder('billing-api').fill(renamed);
+	await page
+		.getByPlaceholder('https://example.com/healthz')
+		.fill(`http://127.0.0.1:${FAULT}/ok`);
 	await page.getByPlaceholder('60').fill('30');
 	await page.getByRole('button', { name: 'Save changes' }).click();
 	await expect(page.getByText(/every 30s/)).toBeVisible();
 	await expect(page.getByText(/generation 3/)).toBeVisible();
+	await expect(page.getByRole('heading', { name: renamed })).toBeVisible();
+	// The API agrees the identity fields went through — the PATCH wasn't view-only.
+	await expect
+		.poll(async () => {
+			const r = await request.get('/api/monitors');
+			const m = (await r.json()).monitors.find(
+				(m: { name: string }) => m.name === renamed
+			);
+			return m ? `${m.interval_s}` : null;
+		})
+		.toBe('30');
 
 	// Delete needs the two-click confirm; a paused, checkless monitor deletes clean.
 	await page.getByRole('button', { name: 'Delete' }).click();
 	await page.getByRole('button', { name: 'Confirm delete' }).click();
 	await expect(page).toHaveURL(/\/$/);
-	await expect(page.getByRole('link', { name })).not.toBeVisible();
+	await expect(page.getByRole('link', { name: renamed })).not.toBeVisible();
 });
 
 test('delete refusal on a monitor with history shows the server error', async ({
@@ -338,6 +355,59 @@ test('an active maintenance window is visible, never silent', async ({ page, req
 	await expect(page.getByText('Maintenance windows')).toBeVisible();
 	await expect(page.getByText('suppressing now')).toBeVisible();
 	await expect(page.getByText('e2e deploy rehearsal')).toBeVisible();
+});
+
+test('maintenance windows add and cancel through the UI', async ({ page, request }) => {
+	const name = `e2e-mw-${Date.now()}`;
+	const id = await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);
+	await page.goto(`/monitors/${id}`);
+	await expect(
+		page.getByText('None set — a window suppresses incident alerts')
+	).toBeVisible();
+
+	// "from" empty means the next slot; "until" is the required bound.
+	await page.getByRole('button', { name: 'Add window' }).click();
+	const until = new Date(Date.now() + 3_600_000);
+	const local = new Date(until.getTime() - until.getTimezoneOffset() * 60_000)
+		.toISOString()
+		.slice(0, 16);
+	await page.locator('input[type="datetime-local"]').nth(1).fill(local);
+	await page.getByPlaceholder('deploy rehearsal').fill('e2e ui window');
+	await page.getByRole('button', { name: 'Add window' }).click();
+	await expect(page.getByText('e2e ui window')).toBeVisible();
+	await expect(page.getByText('suppressing now')).toBeVisible();
+	await expect
+		.poll(async () => {
+			const r = await request.get(`/api/monitors/${id}/maintenance`);
+			return (await r.json()).windows.length;
+		})
+		.toBe(1);
+
+	// Cancelling is a two-click confirm — and the API really drops the window.
+	await page.getByRole('button', { name: 'Cancel' }).click();
+	await page.getByRole('button', { name: 'Confirm cancel' }).click();
+	await expect(
+		page.getByText('None set — a window suppresses incident alerts')
+	).toBeVisible();
+	await expect
+		.poll(async () => {
+			const r = await request.get(`/api/monitors/${id}/maintenance`);
+			return (await r.json()).windows.length;
+		})
+		.toBe(0);
+});
+
+test('back up now writes a server-named file inside SMON_BACKUP_DIR', async ({ page }) => {
+	const dir = process.env['SMON_E2E_BACKUP_DIR'] ?? '';
+	await page.goto('/');
+	// Two clicks like delete: the first arms, the second does the disk work.
+	await page.getByRole('button', { name: 'Back up now' }).click();
+	await page.getByRole('button', { name: 'Confirm backup' }).click();
+	await expect(page.getByText(/saved monitor-\S+\.db \(/)).toBeVisible({
+		timeout: 15_000
+	});
+	const names = fs.readdirSync(dir).filter((n) => /^monitor-.*\.db$/.test(n));
+	expect(names.length, `no backup file in ${dir}`).toBeGreaterThan(0);
 });
 
 test('keyboard navigation reaches the detail page', async ({ page, request }) => {

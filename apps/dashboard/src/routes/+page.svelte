@@ -26,6 +26,46 @@
 
 	let adding = $state(false);
 	let addError = $state<string | null>(null);
+	let backupConfirm = $state(false);
+	let backupBusy = $state(false);
+	let backupNote = $state<string | null>(null);
+
+	// Operator snapshot: two clicks like delete — a backup takes real disk work, and the
+	// confirmation names what the second click does. The server names the file
+	// (SMON_BACKUP_DIR); this only echoes what it reports back.
+	async function backUp() {
+		if (!backupConfirm) {
+			backupConfirm = true;
+			return;
+		}
+		backupConfirm = false;
+		backupBusy = true;
+		try {
+			const response = await apiFetch(
+				'/api/backup',
+				{
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: '{}'
+				},
+				fetch
+			);
+			const failure = await readEnvelope(response);
+			if (failure) {
+				backupNote =
+					failure.status === 404
+						? 'No backup directory is configured on this server (SMON_BACKUP_DIR unset).'
+						: failure.message;
+				return;
+			}
+			const created = (await response.json()) as { name?: string; bytes?: number };
+			backupNote = `saved ${created.name ?? '(unnamed)'} (${Number(created.bytes ?? 0).toLocaleString()} bytes)`;
+		} catch {
+			backupNote = 'The monitor server is unreachable.';
+		} finally {
+			backupBusy = false;
+		}
+	}
 
 	async function create(payload: MonitorPayload) {
 		const response = await apiFetch(
@@ -83,6 +123,15 @@
 			>
 				Status
 			</a>
+			{#if data.reachable && !data.needsAuth}
+				<button
+					onclick={backUp}
+					disabled={backupBusy}
+					class="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-50"
+				>
+					{backupBusy ? 'Backing up…' : backupConfirm ? 'Confirm backup' : 'Back up now'}
+				</button>
+			{/if}
 			{#if data.reachable && !data.needsAuth && !adding}
 				<button
 					onclick={() => (adding = true)}
@@ -93,6 +142,9 @@
 			{/if}
 		</div>
 	</div>
+	{#if backupNote}
+		<p class="-mt-4 text-right text-xs text-muted-foreground">{backupNote}</p>
+	{/if}
 
 	{#if data.needsAuth}
 		<LoginGate />
