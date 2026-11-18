@@ -45,6 +45,9 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_STATUS_DIR=/opt/smon/status
 # SMON_DASHBOARD_DIR=/opt/smon/current/dashboard
 # SMON_MAX_DB_BYTES=2147483648
+# The only directory POST /api/backup may write — absolute, created 0700 at boot.
+# Unset switches the endpoint off (404 backup_disabled).
+# SMON_BACKUP_DIR=/opt/smon/data/backups
 # Retention horizons in seconds (D-012 lists every one): raw checks, daily aggregates,
 # resolved incidents with their alerts and ended windows, delivered alerts.
 # SMON_RETENTION_S=604800

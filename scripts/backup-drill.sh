@@ -21,18 +21,18 @@ require_free_port "$FIXTURE_PORT" SMON_DRILL_FIXTURE_PORT
 BASE="http://127.0.0.1:$PORT"
 
 DB="$(mktemp -u -t smon-drill).db"
-BACKUP="$(mktemp -u -t smon-drill).backup.db"
+BACKUP_DIR=$(mktemp -d /tmp/smon-drill-backups-XXXX)
 STATUS_DIR=$(mktemp -d /tmp/smon-drill-status-XXXX)
 LOG=/tmp/smon-drill-server.log
 export SMON_PROFILE=lab SMON_DATABASE_URL="sqlite:$DB" SMON_STATUS_DIR="$STATUS_DIR" \
-    SMON_LISTEN="127.0.0.1:$PORT"
+    SMON_LISTEN="127.0.0.1:$PORT" SMON_BACKUP_DIR="$BACKUP_DIR"
 
 SERVER_PID=""
 FIXTURE_PID=""
 cleanup() {
     stop_own "$SERVER_PID"
     stop_own "$FIXTURE_PID"
-    rm -f "$DB"* "$BACKUP"*; rm -rf "$STATUS_DIR"
+    rm -f "$DB"*; rm -rf "$STATUS_DIR" "$BACKUP_DIR"
 }
 trap cleanup EXIT
 
@@ -58,9 +58,12 @@ for i in $(seq 1 16); do
 done
 echo "incident open; backing up…"
 
-curl -s -X POST "$BASE/api/backup" \
-    -H 'content-type: application/json' \
-    -d "{\"path\":\"$BACKUP\"}" | tee /dev/stderr
+# D-019: an empty object asks; the server names the file inside SMON_BACKUP_DIR.
+RESPONSE=$(curl -s -X POST "$BASE/api/backup" -H 'content-type: application/json' -d '{}')
+echo "$RESPONSE" | tee /dev/stderr
+NAME=$(echo "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+BACKUP="$BACKUP_DIR/$NAME"
+[ -f "$BACKUP" ] || { echo "FAIL: $NAME not in SMON_BACKUP_DIR"; exit 1; }
 BYTES=$(wc -c <"$BACKUP" | tr -d ' ')
 [ "$BYTES" -gt 0 ] || { echo "FAIL: empty backup"; exit 1; }
 

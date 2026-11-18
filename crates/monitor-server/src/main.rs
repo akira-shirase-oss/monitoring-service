@@ -78,7 +78,29 @@ async fn open_store(config: &Config, mode: Mode) -> anyhow::Result<Option<monito
         db.close().await;
         return Ok(None);
     }
+    // D-019: the only place `/api/backup` may write. Created owner-only at boot so a bad
+    // path fails the boot, never the first backup request after an upgrade.
+    prepare_backup_dir(config).await?;
     Ok(Some(db))
+}
+
+/// `SMON_BACKUP_DIR` (D-019): the confinement root for `/api/backup` snapshots —
+/// created owner-only. Unset means the endpoint stays off; nothing to prepare.
+async fn prepare_backup_dir(config: &Config) -> anyhow::Result<()> {
+    let Some(dir) = &config.backup_dir else {
+        return Ok(());
+    };
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating SMON_BACKUP_DIR {}", dir.display()))?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(
+        dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .await
+    .with_context(|| format!("making SMON_BACKUP_DIR {} owner-only", dir.display()))?;
+    Ok(())
 }
 
 /// A coordinator that makes no loop pass for this long is stalled: its statuses are frozen,
@@ -313,6 +335,7 @@ fn app_state(
         session_idle: config.session_idle,
         clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
+        backup_dir: config.backup_dir.clone(),
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
         allow_local_targets: config.lab,

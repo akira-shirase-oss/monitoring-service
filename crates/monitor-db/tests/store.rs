@@ -1447,6 +1447,14 @@ async fn a_new_store_and_its_backups_are_owner_only() -> anyhow::Result<()> {
         std::fs::read(tmp.path().join("taken.db"))?,
         b"someone else's file"
     );
+
+    // A symlink where the snapshot would land is refused too: `create_new` fails on any
+    // existing name, link or file — the target's contents are never followed or touched.
+    let outside = tmp.path().join("outside.db");
+    std::fs::write(&outside, b"not a backup")?;
+    std::os::unix::fs::symlink(&outside, tmp.path().join("link.db"))?;
+    assert!(db.backup(&tmp.path().join("link.db")).await.is_err());
+    assert_eq!(std::fs::read(&outside)?, b"not a backup");
     Ok(())
 }
 
