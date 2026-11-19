@@ -695,18 +695,20 @@ async fn outbox_lifecycle_pending_retry_exhausted_delivered() -> anyhow::Result<
     // A failed attempt books a retry in the future: no longer due.
     let later = OffsetDateTime::now_utc() + time::Duration::hours(1);
     writer
-        .mark_delivery(&event_id, 1, Some(later), None)
+        .mark_delivery(&event_id, 1, Some(later), None, None)
         .await?;
     assert!(db.pending_outbox("webhook", 3, 10).await?.is_empty());
 
     // Past the retry time it is due again — simulate by scheduling in the past.
     let past = OffsetDateTime::now_utc() - time::Duration::seconds(1);
-    writer.mark_delivery(&event_id, 2, Some(past), None).await?;
+    writer
+        .mark_delivery(&event_id, 2, Some(past), None, None)
+        .await?;
     assert_eq!(db.pending_outbox("webhook", 3, 10).await?.len(), 1);
 
     // Exhausted (attempts = max, no next attempt) is terminal: never pending again, but the
     // row stays in the table.
-    writer.mark_delivery(&event_id, 3, None, None).await?;
+    writer.mark_delivery(&event_id, 3, None, None, None).await?;
     assert!(db.pending_outbox("webhook", 3, 10).await?.is_empty());
     assert_eq!(
         db.workspace(WorkspaceId::DEFAULT)
@@ -732,11 +734,13 @@ async fn a_delivered_event_cannot_be_rewritten() -> anyhow::Result<()> {
         .clone();
 
     let now = OffsetDateTime::now_utc();
-    writer.mark_delivery(&event_id, 1, None, Some(now)).await?;
+    writer
+        .mark_delivery(&event_id, 1, None, Some(now), None)
+        .await?;
     // The guarded update ignores any write to an already-delivered row.
     let later = now + time::Duration::minutes(5);
     writer
-        .mark_delivery(&event_id, 99, Some(later), None)
+        .mark_delivery(&event_id, 99, Some(later), None, None)
         .await?;
 
     let row = &db
@@ -764,7 +768,7 @@ async fn mark_delivery_goes_through_the_single_writer() -> anyhow::Result<()> {
         .clone();
 
     writer
-        .mark_delivery(&event_id, 1, None, Some(OffsetDateTime::now_utc()))
+        .mark_delivery(&event_id, 1, None, Some(OffsetDateTime::now_utc()), None)
         .await?;
     let row = &db
         .workspace(WorkspaceId::DEFAULT)
@@ -772,6 +776,102 @@ async fn mark_delivery_goes_through_the_single_writer() -> anyhow::Result<()> {
         .await?[0];
     assert_eq!(row.attempts, 1);
     assert!(row.delivered_at.is_some());
+    Ok(())
+}
+
+/// S1d (D-017): the workspace webhook is member work — one write opens a
+/// `tenant_webhook` outbox channel carrying the row's URL and secret; the secret is
+/// minted once, kept across URL edits, rotated after a clear. Unconfigured means the
+/// channel is simply never planned. And `mark_delivery`'s detail lands on the row as
+/// `last_error` — the refusal note a send-time SSRF refusal must leave (D-017).
+#[tokio::test]
+async fn a_workspace_webhook_opens_and_closes_its_outbox_channel() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let member = db.member(WorkspaceId::DEFAULT);
+
+    // Unconfigured: the transition plans only the operator webhook row.
+    for _ in 0..3 {
+        writer.record(fail(&monitor)).await?;
+    }
+    let channels: Vec<String> = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?
+        .iter()
+        .map(|row| row.channel.clone())
+        .collect();
+    assert_eq!(channels, ["webhook"]);
+
+    // Configure: secret minted once — a later URL edit keeps it (receivers still verify).
+    let first = member.set_webhook("https://hooks.example.com/one").await?;
+    assert_eq!(first.url, "https://hooks.example.com/one");
+    assert!(first.secret.starts_with("smon_whk_"));
+    let second = member.set_webhook("https://hooks.example.com/two").await?;
+    assert_eq!(second.secret, first.secret, "an edit keeps the secret");
+    let read = member.webhook().await?.expect("webhook configured");
+    assert_eq!(read.secret, first.secret);
+
+    // Recover: the recovered transition now plans the tenant channel too, and the
+    // pending row carries the workspace's target and secret for the send.
+    for _ in 0..2 {
+        writer.record(pass(&monitor)).await?;
+    }
+    let rows = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
+    let channels: Vec<String> = rows.iter().map(|row| row.channel.clone()).collect();
+    assert!(
+        channels
+            .iter()
+            .filter(|c| c.as_str() == "tenant_webhook")
+            .count()
+            == 1,
+        "one tenant row for the recovered transition: {channels:?}"
+    );
+    let pending = db.pending_outbox("tenant_webhook", 3, 10).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].webhook_url.as_deref(), Some(second.url.as_str()));
+    assert_eq!(
+        pending[0].webhook_secret.as_deref(),
+        Some(first.secret.as_str())
+    );
+
+    // A failed send records its classified reason — visible on the row.
+    let event_id = pending[0].event_id.clone();
+    writer
+        .mark_delivery(&event_id, 1, None, None, Some("rejected_local"))
+        .await?;
+    let rows = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
+    let tenant_row = rows
+        .iter()
+        .find(|row| row.channel == "tenant_webhook")
+        .expect("tenant row");
+    assert_eq!(tenant_row.last_error.as_deref(), Some("rejected_local"));
+    // And a landed delivery clears it — no stale note on a recovered row.
+    writer
+        .mark_delivery(&event_id, 2, None, Some(OffsetDateTime::now_utc()), None)
+        .await?;
+    let rows = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
+    let tenant_row = rows
+        .iter()
+        .find(|row| row.channel == "tenant_webhook")
+        .expect("tenant row");
+    assert_eq!(tenant_row.last_error, None);
+
+    // Cleared: secret rotated out, and the next incident plans no tenant row again.
+    member.clear_webhook().await?;
+    assert!(member.webhook().await?.is_none());
+    let third = member
+        .set_webhook("https://hooks.example.com/three")
+        .await?;
+    assert_ne!(third.secret, first.secret, "a clear rotates the secret");
     Ok(())
 }
 
@@ -1281,6 +1381,7 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
             1,
             None,
             Some(OffsetDateTime::now_utc() - time::Duration::days(40)),
+            None,
         )
         .await?;
     // An open incident from 2 days ago, its event undelivered.
@@ -1485,7 +1586,12 @@ async fn only_failed_observation_commits_count_as_write_failures() -> anyhow::Re
             .await
             .is_err()
     );
-    assert!(writer.mark_delivery("evt", 1, None, None).await.is_err());
+    assert!(
+        writer
+            .mark_delivery("evt", 1, None, None, None)
+            .await
+            .is_err()
+    );
     assert_eq!(
         failures(),
         0,

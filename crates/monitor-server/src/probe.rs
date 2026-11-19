@@ -38,6 +38,10 @@ pub struct ProbePolicy {
 pub enum Rejected {
     SchemeNotAllowed,
     LocalAddressForbidden,
+    /// The name could not be resolved within the bound — at save time that is a
+    /// refusal (a target that cannot be proven public is not proven safe), at send
+    /// time it is just another failed attempt.
+    Unresolvable,
 }
 
 /// A DNS answer containing a local address — the whole resolution is refused, because
@@ -53,19 +57,67 @@ impl std::fmt::Display for ResolvedLocal {
 
 impl std::error::Error for ResolvedLocal {}
 
+/// Test-only DNS answers, keyed by name — see `PolicyResolver::for_test`.
+#[cfg(test)]
+type Overrides = Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<SocketAddr>>>>;
+
 /// reqwest's resolver with the policy inside: names resolve through the OS, then every
 /// returned address must be public (unless `lab`). reqwest receives only the validated
 /// set — the check is the resolution itself, so there is no validate-then-re-resolve gap.
-#[derive(Debug, Clone, Copy)]
-struct PolicyResolver {
+#[derive(Debug, Clone)]
+pub struct PolicyResolver {
     allow_local_targets: bool,
+    /// Test-only DNS answers: present names return these addresses *through the same
+    /// `validate_addrs` gate* — validation is never bypassed, only the lookup source is
+    /// swapped. `None` in every build but tests.
+    #[cfg(test)]
+    overrides: Option<Overrides>,
+}
+
+impl PolicyResolver {
+    /// The production constructor: strict unless `SMON_PROFILE=lab` (fixtures and drills
+    /// on loopback). The tenant-webhook sink is built with this; probes build their own
+    /// inside `ProbeClient`.
+    pub fn new(allow_local_targets: bool) -> Self {
+        Self {
+            allow_local_targets,
+            #[cfg(test)]
+            overrides: None,
+        }
+    }
+
+    /// A resolver whose answers for the mapped names come from `overrides` — flip the
+    /// map between calls to simulate DNS changing beneath a stored target (rebinding).
+    /// Real lookups still run for names not in the map; every answer is validated.
+    #[cfg(test)]
+    pub(crate) fn for_test(allow_local_targets: bool, overrides: Overrides) -> Self {
+        Self {
+            allow_local_targets,
+            overrides: Some(overrides),
+        }
+    }
+
+    /// The lab flag the resolver was built with — the tenant deliverer rebuilds its
+    /// literal-side `ProbePolicy` from it so both halves of the send gate agree.
+    pub(crate) fn allows_local(&self) -> bool {
+        self.allow_local_targets
+    }
 }
 
 impl Resolve for PolicyResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let allow = self.allow_local_targets;
+        #[cfg(test)]
+        let overrides = self.overrides.clone();
         Box::pin(async move {
             let host = name.as_str().to_owned();
+            #[cfg(test)]
+            if let Some(map) = &overrides
+                && let Some(addrs) = map.lock().ok().and_then(|m| m.get(&host).cloned())
+            {
+                validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
+                return Ok(Box::new(addrs.into_iter()) as Addrs);
+            }
             let addrs: Vec<SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
             validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
@@ -110,7 +162,32 @@ impl ProbePolicy {
         }
         Ok(())
     }
+
+    /// The validating resolver run at *save* time (D-017): `check`, then a bounded
+    /// DNS resolution of domain hosts — every returned address must be public, the
+    /// same gate `PolicyResolver` enforces again at every send. A name that cannot be
+    /// resolved is refused (`Unresolvable`): an unproven host is not a proven-public
+    /// host. Literal hosts need no lookup — `check` already judged them.
+    pub async fn check_resolved(&self, url: &Url) -> Result<(), Rejected> {
+        self.check(url)?;
+        if self.allow_local_targets {
+            return Ok(());
+        }
+        let Some(Host::Domain(name)) = url.host() else {
+            return Ok(());
+        };
+        let looked = tokio::time::timeout(SAVE_RESOLVE, tokio::net::lookup_host((name, 0))).await;
+        let addrs: Vec<SocketAddr> = match looked {
+            Ok(Ok(iter)) => iter.collect(),
+            _ => return Err(Rejected::Unresolvable),
+        };
+        validate_addrs(addrs.iter().map(SocketAddr::ip), false)
+            .map_err(|_| Rejected::LocalAddressForbidden)
+    }
 }
+
+/// Save-time DNS gets its own short bound — the write shouldn't wait on a slow resolver.
+const SAVE_RESOLVE: Duration = Duration::from_secs(3);
 
 /// IPv4 blocks the monitor never dials: every entry of the IANA IPv4 special-purpose
 /// registry that is not globally reachable, plus multicast and the reserved 240/4. A few
@@ -269,9 +346,7 @@ impl ProbeClient {
                     attempt.follow()
                 }
             }))
-            .dns_resolver(Arc::new(PolicyResolver {
-                allow_local_targets: policy.allow_local_targets,
-            }))
+            .dns_resolver(Arc::new(PolicyResolver::new(policy.allow_local_targets)))
             .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
@@ -323,17 +398,11 @@ impl ProbeClient {
                 latency: start.elapsed(),
                 detail: Some("deadline"),
             },
-            Ok(Attempt::Rejected(Rejected::SchemeNotAllowed)) => ProbeResult {
+            Ok(Attempt::Rejected(rejected)) => ProbeResult {
                 outcome: CheckOutcome::Transport,
                 http_status: None,
                 latency: start.elapsed(),
-                detail: Some("rejected_scheme"),
-            },
-            Ok(Attempt::Rejected(Rejected::LocalAddressForbidden)) => ProbeResult {
-                outcome: CheckOutcome::Transport,
-                http_status: None,
-                latency: start.elapsed(),
-                detail: Some(REJECTED_LOCAL),
+                detail: Some(rejected_detail(rejected)),
             },
             Ok(Attempt::Failed(error)) if error.is_timeout() => ProbeResult {
                 outcome: CheckOutcome::Timeout,
@@ -401,9 +470,22 @@ fn find_tls<'a>(mut node: &'a (dyn std::error::Error + 'static)) -> Option<&'a r
     }
 }
 
+/// The committed detail a `Rejected` maps to. `check()` never yields `Unresolvable` —
+/// `check_resolved` alone can — but the enum is shared, so the word must exist: a name
+/// that cannot resolve is a connect failure, the word the taxonomy already knows.
+/// `pub(crate)` so the tenant deliverer words its send-side `check` refusals identically.
+pub(crate) fn rejected_detail(rejected: Rejected) -> &'static str {
+    match rejected {
+        Rejected::SchemeNotAllowed => "rejected_scheme",
+        Rejected::LocalAddressForbidden => REJECTED_LOCAL,
+        Rejected::Unresolvable => "connect",
+    }
+}
+
 /// A short stable classification — the stored `detail` must stay free of URLs and
-/// headers, so reqwest's Display is never stored.
-fn classify(error: &reqwest::Error) -> &'static str {
+/// headers, so reqwest's Display is never stored. `pub(crate)` so the deliverer classifies
+/// tenant-webhook send errors the same way.
+pub(crate) fn classify(error: &reqwest::Error) -> &'static str {
     // A DNS refusal from PolicyResolver rides inside reqwest's connect error — walk the
     // cause chain so it reports `rejected_local`, not an ambiguous `connect`. TLS
     // failures ride the same chain — catch them on the way down.
@@ -610,9 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_resolver_itself_refuses_a_name_that_resolves_local() {
-        let resolver = PolicyResolver {
-            allow_local_targets: false,
-        };
+        let resolver = PolicyResolver::new(false);
         let name = Name::from_str("localhost").expect("name");
         assert!(
             resolver.resolve(name).await.is_err(),

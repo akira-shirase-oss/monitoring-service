@@ -76,13 +76,15 @@ enum Command {
         observation: Box<Observation>,
         reply: oneshot::Sender<Result<WriteOutcome, QueryError>>,
     },
-    /// The deliverer's bookkeeping: attempt count, scheduled retry or terminal state.
-    /// Delivery writes go through the same single writer — the store has one owner.
+    /// The deliverer's bookkeeping: attempt count, scheduled retry or terminal state,
+    /// and the classified reason the attempt failed. Delivery writes go through the
+    /// same single writer — the store has one owner.
     MarkDelivery {
         event_id: String,
         attempts: i64,
         next_attempt_at: Option<OffsetDateTime>,
         delivered_at: Option<OffsetDateTime>,
+        detail: Option<String>,
         reply: oneshot::Sender<Result<(), QueryError>>,
     },
     /// A retention pass: aggregate + delete expired checks in one transaction. Goes
@@ -118,13 +120,15 @@ impl WriterHandle {
 
     /// Book a delivery outcome. `delivered_at: Some` marks the event terminal-delivered;
     /// `delivered_at: None, next_attempt_at: Some` schedules a retry; `None`/`None` with
-    /// `attempts` at the max is terminal-exhausted.
+    /// `attempts` at the max is terminal-exhausted. `detail` is the classified failure
+    /// (`rejected_local`, `deadline`, `http_503`…); a delivery clears it.
     pub async fn mark_delivery(
         &self,
         event_id: &str,
         attempts: i64,
         next_attempt_at: Option<OffsetDateTime>,
         delivered_at: Option<OffsetDateTime>,
+        detail: Option<&str>,
     ) -> Result<(), WriterError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -133,6 +137,7 @@ impl WriterHandle {
                 attempts,
                 next_attempt_at,
                 delivered_at,
+                detail: detail.map(str::to_owned),
                 reply,
             })
             .await
@@ -224,12 +229,19 @@ async fn run(
                 attempts,
                 next_attempt_at,
                 delivered_at,
+                detail,
                 reply,
             } => {
                 // Delivery bookkeeping is a supporting duty: its failure is the
                 // deliverer's to log and retry, not evidence that observing stopped.
                 let outcome = db
-                    .update_delivery(&event_id, attempts, next_attempt_at, delivered_at)
+                    .update_delivery(
+                        &event_id,
+                        attempts,
+                        next_attempt_at,
+                        delivered_at,
+                        detail.as_deref(),
+                    )
                     .await;
                 if reply.send(outcome).is_err() {
                     debug!("delivery reply channel closed; mark still committed");

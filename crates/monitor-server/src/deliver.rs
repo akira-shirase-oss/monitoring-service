@@ -26,6 +26,8 @@ use url::Url;
 
 use monitor_db::{Db, DeliveryRow, WriterHandle};
 
+use crate::probe;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// One channel's delivery endpoint — where an outbox row goes. `Sink::channel` is the
@@ -36,6 +38,12 @@ pub enum Sink {
         target: Url,
         secret: Option<Vec<u8>>,
     },
+    /// The tenants' own webhooks (D-017): target and secret come from each row's
+    /// workspace at send time, and the DNS answer is re-validated inside the connect
+    /// — a URL that passed at save cannot ride a rebound lookup to a private address.
+    /// The sink carries the validating resolver itself: the client is built *from* it,
+    /// so there is no tenant send that could resolve unvalidated.
+    TenantWebhook { resolver: probe::PolicyResolver },
     /// A plaintext message per event through an SMTP relay.
     Email {
         mailer: AsyncSmtpTransport<Tokio1Executor>,
@@ -48,6 +56,7 @@ impl Sink {
     fn channel(&self) -> &'static str {
         match self {
             Self::Webhook { .. } => "webhook",
+            Self::TenantWebhook { .. } => "tenant_webhook",
             Self::Email { .. } => "email",
         }
     }
@@ -57,6 +66,9 @@ impl Sink {
     fn describe(&self) -> String {
         match self {
             Self::Webhook { target, .. } => crate::redact::origin(target),
+            // Tenant targets live on the rows, not the sink — there is no single
+            // endpoint to name, and logging per-row targets is the URL leak D-017 bars.
+            Self::TenantWebhook { .. } => "per-workspace webhooks".to_owned(),
             Self::Email { to, .. } => format!("smtp relay → {} recipient(s)", to.len()),
         }
     }
@@ -184,11 +196,33 @@ enum Prepared {
         target: Url,
         secret: Option<Vec<u8>>,
     },
+    /// The strict client every tenant send shares — the validating resolver is inside
+    /// it, so there is no client that could ever skip the check. The policy rides
+    /// alongside for the literal check: reqwest never calls the resolver for an IP
+    /// already spelled out in the URL, so each send re-runs `check` too — the send
+    /// gate does not trust that a row was ever screened at save.
+    TenantWebhook {
+        client: reqwest::Client,
+        policy: probe::ProbePolicy,
+    },
     Email {
         mailer: AsyncSmtpTransport<Tokio1Executor>,
         from: Mailbox,
         to: Vec<Mailbox>,
     },
+}
+
+/// The tenant-webhook client (D-017): no proxy, no redirects — and `PolicyResolver`
+/// inside, so every send re-resolves and reqwest only ever dials addresses `is_local`
+/// cleared. The check is *inside* the connect: DNS cannot race a validated answer into
+/// a different dial between the check and the socket.
+fn tenant_client(resolver: probe::PolicyResolver) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(resolver))
+        .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
+        .build()
 }
 
 async fn run(
@@ -224,6 +258,23 @@ async fn run(
                 client,
                 target,
                 secret,
+            }
+        }
+        Sink::TenantWebhook { resolver } => {
+            let allow_local_targets = resolver.allows_local();
+            let client = match tenant_client(resolver) {
+                Ok(client) => client,
+                Err(error) => {
+                    warn!(%error, "tenant webhook deliverer could not build an HTTP client; not delivering");
+                    return;
+                }
+            };
+            Prepared::TenantWebhook {
+                client,
+                policy: probe::ProbePolicy {
+                    allow_local_targets,
+                    extra_roots: Vec::new(),
+                },
             }
         }
         Sink::Email { mailer, from, to } => Prepared::Email { mailer, from, to },
@@ -305,23 +356,48 @@ async fn attempt(
 }
 
 async fn deliver(sink: &Prepared, writer: &WriterHandle, config: &Config, row: &DeliveryRow) {
-    let delivered = match sink {
+    let result: Result<(), String> = match sink {
         Prepared::Webhook {
             client,
             target,
             secret,
         } => deliver_webhook(client, target, secret.as_deref(), config, row).await,
+        Prepared::TenantWebhook { client, policy } => match &row.webhook_url {
+            // D-017's send gate, independent of the save gate: re-parse, re-run the
+            // scheme/literal policy (`check` — the resolver never sees an IP literal),
+            // and let the strict client re-resolve + revalidate names at dial.
+            Some(raw) => match Url::parse(raw) {
+                Ok(target) => match policy.check(&target) {
+                    Ok(()) => {
+                        deliver_webhook(
+                            client,
+                            &target,
+                            row.webhook_secret.as_deref().map(str::as_bytes),
+                            config,
+                            row,
+                        )
+                        .await
+                    }
+                    Err(rejected) => Err(probe::rejected_detail(rejected).to_owned()),
+                },
+                Err(_) => Err("bad_url".to_owned()),
+            },
+            // The channel was cleared between enqueue and attempt — a visible terminal
+            // state, not a silent drop.
+            None => Err("no_target".to_owned()),
+        },
         Prepared::Email { mailer, from, to } => deliver_email(mailer, from, to, config, row).await,
     };
 
     let attempts = row.attempts + 1;
-    if delivered {
+    if result.is_ok() {
         if let Err(error) = writer
             .mark_delivery(
                 &row.event_id,
                 attempts,
                 None,
                 Some(OffsetDateTime::now_utc()),
+                None,
             )
             .await
         {
@@ -331,7 +407,9 @@ async fn deliver(sink: &Prepared, writer: &WriterHandle, config: &Config, row: &
     }
 
     // Rejected or failed: either another attempt is scheduled, or the event is terminal-
-    // exhausted and stays in the table as such.
+    // exhausted and stays in the table as such. The classified reason lands on the row —
+    // a send-time SSRF refusal is evidence (`rejected_local`), never silence.
+    let detail = result.err();
     let exhausted = attempts >= config.max_attempts;
     let next = (!exhausted).then(|| {
         OffsetDateTime::now_utc()
@@ -342,27 +420,29 @@ async fn deliver(sink: &Prepared, writer: &WriterHandle, config: &Config, row: &
                 config.backoff_cap,
             )
     });
-    debug!(event = %row.event_id, attempts, exhausted, "delivery attempt failed");
+    debug!(event = %row.event_id, attempts, exhausted, detail = detail.as_deref().unwrap_or(""), "delivery attempt failed");
     if let Err(error) = writer
-        .mark_delivery(&row.event_id, attempts, next, None)
+        .mark_delivery(&row.event_id, attempts, next, None, detail.as_deref())
         .await
     {
         warn!(%error, event = %row.event_id, "attempt mark failed");
     }
 }
 
+/// `Err(detail)` is the classified failure — the string committed to
+/// `notify_outbox.last_error`, never a reqwest message (they can embed URLs).
 async fn deliver_webhook(
     client: &reqwest::Client,
     target: &Url,
     secret: Option<&[u8]>,
     config: &Config,
     row: &DeliveryRow,
-) -> bool {
+) -> Result<(), String> {
     let body = match serde_json::to_vec(&Payload::from(row)) {
         Ok(body) => body,
         Err(error) => {
             warn!(%error, event = %row.event_id, "payload serialize failed; event stays pending");
-            return false;
+            return Err("serialize".to_owned());
         }
     };
 
@@ -381,15 +461,20 @@ async fn deliver_webhook(
         }
     }
 
+    // The send resolves on response *headers* — the body is never read, so the
+    // response-size cap is literal: zero bytes, and a receiver streaming forever
+    // still can't hold the attempt past its deadline.
     let send = client
         .post(target.clone())
         .headers(headers)
         .body(body)
         .send();
-    matches!(
-        tokio::time::timeout(config.attempt_deadline, send).await,
-        Ok(Ok(response)) if response.status().is_success()
-    )
+    match tokio::time::timeout(config.attempt_deadline, send).await {
+        Ok(Ok(response)) if response.status().is_success() => Ok(()),
+        Ok(Ok(response)) => Err(format!("http_{}", response.status().as_u16())),
+        Ok(Err(error)) => Err(probe::classify(&error).to_owned()),
+        Err(_elapsed) => Err("deadline".to_owned()),
+    }
 }
 
 /// One plaintext message per event. The monitor name is made one line ([`one_line`]) in
@@ -401,7 +486,7 @@ async fn deliver_email(
     to: &[Mailbox],
     config: &Config,
     row: &DeliveryRow,
-) -> bool {
+) -> Result<(), String> {
     let mut message = Message::builder().from(from.clone());
     for recipient in to {
         message = message.to(recipient.clone());
@@ -420,13 +505,15 @@ async fn deliver_email(
         Ok(message) => message,
         Err(error) => {
             warn!(%error, event = %row.event_id, "email build failed; event stays pending");
-            return false;
+            return Err("build".to_owned());
         }
     };
-    matches!(
-        tokio::time::timeout(config.attempt_deadline, mailer.send(message)).await,
-        Ok(Ok(response)) if response.is_positive()
-    )
+    match tokio::time::timeout(config.attempt_deadline, mailer.send(message)).await {
+        Ok(Ok(response)) if response.is_positive() => Ok(()),
+        Ok(Ok(_)) => Err("smtp_rejected".to_owned()),
+        Ok(Err(_)) => Err("smtp".to_owned()),
+        Err(_elapsed) => Err("deadline".to_owned()),
+    }
 }
 
 /// Operator text (a monitor name) as one line: every control character — CR and LF
@@ -491,6 +578,8 @@ mod tests {
             first_fail_at: Some(now),
             last_fail_at: Some(now),
             resolved_at: None,
+            webhook_url: None,
+            webhook_secret: None,
         }
     }
 
@@ -594,5 +683,439 @@ mod tests {
         let body = email_body(&row, "incident opened");
         assert!(body.contains("<https://example.com/health>"), "{body}");
         assert!(!body.contains("pw") && !body.contains("T0K"), "{body}");
+    }
+
+    // ---- D-017 tenant-webhook send gate --------------------------------------
+    // These live in-crate because `PolicyResolver::for_test` is `cfg(test)`: the
+    // rebinding proof needs a DNS answer that flips beneath a stored target.
+
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, RwLock};
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+    use axum::response::Response;
+    use axum::routing::post;
+    use http_body_util::BodyExt;
+    use monitor_db::{Observation, OutboxRow, writer};
+    use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation, WorkspaceId};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct Stub {
+        hits: mpsc::Sender<(HeaderMap, Vec<u8>)>,
+        fail_first: Arc<AtomicUsize>,
+        hang: bool,
+        redirect_to: Option<String>,
+    }
+
+    async fn receiver(State(stub): State<Stub>, request: Request<Body>) -> Response {
+        let (parts, body) = request.into_parts();
+        let bytes = body
+            .collect()
+            .await
+            .map(|c| c.to_bytes().to_vec())
+            .unwrap_or_default();
+        let _ = stub.hits.send((parts.headers, bytes)).await;
+        if stub.hang {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        if let Some(location) = &stub.redirect_to {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::FOUND;
+            response.headers_mut().insert(
+                "location",
+                HeaderValue::from_str(location).expect("ascii url"),
+            );
+            return response;
+        }
+        if stub
+            .fail_first
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            let mut response = Response::new(Body::from("fail"));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return response;
+        }
+        Response::new(Body::empty())
+    }
+
+    async fn stub(
+        fail_first: usize,
+        hang: bool,
+        redirect_to: Option<String>,
+    ) -> (String, mpsc::Receiver<(HeaderMap, Vec<u8>)>) {
+        let (hits_tx, hits_rx) = mpsc::channel(64);
+        let app = axum::Router::new()
+            .route("/", post(receiver))
+            .with_state(Stub {
+                hits: hits_tx,
+                fail_first: Arc::new(AtomicUsize::new(fail_first)),
+                hang,
+                redirect_to,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{port}/"), hits_rx)
+    }
+
+    async fn rig() -> (Db, writer::WriterHandle) {
+        let db = Db::connect("sqlite::memory:", 1).await.expect("db");
+        db.migrate().await.expect("migrate");
+        let statuses = Arc::new(RwLock::new(HashMap::new()));
+        let (handle, _task) = writer::spawn(
+            db.clone(),
+            statuses,
+            HashMap::new(),
+            Arc::default(),
+            8,
+            false,
+        );
+        (db, handle)
+    }
+
+    /// Set the workspace webhook *before* the incident so its `tenant_webhook` row is
+    /// planned; then drive three failures. `url` writes through the store directly —
+    /// the send gate is what is under test here, so a URL the save gate would have
+    /// refused is exactly the input wanted.
+    async fn tenant_event(
+        db: &Db,
+        writer: &writer::WriterHandle,
+        url: &str,
+    ) -> (Monitor, monitor_db::WebhookRow) {
+        let webhook = db
+            .member(WorkspaceId::DEFAULT)
+            .set_webhook(url)
+            .await
+            .expect("webhook stored");
+        let monitor = NewMonitor::new("fixture", Url::parse("https://example.com").expect("url"))
+            .expect("monitor")
+            .into_monitor();
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await
+            .expect("insert");
+        for _ in 0..3 {
+            writer
+                .record(Observation {
+                    monitor_id: monitor.id,
+                    workspace: monitor.workspace,
+                    generation: monitor.generation,
+                    slot_at: OffsetDateTime::now_utc(),
+                    slot: SlotObservation::Probe(CheckOutcome::Transport),
+                    http_status: None,
+                    latency_ms: None,
+                    detail: None,
+                })
+                .await
+                .expect("recorded");
+        }
+        (monitor, webhook)
+    }
+
+    async fn tenant_row(
+        db: &Db,
+        monitor: &Monitor,
+        pred: impl Fn(&OutboxRow) -> bool,
+    ) -> OutboxRow {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(row) = db
+                .workspace(WorkspaceId::DEFAULT)
+                .list_outbox(monitor.id)
+                .await
+                .expect("outbox")
+                .into_iter()
+                .find(|row| row.channel == "tenant_webhook")
+                && (pred(&row) || std::time::Instant::now() > deadline)
+            {
+                return row;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "no tenant_webhook row appeared for {}",
+                monitor.id.0
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    }
+
+    fn fast() -> Config {
+        Config {
+            poll_tick: Duration::from_millis(30),
+            attempt_deadline: Duration::from_millis(400),
+            max_attempts: 1,
+            backoff_base: Duration::from_millis(20),
+            backoff_cap: Duration::from_millis(200),
+            concurrency: 4,
+            batch: 8,
+        }
+    }
+
+    fn strict_sink() -> Sink {
+        Sink::TenantWebhook {
+            resolver: probe::PolicyResolver::new(false),
+        }
+    }
+
+    /// The store's `last_error` after one refused send for `url` — a fresh rig per URL
+    /// so every range is judged on its own.
+    async fn refused_at_send(url: &str) -> Option<String> {
+        let (db, writer) = rig().await;
+        let (monitor, _wh) = tenant_event(&db, &writer, url).await;
+        let shutdown = CancellationToken::new();
+        let task = Deliverer::spawn(db.clone(), writer, fast(), strict_sink(), shutdown.clone());
+        let row = tenant_row(&db, &monitor, |r| r.attempts >= 1).await;
+        shutdown.cancel();
+        task.await.expect("deliverer joins");
+        row.last_error
+    }
+
+    /// The literal side of the send gate: the URL was never screened at save (the test
+    /// wrote it straight into the store) and reqwest never consults DNS for an IP
+    /// literal — `policy.check` at send is the only thing between it and a socket, and
+    /// it refuses every non-public form with the same word as the probes.
+    #[tokio::test]
+    async fn tenant_send_refuses_every_blocked_literal() {
+        let (stub_url, mut hits) = stub(0, false, None).await;
+        let port: u16 = stub_url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("stub port");
+        for (url, detail) in [
+            ("http://127.0.0.1/hook", "rejected_local"),
+            ("http://0.0.0.0/hook", "rejected_local"),
+            ("http://255.255.255.255/hook", "rejected_local"),
+            ("http://10.1.2.3/hook", "rejected_local"),
+            ("http://172.16.5.4/hook", "rejected_local"),
+            ("http://192.168.1.1/hook", "rejected_local"),
+            ("http://169.254.0.1/hook", "rejected_local"),
+            ("http://169.254.169.254/latest/meta-data", "rejected_local"),
+            ("http://100.64.1.1/hook", "rejected_local"),
+            ("http://192.0.2.1/hook", "rejected_local"),
+            ("http://198.51.100.7/hook", "rejected_local"),
+            ("http://203.0.113.9/hook", "rejected_local"),
+            ("http://198.18.0.1/hook", "rejected_local"),
+            ("http://192.0.0.9/hook", "rejected_local"),
+            ("http://192.88.99.1/hook", "rejected_local"),
+            ("http://224.0.0.1/hook", "rejected_local"),
+            ("http://240.0.0.1/hook", "rejected_local"),
+            ("http://[::1]/hook", "rejected_local"),
+            ("http://[::]/hook", "rejected_local"),
+            ("http://[fe80::1]/hook", "rejected_local"),
+            ("http://[fd12:3456::1]/hook", "rejected_local"),
+            ("http://[fd00:ec2::254]/hook", "rejected_local"),
+            ("http://[ff02::1]/hook", "rejected_local"),
+            ("http://[::ffff:127.0.0.1]/hook", "rejected_local"),
+            ("http://[::ffff:10.0.0.1]/hook", "rejected_local"),
+            ("http://[::ffff:169.254.169.254]/hook", "rejected_local"),
+            ("ftp://hooks.example.com/x", "rejected_scheme"),
+            ("file:///etc/passwd", "rejected_scheme"),
+        ] {
+            assert_eq!(refused_at_send(url).await.as_deref(), Some(detail), "{url}");
+        }
+        // The strongest "never sent": this target is a live listener — the refusal
+        // happened before any dial, so it saw nothing.
+        assert_eq!(
+            refused_at_send(&format!("http://127.0.0.1:{port}/hook"))
+                .await
+                .as_deref(),
+            Some("rejected_local")
+        );
+        assert!(
+            hits.try_recv().is_err(),
+            "the stub saw a dial it must not have"
+        );
+    }
+
+    /// D-017's core scenario, end to end: a name that was public when the webhook was
+    /// configured re-answers with a private address at send. The override map is the
+    /// lookup — validation is the resolution itself, so the flipped answer is refused
+    /// inside the connect, recorded as `rejected_local`, and the receiver it names is
+    /// a live stub that never sees a packet.
+    #[tokio::test]
+    async fn a_rebound_name_is_refused_inside_the_connect_and_recorded() {
+        let (db, writer) = rig().await;
+        let (stub_url, mut hits) = stub(0, false, None).await;
+        let stub_port: u16 = stub_url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("stub port");
+        let url = format!("http://hooks.tenant.example:{stub_port}/hook");
+        let (monitor, _wh) = tenant_event(&db, &writer, &url).await;
+
+        let overrides: Arc<Mutex<HashMap<String, Vec<SocketAddr>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // "Public at save": the name first answers a public (if unreachable) address.
+        overrides.lock().expect("map").insert(
+            "hooks.tenant.example".to_owned(),
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                stub_port,
+            )],
+        );
+        let shutdown = CancellationToken::new();
+        let task = Deliverer::spawn(
+            db.clone(),
+            writer,
+            Config {
+                max_attempts: 3,
+                ..fast()
+            },
+            Sink::TenantWebhook {
+                resolver: probe::PolicyResolver::for_test(false, overrides.clone()),
+            },
+            shutdown.clone(),
+        );
+        // Attempt one dials the public answer and fails there — evidence the override
+        // was validated as public and used.
+        let row = tenant_row(&db, &monitor, |r| r.attempts >= 1 && r.last_error.is_some()).await;
+        assert_ne!(row.last_error.as_deref(), Some("rejected_local"));
+
+        // "Private at send": the same name now answers the stub's own loopback address.
+        overrides.lock().expect("map").insert(
+            "hooks.tenant.example".to_owned(),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), stub_port)],
+        );
+        let row = tenant_row(&db, &monitor, |r| r.attempts >= 3 && r.last_error.is_some()).await;
+        shutdown.cancel();
+        task.await.expect("deliverer joins");
+        assert_eq!(row.last_error.as_deref(), Some("rejected_local"));
+        assert!(row.delivered_at.is_none());
+        assert!(row.next_attempt_at.is_none(), "exhausted stays terminal");
+        // The flip pointed at a live receiver — nothing ever reached it.
+        assert!(hits.try_recv().is_err(), "payload must never be sent");
+    }
+
+    /// Redirects are off for tenant sends: a receiver answering 302 at a private
+    /// destination is not followed — the attempt fails as `http_302` and the redirect
+    /// target never sees the payload. (`lab` lets both stubs live on loopback; had the
+    /// hop been followed it would have reached the second.)
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_never_followed() {
+        let (db, writer) = rig().await;
+        let (b_url, mut b_hits) = stub(0, false, None).await;
+        let (a_url, mut a_hits) = stub(0, false, Some(b_url.clone())).await;
+        let (monitor, _wh) = tenant_event(&db, &writer, &a_url).await;
+        let shutdown = CancellationToken::new();
+        let task = Deliverer::spawn(
+            db.clone(),
+            writer,
+            fast(),
+            Sink::TenantWebhook {
+                resolver: probe::PolicyResolver::new(true),
+            },
+            shutdown.clone(),
+        );
+        let row = tenant_row(&db, &monitor, |r| r.attempts >= 1).await;
+        shutdown.cancel();
+        task.await.expect("deliverer joins");
+        assert_eq!(row.last_error.as_deref(), Some("http_302"));
+        assert!(
+            a_hits.try_recv().is_ok(),
+            "the post did reach the first hop"
+        );
+        assert!(
+            b_hits.try_recv().is_err(),
+            "the redirect target saw nothing"
+        );
+    }
+
+    /// A real tenant send: the per-workspace secret signs the body, the row is marked
+    /// delivered — and a failure's note on an earlier attempt is cleared, not kept as
+    /// stale evidence.
+    #[tokio::test]
+    async fn a_tenant_send_signs_with_its_workspace_secret_and_clears_notes() {
+        let (db, writer) = rig().await;
+        let (stub_url, mut hits) = stub(1, false, None).await; // first attempt 500s
+        let (monitor, webhook) = tenant_event(&db, &writer, &stub_url).await;
+        let shutdown = CancellationToken::new();
+        let task = Deliverer::spawn(
+            db.clone(),
+            writer,
+            Config {
+                max_attempts: 3,
+                ..fast()
+            },
+            Sink::TenantWebhook {
+                resolver: probe::PolicyResolver::new(true),
+            },
+            shutdown.clone(),
+        );
+        // The failed first attempt records its classified note.
+        let row = tenant_row(&db, &monitor, |r| r.attempts >= 1).await;
+        assert_eq!(row.last_error.as_deref(), Some("http_500"));
+
+        let (headers, body) = tokio::time::timeout(Duration::from_secs(5), hits.recv())
+            .await
+            .expect("hit")
+            .expect("the retry arrives");
+        let signature = headers
+            .get("x-smon-signature")
+            .and_then(|v| v.to_str().ok())
+            .expect("signed");
+        let mut mac = HmacSha256::new_from_slice(webhook.secret.as_bytes()).expect("key");
+        mac.update(&body);
+        assert_eq!(
+            signature,
+            format!("sha256={}", hex_lower(&mac.finalize().into_bytes()))
+        );
+        let row = tenant_row(&db, &monitor, |r| r.delivered_at.is_some()).await;
+        assert!(row.last_error.is_none(), "success clears the stale note");
+        shutdown.cancel();
+        task.await.expect("deliverer joins");
+    }
+
+    /// A workspace that cleared its webhook after the event was queued is a visible
+    /// terminal state on the row — never a silent drop.
+    #[tokio::test]
+    async fn a_cleared_channel_reports_no_target() {
+        let (db, writer) = rig().await;
+        let (monitor, _wh) = tenant_event(&db, &writer, "http://93.184.216.34/hook").await;
+        db.member(WorkspaceId::DEFAULT)
+            .clear_webhook()
+            .await
+            .expect("cleared");
+        let shutdown = CancellationToken::new();
+        let task = Deliverer::spawn(db.clone(), writer, fast(), strict_sink(), shutdown.clone());
+        let row = tenant_row(&db, &monitor, |r| r.attempts >= 1).await;
+        shutdown.cancel();
+        task.await.expect("deliverer joins");
+        assert_eq!(row.last_error.as_deref(), Some("no_target"));
+    }
+
+    /// The per-attempt deadline applies to tenant sends too — a hanging receiver is a
+    /// `deadline` note, not a stalled delivery slot.
+    #[tokio::test]
+    async fn a_hanging_tenant_receiver_meets_the_attempt_deadline() {
+        let (db, writer) = rig().await;
+        let (stub_url, _hits) = stub(0, true, None).await;
+        let (monitor, _wh) = tenant_event(&db, &writer, &stub_url).await;
+        let shutdown = CancellationToken::new();
+        let task = Deliverer::spawn(
+            db.clone(),
+            writer,
+            fast(),
+            Sink::TenantWebhook {
+                resolver: probe::PolicyResolver::new(true),
+            },
+            shutdown.clone(),
+        );
+        let row = tenant_row(&db, &monitor, |r| r.attempts >= 1).await;
+        shutdown.cancel();
+        task.await.expect("deliverer joins");
+        assert_eq!(row.last_error.as_deref(), Some("deadline"));
     }
 }

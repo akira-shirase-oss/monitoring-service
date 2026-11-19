@@ -681,6 +681,24 @@ fn spawn_deliverers(
         );
         supervisor.watch("email deliverer", Role::Supporting, email_deliverer);
     }
+    // Tenant webhooks (D-017) always run — rows exist only while a workspace keeps a
+    // webhook configured, so the loop is an idle poll when none does. The strict
+    // client inside re-validates DNS at every send; `lab` admits loopback receivers
+    // for fixtures and drills.
+    let tenant_deliverer = Deliverer::spawn(
+        db.clone(),
+        writer.clone(),
+        DelivererConfig::default(),
+        Sink::TenantWebhook {
+            resolver: monitor_server::probe::PolicyResolver::new(config.lab),
+        },
+        shutdown.clone(),
+    );
+    supervisor.watch(
+        "tenant webhook deliverer",
+        Role::Supporting,
+        tenant_deliverer,
+    );
 }
 
 /// The email alert channel (M7.1): `SMON_SMTP_DSN` selects the relay — prefer

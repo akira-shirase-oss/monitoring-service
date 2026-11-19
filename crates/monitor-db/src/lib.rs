@@ -1487,7 +1487,7 @@ impl WorkspaceDb<'_> {
     pub async fn list_outbox(&self, monitor: MonitorId) -> Result<Vec<OutboxRow>, QueryError> {
         let rows = sqlx::query_as::<_, OutboxRow>(
             "SELECT id, event_id, monitor_id, incident_id, kind, channel, attempts, next_attempt_at,
-                    delivered_at, created_at
+                    delivered_at, created_at, last_error
              FROM notify_outbox WHERE monitor_id = ? AND workspace_id = ? ORDER BY id",
         )
         .bind(monitor.0.to_string())
@@ -1512,10 +1512,12 @@ impl Db {
             "SELECT o.event_id, o.kind, o.attempts, o.created_at, o.channel,
                     m.id AS monitor_id, m.name AS monitor_name, m.url AS monitor_url,
                     i.id AS incident_id, i.opened_at, i.first_fail_at, i.last_fail_at,
-                    i.resolved_at
+                    i.resolved_at,
+                    w.webhook_url, w.webhook_secret
              FROM notify_outbox o
              JOIN monitors m ON m.id = o.monitor_id
              JOIN incidents i ON i.id = o.incident_id
+             JOIN workspaces w ON w.id = o.workspace_id
              WHERE o.channel = ?
                AND o.delivered_at IS NULL AND o.attempts < ?
                AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
@@ -1532,21 +1534,26 @@ impl Db {
 
     /// Record a delivery attempt's bookkeeping. `delivered_at` marks the event terminal;
     /// `next_attempt_at = None` with `delivered_at = None` is the exhausted terminal state —
-    /// the row stays in the table, visible, never silently dropped.
+    /// the row stays in the table, visible, never silently dropped. `detail` is the
+    /// classified reason the attempt failed (`rejected_local`, `deadline`, `http_503`…);
+    /// a successful delivery clears it so a recovered row shows no stale note.
     pub(crate) async fn update_delivery(
         &self,
         event_id: &str,
         attempts: i64,
         next_attempt_at: Option<OffsetDateTime>,
         delivered_at: Option<OffsetDateTime>,
+        detail: Option<&str>,
     ) -> Result<(), QueryError> {
         sqlx::query(
-            "UPDATE notify_outbox SET attempts = ?, next_attempt_at = ?, delivered_at = ?
+            "UPDATE notify_outbox SET attempts = ?, next_attempt_at = ?, delivered_at = ?,
+                    last_error = ?
              WHERE event_id = ? AND delivered_at IS NULL",
         )
         .bind(attempts)
         .bind(next_attempt_at)
         .bind(delivered_at)
+        .bind(detail)
         .bind(event_id)
         .execute(&self.pool)
         .await?;
@@ -1843,12 +1850,20 @@ async fn enqueue_outbox(
 ) -> Result<(), QueryError> {
     // One row per delivery channel: webhook is always planned (pending rows are the
     // visible "no receiver" signal); email rows only exist when SMTP is configured —
-    // an unconfigured channel is no plan, not a pending one.
-    let channels: &[&str] = if queue_email {
-        &["webhook", "email"]
-    } else {
-        &["webhook"]
-    };
+    // an unconfigured channel is no plan, not a pending one. A `tenant_webhook` row
+    // exists only while the workspace's own webhook is configured (D-017).
+    let mut channels: Vec<&str> = vec!["webhook"];
+    if queue_email {
+        channels.push("email");
+    }
+    let tenant_webhook: Option<String> =
+        sqlx::query_scalar("SELECT webhook_url FROM workspaces WHERE id = ?")
+            .bind(workspace.0.to_string())
+            .fetch_one(&mut **tx)
+            .await?;
+    if tenant_webhook.is_some() {
+        channels.push("tenant_webhook");
+    }
     for channel in channels {
         sqlx::query(
             "INSERT INTO notify_outbox (event_id, monitor_id, workspace_id, incident_id, kind, channel, created_at)
@@ -1859,7 +1874,7 @@ async fn enqueue_outbox(
         .bind(workspace.0.to_string())
         .bind(incident_id)
         .bind(kind)
-        .bind(*channel)
+        .bind(channel)
         .bind(OffsetDateTime::now_utc())
         .execute(&mut **tx)
         .await?;
@@ -2169,6 +2184,48 @@ impl MemberDb<'_> {
     pub async fn delete_window(&self, window_id: i64) -> Result<bool, QueryError> {
         self.view.view.delete_window(window_id).await
     }
+
+    /// This workspace's own webhook channel (D-017): URL and signing secret, or `None`
+    /// while unconfigured. Members read it to point receivers at the secret.
+    pub async fn webhook(&self) -> Result<Option<WebhookRow>, QueryError> {
+        sqlx::query_as::<_, WebhookRow>(
+            "SELECT webhook_url AS url, webhook_secret AS secret
+             FROM workspaces WHERE id = ? AND webhook_url IS NOT NULL",
+        )
+        .bind(self.view.view.workspace.0.to_string())
+        .fetch_optional(&self.view.view.db.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Store the validated URL (the handler's SSRF check ran first) and mint the
+    /// signing secret if none survives — `set` preserves an existing secret so
+    /// receivers keep verifying; `clear` removes both, so a later set rotates.
+    pub async fn set_webhook(&self, url: &str) -> Result<WebhookRow, QueryError> {
+        let mint = format!("smon_whk_{}", Uuid::now_v7().simple());
+        sqlx::query_as::<_, WebhookRow>(
+            "UPDATE workspaces
+                SET webhook_url = ?, webhook_secret = COALESCE(webhook_secret, ?)
+              WHERE id = ?
+              RETURNING webhook_url AS url, webhook_secret AS secret",
+        )
+        .bind(url)
+        .bind(mint)
+        .bind(self.view.view.workspace.0.to_string())
+        .fetch_one(&self.view.view.db.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Remove the channel: URL and secret both cleared — pending `tenant_webhook`
+    /// rows then fail their next attempt with `no_target`, visible, not dropped.
+    pub async fn clear_webhook(&self) -> Result<(), QueryError> {
+        sqlx::query("UPDATE workspaces SET webhook_url = NULL, webhook_secret = NULL WHERE id = ?")
+            .bind(self.view.view.workspace.0.to_string())
+            .execute(&self.view.view.db.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Member plus the workspace's people and keys — the owner role and the operator
@@ -2470,9 +2527,21 @@ pub struct OutboxRow {
     pub next_attempt_at: Option<OffsetDateTime>,
     pub delivered_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+    /// Classified reason the last attempt failed — a refusal (`rejected_local`) or an
+    /// exhaustion stays recorded here, visible in `list_outbox`.
+    pub last_error: Option<String>,
 }
 
-/// One pending event joined with the monitor and incident its payload needs.
+/// The workspace's own webhook channel (D-017): the URL validated at save and
+/// revalidated at every send, and the secret receivers verify signatures with.
+#[derive(Debug, FromRow)]
+pub struct WebhookRow {
+    pub url: String,
+    pub secret: String,
+}
+
+/// One pending event joined with the monitor and incident its payload needs — plus the
+/// workspace's webhook columns, which only the `tenant_webhook` channel reads.
 #[derive(Debug, FromRow)]
 pub struct DeliveryRow {
     pub event_id: String,
@@ -2488,6 +2557,11 @@ pub struct DeliveryRow {
     pub first_fail_at: Option<OffsetDateTime>,
     pub last_fail_at: Option<OffsetDateTime>,
     pub resolved_at: Option<OffsetDateTime>,
+    /// This workspace's tenant-webhook URL at poll time (D-017); `None` when the
+    /// channel was cleared between enqueue and attempt — the send fails `no_target`.
+    pub webhook_url: Option<String>,
+    /// Its signing secret; travels with the row so a rotation can't sign under a mix.
+    pub webhook_secret: Option<String>,
 }
 
 #[cfg(test)]
