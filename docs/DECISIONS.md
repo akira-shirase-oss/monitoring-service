@@ -2,6 +2,17 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-019 — Backups are confined to `SMON_BACKUP_DIR` under server-drawn names
+
+`POST /api/backup` took an absolute `path` — a write-anywhere primitive the admin token's
+leak would turn into arbitrary file creation as the service user, and a footgun for
+clobbering files the store didn't write. Now the endpoint takes only `{}`: the snapshot
+lands in `SMON_BACKUP_DIR` (absolute, created owner-only at boot so a bad path fails the
+boot) as `monitor-<UTC>-<random>.db` through `create_new`+0600, and a body that names a
+path — or anything else — is refused with 422. Unset dir → 404 `backup_disabled`. The
+response returns `{"name","bytes"}`; the CLI (`monitor backup`) and the dashboard's "Back
+up now" both go through it, so no path is a back door the API has but the clients can't use.
+
 ## D-018 — Slots are spread by phase; the probe budget follows the schedule, up to 512
 
 The coordinator starts probes on its 1 s tick within a global bound. That bound was a
@@ -213,8 +224,9 @@ first pass commits one `missed` row per lost slot (962 for 100 monitors after a 
 freeze), so the coordinator also beats after every committed miss: staleness is judged by
 progress, and a long catch-up is never read as a wedged loop (a writer that stops taking
 commits stops the beats). (Unit-tested by
-`committing_a_backlog_of_misses_keeps_the_heartbeat_fresh`; the 130 s SIGSTOP drill not
-re-run since.) Supporting tasks stay *degraded*, with
+`committing_a_backlog_of_misses_keeps_the_heartbeat_fresh`; the real-process drill is now
+scripted as `scripts/freeze-drill.sh` — it freezes the server ~135 s and asserts no exit,
+the missed rows, and the honest recovery — 130 s SIGSTOP drill not re-run yet.) Supporting tasks stay *degraded*, with
 no exit. The systemd unit backs restarts off from 15 s to 10 minutes (`RestartSteps`,
 systemd ≥ 254) under a start limit of 10 in 30 minutes that a backed-off loop never
 reaches: a deterministic crash is spaced out instead of looping every few seconds.

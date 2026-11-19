@@ -30,7 +30,8 @@ const CAP = Number(arg('cap', 16));
 // The server's header-read deadline is 10 s; allow scheduling slack, but not "forever".
 const DEADLINE_MS = Number(arg('deadline-s', 15)) * 1000;
 const OUT_DIR = resolve(ROOT, arg('out', 'perf/results'));
-const DB = `/tmp/smon-conns-${process.pid}.db`;
+const TMP = process.env.SMON_TMP ?? '/tmp';
+const DB = `${TMP}/smon-conns-${process.pid}.db`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

@@ -1,5 +1,10 @@
 # Deploy runbook — Service Monitor
 
+This is the operator runbook: env reference, upgrade/rollback, backup/restore, and the
+honest-failure cases. The concrete first production install — SFO3 droplet, Cloudflare,
+Caddy with the origin cert + AOP, the R2+age backup timer, smoke and restore drill — is
+[`deploy/droplet/`](droplet/DEPLOY.md), which defers to this file for the internals.
+
 The monitor's whole job is watching other things; running it on the same box it watches
 means a shared failure reports nothing — or worse, lies about both. Run it on its own
 host, and host the public status page somewhere else again (`SMON_STATUS_DIR` is just a
@@ -146,12 +151,13 @@ Then check `env` against the strict parser (inline comments above; an admin toke
 least 32 bytes) and continue:
 
 **Back up first.** A release that adds migrations can't be rolled back by repointing
-`current` (see Rollback), so take a backup with the *running* release before deploying:
+`current` (see Rollback), so take a backup with the *running* release before deploying —
+the server names the file inside `SMON_BACKUP_DIR` (D-019):
 
 ```sh
+monitor backup        # prints the server-drawn name + size; or curl:
 curl -X POST .../api/backup -H "authorization: Bearer $SMON_ADMIN_TOKEN" \
-    -H 'content-type: application/json' \
-    -d "{\"path\":\"/opt/smon/data/backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ).db\"}"
+    -H 'content-type: application/json' -d '{}'
 ```
 
 ```sh
@@ -198,9 +204,14 @@ Evidence written after the upgrade is lost; there is no downgrade migration.
 
 ## Backup / restore
 
-Backups are created new and owner-only (0600): the target path must not exist yet
-(an existing file is refused with 422, never overwritten). Keep them inside `data/` (0700)
-or another owner-only directory — they hold monitored URLs and alert history.
+`POST /api/backup` writes every snapshot inside `SMON_BACKUP_DIR` — an absolute path the
+boot creates owner-only (0700), e.g. `/opt/smon/data/backups`. The client supplies nothing
+but `{}`; the server draws the name (`monitor-<UTC>-<random>.db`, created `create_new`
+and 0600) and answers `{"name", "bytes"}`. A body naming a path is refused with 422:
+a client-chosen path was a write-anywhere primitive, so there is deliberately no way to
+aim the write (D-019). With `SMON_BACKUP_DIR` unset the endpoint is off (404
+`backup_disabled`). Snapshots hold monitored URLs and alert history — keep the directory
+owner-only; `data/` (0700) is the right parent.
 
 Restore only into a stopped server, and delete any `monitor.db-wal`/`-shm` beside the
 restored file first: the bundled SQLite (`libsqlite3-sys` 0.37) is affected by
@@ -208,10 +219,7 @@ RUSTSEC-2026-0459, which needs a database opened together with a `-wal` that som
 wrote (deny.toml records the assessment and the re-check date).
 
 ```sh
-# a new name each time (an existing file is refused); data/backups/ is owned by smon
-curl -X POST .../api/backup -H "authorization: Bearer $SMON_ADMIN_TOKEN" \
-    -H 'content-type: application/json' \
-    -d "{\"path\":\"/opt/smon/data/backups/monitor-$(date -u +%Y%m%dT%H%M%SZ).db\"}"
+monitor backup                     # or curl -X POST .../api/backup -d '{}'
 # restore: stop, copy the snapshot over data/monitor.db (remove -wal/-shm), start
 scripts/backup-drill.sh   # the drill that proves it (own ports 58460/58461; safe beside a live monitor)
 ```

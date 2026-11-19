@@ -1,0 +1,50 @@
+# PROPOSED — move to .github/workflows/outside-check.yml to activate.
+# The outside checker (deploy/droplet/DEPLOY.md step 13): a GitHub runner — outside both
+# droplets and outside Cloudflare's edge — curls the public endpoints, then republishes the
+# status page to Cloudflare Pages from smon's status.json.
+#
+# Secrets (GitHub repo settings, NEVER the droplet):
+#   CLOUDFLARE_API_TOKEN   — a token with Pages:Edit, scoped to the status project
+#   CLOUDFLARE_ACCOUNT_ID
+#
+# NOTE: GitHub's scheduled runs can be delayed (minutes under load). That is what
+# status.json's expires_at is for — a late republish leaves a visibly stale beat, which the
+# page honestly renders as "monitoring unavailable", never a fresh lie. The curl checks
+# below still report the droplets' real state at run time.
+name: outside-check
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MONITOR: https://monitor.example.com          # placeholder — set the real name as a repo variable
+      STATUS_HOST: https://status.example.com
+    steps:
+      - name: Public endpoints answer from outside both droplets
+        run: |
+          set -e
+          curl -fsS --max-time 10 "$MONITOR/livez" | grep -q '"status"'
+          curl -fsS --max-time 10 "$MONITOR/readyz" | grep -q '"status"'
+          curl -fsS --max-time 10 "$MONITOR/version" | grep -q '"version"'
+          # The targets under watch, seen from a third network entirely:
+          curl -fsS --max-time 10 https://app.colophon.404human.dev/readyz || echo "colophon unreachable — that is the monitor's finding, not this job's"
+          curl -fsS --max-time 10 "$STATUS_HOST/" -o /dev/null
+
+      - name: Republish the status page from smon's status.json
+        run: |
+          mkdir site
+          curl -fsS --max-time 10 "$MONITOR/status.json" -o site/status.json
+          cp deploy/github/status-page/index.html site/index.html
+          npx --yes wrangler@3 pages deploy site \
+            --project-name="${{ vars.STATUS_PAGES_PROJECT || 'status' }}" \
+            --branch=main
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

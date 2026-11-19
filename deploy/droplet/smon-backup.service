@@ -1,0 +1,17 @@
+# The off-box backup (deploy/droplet/DEPLOY.md, step 9): a server-named snapshot, encrypted
+# with age, uploaded to the R2 `smon-backups` bucket, then 14 daily + 8 weekly kept.
+[Unit]
+Description=Service Monitor snapshot backup (age) to R2
+Wants=network-online.target
+After=network-online.target monitor-server.service
+
+[Service]
+Type=oneshot
+LoadCredential=s3_secret_key:/opt/smon/credentials/s3_secret_key
+ExecStart=/usr/local/bin/smon-backup run
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/smon/data/backups
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

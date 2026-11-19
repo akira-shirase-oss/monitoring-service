@@ -17,13 +17,14 @@ const DURATION_S = Number(arg('duration-s', 300));
 const OUT_DIR = resolve(ROOT, arg('out', 'perf/results'));
 // Its own ports — never 58400, where an installed monitor listens (perf/lib-ports.mjs).
 const FIXTURE_PORT = Number(arg('fixture-port', 58720)), SERVER_PORT = Number(arg('server-port', 58420));
-const DB = `/tmp/smon-storm-${process.pid}.db`, LOG = `/tmp/smon-storm-${process.pid}.log`;
+const TMP = process.env.SMON_TMP ?? '/tmp';
+const DB = `${TMP}/smon-storm-${process.pid}.db`, LOG = `${TMP}/smon-storm-${process.pid}.log`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sqlite = (sql) => execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8' }).trim() || '[]';
 const children = [];
 const run = (cmd, args, env = {}) => { const p = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' }); children.push(p); return p; };
-const DEAD = 40, ORIGINS = 10, SURVIVOR_PORT = FIXTURE_PORT + ORIGINS;
+const DEAD = 40, ORIGINS = Number(arg('origins', 10)), SURVIVOR_PORT = FIXTURE_PORT + ORIGINS;
 
 await requireFreePorts([
 	[SERVER_PORT, '--server-port'],

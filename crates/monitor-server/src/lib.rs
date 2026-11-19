@@ -88,6 +88,9 @@ pub struct AppState {
     /// `SMON_TRUSTED_PROXY`: the reverse proxy whose right-most `X-Forwarded-For` entry
     /// names the client for credential throttling (`throttle.rs`). `None`: the TCP peer.
     pub trusted_proxy: Option<std::net::IpAddr>,
+    /// `SMON_BACKUP_DIR` (D-019): the only directory `/api/backup` may write, created
+    /// owner-only at boot. `None` switches the endpoint off (`backup_disabled`, 404).
+    pub backup_dir: Option<std::path::PathBuf>,
     /// `SMON_PROFILE=lab`: local/private targets may be registered (fixtures). Otherwise
     /// a URL the SSRF guard would refuse is refused at registration (D-013).
     pub allow_local_targets: bool,
@@ -981,32 +984,57 @@ async fn list_incidents(
     Ok(Json(serde_json::json!({ "incidents": incidents })))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct BackupRequest {
-    /// Absolute path the snapshot is written to. Relative paths are rejected — where a
-    /// backup lands is an operator's explicit choice, not a cwd accident — and so is an
-    /// existing file: a backup is created new, owner-only (0600).
-    pub path: String,
+/// The backup file's UTC stamp: `monitor-<stamp>-<random>.db`, second precision —
+/// enough for an operator to sort and old enough that a redraw suffix is the uniquifier.
+fn backup_stamp(now: OffsetDateTime) -> String {
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
 }
 
 /// Online snapshot of the store via `VACUUM INTO` (M4.3): the restore drill proves open
 /// incidents and pending outbox rows survive the round trip.
+///
+/// D-019: the file lands in `SMON_BACKUP_DIR` under a server-drawn name; the client
+/// supplies nothing but an empty object. The previous contract — any absolute `path` —
+/// was a write-anywhere primitive one admin-token leak away. A name collision redraws
+/// (the suffix is 32 random bits per draw); after three, something else is wrong.
 async fn backup(
     State(state): State<AppState>,
-    Json(input): Json<BackupRequest>,
+    Json(input): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = std::path::PathBuf::from(&input.path);
-    if !path.is_absolute() {
-        return Err(ApiError::BadId);
+    if !input.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Err(ApiError::Invalid(
+            "POST an empty object — backups land in SMON_BACKUP_DIR under a \
+             server-chosen name; a client `path` is refused"
+                .into(),
+        ));
     }
-    let bytes = state.db.backup(&path).await.map_err(|error| match error {
-        QueryError::Invalid(message) => ApiError::Invalid(message),
-        other => ApiError::Db(other),
-    })?;
-    Ok(Json(serde_json::json!({
-        "path": input.path,
-        "bytes": bytes,
-    })))
+    let Some(dir) = &state.backup_dir else {
+        return Err(ApiError::BackupDisabled);
+    };
+    let stamp = backup_stamp((state.clock)());
+    for _draw in 0..3 {
+        let name = format!(
+            "monitor-{stamp}-{}.db",
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
+        match state.db.backup(&dir.join(&name)).await {
+            Ok(bytes) => {
+                return Ok(Json(serde_json::json!({ "name": name, "bytes": bytes })));
+            }
+            // the name was already taken — redraw
+            Err(QueryError::Invalid(_)) => {}
+            Err(error) => return Err(ApiError::Db(error)),
+        }
+    }
+    Err(ApiError::Corrupt)
 }
 
 async fn find_monitor(state: &AppState, id: &str) -> Result<MonitorRow, ApiError> {
@@ -1077,6 +1105,9 @@ pub enum ApiError {
     RefusedTarget,
     #[error(transparent)]
     Validation(#[from] ValidationError),
+    /// D-019: `SMON_BACKUP_DIR` unset — the endpoint is off, like `auth_disabled` on login.
+    #[error("backups are not configured on this server (SMON_BACKUP_DIR unset)")]
+    BackupDisabled,
     #[error("stored data violates the contract")]
     Corrupt,
     /// The store failed. Clients get fixed text; the detail (SQLite and sqlx messages:
@@ -1096,6 +1127,7 @@ impl ApiError {
             Self::LimitReached(_) => "limit_reached",
             Self::Capacity(_) => "capacity_exceeded",
             Self::RefusedTarget => "refused_target",
+            Self::BackupDisabled => "backup_disabled",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
         }
@@ -1103,7 +1135,7 @@ impl ApiError {
 
     fn status(&self) -> StatusCode {
         match self {
-            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotFound | Self::BackupDisabled => StatusCode::NOT_FOUND,
             Self::BadId
             | Self::BadUrl
             | Self::Validation(_)

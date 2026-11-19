@@ -36,6 +36,7 @@ enum Mode {
 const USAGE: &str = "usage: monitor-server            serve (the store must exist)
        monitor-server --init     create and migrate the store of a new install, then exit
        monitor-server --version  print the version
+       monitor-server --db-version  print the newest schema migration this build knows
        monitor-server --help     print this help
 configuration: SMON_* environment variables (README, Configuration)";
 
@@ -48,6 +49,10 @@ fn parse_mode() -> Result<Mode, std::process::ExitCode> {
         [flag] if flag == "--init" => Ok(Mode::Init),
         [flag] if flag == "--version" || flag == "-V" => {
             println!("monitor-server {}", env!("CARGO_PKG_VERSION"));
+            Err(std::process::ExitCode::SUCCESS)
+        }
+        [flag] if flag == "--db-version" => {
+            println!("{}", monitor_db::Db::known_schema_version());
             Err(std::process::ExitCode::SUCCESS)
         }
         [flag] if flag == "--help" || flag == "-h" => {
@@ -78,7 +83,29 @@ async fn open_store(config: &Config, mode: Mode) -> anyhow::Result<Option<monito
         db.close().await;
         return Ok(None);
     }
+    // D-019: the only place `/api/backup` may write. Created owner-only at boot so a bad
+    // path fails the boot, never the first backup request after an upgrade.
+    prepare_backup_dir(config).await?;
     Ok(Some(db))
+}
+
+/// `SMON_BACKUP_DIR` (D-019): the confinement root for `/api/backup` snapshots —
+/// created owner-only. Unset means the endpoint stays off; nothing to prepare.
+async fn prepare_backup_dir(config: &Config) -> anyhow::Result<()> {
+    let Some(dir) = &config.backup_dir else {
+        return Ok(());
+    };
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating SMON_BACKUP_DIR {}", dir.display()))?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(
+        dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .await
+    .with_context(|| format!("making SMON_BACKUP_DIR {} owner-only", dir.display()))?;
+    Ok(())
 }
 
 /// A coordinator that makes no loop pass for this long is stalled: its statuses are frozen,
@@ -313,6 +340,7 @@ fn app_state(
         session_idle: config.session_idle,
         clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
+        backup_dir: config.backup_dir.clone(),
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
         allow_local_targets: config.lab,
@@ -606,9 +634,10 @@ fn spawn_deliverers(
     }
 }
 
-/// The email alert channel (M7.1): `SMON_SMTP_DSN` selects the relay
-/// (`smtps://user:pass@host[:465]`, `smtp://user:pass@host[:587]?tls=required` for mandatory
-/// STARTTLS, or a bare `smtp://` for an explicitly plaintext local relay), `SMON_SMTP_FROM`
+/// The email alert channel (M7.1): `SMON_SMTP_DSN` selects the relay — prefer
+/// `smtps://user:pass@host[:465]` (implicit TLS, no cleartext preamble);
+/// `smtp://user:pass@host[:587]?tls=required` is mandatory STARTTLS where implicit TLS
+/// isn't offered, and a bare `smtp://` an explicitly plaintext local relay. `SMON_SMTP_FROM`
 /// is the sender mailbox, `SMON_SMTP_TO` a comma-separated recipient list. All three are
 /// required together; a partial configuration is a boot error, not a half-live channel.
 fn smtp_sink(config: &Config) -> anyhow::Result<Option<Sink>> {

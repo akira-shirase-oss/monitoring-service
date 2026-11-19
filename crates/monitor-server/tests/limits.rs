@@ -32,6 +32,7 @@ async fn app() -> anyhow::Result<(axum::Router, Db, tempfile::TempDir)> {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,

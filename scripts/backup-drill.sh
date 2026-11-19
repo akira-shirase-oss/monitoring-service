@@ -21,18 +21,18 @@ require_free_port "$FIXTURE_PORT" SMON_DRILL_FIXTURE_PORT
 BASE="http://127.0.0.1:$PORT"
 
 DB="$(mktemp -u -t smon-drill).db"
-BACKUP="$(mktemp -u -t smon-drill).backup.db"
+BACKUP_DIR=$(mktemp -d /tmp/smon-drill-backups-XXXX)
 STATUS_DIR=$(mktemp -d /tmp/smon-drill-status-XXXX)
 LOG=/tmp/smon-drill-server.log
 export SMON_PROFILE=lab SMON_DATABASE_URL="sqlite:$DB" SMON_STATUS_DIR="$STATUS_DIR" \
-    SMON_LISTEN="127.0.0.1:$PORT"
+    SMON_LISTEN="127.0.0.1:$PORT" SMON_BACKUP_DIR="$BACKUP_DIR"
 
 SERVER_PID=""
 FIXTURE_PID=""
 cleanup() {
     stop_own "$SERVER_PID"
     stop_own "$FIXTURE_PID"
-    rm -f "$DB"* "$BACKUP"*; rm -rf "$STATUS_DIR"
+    rm -f "$DB"*; rm -rf "$STATUS_DIR" "$BACKUP_DIR"
 }
 trap cleanup EXIT
 
@@ -44,23 +44,36 @@ wait_own_http "http://127.0.0.1:$FIXTURE_PORT/ok" "$FIXTURE_PID"
 SERVER_PID=$!
 wait_own_http "$BASE/livez" "$SERVER_PID"
 
+INTERVAL=15
 MONITOR=$(curl -s -X POST "$BASE/api/monitors" \
     -H 'content-type: application/json' \
-    -d "{\"name\":\"drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/fail\",\"interval_s\":15,\"timeout_s\":5}" \
+    -d "{\"name\":\"drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/fail\",\"interval_s\":$INTERVAL,\"timeout_s\":5}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 echo "monitor: $MONITOR — driving the incident open (~45s of failures)…"
 
-for i in $(seq 1 16); do
+# The first slot lands inside an interval window (D-018 phase spread), then three
+# consecutive failures open the incident: ~4 intervals plus slack, not a fixed guess.
+WAIT_OPEN=$((4 * INTERVAL + 20))
+for i in $(seq 1 $((WAIT_OPEN / 4))); do
     sleep 4
-    STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+    STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' 2>/dev/null || echo "?")
     [ "$STATE" = "down" ] && break
-    [ "$i" = 16 ] && { echo "FAIL: incident never opened"; exit 1; }
+    [ "$i" = $((WAIT_OPEN / 4)) ] && {
+        echo "FAIL: incident never opened within ${WAIT_OPEN}s" >&2
+        echo "monitor view: $(curl -s "$BASE/api/monitors/$MONITOR")" >&2
+        echo "recent checks: $(curl -s "$BASE/api/monitors/$MONITOR/checks?limit=10")" >&2
+        echo "last server log lines:" >&2; tail -n 10 "$LOG" >&2
+        exit 1
+    }
 done
 echo "incident open; backing up…"
 
-curl -s -X POST "$BASE/api/backup" \
-    -H 'content-type: application/json' \
-    -d "{\"path\":\"$BACKUP\"}" | tee /dev/stderr
+# D-019: an empty object asks; the server names the file inside SMON_BACKUP_DIR.
+RESPONSE=$(curl -s -X POST "$BASE/api/backup" -H 'content-type: application/json' -d '{}')
+echo "$RESPONSE" | tee /dev/stderr
+NAME=$(echo "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+BACKUP="$BACKUP_DIR/$NAME"
+[ -f "$BACKUP" ] || { echo "FAIL: $NAME not in SMON_BACKUP_DIR"; exit 1; }
 BYTES=$(wc -c <"$BACKUP" | tr -d ' ')
 [ "$BYTES" -gt 0 ] || { echo "FAIL: empty backup"; exit 1; }
 

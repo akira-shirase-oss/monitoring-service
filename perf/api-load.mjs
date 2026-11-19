@@ -46,17 +46,24 @@ const BIN_PROFILE = arg('bin', 'debug');
 if (!['debug', 'release'].includes(BIN_PROFILE)) throw new Error(`--bin ${BIN_PROFILE}: expected debug or release`);
 const BIN =
 	BIN_PROFILE === 'release' ? `${ROOT}/target/release/monitor-server` : `${ROOT}/target/debug/monitor-server`;
-const DB = `/tmp/smon-api-${process.pid}.db`;
-const LOG = `/tmp/smon-api-${process.pid}.log`;
-const SUMMARY = `/tmp/smon-api-${process.pid}-k6.json`;
+const TMP = process.env.SMON_TMP ?? '/tmp';
+const DB = `${TMP}/smon-api-${process.pid}.db`;
+const LOG = `${TMP}/smon-api-${process.pid}.log`;
+const SUMMARY = `${TMP}/smon-api-${process.pid}-k6.json`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`;
 const TOKEN = randomBytes(32).toString('hex');
 const AUTH = { authorization: `Bearer ${TOKEN}` };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sqlite = (sql) =>
 	execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim() || '[]';
-const loadavg = () =>
-	execFileSync('sysctl', ['-n', 'vm.loadavg'], { encoding: 'utf8' }).trim().replace(/[{}]/g, '').trim().split(/\s+/).map(Number);
+// sysctl is denied in some sandboxes; the average is run metadata, so a run degrades to null.
+const loadavg = () => {
+	try {
+		return execFileSync('sysctl', ['-n', 'vm.loadavg'], { encoding: 'utf8' }).trim().replace(/[{}]/g, '').trim().split(/\s+/).map(Number);
+	} catch {
+		return null;
+	}
+};
 const pct = (sorted, p) =>
 	sorted.length === 0 ? null : sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
 

@@ -1,0 +1,87 @@
+{
+  "date": "2026-11-19T03:13:56.653Z",
+  "scenario": "incident-storm",
+  "duration_s": 300,
+  "monitors": {
+    "dead": 40,
+    "surviving": 1
+  },
+  "api_reads": 4582,
+  "api_read_failures": 0,
+  "final": {
+    "t": 295.169,
+    "open_incidents": 40,
+    "outbox_pending": 0,
+    "survivor_checks": 20
+  },
+  "storm_series": [
+    {
+      "t": 5.04,
+      "open_incidents": 0,
+      "outbox_pending": 0,
+      "survivor_checks": 0
+    },
+    {
+      "t": 35.032,
+      "open_incidents": 8,
+      "outbox_pending": 1,
+      "survivor_checks": 2
+    },
+    {
+      "t": 65.063,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 4
+    },
+    {
+      "t": 95.07,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 6
+    },
+    {
+      "t": 125.075,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 8
+    },
+    {
+      "t": 155.076,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 10
+    },
+    {
+      "t": 185.106,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 12
+    },
+    {
+      "t": 215.097,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 14
+    },
+    {
+      "t": 245.11,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 16
+    },
+    {
+      "t": 275.114,
+      "open_incidents": 40,
+      "outbox_pending": 0,
+      "survivor_checks": 18
+    }
+  ],
+  "machine": "apple-m2-pro-12c",
+  "commit": "078cfed",
+  "gates": {
+    "incidents_opened": true,
+    "survivor_kept_checking": true,
+    "api_reads_ok": true
+  },
+  "passed": true
+}

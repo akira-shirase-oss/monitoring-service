@@ -330,7 +330,14 @@ impl Db {
         let options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(create)
             .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Without this every connection carries SQLite's default busy_timeout of 0:
+            // an API write (a session insert) meeting the writer's commit returns
+            // SQLITE_BUSY instantly — the session-churn run caught two logins and a
+            // delete failing that way. Five seconds absorbs a commit's whole window
+            // (measured at tens of ms) with room to spare; the deadline stays honest —
+            // a lock held longer still fails, just after waiting instead of instantly.
+            .busy_timeout(std::time::Duration::from_secs(5));
         // sqlx renames an in-memory database to a shared-cache `file:` name — decide from
         // the URL the caller wrote, never from that name.
         let in_memory = url.contains(":memory:") || url.contains("mode=memory");
@@ -409,6 +416,19 @@ impl Db {
     pub async fn migrate(&self) -> Result<(), DbError> {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
+    }
+
+    /// The newest migration this build knows. Migrations are forward-only, so a
+    /// store whose applied set is newer than this must never be opened by this
+    /// binary — the deploy guard (`deploy/droplet/schema-guard.sh`) compares it
+    /// against the database's `_sqlx_migrations` before a `current` switch.
+    pub fn known_schema_version() -> i64 {
+        sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Online backup: `VACUUM INTO` writes one consistent snapshot file — the WAL-aware

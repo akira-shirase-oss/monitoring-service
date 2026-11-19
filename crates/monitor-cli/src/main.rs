@@ -35,6 +35,9 @@ enum Command {
         #[command(subcommand)]
         action: Maintenance,
     },
+    /// Write an online snapshot of the store into the server's `SMON_BACKUP_DIR`
+    /// (D-019); the server names the file — prints its name and size.
+    Backup,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +219,20 @@ async fn run() -> Result<()> {
         }
         Command::Monitors { action } => monitors(&client, base, action).await?,
         Command::Maintenance { action } => maintenance(&client, base, action).await?,
+        Command::Backup => {
+            let body = post(
+                &client,
+                &format!("{base}/api/backup"),
+                &serde_json::json!({}),
+            )
+            .await?;
+            let created: serde_json::Value = serde_json::from_str(&body)?;
+            println!(
+                "created {}\t{} bytes",
+                created["name"].as_str().unwrap_or("(unnamed)"),
+                created["bytes"].as_u64().unwrap_or(0)
+            );
+        }
     }
     Ok(())
 }
@@ -555,6 +572,16 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<String> {
 
 async fn patch(client: &reqwest::Client, url: &str, payload: &serde_json::Value) -> Result<String> {
     let response = send(client.patch(url).json(payload)).await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        explain_error(status.as_u16(), &body)?;
+    }
+    Ok(body)
+}
+
+async fn post(client: &reqwest::Client, url: &str, payload: &serde_json::Value) -> Result<String> {
+    let response = send(client.post(url).json(payload)).await?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {

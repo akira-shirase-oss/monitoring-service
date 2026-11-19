@@ -27,6 +27,9 @@ async fn app() -> anyhow::Result<(
     let url = format!("sqlite:{}", tmp.path().join("api.db").display());
     let db = Db::connect(&url, 1).await?;
     db.migrate().await?;
+    // The confinement dir a serving boot would have created (D-019).
+    let backup_dir = tmp.path().join("backups");
+    std::fs::create_dir_all(&backup_dir)?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let write_health: monitor_db::WriteHealth = Arc::default();
     let (registry, _rx) = watch::channel(Arc::new(Vec::new()));
@@ -43,6 +46,7 @@ async fn app() -> anyhow::Result<(
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: Some(backup_dir),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -711,44 +715,130 @@ async fn invalid_input_gets_an_error_envelope() {
     assert_eq!(body["error"]["code"], "invalid_request");
 }
 
-/// Backup endpoint (M4.3): absolute paths produce a snapshot file; relative paths are a
-/// bad request — where a backup lands is the operator's explicit choice.
+/// Backup endpoint (M4.3, D-019): `{}` asks for a snapshot; it lands inside the
+/// configured `SMON_BACKUP_DIR` under a server-drawn name, owner-only like the store.
 #[tokio::test]
-async fn backup_writes_a_snapshot_to_an_absolute_path() {
-    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
-    let tmp = tempfile::tempdir().unwrap();
-    let backup = tmp.path().join("snapshot.db");
+async fn backup_writes_a_server_named_snapshot_into_the_configured_dir() -> anyhow::Result<()> {
+    let (app, _statuses, _db, _wh, tmp) = app().await?;
+    let (status, body) = send(&app, "POST", "/api/backup", Some(serde_json::json!({}))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let name = body["name"].as_str().unwrap_or_default();
+    assert!(
+        name.starts_with("monitor-")
+            && std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db")),
+        "{name}"
+    );
+    let file = tmp.path().join("backups").join(name);
+    assert!(file.exists(), "{name} not in the backup dir");
+    assert_eq!(
+        std::fs::metadata(&file)?.len(),
+        body["bytes"].as_u64().unwrap_or_default()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&file)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    Ok(())
+}
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::post("/api/backup")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({"path": "relative.db"})).unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+/// Two backups stamped in the same second still land as two files — the random suffix
+/// draws distinct names, and `create_new` turns a collision into a redraw, never an
+/// overwrite.
+#[tokio::test]
+async fn two_backups_in_one_second_get_distinct_names() -> anyhow::Result<()> {
+    let (_app, statuses, db, write_health, tmp) = app().await?;
+    // A frozen clock forces the same second stamp: the suffix is what must differ.
+    let stamp = time::OffsetDateTime::from_unix_timestamp(1_763_000_000)?;
+    let app = monitor_server::router(monitor_server::AppState {
+        db,
+        statuses,
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(write_health, Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
+        clock: Arc::new(move || stamp),
+        trusted_proxy: None,
+        backup_dir: Some(tmp.path().join("backups")),
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
+        version: "test",
+    });
+    let mut names = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let (status, body) = send(&app, "POST", "/api/backup", Some(serde_json::json!({}))).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        names.insert(body["name"].as_str().unwrap_or_default().to_owned());
+    }
+    assert_eq!(names.len(), 2, "same-stamp backups collided");
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("backups"))?.count(),
+        2,
+        "one backup overwrote the other"
+    );
+    Ok(())
+}
 
-    let response = app
-        .oneshot(
-            Request::post("/api/backup")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({"path": backup.to_str().unwrap()}))
-                        .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await.unwrap();
-    assert!(body["bytes"].as_u64().unwrap() > 0);
-    assert!(backup.exists());
+/// Without `SMON_BACKUP_DIR` the endpoint is off — 404 `backup_disabled`, like
+/// `auth_disabled` on login, never a write into an implied default directory.
+#[tokio::test]
+async fn backup_is_disabled_without_a_configured_dir() -> anyhow::Result<()> {
+    let (_app, statuses, db, write_health, _tmp) = app().await?;
+    let app = monitor_server::router(monitor_server::AppState {
+        db,
+        statuses,
+        registry: watch::channel(Arc::new(Vec::new())).0,
+        vitals: monitor_server::vitals::Vitals::new(write_health, Duration::from_secs(30)),
+        admin_token: None,
+        session_ttl: Duration::from_hours(12),
+        session_idle: Duration::from_hours(1),
+        clock: monitor_server::system_clock(),
+        trusted_proxy: None,
+        backup_dir: None,
+        cookie_secure: monitor_server::auth::CookieSecure::Auto,
+        max_monitors: 100,
+        allow_local_targets: false,
+        version: "test",
+    });
+    let (status, body) = send(&app, "POST", "/api/backup", Some(serde_json::json!({}))).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "backup_disabled");
+    Ok(())
+}
+
+/// D-019: where a backup lands is the server's choice — `SMON_BACKUP_DIR` confines it
+/// and the server names the file. A client-supplied `path` (or any other body field)
+/// is a refusal, never an instruction: the old contract was a write-anywhere primitive
+/// one admin-token leak away.
+#[tokio::test]
+async fn a_client_supplied_backup_path_is_refused() -> anyhow::Result<()> {
+    let (app, _statuses, _db, _wh, _tmp) = app().await?;
+    let out = tempfile::tempdir()?;
+    for body in [
+        serde_json::json!({ "path": out.path().join("stolen.db").display().to_string() }),
+        serde_json::json!({ "path": "../escape.db" }),
+        serde_json::json!({ "path": "relative.db" }),
+        serde_json::json!({ "path": "/tmp/smon-trap.db", "name": "x" }),
+        serde_json::json!({ "unrelated": true }),
+        serde_json::json!("backup please"),
+    ] {
+        let (status, envelope) = send(&app, "POST", "/api/backup", Some(body.clone())).await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(envelope["error"]["code"], "invalid_request", "{body}");
+    }
+    assert_eq!(
+        std::fs::read_dir(out.path())?.count(),
+        0,
+        "a refused backup was written"
+    );
+    Ok(())
 }
 
 /// Management auth (M5.1): with a token configured, every /api route denies a missing,
@@ -768,6 +858,7 @@ async fn auth_denies_without_a_valid_bearer_token() {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -842,6 +933,7 @@ async fn authed_with(
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1153,6 +1245,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1230,6 +1323,7 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 2,
         allow_local_targets: false,
@@ -1394,6 +1488,7 @@ async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: true,
@@ -1428,6 +1523,7 @@ async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1467,6 +1563,7 @@ async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1499,6 +1596,7 @@ fn authed_on(db: &Db, token: &str) -> Router {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1631,6 +1729,7 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
         session_idle: Duration::from_secs(60),
         clock,
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
         allow_local_targets: false,
@@ -1651,27 +1750,6 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
         StatusCode::UNAUTHORIZED,
         "unused for 61 s: ended"
     );
-    Ok(())
-}
-
-/// A backup is created new: a path that already exists is refused with 422 and left as it
-/// was — `POST /api/backup` can't be pointed at a file to overwrite or a pre-planted one.
-#[tokio::test]
-async fn a_backup_onto_an_existing_file_is_refused_and_leaves_it_alone() -> anyhow::Result<()> {
-    let (app, _statuses, _db, _wh, _tmp) = app().await?;
-    let tmp = tempfile::tempdir()?;
-    let taken = tmp.path().join("taken.db");
-    std::fs::write(&taken, b"not yours")?;
-    let (status, body) = send(
-        &app,
-        "POST",
-        "/api/backup",
-        Some(serde_json::json!({ "path": taken.display().to_string() })),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["error"]["code"], "invalid_request");
-    assert_eq!(std::fs::read(&taken)?, b"not yours");
     Ok(())
 }
 
@@ -1819,6 +1897,7 @@ fn uncapped(db: &Db) -> Router {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100_000,
         allow_local_targets: false,
@@ -1953,6 +2032,7 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
         session_idle: Duration::from_hours(1),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
+        backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100_000,
         allow_local_targets: true,

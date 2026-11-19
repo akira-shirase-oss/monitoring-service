@@ -1447,6 +1447,14 @@ async fn a_new_store_and_its_backups_are_owner_only() -> anyhow::Result<()> {
         std::fs::read(tmp.path().join("taken.db"))?,
         b"someone else's file"
     );
+
+    // A symlink where the snapshot would land is refused too: `create_new` fails on any
+    // existing name, link or file — the target's contents are never followed or touched.
+    let outside = tmp.path().join("outside.db");
+    std::fs::write(&outside, b"not a backup")?;
+    std::os::unix::fs::symlink(&outside, tmp.path().join("link.db"))?;
+    assert!(db.backup(&tmp.path().join("link.db")).await.is_err());
+    assert_eq!(std::fs::read(&outside)?, b"not a backup");
     Ok(())
 }
 
@@ -1630,5 +1638,34 @@ async fn the_writers_commits_never_queue_behind_api_reads() -> anyhow::Result<()
         own * 3 < shared,
         "the writer's connection still queues behind reads: median {own} µs vs {shared} µs shared"
     );
+    Ok(())
+}
+
+/// The session-churn run caught it: a session insert meeting a held write lock used to
+/// return `SQLITE_BUSY` instantly — SQLite's default `busy_timeout` is 0. Pooled connections
+/// now wait out the lock and then succeed; the churn gate wants zero login failures.
+#[tokio::test]
+async fn a_pooled_write_waits_out_a_held_write_lock() -> anyhow::Result<()> {
+    // A lock holder outside our pool: an immediate transaction keeps the write lock.
+    use sqlx::Connection as _;
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("store.db").display());
+    let db = Db::connect(&url, 2).await?;
+    db.migrate().await?;
+
+    let mut holder = sqlx::SqliteConnection::connect(&url).await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut holder).await?;
+
+    let writer = {
+        let db = db.clone();
+        tokio::spawn(async move { db.create_session("s1", OffsetDateTime::now_utc()).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        !writer.is_finished(),
+        "the write finished while the lock was held — it failed instantly"
+    );
+    sqlx::query("COMMIT").execute(&mut holder).await?;
+    writer.await??;
     Ok(())
 }

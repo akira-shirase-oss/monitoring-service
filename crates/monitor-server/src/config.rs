@@ -23,6 +23,7 @@ use url::Url;
 pub const KNOWN: &[&str] = &[
     "SMON_ADMIN_TOKEN",
     "SMON_AGGREGATE_RETENTION_S",
+    "SMON_BACKUP_DIR",
     "SMON_COOKIE_SECURE",
     "SMON_DASHBOARD_DIR",
     "SMON_DATABASE_URL",
@@ -81,6 +82,9 @@ pub struct Config {
     /// `SMON_PROFILE=lab`: loopback/private targets allowed (fixtures only).
     pub lab: bool,
     pub admin_token: Option<String>,
+    /// `SMON_BACKUP_DIR` (D-019): the only directory `POST /api/backup` may write —
+    /// absolute, created owner-only at boot. `None` switches the endpoint off (404).
+    pub backup_dir: Option<std::path::PathBuf>,
     pub max_db_bytes: u64,
     pub retention: RetentionPolicy,
     pub retention_interval: Duration,
@@ -117,6 +121,7 @@ impl fmt::Debug for Config {
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("backup_dir", &self.backup_dir)
             .field("max_db_bytes", &self.max_db_bytes)
             .field("retention", &self.retention)
             .field(
@@ -200,6 +205,19 @@ impl<F: Fn(&str) -> Option<String>> Reader<F> {
                 ));
                 None
             }
+        }
+    }
+
+    /// The backup confinement root (D-019): absolute only — a relative one would let
+    /// the service's cwd decide where an admin write lands.
+    fn backup_dir(&mut self) -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(self.raw("SMON_BACKUP_DIR")?.trim());
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            self.problems
+                .push("SMON_BACKUP_DIR must be an absolute path".to_owned());
+            None
         }
     }
 
@@ -371,6 +389,7 @@ impl Config {
         let admin_token = env
             .raw("SMON_ADMIN_TOKEN")
             .and_then(|token| env.admin_token(token));
+        let backup_dir = env.backup_dir();
         let max_db_bytes = env.ranged("SMON_MAX_DB_BYTES", 2 * 1024 * MIB, MIB..=u64::MAX);
         let (retention, retention_interval) = env.retention();
         let (status_dir, status_interval, status_ttl) = env.status();
@@ -423,6 +442,7 @@ impl Config {
             dashboard_dir,
             lab,
             admin_token,
+            backup_dir,
             max_db_bytes,
             retention,
             retention_interval,

@@ -11,17 +11,16 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 
 ## Contract
 
-- **Routes:** `/livez`, `/readyz`; `GET|POST /api/monitors`,
+- **Routes:** `/livez`, `/readyz`, `/version`; `GET|POST /api/monitors`,
   `GET|PATCH|DELETE /api/monitors/{id}`; `GET /api/monitors/{id}/checks`,
-  `GET /api/monitors/{id}/stats` (coverage/success, `?window_s=` bounded), `GET /api/incidents`;
-  `GET|POST /api/monitors/{id}/maintenance`, `DELETE /api/maintenance/{id}` (M6.11 —
-  server-computed `active` flag, `starts_at < ends_at` enforced, past windows kept as
-  records). CLI: `monitor maintenance add <id> --from now|<rfc3339> --to <rfc3339>
-  [--reason s]`, `maintenance list <id>`, `maintenance rm <window-id>` — a bad timestamp
-  is a usage error (exit 2), not a round-tripped 422.
-  (`?monitor_id=`, `?state=`, `?limit=`). Still to come: `GET /api/status` (M3.2 public
-  snapshot). Incidents are system-created evidence — there is deliberately no `POST`.
-  `IncidentView` carries all four times (M6.3): `first_fail_at`, `opened_at`,
+  `GET /api/monitors/{id}/stats` (coverage/success, `?window_s=` bounded), `GET /api/incidents`
+  (`?monitor_id=`, `?state=`, `?limit=`); `GET|POST /api/monitors/{id}/maintenance`,
+  `DELETE /api/maintenance/{id}` (M6.11 — server-computed `active` flag,
+  `starts_at < ends_at` enforced, past windows kept as records); `POST /api/backup`
+  (D-019 — takes `{}`, writes a server-named snapshot inside `SMON_BACKUP_DIR`, answers
+  `{"name","bytes"}`; a client-supplied path is refused 422; unset dir → 404
+  `backup_disabled`). Incidents are system-created evidence — there is deliberately no
+  `POST`. `IncidentView` carries all four times (M6.3): `first_fail_at`, `opened_at`,
   `last_fail_at`, `resolved_at` — RFC3339, nullable for pre-M6.3 rows.
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
@@ -59,8 +58,11 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Writes bump generation** on any schedule/target/threshold/paused change (module 01
   invariant). `failures_to_open` / `passes_to_recover` (`1..=10`, default 3/2) are settable
   on create and patch; out-of-range → `invalid_request`.
-- **CLI parity:** `monitor ping`, `monitors list|add|edit|pause|delete`, `checks`,
-  `incidents`, `status` — everything the API can do, nothing more.
+- **CLI parity:** `monitor ping`, `monitors list|add|show|edit|pause|unpause|delete`,
+  `maintenance add|list|rm`, `backup` — every management operation the API offers.
+  `monitor maintenance add <id> --from now|<rfc3339> --to <rfc3339> [--reason s]` — a bad
+  timestamp is a usage error (exit 2), not a round-tripped 422. System endpoints
+  (`/livez`, `/readyz`, `/version`) are read through `ping`, not wrapped as commands.
 - **CLI exit codes (M6.9, pinned by `tests/exit_codes.rs`):** `0` success; `1` an API or
   application error (envelope errors like `not_found`/`conflict`/`invalid_request`, or an
   unexpected response); `2` usage error (clap rejects, empty `edit`); `3` server

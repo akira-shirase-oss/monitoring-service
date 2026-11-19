@@ -1,0 +1,112 @@
+{
+  "run": {
+    "scenario": "api-reads",
+    "commit": "078cfed",
+    "machine": "Darwin arm64",
+    "started": "2026-11-19T02:54:48.868Z",
+    "bin": "release",
+    "requests_target": 1000000,
+    "vus": 32,
+    "monitors": 100,
+    "origins": 9,
+    "warmup_s": 20,
+    "k6_wall_s": 637.8,
+    "k6_exit": 0,
+    "loadavg_before": null,
+    "loadavg_after": null
+  },
+  "api": {
+    "requests": 1000000,
+    "rps": 1569,
+    "failed": 0,
+    "failed_rate": 0,
+    "status_200": {
+      "passes": 1000000,
+      "fails": 0
+    },
+    "latency_ms": {
+      "min": 1.229,
+      "p50": 16.133,
+      "p90": 30.835,
+      "p95": 32.391,
+      "p99": 42.375,
+      "max": 312.022,
+      "avg": 20.358798831000158
+    },
+    "by_route_ms": {
+      "incidents": {
+        "min": 1.229,
+        "p50": 14.705,
+        "p90": 16.686100000000003,
+        "p95": 17.779,
+        "p99": 28.860059999999994,
+        "max": 204.765,
+        "avg": 15.25923519000016
+      },
+      "checks": {
+        "min": 17.582,
+        "p50": 29.955,
+        "p90": 33.443,
+        "p95": 35.628049999999995,
+        "p99": 57.73909999999998,
+        "max": 312.022,
+        "avg": 31.028420430000303
+      },
+      "get": {
+        "min": 5.863,
+        "p50": 15.238,
+        "p90": 17.121,
+        "p95": 18.25204999999999,
+        "p99": 29.716019999999997,
+        "max": 217.718,
+        "avg": 15.806214885
+      },
+      "list": {
+        "min": 3.417,
+        "p50": 15.604,
+        "p90": 17.525,
+        "p95": 18.574,
+        "p99": 30.080149999999946,
+        "max": 223.803,
+        "avg": 16.16769565499994
+      },
+      "stats": {
+        "min": 16.91,
+        "p50": 28.905,
+        "p90": 32.137,
+        "p95": 34.23109999999999,
+        "p99": 56.39506,
+        "max": 311.526,
+        "avg": 29.988699870000445
+      }
+    }
+  },
+  "probes_during_window": {
+    "checks": 4256,
+    "by_outcome": {
+      "pass": 3289,
+      "http_fail": 720,
+      "timeout": 212,
+      "transport": 35
+    },
+    "missed": 0,
+    "commit_lag_ms": {
+      "p50": 505,
+      "p95": 1322,
+      "max": 1828
+    }
+  },
+  "server_rss_kb": {
+    "first": null,
+    "last": null,
+    "max": 0
+  },
+  "samples": [],
+  "db_bytes": 1007616,
+  "k6_stderr": null,
+  "gates": {
+    "every_request_sent": true,
+    "zero_failed": true
+  },
+  "passed": true
+}

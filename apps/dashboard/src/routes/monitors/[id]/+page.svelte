@@ -29,22 +29,32 @@
 	let actionError = $state<string | null>(null);
 	let actionBusy = $state(false);
 
+	let addingWindow = $state(false);
+	let windowStart = $state('');
+	let windowEnd = $state('');
+	let windowReason = $state('');
+	let confirmingWindow = $state<number | null>(null);
+	let windowError = $state<string | null>(null);
+	let windowBusy = $state(false);
+
 	// Every management write shows the server's own error — a 409 conflict is real
 	// information (stale read, or the monitor has history), never something to swallow.
+	// Returns the failure text (null on success) so each section shows it near its form.
+	async function write(path: string, init: RequestInit): Promise<string | null> {
+		try {
+			const response = await apiFetch(path, init, fetch);
+			const failure = await readEnvelope(response);
+			return failure ? failure.message : null;
+		} catch {
+			return 'The monitor server is unreachable.';
+		}
+	}
+
 	async function mutate(id: string, init: RequestInit): Promise<boolean> {
 		actionBusy = true;
 		try {
-			const response = await apiFetch(`/api/monitors/${id}`, init, fetch);
-			const failure = await readEnvelope(response);
-			if (failure) {
-				actionError = failure.message;
-				return false;
-			}
-			actionError = null;
-			return true;
-		} catch {
-			actionError = 'The monitor server is unreachable.';
-			return false;
+			actionError = await write(`/api/monitors/${id}`, init);
+			return actionError === null;
 		} finally {
 			actionBusy = false;
 		}
@@ -75,6 +85,53 @@
 			return;
 		}
 		if (await mutate(id, { method: 'DELETE' })) await goto('/');
+	}
+
+	// A window's start is optional in the form — empty means "from the next slot".
+	// The API wants explicit RFC 3339 bounds, so "now" is filled in here.
+	async function addWindow(id: string) {
+		const start = windowStart ? new Date(windowStart) : new Date();
+		const end = new Date(windowEnd);
+		if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+			windowError = 'An end time is required.';
+			return;
+		}
+		windowBusy = true;
+		try {
+			windowError = await write(`/api/monitors/${id}/maintenance`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({
+					starts_at: start.toISOString(),
+					ends_at: end.toISOString(),
+					...(windowReason.trim() ? { reason: windowReason.trim() } : {})
+				})
+			});
+			if (windowError === null) {
+				addingWindow = false;
+				windowStart = windowEnd = windowReason = '';
+				await invalidateAll();
+			}
+		} finally {
+			windowBusy = false;
+		}
+	}
+
+	// Same two-click confirm as monitor delete — cancelling an active window resumes
+	// paging on the next slot, so the second click names what it does.
+	async function removeWindow(windowId: number) {
+		if (confirmingWindow !== windowId) {
+			confirmingWindow = windowId;
+			return;
+		}
+		confirmingWindow = null;
+		windowBusy = true;
+		try {
+			windowError = await write(`/api/maintenance/${windowId}`, { method: 'DELETE' });
+			if (windowError === null) await invalidateAll();
+		} finally {
+			windowBusy = false;
+		}
 	}
 
 	function variantFor(outcome: CheckView['outcome']): BadgeVariant {
@@ -183,11 +240,14 @@
 					<Card.Content class="p-4">
 						<MonitorForm
 							initial={{
+								name: data.monitor.name,
+								url: data.monitor.url,
 								interval_s: data.monitor.interval_s,
 								timeout_s: data.monitor.timeout_s,
 								failures_to_open: data.monitor.failures_to_open,
 								passes_to_recover: data.monitor.passes_to_recover
 							}}
+							showIdentity
 							submitLabel="Save changes"
 							onSubmit={(payload) => saveEdit(data.monitor.id, data.monitor.generation, payload)}
 							onCancel={() => (editing = false)}
@@ -203,9 +263,72 @@
 			</p>
 		</div>
 
-		{#if data.windows.length > 0}
-			<div>
+		<div>
+			<div class="flex items-center justify-between gap-4">
 				<h2 class="text-sm font-medium text-muted-foreground">Maintenance windows</h2>
+				<button
+					onclick={() => {
+						addingWindow = !addingWindow;
+						windowError = null;
+					}}
+					disabled={windowBusy}
+					class="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-50"
+				>
+					{addingWindow ? 'Close' : 'Add window'}
+				</button>
+			</div>
+			{#if addingWindow}
+				<form
+					class="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-3"
+					onsubmit={(event) => {
+						event.preventDefault();
+						addWindow(data.monitor.id);
+					}}
+				>
+					<div>
+						<span class="block text-xs font-medium text-muted-foreground">from (empty = now)</span>
+						<input
+							bind:value={windowStart}
+							type="datetime-local"
+							class="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm tabular"
+						/>
+					</div>
+					<div>
+						<span class="block text-xs font-medium text-muted-foreground">until</span>
+						<input
+							bind:value={windowEnd}
+							required
+							type="datetime-local"
+							class="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm tabular"
+						/>
+					</div>
+					<div>
+						<span class="block text-xs font-medium text-muted-foreground">reason</span>
+						<input
+							bind:value={windowReason}
+							class="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+							placeholder="deploy rehearsal"
+						/>
+					</div>
+					<div class="col-span-2 flex items-end justify-end sm:col-span-3">
+						<button
+							type="submit"
+							disabled={windowBusy}
+							class="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
+						>
+							{windowBusy ? 'Saving…' : 'Add window'}
+						</button>
+					</div>
+				</form>
+			{/if}
+			{#if windowError}
+				<p class="mt-2 text-sm text-attention-ink">{windowError}</p>
+			{/if}
+			{#if data.windows.length === 0 && !addingWindow}
+				<p class="mt-2 text-sm text-muted-foreground">
+					None set — a window suppresses incident alerts while checks keep recording.
+				</p>
+			{:else if data.windows.length > 0}
 				<div class="mt-2 flex flex-col gap-1.5">
 					{#each data.windows as window (window.id)}
 						<div
@@ -221,22 +344,31 @@
 									<span class="block text-xs">{window.reason}</span>
 								{/if}
 							</span>
-							<Badge variant={window.active ? 'down' : 'secondary'}>
-								{window.active
-									? 'suppressing now'
-									: new Date(window.ends_at) < new Date()
-										? 'ended'
-										: 'scheduled'}
-							</Badge>
+							<span class="flex shrink-0 items-center gap-3">
+								<Badge variant={window.active ? 'down' : 'secondary'}>
+									{window.active
+										? 'suppressing now'
+										: new Date(window.ends_at) < new Date()
+											? 'ended'
+											: 'scheduled'}
+								</Badge>
+								<button
+									onclick={() => removeWindow(window.id)}
+									disabled={windowBusy}
+									class="rounded-md border border-input px-2 py-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50"
+								>
+									{confirmingWindow === window.id ? 'Confirm cancel' : 'Cancel'}
+								</button>
+							</span>
 						</div>
 					{/each}
 				</div>
-				<p class="mt-2 text-xs text-muted-foreground">
-					Checks still record during a window; an incident that would open is suppressed, and a
-					target still broken at expiry opens on the next failing check.
-				</p>
-			</div>
-		{/if}
+			{/if}
+			<p class="mt-2 text-xs text-muted-foreground">
+				Checks still record during a window; an incident that would open is suppressed, and a
+				target still broken at expiry opens on the next failing check.
+			</p>
+		</div>
 
 		<div>
 			<h2 class="text-sm font-medium text-muted-foreground">Recent checks</h2>

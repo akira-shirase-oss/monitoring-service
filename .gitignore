@@ -31,3 +31,4 @@ apps/dashboard/playwright-report/
 
 # cargo-mutants working dirs (transient — evidence lands in perf/results/)
 mutants.out*/
+perf/tmp/
