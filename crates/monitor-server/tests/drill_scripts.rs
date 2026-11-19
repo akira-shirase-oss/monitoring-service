@@ -367,17 +367,45 @@ fn the_drill_waits_only_on_its_own_processes() {
 /// `"id"` — the exact setup failure this pin exists to keep fixed.
 #[test]
 fn the_freeze_drill_registers_a_monitor_with_a_valid_interval() {
-    // The payload lives inside a double-quoted bash string, so the file carries `\"interval_s\":`.
-    let marker = "interval_s\\\":";
-    let pos = FREEZE.find(marker).expect("the drill sets interval_s");
-    let digits: String = FREEZE[pos + marker.len()..]
+    // The payload lives inside a double-quoted bash string, so the file carries
+    // `\"interval_s\":$INTERVAL` — follow the variable to its literal assignment.
+    assert!(
+        FREEZE.contains("interval_s\\\":$INTERVAL"),
+        "the drill must post the shared INTERVAL variable, not an inline literal"
+    );
+    let pos = FREEZE.find("INTERVAL=").expect("the drill sets INTERVAL");
+    let digits: String = FREEZE[pos + "INTERVAL=".len()..]
         .chars()
         .take_while(|c| c.is_ascii_digit())
         .collect();
-    let interval: u64 = digits.parse().expect("interval_s must be a literal number");
+    let interval: u64 = digits.parse().expect("INTERVAL must be a literal number");
     assert!(
         interval >= monitor_domain::MIN_INTERVAL.as_secs(),
-        "freeze-drill interval_s={interval} is below the domain minimum {}",
+        "freeze-drill INTERVAL={interval} is below the domain minimum {}",
         monitor_domain::MIN_INTERVAL.as_secs()
     );
+}
+
+/// First check slots land inside the interval window (D-018 phase spread), so a fixed
+/// wait shorter than the interval is a drill that can never pass — the freeze drill
+/// failed exactly that way ("monitor never came up" after 12 s at a 15 s interval).
+/// Both drills derive their waits from the interval they register, and a timeout prints
+/// the monitor's checks before failing.
+#[test]
+fn the_drills_wait_budgets_come_from_the_interval_and_report_on_timeout() {
+    for (name, text) in [("backup-drill.sh", DRILL), ("freeze-drill.sh", FREEZE)] {
+        assert!(text.contains("INTERVAL="), "{name} must name its interval");
+        assert!(
+            text.contains("* INTERVAL"),
+            "{name} must derive its wait budget from the interval, not a fixed count"
+        );
+        assert!(
+            !text.contains("seq 1 12") && !text.contains("seq 1 16"),
+            "{name} still carries a fixed wait that pre-dates the phase spread"
+        );
+        assert!(
+            text.contains("/checks?limit="),
+            "{name} must print the monitor's checks on timeout"
+        );
+    }
 }

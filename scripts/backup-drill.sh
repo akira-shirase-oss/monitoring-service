@@ -44,17 +44,27 @@ wait_own_http "http://127.0.0.1:$FIXTURE_PORT/ok" "$FIXTURE_PID"
 SERVER_PID=$!
 wait_own_http "$BASE/livez" "$SERVER_PID"
 
+INTERVAL=15
 MONITOR=$(curl -s -X POST "$BASE/api/monitors" \
     -H 'content-type: application/json' \
-    -d "{\"name\":\"drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/fail\",\"interval_s\":15,\"timeout_s\":5}" \
+    -d "{\"name\":\"drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/fail\",\"interval_s\":$INTERVAL,\"timeout_s\":5}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 echo "monitor: $MONITOR — driving the incident open (~45s of failures)…"
 
-for i in $(seq 1 16); do
+# The first slot lands inside an interval window (D-018 phase spread), then three
+# consecutive failures open the incident: ~4 intervals plus slack, not a fixed guess.
+WAIT_OPEN=$((4 * INTERVAL + 20))
+for i in $(seq 1 $((WAIT_OPEN / 4))); do
     sleep 4
-    STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+    STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' 2>/dev/null || echo "?")
     [ "$STATE" = "down" ] && break
-    [ "$i" = 16 ] && { echo "FAIL: incident never opened"; exit 1; }
+    [ "$i" = $((WAIT_OPEN / 4)) ] && {
+        echo "FAIL: incident never opened within ${WAIT_OPEN}s" >&2
+        echo "monitor view: $(curl -s "$BASE/api/monitors/$MONITOR")" >&2
+        echo "recent checks: $(curl -s "$BASE/api/monitors/$MONITOR/checks?limit=10")" >&2
+        echo "last server log lines:" >&2; tail -n 10 "$LOG" >&2
+        exit 1
+    }
 done
 echo "incident open; backing up…"
 

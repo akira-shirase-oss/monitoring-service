@@ -48,17 +48,27 @@ wait_own_http "$BASE/livez" "$SERVER_PID"
 
 # interval_s must respect the domain minimum (MIN_INTERVAL, 15 s): below it the API
 # answers a validation error and there is no monitor to drill.
+INTERVAL=15
 MONITOR=$(curl -s -X POST "$BASE/api/monitors" \
     -H 'content-type: application/json' \
-    -d "{\"name\":\"freeze-drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/ok\",\"interval_s\":15,\"timeout_s\":2}" \
+    -d "{\"name\":\"freeze-drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/ok\",\"interval_s\":$INTERVAL,\"timeout_s\":2}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 echo "monitor: $MONITOR — waiting for the first fresh probes…"
 
-for i in $(seq 1 12); do
+# The first slot is scheduled inside the interval window, not at creation (D-018 phase
+# spread) — wait 3 × interval + slack, then report what the API saw before failing.
+WAIT_FIRST=$((3 * INTERVAL + 10))
+for i in $(seq 1 "$WAIT_FIRST"); do
     sleep 1
-    STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+    STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' 2>/dev/null || echo "?")
     [ "$STATE" = "up" ] && break
-    [ "$i" = 12 ] && { echo "FAIL: monitor never came up"; exit 1; }
+    [ "$i" = "$WAIT_FIRST" ] && {
+        echo "FAIL: monitor never came up within ${WAIT_FIRST}s" >&2
+        echo "monitor view: $(curl -s "$BASE/api/monitors/$MONITOR")" >&2
+        echo "recent checks: $(curl -s "$BASE/api/monitors/$MONITOR/checks?limit=10")" >&2
+        echo "last server log lines:" >&2; tail -n 10 "$LOG" >&2
+        exit 1
+    }
 done
 echo "up; freezing the whole process for ${FREEZE_S}s (SIGSTOP)…"
 
@@ -77,7 +87,10 @@ fi
 # fresh probes bring the status back to up — never interpolated, never a false recovery.
 MISSED=""
 STATE=""
-for i in $(seq 1 30); do
+# After the resume the missed rows commit at once, then the status needs one fresh slot —
+# again inside an interval window, so the same derived wait.
+WAIT_RESUME=$((3 * INTERVAL + 10))
+for i in $(seq 1 "$WAIT_RESUME"); do
     sleep 1
     MISSED=$(curl -s "$BASE/api/monitors/$MONITOR/checks?limit=100" \
         | python3 -c 'import json,sys; print(sum(1 for c in json.load(sys.stdin)["checks"] if c["outcome"]=="missed"))' 2>/dev/null || echo 0)
