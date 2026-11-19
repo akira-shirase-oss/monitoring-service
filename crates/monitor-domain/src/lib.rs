@@ -50,6 +50,52 @@ pub struct WorkspaceId(pub Uuid);
 #[serde(transparent)]
 pub struct AccountId(pub Uuid);
 
+/// Identifies one workspace API token — a credential an owner mints for automation in
+/// exactly one workspace, kept by the store as a digest (S1c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ApiTokenId(pub Uuid);
+
+/// What a member or an API token may do in a workspace (S1c). Declared weakest to
+/// strongest, so `role >= Role::Member` is the "may write" test and `>= Role::Owner`
+/// the "may administer" test — the store facade hands out views accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Reads the workspace's evidence and roster; changes nothing.
+    Viewer,
+    /// Viewer plus monitor and maintenance-window writes.
+    Member,
+    /// Member plus roster and API-token administration.
+    Owner,
+}
+
+impl Role {
+    /// The stored spelling — the `members.role`/`api_tokens.role` CHECK constraints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Member => "member",
+            Self::Owner => "owner",
+        }
+    }
+
+    /// Parse the stored spelling; anything else is not a role (fail closed).
+    pub fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "viewer" => Some(Self::Viewer),
+            "member" => Some(Self::Member),
+            "owner" => Some(Self::Owner),
+            _ => None,
+        }
+    }
+
+    /// "At least `need`" — `Role::Member.at_least(Role::Viewer)` is true.
+    pub fn at_least(self, need: Self) -> bool {
+        self >= need
+    }
+}
+
 impl AccountId {
     #[must_use]
     pub fn new() -> Self {
@@ -57,7 +103,20 @@ impl AccountId {
     }
 }
 
+impl ApiTokenId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
 impl Default for AccountId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for ApiTokenId {
     fn default() -> Self {
         Self::new()
     }

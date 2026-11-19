@@ -14,8 +14,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use monitor_domain::{
-    AccountId, CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation,
-    Thresholds, WorkspaceId,
+    AccountId, ApiTokenId, CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, Role,
+    SlotObservation, Thresholds, WorkspaceId,
 };
 
 pub mod writer;
@@ -641,6 +641,17 @@ impl Db {
             }
             QueryError::Sql(e)
         })?;
+        // The signup account is its new workspace's owner (S1c) — inside the same
+        // transaction, so an account never exists without a membership.
+        sqlx::query(
+            "INSERT INTO members (workspace_id, account_id, role, created_at)
+             VALUES (?, ?, 'owner', ?)",
+        )
+        .bind(account.workspace.0.to_string())
+        .bind(account.id.0.to_string())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
         // The account row must exist before `used_by` may name it (SQLite enforces the
         // FK per-statement, not at commit) — the consume is last, still atomic.
         let consumed = sqlx::query(
@@ -771,6 +782,90 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(None)
+    }
+
+    /// The role `account` holds in `workspace`, or `None` — the membership check every
+    /// scoped request passes through (S1c). Unscoped on purpose: the credential claims
+    /// the workspace; this answers whether the claim holds.
+    pub async fn member_role(
+        &self,
+        workspace: WorkspaceId,
+        account: AccountId,
+    ) -> Result<Option<Role>, QueryError> {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM members WHERE workspace_id = ? AND account_id = ?",
+        )
+        .bind(workspace.0.to_string())
+        .bind(account.0.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        stored
+            .map(|role| {
+                Role::parse(&role)
+                    .ok_or_else(|| QueryError::Corrupt(format!("unreadable role {role:?}")))
+            })
+            .transpose()
+    }
+
+    /// The API-token row behind a presented token's digest (S1c). Unscoped on purpose:
+    /// the credential itself carries the workspace it authorizes — the row's
+    /// `workspace_id` *is* the scope.
+    pub async fn api_token_by_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<ApiTokenRow>, QueryError> {
+        sqlx::query_as::<_, ApiTokenRow>(
+            "SELECT id, workspace_id, created_by, name, token_digest, role,
+                    created_at, revoked_at, last_used_at
+               FROM api_tokens WHERE token_digest = ?",
+        )
+        .bind(digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Land the batched last-used stamps in one transaction — the `last_used_at`
+    /// column is only ever written here, never per request (S1c).
+    pub async fn touch_api_tokens(
+        &self,
+        uses: &[(ApiTokenId, OffsetDateTime)],
+    ) -> Result<u64, QueryError> {
+        let mut tx = self.pool.begin().await?;
+        let mut touched = 0;
+        for (token, at) in uses {
+            touched += sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
+                .bind(at)
+                .bind(token.0.to_string())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(touched)
+    }
+
+    /// Read-level view of one workspace — every member role may hold one (S1c).
+    pub fn viewer(&self, workspace: WorkspaceId) -> ViewerDb<'_> {
+        ViewerDb {
+            view: self.workspace(workspace),
+        }
+    }
+
+    /// Read plus the workspace's own resources (monitors, maintenance windows) — the
+    /// member and owner roles (S1c).
+    pub fn member(&self, workspace: WorkspaceId) -> MemberDb<'_> {
+        MemberDb {
+            view: self.viewer(workspace),
+        }
+    }
+
+    /// Member plus the workspace's people and keys — the owner role and the operator
+    /// (S1c). Roster and token methods exist only on this view.
+    pub fn owner(&self, workspace: WorkspaceId) -> OwnerDb<'_> {
+        OwnerDb {
+            view: self.member(workspace),
+        }
     }
 }
 
@@ -1870,6 +1965,400 @@ pub struct NewAccount {
     pub workspace_name: String,
     pub email: String,
     pub password_hash: String,
+}
+
+/// One `members` row joined to its account's email — the roster the API lists (S1c).
+/// `role()` parses the stored role; an unreadable one is corruption, not a viewer.
+#[derive(Debug, FromRow)]
+pub struct MemberRow {
+    pub account_id: String,
+    pub email: String,
+    pub role: String,
+    pub created_at: OffsetDateTime,
+}
+
+impl MemberRow {
+    /// The member's role; `None` means the stored string isn't a role — corruption,
+    /// never quietly a viewer.
+    pub fn role(&self) -> Option<Role> {
+        Role::parse(&self.role)
+    }
+
+    /// The account id as a domain type; `None` means a stored non-uuid — corruption.
+    pub fn account(&self) -> Option<AccountId> {
+        Uuid::parse_str(&self.account_id).ok().map(AccountId)
+    }
+}
+
+/// One `api_tokens` row (S1c). `token_digest` is all the store ever knows of the
+/// secret — the plaintext exists in the mint response alone. `role()` parses the
+/// stored role (a token can never hold owner; the CHECK constraint agrees).
+#[derive(Debug, FromRow)]
+pub struct ApiTokenRow {
+    pub id: String,
+    pub workspace_id: String,
+    pub created_by: Option<String>,
+    pub name: String,
+    pub token_digest: String,
+    pub role: String,
+    pub created_at: OffsetDateTime,
+    pub revoked_at: Option<OffsetDateTime>,
+    pub last_used_at: Option<OffsetDateTime>,
+}
+
+impl ApiTokenRow {
+    /// The token's id as a domain type; `None` means stored corruption.
+    pub fn token(&self) -> Option<ApiTokenId> {
+        Uuid::parse_str(&self.id).ok().map(ApiTokenId)
+    }
+
+    /// The workspace the token authorizes — its scope travels inside the credential.
+    pub fn workspace(&self) -> Option<WorkspaceId> {
+        Uuid::parse_str(&self.workspace_id).ok().map(WorkspaceId)
+    }
+
+    /// The role minted into the token; `None` is stored corruption.
+    pub fn role(&self) -> Option<Role> {
+        Role::parse(&self.role)
+    }
+
+    /// Live right now: a revoked token answers like an unknown one.
+    pub fn live(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+/// The read-level view of one workspace (S1c): what every member role — and the
+/// operator — may see. Construction goes through `Db::viewer(_)`; reads delegate to
+/// the workspace view, so the tenant boundary is still enforced by the type.
+pub struct ViewerDb<'a> {
+    view: WorkspaceDb<'a>,
+}
+
+impl ViewerDb<'_> {
+    /// The bound workspace.
+    pub fn id(&self) -> WorkspaceId {
+        self.view.id()
+    }
+
+    pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
+        self.view.list_monitors().await
+    }
+
+    /// The monitor row itself, or `None` — absent and other-workspace look the same.
+    pub async fn monitor_row(&self, monitor: MonitorId) -> Result<Option<MonitorRow>, QueryError> {
+        self.view.monitor_row(monitor).await
+    }
+
+    pub async fn has_history(&self, monitor: MonitorId) -> Result<bool, QueryError> {
+        self.view.has_history(monitor).await
+    }
+
+    pub async fn list_checks(
+        &self,
+        monitor: MonitorId,
+        limit: i64,
+    ) -> Result<Vec<CheckRow>, QueryError> {
+        self.view.list_checks(monitor, limit).await
+    }
+
+    pub async fn check_stats(
+        &self,
+        monitor: MonitorId,
+        since: OffsetDateTime,
+    ) -> Result<CoverageStats, QueryError> {
+        self.view.check_stats(monitor, since).await
+    }
+
+    pub async fn list_windows(
+        &self,
+        monitor: MonitorId,
+    ) -> Result<Vec<MaintenanceRow>, QueryError> {
+        self.view.list_windows(monitor).await
+    }
+
+    pub async fn list_incidents(
+        &self,
+        monitor: Option<MonitorId>,
+        state: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IncidentRow>, QueryError> {
+        self.view.list_incidents(monitor, state, limit).await
+    }
+
+    pub async fn monitor_count(&self) -> Result<u64, QueryError> {
+        self.view.monitor_count().await
+    }
+
+    pub async fn list_outbox(&self, monitor: MonitorId) -> Result<Vec<OutboxRow>, QueryError> {
+        self.view.list_outbox(monitor).await
+    }
+
+    /// The workspace's roster, oldest membership first — membership itself is
+    /// workspace state every member may read (S1c).
+    pub async fn list_members(&self) -> Result<Vec<MemberRow>, QueryError> {
+        sqlx::query_as::<_, MemberRow>(
+            "SELECT m.account_id, a.email, m.role, m.created_at
+               FROM members m JOIN accounts a ON a.id = m.account_id
+              WHERE m.workspace_id = ? ORDER BY m.created_at",
+        )
+        .bind(self.view.workspace.0.to_string())
+        .fetch_all(&self.view.db.pool)
+        .await
+        .map_err(Into::into)
+    }
+}
+
+/// Read plus the workspace's own resources — the member and owner roles (S1c).
+/// Derefs to [`ViewerDb`], so reads are inherited; only write methods are added here.
+/// There is deliberately no roster or token method to reach for.
+pub struct MemberDb<'a> {
+    view: ViewerDb<'a>,
+}
+
+impl<'a> std::ops::Deref for MemberDb<'a> {
+    type Target = ViewerDb<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+impl MemberDb<'_> {
+    /// Insert unless `max_monitors` already exist — the cap counts this workspace.
+    pub async fn insert_monitor_within(
+        &self,
+        monitor: &Monitor,
+        max_monitors: u64,
+    ) -> Result<bool, QueryError> {
+        self.view
+            .view
+            .insert_monitor_within(monitor, max_monitors)
+            .await
+    }
+
+    /// Optimistic write: the row must still be at `generation`; absent and
+    /// other-workspace read the same (`Ok(None)`), and a newer row is `None` too.
+    pub async fn update_monitor(
+        &self,
+        monitor: &Monitor,
+        generation: u64,
+    ) -> Result<Option<u64>, QueryError> {
+        self.view.view.update_monitor(monitor, generation).await
+    }
+
+    /// Delete a monitor with no recorded evidence; `false` = history exists or the
+    /// monitor isn't in this workspace.
+    pub async fn delete_monitor(&self, monitor: MonitorId) -> Result<bool, QueryError> {
+        self.view.view.delete_monitor(monitor).await
+    }
+
+    pub async fn create_window(
+        &self,
+        monitor: MonitorId,
+        starts_at: OffsetDateTime,
+        ends_at: OffsetDateTime,
+        reason: &str,
+    ) -> Result<MaintenanceRow, QueryError> {
+        self.view
+            .view
+            .create_window(monitor, starts_at, ends_at, reason)
+            .await
+    }
+
+    /// Cancel a maintenance window in this workspace; `false` = not here.
+    pub async fn delete_window(&self, window_id: i64) -> Result<bool, QueryError> {
+        self.view.view.delete_window(window_id).await
+    }
+}
+
+/// Member plus the workspace's people and keys — the owner role and the operator
+/// (S1c). Derefs to [`MemberDb`]; roster and API-token methods exist only here, so a
+/// member view cannot administer even by accident.
+pub struct OwnerDb<'a> {
+    view: MemberDb<'a>,
+}
+
+impl<'a> std::ops::Deref for OwnerDb<'a> {
+    type Target = MemberDb<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+impl OwnerDb<'_> {
+    /// Seat `account` at `role`. A second seat for the same account is a conflict,
+    /// not a silent role change.
+    pub async fn add_member(
+        &self,
+        account: AccountId,
+        role: Role,
+        now: OffsetDateTime,
+    ) -> Result<(), QueryError> {
+        sqlx::query(
+            "INSERT INTO members (workspace_id, account_id, role, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(self.view.view.view.workspace.0.to_string())
+        .bind(account.0.to_string())
+        .bind(role.as_str())
+        .bind(now)
+        .execute(&self.view.view.view.db.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db) = &e
+                && db.is_unique_violation()
+            {
+                return QueryError::Invalid("that account is already a member".into());
+            }
+            QueryError::Sql(e)
+        })?;
+        Ok(())
+    }
+
+    /// Change `account`'s role. The last-owner rule is enforced inside the
+    /// transaction — a demotion that would leave the workspace ownerless is refused,
+    /// race-free. `Ok(false)` = no such member.
+    pub async fn set_member_role(
+        &self,
+        account: AccountId,
+        role: Role,
+    ) -> Result<bool, QueryError> {
+        self.change_membership(account, Some(role)).await
+    }
+
+    /// Remove `account` from the roster — same last-owner guard as a demotion.
+    /// `Ok(false)` = no such member.
+    pub async fn remove_member(&self, account: AccountId) -> Result<bool, QueryError> {
+        self.change_membership(account, None).await
+    }
+
+    /// The one transaction behind `set_member_role`/`remove_member`: `Some(role)`
+    /// updates, `None` deletes — both refuse to orphan the workspace's last owner.
+    async fn change_membership(
+        &self,
+        account: AccountId,
+        role: Option<Role>,
+    ) -> Result<bool, QueryError> {
+        let ws = &self.view.view.view;
+        let mut tx = ws.db.pool.begin().await?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM members WHERE workspace_id = ? AND account_id = ?",
+        )
+        .bind(ws.workspace.0.to_string())
+        .bind(account.0.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if current == "owner" && role != Some(Role::Owner) {
+            let owners: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM members WHERE workspace_id = ? AND role = 'owner'",
+            )
+            .bind(ws.workspace.0.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if owners <= 1 {
+                return Err(QueryError::Invalid("the workspace needs an owner".into()));
+            }
+        }
+        let affected = match role {
+            Some(role) => {
+                sqlx::query("UPDATE members SET role = ? WHERE workspace_id = ? AND account_id = ?")
+                    .bind(role.as_str())
+                    .bind(ws.workspace.0.to_string())
+                    .bind(account.0.to_string())
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected()
+            }
+            None => sqlx::query("DELETE FROM members WHERE workspace_id = ? AND account_id = ?")
+                .bind(ws.workspace.0.to_string())
+                .bind(account.0.to_string())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected(),
+        };
+        tx.commit().await?;
+        Ok(affected == 1)
+    }
+
+    /// Mint a token row: `digest` is all that persists of the secret (S1c). Tokens
+    /// can never hold owner — a credential must not administer the workspace that
+    /// issued it.
+    pub async fn create_api_token(
+        &self,
+        name: &str,
+        role: Role,
+        digest: &str,
+        created_by: Option<AccountId>,
+        now: OffsetDateTime,
+    ) -> Result<ApiTokenRow, QueryError> {
+        if role == Role::Owner {
+            return Err(QueryError::Invalid("tokens cannot hold owner".into()));
+        }
+        let view = &self.view.view.view;
+        let id = ApiTokenId::new();
+        sqlx::query(
+            "INSERT INTO api_tokens
+                (id, workspace_id, created_by, name, token_digest, role, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.0.to_string())
+        .bind(view.workspace.0.to_string())
+        .bind(created_by.map(|a| a.0.to_string()))
+        .bind(name)
+        .bind(digest)
+        .bind(role.as_str())
+        .bind(now)
+        .execute(&view.db.pool)
+        .await?;
+        Ok(ApiTokenRow {
+            id: id.0.to_string(),
+            workspace_id: view.workspace.0.to_string(),
+            created_by: created_by.map(|a| a.0.to_string()),
+            name: name.to_owned(),
+            token_digest: digest.to_owned(),
+            role: role.as_str().to_owned(),
+            created_at: now,
+            revoked_at: None,
+            last_used_at: None,
+        })
+    }
+
+    /// This workspace's token metadata — never the digest-bearing secret.
+    pub async fn list_api_tokens(&self) -> Result<Vec<ApiTokenRow>, QueryError> {
+        let view = &self.view.view.view;
+        sqlx::query_as::<_, ApiTokenRow>(
+            "SELECT id, workspace_id, created_by, name, token_digest, role,
+                    created_at, revoked_at, last_used_at
+               FROM api_tokens WHERE workspace_id = ? ORDER BY created_at",
+        )
+        .bind(view.workspace.0.to_string())
+        .fetch_all(&view.db.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Stamp `revoked_at`; `false` = unknown here or already dead.
+    pub async fn revoke_api_token(
+        &self,
+        token: ApiTokenId,
+        now: OffsetDateTime,
+    ) -> Result<bool, QueryError> {
+        let view = &self.view.view.view;
+        let affected = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = ?
+             WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(token.0.to_string())
+        .bind(view.workspace.0.to_string())
+        .execute(&view.db.pool)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
+    }
 }
 
 /// One `sessions` row as the guard sees it (S1b: `account_id` is `Some` for account

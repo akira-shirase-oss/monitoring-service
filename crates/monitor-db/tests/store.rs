@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use monitor_db::{Db, Observation, QueryError, RetentionPolicy, WriteHealth, WriteOutcome, writer};
 use monitor_domain::{
-    CheckOutcome, Effect, Health, Monitor, MonitorId, NewMonitor, SlotObservation, Status,
+    CheckOutcome, Effect, Health, Monitor, MonitorId, NewMonitor, Role, SlotObservation, Status,
     WorkspaceId,
 };
 use time::OffsetDateTime;
@@ -2002,5 +2002,145 @@ async fn a_signup_consumes_its_invite_atomically() -> anyhow::Result<()> {
     );
     assert!(won.is_ok());
     assert!(matches!(lost, Err(QueryError::Invalid(_))));
+    Ok(())
+}
+
+/// S1c: a signup seats its account as the workspace's owner; the roster admin enforces
+/// the last-owner rule inside the transaction.
+#[tokio::test]
+async fn membership_roles() -> anyhow::Result<()> {
+    let (db, _, _) = store().await?;
+    let now = OffsetDateTime::now_utc();
+    let invite = db
+        .create_invite("digest-m", now, now + time::Duration::days(1))
+        .await?;
+    let account = monitor_db::NewAccount {
+        id: monitor_domain::AccountId::new(),
+        workspace: WorkspaceId::new(),
+        workspace_slug: "ws-m".into(),
+        workspace_name: "ws".into(),
+        email: "m@b.c".into(),
+        password_hash: "phc".into(),
+    };
+    let row = db.signup(&invite.id, &account, now).await?;
+    let ws = account.workspace;
+    let owner = account.id;
+
+    // The signup itself seated the owner row.
+    let scope = db.owner(ws);
+    let members = scope.list_members().await?;
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].account_id, row.id);
+    assert_eq!(members[0].role, "owner");
+    assert_eq!(db.member_role(ws, owner).await?, Some(Role::Owner));
+
+    // The last owner cannot be demoted or removed — either path would orphan the
+    // workspace.
+    assert!(matches!(
+        scope.set_member_role(owner, Role::Member).await,
+        Err(QueryError::Invalid(_))
+    ));
+    assert!(matches!(
+        scope.remove_member(owner).await,
+        Err(QueryError::Invalid(_))
+    ));
+
+    // Seat a second owner and the first may step down; removing a stranger is a
+    // plain false, not an error. The member must be a real account — the FK says so.
+    let invite_b = db
+        .create_invite("digest-n", now, now + time::Duration::days(1))
+        .await?;
+    let second = db
+        .signup(
+            &invite_b.id,
+            &monitor_db::NewAccount {
+                id: monitor_domain::AccountId::new(),
+                workspace: WorkspaceId::new(),
+                workspace_slug: "ws-n".into(),
+                workspace_name: "ws-n".into(),
+                email: "n@b.c".into(),
+                password_hash: "phc".into(),
+            },
+            now,
+        )
+        .await?
+        .id;
+    let second = monitor_domain::AccountId(uuid::Uuid::parse_str(&second)?);
+    scope.add_member(second, Role::Owner, now).await?;
+    assert!(matches!(
+        scope.add_member(second, Role::Viewer, now).await,
+        Err(QueryError::Invalid(_))
+    ));
+    assert!(scope.set_member_role(owner, Role::Viewer).await?);
+    assert_eq!(db.member_role(ws, owner).await?, Some(Role::Viewer));
+    assert!(scope.remove_member(owner).await?);
+    assert_eq!(db.member_role(ws, owner).await?, None);
+    assert!(
+        !scope
+            .remove_member(monitor_domain::AccountId::new())
+            .await?
+    );
+    Ok(())
+}
+
+/// S1c tokens: only the digest persists; owner is refused outright; lookup is by
+/// digest; last-used lands through the batch touch, never per request.
+#[tokio::test]
+async fn api_tokens_digest_and_touch() -> anyhow::Result<()> {
+    let (db, _, _) = store().await?;
+    let now = OffsetDateTime::now_utc();
+    let scope = db.owner(WorkspaceId::DEFAULT);
+    assert!(matches!(
+        scope
+            .create_api_token("boss", Role::Owner, "d-owner", None, now)
+            .await,
+        Err(QueryError::Invalid(_))
+    ));
+    let minted = scope
+        .create_api_token("ci", Role::Member, "d-ci", None, now)
+        .await?;
+    assert_eq!(minted.role, "member");
+    assert!(minted.last_used_at.is_none());
+    assert!(
+        db.api_token_by_digest("d-ci")
+            .await?
+            .is_some_and(|row| row.id == minted.id)
+    );
+    assert!(db.api_token_by_digest("d-wrong").await?.is_none());
+    let later = now + time::Duration::minutes(5);
+    assert_eq!(
+        db.touch_api_tokens(&[(
+            monitor_domain::ApiTokenId(uuid::Uuid::parse_str(&minted.id)?),
+            later
+        )])
+        .await?,
+        1
+    );
+    assert_eq!(
+        db.api_token_by_digest("d-ci").await?.unwrap().last_used_at,
+        Some(later)
+    );
+    // Revocation stamps the row and refuses a second stamp — the row stays.
+    assert!(
+        scope
+            .revoke_api_token(
+                monitor_domain::ApiTokenId(uuid::Uuid::parse_str(&minted.id)?),
+                later
+            )
+            .await?
+    );
+    assert!(
+        !scope
+            .revoke_api_token(
+                monitor_domain::ApiTokenId(uuid::Uuid::parse_str(&minted.id)?),
+                later
+            )
+            .await?
+    );
+    assert!(
+        db.api_token_by_digest("d-ci")
+            .await?
+            .is_some_and(|row| row.revoked_at == Some(later))
+    );
     Ok(())
 }
