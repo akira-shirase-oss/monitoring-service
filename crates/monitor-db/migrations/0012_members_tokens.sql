@@ -13,6 +13,11 @@ CREATE TABLE members (
 
 CREATE INDEX members_account_idx ON members (account_id);
 
+-- Accounts minted before the table existed still own their home workspace —
+-- without this row they'd sign in and be refused every scoped request.
+INSERT INTO members (workspace_id, account_id, role, created_at)
+SELECT workspace_id, id, 'owner', created_at FROM accounts;
+
 CREATE TABLE api_tokens (
     id           TEXT PRIMARY KEY,            -- uuid
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
