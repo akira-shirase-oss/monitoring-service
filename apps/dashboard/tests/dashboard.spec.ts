@@ -38,6 +38,35 @@ test('an unreachable API shows "cannot see", never a green board', async ({ page
 	await expect(page.getByText('No monitors yet.')).not.toBeVisible();
 });
 
+test('the engine verdict shows as a banner — degraded and unavailable, never hidden', async ({
+	page
+}) => {
+	// The verdict rides inside GET /api/monitors (`monitoring`): degraded keeps serving,
+	// unavailable means every status reads unknown. The API is real; only the verdict
+	// field is shaped, the way a stopped supporting task would shape it.
+	const shape = async (monitoring: object) => {
+		await page.route('**/api/monitors', async (route) => {
+			if (route.request().method() !== 'GET') return route.continue();
+			const response = await route.fetch();
+			const body = await response.json();
+			return route.fulfill({ response, json: { ...body, monitoring } });
+		});
+	};
+
+	await shape({ status: 'degraded', faults: ['snapshot writer stopped'] });
+	await page.goto('/');
+	await expect(page.getByText('Monitoring is degraded.')).toBeVisible();
+	await expect(page.getByText(/snapshot writer stopped/)).toBeVisible();
+
+	await page.unroute('**/api/monitors');
+	await shape({ status: 'unavailable', faults: [] });
+	await page.goto('/');
+	await expect(page.getByText('Monitoring is unavailable.')).toBeVisible();
+	await expect(page.getByText(/every status below reads unknown/)).toBeVisible();
+	// An unreachable server is a different truth — it must not show as engine-down.
+	await expect(page.getByText('The monitor server is unreachable.')).not.toBeVisible();
+});
+
 test('a monitor registers, probes land, and the badge turns up', async ({
 	page,
 	request

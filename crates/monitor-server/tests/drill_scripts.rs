@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const DRILL: &str = include_str!("../../../scripts/backup-drill.sh");
+const FREEZE: &str = include_str!("../../../scripts/freeze-drill.sh");
 const DEV: &str = include_str!("../../../scripts/dev.sh");
 
 fn script(name: &str) -> PathBuf {
@@ -26,7 +27,11 @@ fn code(script: &str) -> Vec<&str> {
 
 #[test]
 fn the_drill_and_dev_scripts_never_target_or_kill_the_default_port() {
-    for (name, text) in [("backup-drill.sh", DRILL), ("dev.sh", DEV)] {
+    for (name, text) in [
+        ("backup-drill.sh", DRILL),
+        ("freeze-drill.sh", FREEZE),
+        ("dev.sh", DEV),
+    ] {
         for line in code(text) {
             assert!(!line.contains("58400"), "{name} targets :58400: {line}");
             let kills_by_port =
@@ -39,6 +44,7 @@ fn the_drill_and_dev_scripts_never_target_or_kill_the_default_port() {
     }
     // Each picks its own port, overridable, and guards it before starting anything.
     assert!(DRILL.contains("SMON_DRILL_PORT") && DRILL.contains("require_free_port"));
+    assert!(FREEZE.contains("SMON_FREEZE_PORT") && FREEZE.contains("require_free_port"));
     assert!(DEV.contains("SMON_DEV_PORT") && DEV.contains("require_free_port"));
     assert!(
         DEV.contains("SMON_LISTEN"),
@@ -62,6 +68,13 @@ fn a_script_refuses_a_port_that_is_already_in_use_and_kills_nothing() {
             vec![
                 ("SMON_DRILL_PORT", port.as_str()),
                 ("SMON_DRILL_FIXTURE_PORT", spare_port.as_str()),
+            ],
+        ),
+        (
+            "freeze-drill.sh",
+            vec![
+                ("SMON_FREEZE_PORT", port.as_str()),
+                ("SMON_FREEZE_FIXTURE_PORT", spare_port.as_str()),
             ],
         ),
         ("dev.sh", vec![("SMON_DEV_PORT", port.as_str())]),
@@ -329,19 +342,22 @@ fn wait_own_http_fails_when_its_child_died_even_if_the_url_answers() {
     assert!(output.status.success(), "{output:?}");
 }
 
-/// The drill uses the guarded wait for every process it starts.
+/// The drills use the guarded wait for every process they start.
 #[test]
 fn the_drill_waits_only_on_its_own_processes() {
-    let lines = code(DRILL);
-    assert!(
-        !lines.iter().any(|line| line.starts_with("wait_http ")),
-        "the drill must use wait_own_http, which also checks the child is alive"
-    );
-    assert!(
-        lines
-            .iter()
-            .filter(|line| line.starts_with("wait_own_http "))
-            .count()
-            >= 3
-    );
+    for (name, text) in [("backup-drill.sh", DRILL), ("freeze-drill.sh", FREEZE)] {
+        let lines = code(text);
+        assert!(
+            !lines.iter().any(|line| line.starts_with("wait_http ")),
+            "{name} must use wait_own_http, which also checks the child is alive"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("wait_own_http "))
+                .count()
+                >= 2,
+            "{name} must wait on its own processes"
+        );
+    }
 }

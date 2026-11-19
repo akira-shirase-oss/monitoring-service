@@ -224,8 +224,9 @@ first pass commits one `missed` row per lost slot (962 for 100 monitors after a 
 freeze), so the coordinator also beats after every committed miss: staleness is judged by
 progress, and a long catch-up is never read as a wedged loop (a writer that stops taking
 commits stops the beats). (Unit-tested by
-`committing_a_backlog_of_misses_keeps_the_heartbeat_fresh`; the 130 s SIGSTOP drill not
-re-run since.) Supporting tasks stay *degraded*, with
+`committing_a_backlog_of_misses_keeps_the_heartbeat_fresh`; the real-process drill is now
+scripted — `scripts/freeze-drill.sh` freezes the server ~135 s and asserts no exit, the
+missed rows, and the honest recovery — but has not been re-run yet.) Supporting tasks stay *degraded*, with
 no exit. The systemd unit backs restarts off from 15 s to 10 minutes (`RestartSteps`,
 systemd ≥ 254) under a start limit of 10 in 30 minutes that a backed-off loop never
 reaches: a deterministic crash is spaced out instead of looping every few seconds.
