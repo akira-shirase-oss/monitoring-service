@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use monitor_db::Db;
+use monitor_domain::WorkspaceId;
 use monitor_server::{AppState, router};
 use tokio::sync::watch;
 use tower::ServiceExt;
@@ -44,6 +45,8 @@ async fn app() -> anyhow::Result<(
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: Some(backup_dir),
@@ -486,10 +489,15 @@ async fn seed_check(
     outcome: monitor_domain::CheckOutcome,
 ) -> anyhow::Result<monitor_db::WriteOutcome> {
     let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(id)?);
-    let generation = db.monitor_generation(monitor_id).await?.unwrap_or(1);
+    let generation = db
+        .workspace(WorkspaceId::DEFAULT)
+        .monitor_generation(monitor_id)
+        .await?
+        .unwrap_or(1);
     Ok(writer
         .record(monitor_db::Observation {
             monitor_id,
+            workspace: WorkspaceId::DEFAULT,
             generation,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Probe(outcome),
@@ -608,6 +616,7 @@ async fn a_stale_observation_after_edit_is_dropped() {
     let outcome = writer
         .record(monitor_db::Observation {
             monitor_id,
+            workspace: WorkspaceId::DEFAULT,
             generation: 1,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Probe(monitor_domain::CheckOutcome::Pass),
@@ -618,7 +627,13 @@ async fn a_stale_observation_after_edit_is_dropped() {
         .await
         .unwrap();
     assert_eq!(outcome, monitor_db::WriteOutcome::DroppedStaleGeneration);
-    assert!(db.list_checks(monitor_id, 10).await.unwrap().is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -637,6 +652,7 @@ async fn stats_separates_coverage_from_success() {
         seed_check(&db, &writer, &id, outcome).await.unwrap();
     }
     let generation = db
+        .workspace(WorkspaceId::DEFAULT)
         .monitor_generation(monitor_id)
         .await
         .unwrap()
@@ -644,6 +660,7 @@ async fn stats_separates_coverage_from_success() {
     writer
         .record(monitor_db::Observation {
             monitor_id,
+            workspace: WorkspaceId::DEFAULT,
             generation,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Missed,
@@ -763,6 +780,8 @@ async fn two_backups_in_one_second_get_distinct_names() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: Arc::new(move || stamp),
         trusted_proxy: None,
         backup_dir: Some(tmp.path().join("backups")),
@@ -799,6 +818,8 @@ async fn backup_is_disabled_without_a_configured_dir() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -856,6 +877,8 @@ async fn auth_denies_without_a_valid_bearer_token() {
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -931,6 +954,8 @@ async fn authed_with(
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1219,7 +1244,9 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
     let monitor =
         monitor_domain::NewMonitor::new("watched", url::Url::parse("https://example.com/health")?)?
             .into_monitor();
-    db.insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
 
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let write_health: monitor_db::WriteHealth = Arc::default();
@@ -1243,6 +1270,8 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1256,6 +1285,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
     writer
         .record(monitor_db::Observation {
             monitor_id: monitor.id,
+            workspace: monitor.workspace,
             generation: monitor.generation,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Probe(monitor_domain::CheckOutcome::Pass),
@@ -1321,6 +1351,8 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1338,7 +1370,7 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "limit_reached");
     assert_eq!(
-        db.monitor_count().await?,
+        db.workspace(WorkspaceId::DEFAULT).monitor_count().await?,
         2,
         "nothing was inserted past the cap"
     );
@@ -1486,6 +1518,8 @@ async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1521,6 +1555,8 @@ async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1561,6 +1597,8 @@ async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1594,6 +1632,8 @@ fn authed_on(db: &Db, token: &str) -> Router {
         admin_token: Some(Arc::from(token)),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1727,6 +1767,8 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
         admin_token: Some(Arc::from(token)),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_secs(60),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock,
         trusted_proxy: None,
         backup_dir: None,
@@ -1895,6 +1937,8 @@ fn uncapped(db: &Db) -> Router {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1929,7 +1973,8 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
         .into_monitor())
     };
     for i in 0..479 {
-        db.insert_monitor(&slow(format!("m{i}"), &format!("https://o{i}.example/"))?)
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&slow(format!("m{i}"), &format!("https://o{i}.example/"))?)
             .await?;
     }
     let app = uncapped(&db);
@@ -1949,7 +1994,14 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     let (status, body) = send(&app, "POST", "/api/monitors", Some(one_more)).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "capacity_exceeded");
-    assert_eq!(db.list_monitors().await?.len(), 480, "nothing was stored");
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .len(),
+        480,
+        "nothing was stored"
+    );
 
     // Per origin, in a fresh store.
     let tmp2 = tempfile::tempdir()?;
@@ -1958,7 +2010,9 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     for i in 0..30 {
         let mut monitor = slow(format!("p{i}"), &format!("https://api.example/{i}"))?;
         monitor.timeout = Duration::from_secs(3);
-        db.insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
     }
     let app = uncapped(&db);
     let same_origin = serde_json::json!({
@@ -1982,6 +2036,7 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     // An edit that would overload the origin is refused the same way.
     let faster = serde_json::json!({ "interval_s": 15, "url": "https://api.example/again" });
     let other_id = db
+        .workspace(WorkspaceId::DEFAULT)
         .list_monitors()
         .await?
         .into_iter()
@@ -2020,7 +2075,9 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
             Duration::from_secs(3),
         )?
         .into_monitor();
-        db.insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
     }
     let app = monitor_server::router(monitor_server::AppState {
         db: db.clone(),
@@ -2030,6 +2087,8 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,

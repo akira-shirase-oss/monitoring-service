@@ -24,14 +24,23 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use monitor_db::Db;
+use monitor_domain::WorkspaceId;
 use tower::ServiceExt;
 
 const ROUTER_SOURCE: &str = include_str!("../src/lib.rs");
 const TOKEN: &str = "inventory-token-0123456789abcdef0123456789";
 
-/// The routes that are public by design: health, the build version, and the two
-/// endpoints that exchange the token for a session (they enforce their own rules).
-const PUBLIC: [&str; 5] = ["/livez", "/readyz", "/version", "/api/login", "/api/logout"];
+/// The routes that are public by design: health, the build version, and the
+/// endpoints that exchange a credential for a session (login, signup, logout —
+/// they enforce their own rules: invite validation, throttling, password work).
+const PUBLIC: [&str; 6] = [
+    "/livez",
+    "/readyz",
+    "/version",
+    "/api/login",
+    "/api/signup",
+    "/api/logout",
+];
 
 /// The string literal each `marker` call opens with, in source order.
 fn literals_after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
@@ -152,6 +161,8 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::from_hours(1),
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -292,7 +303,13 @@ async fn every_api_route_and_method_denies_a_request_without_a_valid_credential(
     }
 
     // Nothing happened: no monitor, no backup file.
-    assert!(db.list_monitors().await.expect("list").is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await
+            .expect("list")
+            .is_empty()
+    );
     assert!(!backup.exists(), "an unauthenticated backup was written");
 
     // And the same requests with the token are not refused by the layer — the 401s above

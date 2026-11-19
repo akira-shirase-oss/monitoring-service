@@ -152,8 +152,17 @@ pub async fn write_beat(
     config: &Config,
     observing: bool,
 ) -> Result<(), BeatError> {
-    let monitors = super::load_registry(db).await?;
-    let open = db.open_incidents().await?;
+    // The public beat is the operator's view — the default workspace until per-workspace
+    // status pages land (D-021, S2). `load_registry` is the engine's all-workspace sweep;
+    // this page never shows another tenant's monitors.
+    let scoped = db.workspace(monitor_domain::WorkspaceId::DEFAULT);
+    let monitors = scoped
+        .list_monitors()
+        .await?
+        .into_iter()
+        .map(Monitor::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let open = scoped.open_incidents().await?;
     let json = build(&monitors, statuses, &open, config.ttl, observing);
     let bytes = serde_json::to_vec_pretty(&json)?;
     std::fs::create_dir_all(&config.dir)?;

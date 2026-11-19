@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use monitor_db::{Db, SharedStatuses, writer};
-use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation, Status};
+use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation, Status, WorkspaceId};
 use monitor_server::snapshot;
 use monitor_server::vitals::{Role, Vitals};
 use sha2::{Digest, Sha256};
@@ -109,7 +109,10 @@ async fn the_writer_beats_a_real_file_with_committed_evidence() {
     let db = Db::connect("sqlite::memory:", 1).await.unwrap();
     db.migrate().await.unwrap();
     let monitor = monitor("snap-target");
-    db.insert_monitor(&monitor).await.unwrap();
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await
+        .unwrap();
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::new()));
     let (writer, _task) = writer::spawn(
         db.clone(),
@@ -123,6 +126,7 @@ async fn the_writer_beats_a_real_file_with_committed_evidence() {
     writer
         .record(monitor_db::Observation {
             monitor_id: monitor.id,
+            workspace: monitor.workspace,
             generation: monitor.generation,
             slot_at: OffsetDateTime::now_utc(),
             slot: SlotObservation::Probe(CheckOutcome::Pass),
@@ -172,7 +176,10 @@ async fn a_dead_engine_stops_the_heartbeat_reading_fresh() {
     let db = Db::connect("sqlite::memory:", 1).await.unwrap();
     db.migrate().await.unwrap();
     let monitor = monitor("snap-target");
-    db.insert_monitor(&monitor).await.unwrap();
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await
+        .unwrap();
     // The committed map still says up — exactly the stale value a dead writer leaves.
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::from([(monitor.id, Status::Up)])));
     let vitals = Vitals::new(Arc::default(), std::time::Duration::from_secs(30));
@@ -223,7 +230,10 @@ async fn a_final_beat_reads_unavailable_immediately() {
     let db = Db::connect("sqlite::memory:", 1).await.unwrap();
     db.migrate().await.unwrap();
     let monitor = monitor("final");
-    db.insert_monitor(&monitor).await.unwrap();
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await
+        .unwrap();
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::from([(monitor.id, Status::Up)])));
     let config = snapshot::Config {
         dir: dir.clone(),

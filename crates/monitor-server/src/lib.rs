@@ -24,7 +24,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -39,7 +39,10 @@ use uuid::Uuid;
 use monitor_db::{
     CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses,
 };
-use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError};
+use monitor_domain::{
+    AccountId, ApiTokenId, Monitor, MonitorId, MonitorPatch, NewMonitor, Role, Status,
+    ValidationError,
+};
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
 const BODY_LIMIT: usize = 16 * 1024;
@@ -51,6 +54,49 @@ const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
 /// Wall-clock time for session expiry (D-016). Injected so tests can move it; the server
 /// uses [`system_clock`].
 pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
+/// The request's store view comes from its credential *and* role (S1b/S1c): the
+/// operator sees the default workspace (or one it picked), an account or API token
+/// its own — a monitor in any other workspace is exactly as absent as one that never
+/// existed, which is the isolation the API owes (D-020). `viewer_for` is the read
+/// view every principal holds; `member_for` adds resource writes (member+ roles);
+/// `owner_for` adds roster and token administration (owner, or the operator).
+/// A view the role doesn't hold simply doesn't exist — denial by type, not a flag.
+fn viewer_for<'a>(state: &'a AppState, principal: &auth::Principal) -> monitor_db::ViewerDb<'a> {
+    state.db.viewer(principal.workspace())
+}
+
+fn member_for<'a>(
+    state: &'a AppState,
+    principal: &auth::Principal,
+) -> Result<monitor_db::MemberDb<'a>, ApiError> {
+    match principal {
+        auth::Principal::Operator { .. } => Ok(state.db.member(principal.workspace())),
+        auth::Principal::Account { role, .. } | auth::Principal::Token { role, .. }
+            if role.at_least(Role::Member) =>
+        {
+            Ok(state.db.member(principal.workspace()))
+        }
+        _ => Err(ApiError::Forbidden(
+            "a viewer can read this workspace but not change it".into(),
+        )),
+    }
+}
+
+fn owner_for<'a>(
+    state: &'a AppState,
+    principal: &auth::Principal,
+) -> Result<monitor_db::OwnerDb<'a>, ApiError> {
+    match principal {
+        auth::Principal::Operator { .. } => Ok(state.db.owner(principal.workspace())),
+        auth::Principal::Account { role, .. } if role.at_least(Role::Owner) => {
+            Ok(state.db.owner(principal.workspace()))
+        }
+        _ => Err(ApiError::Forbidden(
+            "roster and API tokens are owner work".into(),
+        )),
+    }
+}
 
 /// The real clock.
 pub fn system_clock() -> Clock {
@@ -78,6 +124,10 @@ pub struct AppState {
     /// `SMON_SESSION_IDLE_S`: a session unused for this long ends, inside its lifetime too
     /// (D-016). The dashboard's 15 s refresh keeps an open tab's session in use.
     pub session_idle: Duration,
+    /// How long a sign-in or signup may wait for a password-hashing slot before it is
+    /// answered 503 `busy` (`auth::PASSWORD_WORK_WAIT` in production). A bounded queue
+    /// keeps a credential flood from parking every connection the API has.
+    pub password_work_wait: Duration,
     /// "Now" for session creation, expiry and idleness.
     pub clock: Clock,
     /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
@@ -94,7 +144,27 @@ pub struct AppState {
     /// `SMON_PROFILE=lab`: local/private targets may be registered (fixtures). Otherwise
     /// a URL the SSRF guard would refuse is refused at registration (D-013).
     pub allow_local_targets: bool,
+    /// Pending API-token last-used stamps (S1c): the auth path writes here, the
+    /// flusher lands them in one store write — never a write per request.
+    pub token_use: auth::TokenUse,
     pub version: &'static str,
+}
+
+/// Drain the pending token-use stamps into the store in one transaction — the batched
+/// counterpart to `AppState::token_use` (S1c). The flusher task calls this on its
+/// interval; tests call it directly.
+pub async fn flush_token_uses(state: &AppState) -> Result<u64, QueryError> {
+    let pending: Vec<(ApiTokenId, OffsetDateTime)> = {
+        let mut map = state
+            .token_use
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.drain().collect()
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    state.db.touch_api_tokens(&pending).await
 }
 
 /// Re-read the store and publish the monitor set the coordinator schedules against.
@@ -108,9 +178,10 @@ pub async fn publish_registry(state: &AppState) -> Result<(), ApiError> {
 }
 
 /// The registry is the stored monitor set converted through the domain — corrupt rows are
-/// corruption, not a monitor to skip quietly.
+/// corruption, not a monitor to skip quietly. The engine sweeps *every* workspace: tenancy
+/// scopes what a request can reach, never what the scheduler observes (D-020).
 pub async fn load_registry(db: &Db) -> Result<Vec<Monitor>, QueryError> {
-    db.list_monitors()
+    db.list_monitors_engine()
         .await?
         .into_iter()
         .map(Monitor::try_from)
@@ -127,8 +198,9 @@ pub async fn rebuild_health(
 ) -> Result<std::collections::HashMap<MonitorId, monitor_domain::Health>, QueryError> {
     let mut health = std::collections::HashMap::with_capacity(monitors.len());
     for monitor in monitors {
-        let open = db.open_incident(monitor.id).await?.is_some();
-        let tail = db
+        let scoped = db.workspace(monitor.workspace);
+        let open = scoped.open_incident(monitor.id).await?.is_some();
+        let tail = scoped
             .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
             .await?;
         let rebuilt = monitor_domain::Health::rebuild(open, &tail, monitor.thresholds);
@@ -162,7 +234,11 @@ pub async fn record_downtime(
 ) -> Result<usize, monitor_db::WriterError> {
     let mut gaps = 0;
     for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
-        let Some(last) = db.last_slot_at(monitor.id).await? else {
+        let Some(last) = db
+            .workspace(monitor.workspace)
+            .last_slot_at(monitor.id)
+            .await?
+        else {
             continue; // never observed: nothing to be stale about
         };
         let interval = time::Duration::try_from(monitor.interval).unwrap_or(time::Duration::MAX);
@@ -174,6 +250,7 @@ pub async fn record_downtime(
         writer
             .record(monitor_db::Observation {
                 monitor_id: monitor.id,
+                workspace: monitor.workspace,
                 generation: monitor.generation,
                 slot_at: last + interval,
                 slot: monitor_domain::SlotObservation::Missed,
@@ -211,6 +288,23 @@ fn routes(state: AppState) -> Router {
         )
         .route("/maintenance/{id}", delete(delete_window))
         .route("/incidents", get(list_incidents))
+        // Invites are minted inside the authed API — operator-only in the handler.
+        .route("/invites", post(create_invite))
+        // Roster and workspace API tokens (S1c): reads any member, writes owner-only —
+        // `member_for`/`owner_for` decide by the request's role, not by route table.
+        .route("/members", get(list_members).post(add_member))
+        .route(
+            "/members/{id}",
+            patch(set_member_role).delete(remove_member),
+        )
+        .route("/tokens", get(list_tokens).post(create_token))
+        .route("/tokens/{id}", delete(revoke_token))
+        // The workspace's own webhook (S1d, D-017): member work — the URL is
+        // SSRF-validated at save and revalidated inside every send.
+        .route(
+            "/workspace/webhook",
+            get(read_webhook).put(put_webhook).delete(delete_webhook),
+        )
         .route("/backup", post(backup))
         // Auth wraps the whole API: /livez, /readyz and static files stay open —
         // the dashboard must load to *hold* a token, and readiness is not a secret.
@@ -223,9 +317,10 @@ fn routes(state: AppState) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/version", get(version))
-        // Login/logout live outside the auth layer: a credential can't be required
-        // to earn a credential. Both enforce their own rules inside the handlers.
+        // Login/signup/logout live outside the auth layer: a credential can't be
+        // required to earn a credential. All enforce their own rules inside.
         .route("/api/login", post(login))
+        .route("/api/signup", post(signup))
         .route("/api/logout", post(logout))
         .nest("/api", api)
         .with_state(state)
@@ -243,6 +338,7 @@ struct ScheduleLock(Arc<tokio::sync::Mutex<()>>);
 /// the proposed set.
 async fn check_capacity(
     state: &AppState,
+    principal: &auth::Principal,
     change: impl FnOnce(&mut Vec<Monitor>),
 ) -> Result<(), ApiError> {
     let mut monitors = load_registry(&state.db).await?;
@@ -262,11 +358,22 @@ async fn check_capacity(
              at once. Lengthen intervals or shorten timeouts",
             schedule::MAX_GLOBAL_SLOTS
         ))),
-        Some(schedule::Overload::Origin { origin, per_tick }) => Err(ApiError::Capacity(format!(
-            "{origin} would need {per_tick:.1} probe starts a second; one origin gets at most {}. \
-             Lengthen the intervals of its monitors",
-            config.per_origin_slots
-        ))),
+        Some(schedule::Overload::Origin { origin, per_tick }) => {
+            // The origin name would tell a tenant about another tenant's targets —
+            // operators get it, accounts get the shape of the limit instead (D-020).
+            let detail = match principal {
+                auth::Principal::Operator { .. } => {
+                    format!("{origin} would need {per_tick:.1} probe starts a second")
+                }
+                auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
+                    "one origin would exceed its probe rate".to_owned()
+                }
+            };
+            Err(ApiError::Capacity(format!(
+                "{detail}; one origin gets at most {}. Lengthen the intervals of its monitors",
+                config.per_origin_slots
+            )))
+        }
     }
 }
 
@@ -329,7 +436,26 @@ async fn version(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 #[derive(Debug, Deserialize)]
 pub struct LoginBody {
-    pub token: String,
+    /// Operator sign-in (existing): the admin token. Exactly one of `token` or
+    /// (`email`, `password`) must be set — anything else is a malformed request.
+    pub token: Option<String>,
+    /// Account sign-in (S1b).
+    pub email: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SignupBody {
+    pub email: String,
+    pub password: String,
+    /// The invite code the operator handed out — shown once, stored only as a digest.
+    pub invite: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InviteBody {
+    /// Hours the code stays usable; default three days, hard bound thirty.
+    pub ttl_hours: Option<u64>,
 }
 
 /// Turn the admin token into a session: the browser presents the token once, the
@@ -358,6 +484,38 @@ async fn login(
             .into_response();
     }
 
+    let Some(guard) = extensions.get::<throttle::Guard>() else {
+        tracing::error!("invariant: routes() installs the credential guard");
+        return ApiError::Corrupt.into_response();
+    };
+    let attempt = match guard.throttle.admit(guard.client(&extensions, &headers)) {
+        Ok(attempt) => attempt,
+        Err(wait) => return throttle::too_many(wait),
+    };
+    let penalties = guard.penalties.clone();
+    if let Some(token) = body.token.as_deref() {
+        return login_operator(&state, token, &headers, attempt, &penalties).await;
+    }
+    let (Some(email), Some(password)) = (body.email.as_deref(), body.password.as_deref()) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": { "code": "invalid_request",
+                           "message": "send `token`, or `email` and `password`" }
+            })),
+        )
+            .into_response();
+    };
+    login_account(&state, email, password, &headers, attempt, &penalties).await
+}
+
+async fn login_operator(
+    state: &AppState,
+    token: &str,
+    headers: &axum::http::HeaderMap,
+    attempt: throttle::Attempt,
+    penalties: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Response {
     let Some(admin) = &state.admin_token else {
         // Tokenless dev mode has no credential to exchange — say so plainly.
         return (
@@ -369,21 +527,10 @@ async fn login(
         )
             .into_response();
     };
-    // Per-address guessing budget (throttle.rs): taken before the token is compared, so
-    // a throttled address can't learn whether a guess was right; a right token gives it
-    // back. Another address's flood never touches this one's budget.
-    let Some(guard) = extensions.get::<throttle::Guard>() else {
-        tracing::error!("invariant: routes() installs the credential guard");
-        return ApiError::Corrupt.into_response();
-    };
-    let attempt = match guard.throttle.admit(guard.client(&extensions, &headers)) {
-        Ok(attempt) => attempt,
-        Err(wait) => return throttle::too_many(wait),
-    };
-    if !auth::digests_match(body.token.as_bytes(), admin.as_bytes()) {
+    if !auth::digests_match(token.as_bytes(), admin.as_bytes()) {
         drop(attempt); // stays spent
         // A courtesy delay, bounded across all addresses; the buckets bound the rate.
-        if let Ok(_penalty) = guard.penalties.try_acquire() {
+        if let Ok(_penalty) = penalties.try_acquire() {
             tokio::time::sleep(WRONG_TOKEN_DELAY).await;
         }
         return (
@@ -417,23 +564,630 @@ async fn login(
                 "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
                 auth::SESSION_COOKIE,
                 state.session_ttl.as_secs(),
-                state.cookie_secure.attribute(&headers),
+                state.cookie_secure.attribute(headers),
             ),
         )],
     )
         .into_response()
 }
 
+/// Account sign-in (S1b): argon2id verify behind the password-work limit, the same
+/// per-address guessing budget, and the same cookie contract as the operator session —
+/// but the session row carries the account, so the request resolves its own workspace.
+async fn login_account(
+    state: &AppState,
+    email: &str,
+    password: &str,
+    headers: &axum::http::HeaderMap,
+    attempt: throttle::Attempt,
+    penalties: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Response {
+    let email = email.trim().to_ascii_lowercase();
+    let account = match state.db.account_by_email(&email).await {
+        Ok(row) => row,
+        Err(error) => return ApiError::Db(error).into_response(),
+    };
+    // Unknown address verifies against the dummy hash — same work, no existence oracle.
+    let hash = account
+        .as_ref()
+        .map_or(auth::DUMMY_LOGIN_HASH, |row| row.password_hash.as_str());
+    match auth::verify_password(hash, password, state.password_work_wait).await {
+        Ok(true) => {}
+        Ok(false) => {
+            drop(attempt);
+            if let Ok(_penalty) = penalties.try_acquire() {
+                tokio::time::sleep(WRONG_TOKEN_DELAY).await;
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": { "code": "unauthenticated", "message": "invalid credentials" }
+                })),
+            )
+                .into_response();
+        }
+        Err(auth::PasswordWorkError::Busy) => {
+            drop(attempt);
+            return password_busy();
+        }
+        Err(auth::PasswordWorkError::Hash(_)) => {
+            unreachable!("verification never hashes")
+        }
+    }
+    let Some(account) = account else {
+        // Dummy-hash path passed? A correct guess on a nonexistent address still has
+        // no account to sign into — same envelope as a wrong password.
+        drop(attempt);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": { "code": "unauthenticated", "message": "invalid credentials" }
+            })),
+        )
+            .into_response();
+    };
+    attempt.succeeded();
+    let Ok(account_id) = Uuid::parse_str(&account.id) else {
+        return ApiError::Corrupt.into_response();
+    };
+    let id = Uuid::new_v4().simple().to_string();
+    let now = (state.clock)();
+    let expires = now
+        + time::Duration::seconds(i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX));
+    if let Err(error) = state
+        .db
+        .create_account_session_at(
+            &auth::account_session_key(&id),
+            AccountId(account_id),
+            now,
+            expires,
+        )
+        .await
+    {
+        tracing::error!(%error, "account session insert failed");
+        return ApiError::Db(error).into_response();
+    }
+    (
+        StatusCode::NO_CONTENT,
+        [(
+            axum::http::header::SET_COOKIE,
+            format!(
+                "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+                auth::SESSION_COOKIE,
+                state.session_ttl.as_secs(),
+                state.cookie_secure.attribute(headers),
+            ),
+        )],
+    )
+        .into_response()
+}
+
+/// Mint an invite code (S1b): the operator asks, the code is shown once in this
+/// response, and the store only ever holds its digest — single-use and expiring.
+async fn create_invite(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<InviteBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    const MAX_TTL_HOURS: u64 = 24 * 30;
+    if !matches!(principal, auth::Principal::Operator { .. }) {
+        return Err(ApiError::Forbidden(
+            "invites are an operator operation".into(),
+        ));
+    }
+    let ttl_hours = body.ttl_hours.unwrap_or(72);
+    if ttl_hours == 0 || ttl_hours > MAX_TTL_HOURS {
+        return Err(ApiError::Invalid(format!(
+            "ttl_hours must be 1..={MAX_TTL_HOURS}"
+        )));
+    }
+    let code = format!("smon_inv_{}", Uuid::new_v4().simple());
+    let now = (state.clock)();
+    let expires = now + time::Duration::hours(i64::try_from(ttl_hours).unwrap_or(i64::MAX));
+    let row = state
+        .db
+        .create_invite(&auth::invite_key(&code), now, expires)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "invite": { "code": code, "expires_at": row.expires_at }
+        })),
+    ))
+}
+
+/// The roster as the API shows it — account id, email, role, when they joined.
+fn member_view(row: &monitor_db::MemberRow) -> Result<serde_json::Value, ApiError> {
+    let account = row.account().ok_or(ApiError::Corrupt)?;
+    let role = row.role().ok_or(ApiError::Corrupt)?;
+    Ok(serde_json::json!({
+        "account": account.0,
+        "email": row.email,
+        "role": role.as_str(),
+        "created_at": row.created_at,
+    }))
+}
+
+/// Token metadata as the API shows it — never the digest, and the secret itself only
+/// ever existed in the mint response.
+fn token_view(row: &monitor_db::ApiTokenRow) -> Result<serde_json::Value, ApiError> {
+    let token = row.token().ok_or(ApiError::Corrupt)?;
+    let role = row.role().ok_or(ApiError::Corrupt)?;
+    Ok(serde_json::json!({
+        "id": token.0,
+        "name": row.name,
+        "role": role.as_str(),
+        "created_at": row.created_at,
+        "revoked_at": row.revoked_at,
+        "last_used_at": row.last_used_at,
+    }))
+}
+
+/// The workspace roster — every member may read it (S1c).
+async fn list_members(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let members = viewer_for(&state, &principal)
+        .list_members()
+        .await?
+        .iter()
+        .map(member_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(serde_json::json!({ "members": members })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemberBody {
+    pub email: Option<String>,
+    pub role: Option<Role>,
+}
+
+/// Seat an existing account in this workspace at `role` — owner work (S1c). The email
+/// is normalized exactly like signup's; an unknown one is a 404, never a silent seat.
+async fn add_member(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<MemberBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let (Some(email), Some(role)) = (body.email, body.role) else {
+        return Err(ApiError::Invalid("email and role are required".into()));
+    };
+    let account = state
+        .db
+        .account_by_email(&email.trim().to_lowercase())
+        .await?
+        .ok_or_else(|| ApiError::Invalid("no account with that email".into()))?;
+    let id = Uuid::parse_str(&account.id).map_err(|_| ApiError::Corrupt)?;
+    view.add_member(AccountId(id), role, (state.clock)())
+        .await
+        .map_err(|e| match e {
+            QueryError::Invalid(msg) => ApiError::Conflict(msg),
+            other => ApiError::Db(other),
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "member": { "account": id, "email": account.email, "role": role.as_str() }
+        })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemberRoleBody {
+    pub role: Option<Role>,
+}
+
+/// Change a member's role. The last-owner rule lives in the store transaction — a
+/// demotion that would orphan the workspace comes back a conflict (S1c).
+async fn set_member_role(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<MemberRoleBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let account = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound)?;
+    let Some(role) = body.role else {
+        return Err(ApiError::Invalid("role is required".into()));
+    };
+    let changed = view
+        .set_member_role(AccountId(account), role)
+        .await
+        .map_err(|e| match e {
+            QueryError::Invalid(msg) => ApiError::Conflict(msg),
+            other => ApiError::Db(other),
+        })?;
+    if !changed {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(
+        serde_json::json!({ "member": { "account": account, "role": role.as_str() } }),
+    ))
+}
+
+/// Take a member's seat away — same last-owner guard as a demotion (S1c).
+async fn remove_member(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let account = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound)?;
+    let removed = view
+        .remove_member(AccountId(account))
+        .await
+        .map_err(|e| match e {
+            QueryError::Invalid(msg) => ApiError::Conflict(msg),
+            other => ApiError::Db(other),
+        })?;
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// This workspace's token metadata — owner-only: names and lifetimes are automation
+/// intel a member doesn't need (S1c).
+async fn list_tokens(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tokens = owner_for(&state, &principal)?
+        .list_api_tokens()
+        .await?
+        .iter()
+        .map(token_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(serde_json::json!({ "tokens": tokens })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenBody {
+    pub name: Option<String>,
+    pub role: Option<Role>,
+}
+
+/// Mint a workspace API token (S1c): the secret is shown once here and kept as a
+/// digest — same rule as invites. Tokens hold member or viewer, never owner: a
+/// credential must not administer the workspace that issued it.
+async fn create_token(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<TokenBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let (Some(name), Some(role)) = (body.name, body.role) else {
+        return Err(ApiError::Invalid("name and role are required".into()));
+    };
+    let name = name.trim().to_owned();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(ApiError::Invalid("name must be 1..=80 chars".into()));
+    }
+    if role == Role::Owner {
+        return Err(ApiError::Invalid(
+            "tokens hold member or viewer, never owner".into(),
+        ));
+    }
+    let created_by = match principal {
+        auth::Principal::Account { account, .. } => Some(account),
+        _ => None,
+    };
+    let secret = format!("smon_wst_{}", Uuid::new_v4().simple());
+    let row = view
+        .create_api_token(
+            &name,
+            role,
+            &auth::api_token_key(&secret),
+            created_by,
+            (state.clock)(),
+        )
+        .await?;
+    let mut view_json = token_view(&row)?;
+    view_json["secret"] = serde_json::Value::String(secret);
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "token": view_json })),
+    ))
+}
+
+/// Revoke a token: `revoked_at` stamps it dead and the row stays as history (S1c).
+async fn revoke_token(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let token = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound)?;
+    if !view
+        .revoke_api_token(ApiTokenId(token), (state.clock)())
+        .await?
+    {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The workspace's own webhook as members see it — URL and the signing secret a
+/// receiver verifies with. Viewer principals have no method for it (member work).
+async fn read_webhook(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let view = member_for(&state, &principal)?;
+    let webhook = view
+        .webhook()
+        .await?
+        .map(|row| serde_json::json!({ "url": row.url, "secret": row.secret }));
+    Ok(Json(serde_json::json!({ "webhook": webhook })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebhookBody {
+    pub url: String,
+}
+
+/// Store a tenant webhook (S1d, D-017): the URL passes the probe policy *and* the
+/// validating resolver before it lands — scheme, literal addresses, and every address
+/// the name currently resolves to. The send side re-runs the resolver on every
+/// attempt, so what is proven public today is re-proven before each POST.
+async fn put_webhook(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<WebhookBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let view = member_for(&state, &principal)?;
+    let url = url::Url::parse(&body.url).map_err(|_| ApiError::BadUrl)?;
+    check_webhook_target(&state, &url).await?;
+    let row = view.set_webhook(url.as_str()).await?;
+    Ok(Json(serde_json::json!({
+        "webhook": { "url": row.url, "secret": row.secret }
+    })))
+}
+
+/// Remove the workspace's webhook — pending `tenant_webhook` rows then fail their
+/// next attempt visibly (`no_target`) instead of being silently dropped.
+async fn delete_webhook(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<StatusCode, ApiError> {
+    let view = member_for(&state, &principal)?;
+    view.clear_webhook().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The D-017 save gate: scheme and literal checks, then a bounded DNS resolution —
+/// every returned address must be public, the same gate the send-time resolver runs.
+/// `Unresolvable` is its own message: a name that cannot resolve is not proof of
+/// a public target, but it isn't a policy refusal either.
+async fn check_webhook_target(state: &AppState, url: &url::Url) -> Result<(), ApiError> {
+    let policy = probe::ProbePolicy {
+        allow_local_targets: state.allow_local_targets,
+        extra_roots: Vec::new(),
+    };
+    match policy.check_resolved(url).await {
+        Ok(()) => Ok(()),
+        Err(probe::Rejected::Unresolvable) => Err(ApiError::Invalid(
+            "the webhook host did not resolve to a public address".into(),
+        )),
+        Err(_) => Err(ApiError::RefusedTarget),
+    }
+}
+
+/// One 422 shape answer for every malformed signup field.
+fn signup_invalid(message: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "error": { "code": "invalid_request", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+/// 503 for a full password-work queue: `busy` + Retry-After — the client may retry in
+/// a moment; the API is not down, only the hashing slots are.
+fn password_busy() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": { "code": "busy",
+                       "message": "too many sign-ins in flight; retry in a moment" }
+        })),
+    )
+        .into_response()
+}
+
+/// One 403 for every unusable code — unknown, spent and expired read the same.
+fn invite_denied(attempt: throttle::Attempt) -> Response {
+    drop(attempt);
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": { "code": "invalid_invite",
+                       "message": "invite code is invalid or expired" }
+        })),
+    )
+        .into_response()
+}
+
+/// The field-shape gate before anything is looked up; the normalized email is what
+/// persists (lowercase, trimmed — `accounts.email` is UNIQUE on that form). `Err` is
+/// the message the 422 carries.
+fn check_signup_fields(body: &SignupBody) -> Result<String, &'static str> {
+    let email = body.email.trim().to_ascii_lowercase();
+    if !email.contains('@') || email.len() > 254 {
+        return Err("`email` must be an email address");
+    }
+    if body.password.len() < 8 || body.password.len() > 256 {
+        return Err("`password` must be 8..=256 characters");
+    }
+    if body.invite.is_empty() || body.invite.len() > 128 {
+        return Err("`invite` is required");
+    }
+    Ok(email)
+}
+
+/// The workspace and account a valid signup mints. The slug derives from the email's
+/// local part plus account-id entropy, so two signups can't collide on it.
+fn new_account(email: &str, password_hash: String) -> monitor_db::NewAccount {
+    let local = email.split('@').next().unwrap_or("ws");
+    let slug_base: String = local
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(20)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let id = AccountId::new();
+    monitor_db::NewAccount {
+        id,
+        workspace: monitor_domain::WorkspaceId::new(),
+        workspace_slug: format!(
+            "{}-{}",
+            if slug_base.is_empty() {
+                "ws"
+            } else {
+                &slug_base
+            },
+            &id.0.simple().to_string()[..6]
+        ),
+        workspace_name: email.to_owned(),
+        email: email.to_owned(),
+        password_hash,
+    }
+}
+
+/// Invite-gated signup (S1b): a valid, unused, unexpired code mints a workspace and an
+/// account in one store transaction. The invite is consumed atomically, so two signups
+/// racing one code get one account; unknown, used and expired all read the same 403.
+async fn signup(
+    State(state): State<AppState>,
+    extensions: axum::http::Extensions,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SignupBody>,
+) -> Response {
+    // Same CSRF rule as login: Origin, when sent, must match the Host.
+    let authority = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN)
+        && !auth::origin_matches_host(origin, authority)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": { "code": "origin_mismatch", "message": "Origin does not match Host" }
+            })),
+        )
+            .into_response();
+    }
+    let Some(guard) = extensions.get::<throttle::Guard>() else {
+        tracing::error!("invariant: routes() installs the credential guard");
+        return ApiError::Corrupt.into_response();
+    };
+    let attempt = match guard.throttle.admit(guard.client(&extensions, &headers)) {
+        Ok(attempt) => attempt,
+        Err(wait) => return throttle::too_many(wait),
+    };
+    let email = match check_signup_fields(&body) {
+        Ok(email) => email,
+        Err(message) => {
+            drop(attempt);
+            return signup_invalid(message);
+        }
+    };
+    let digest = auth::invite_key(&body.invite);
+    let invite = match state.db.invite_by_digest(&digest).await {
+        Ok(Some(row)) if auth::digests_match(digest.as_bytes(), row.code_digest.as_bytes()) => row,
+        Ok(_) => return invite_denied(attempt),
+        Err(error) => return ApiError::Db(error).into_response(),
+    };
+    // Used and expired deny the same as unknown — before the email check can say
+    // anything else, so a spent code never reads differently than a forged one.
+    if invite.used_at.is_some() || invite.expires_at <= (state.clock)() {
+        return invite_denied(attempt);
+    }
+    // A taken email is told before the invite burns — the invite stays spendable.
+    match state.db.account_by_email(&email).await {
+        Ok(Some(_)) => {
+            drop(attempt);
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": { "code": "conflict", "message": "email is already registered" }
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(error) => return ApiError::Db(error).into_response(),
+    }
+    let password_hash = match auth::hash_password(&body.password, state.password_work_wait).await {
+        Ok(hash) => hash,
+        Err(auth::PasswordWorkError::Busy) => {
+            drop(attempt);
+            return password_busy();
+        }
+        Err(auth::PasswordWorkError::Hash(error)) => {
+            tracing::error!(%error, "password hashing failed");
+            return ApiError::Corrupt.into_response();
+        }
+    };
+    let new = new_account(&email, password_hash);
+    match state.db.signup(&invite.id, &new, (state.clock)()).await {
+        Ok(_) => {
+            attempt.succeeded();
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "account": {
+                        "id": new.id.0,
+                        "email": email,
+                        "workspace": new.workspace.0,
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(QueryError::Invalid(message))
+            if message.contains("email") || message.contains("slug") =>
+        {
+            drop(attempt);
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": { "code": "conflict", "message": message }
+                })),
+            )
+                .into_response()
+        }
+        Err(QueryError::Invalid(_)) => invite_denied(attempt),
+        Err(error) => ApiError::Db(error).into_response(),
+    }
+}
+
 /// Delete the session row and expire the cookie. Idempotent — clearing an already-gone
 /// session answers the same way, so a browser can always reset its own state.
 async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
     // Tokenless dev mode never issues sessions, so there is no row to delete.
-    if let Some(id) = auth::session_cookie(headers.get(axum::http::header::COOKIE))
-        && let Some(admin) = &state.admin_token
-        && let Err(error) = state.db.delete_session(&auth::session_key(admin, id)).await
-    {
-        tracing::error!(%error, "session delete failed");
-        return ApiError::Db(error).into_response();
+    if let Some(id) = auth::session_cookie(headers.get(axum::http::header::COOKIE)) {
+        if let Some(admin) = &state.admin_token
+            && let Err(error) = state.db.delete_session(&auth::session_key(admin, id)).await
+        {
+            tracing::error!(%error, "session delete failed");
+            return ApiError::Db(error).into_response();
+        }
+        if let Err(error) = state
+            .db
+            .delete_session(&auth::account_session_key(id))
+            .await
+        {
+            tracing::error!(%error, "account session delete failed");
+            return ApiError::Db(error).into_response();
+        }
     }
     (
         StatusCode::NO_CONTENT,
@@ -514,9 +1268,12 @@ struct MonitorView {
 /// The monitor list carries the engine verdict alongside it (`monitoring`), read once so
 /// the statuses and the verdict can't disagree: while the engine is not observing, every
 /// status is `unknown` — the last committed value is history, not current evidence.
-async fn list_monitors(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn list_monitors(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let verdict = state.vitals.verdict();
-    let rows = state.db.list_monitors().await?;
+    let rows = viewer_for(&state, &principal).list_monitors().await?;
     let monitors: Vec<MonitorView> = rows
         .into_iter()
         .map(|row| view_from_row(row, &state.statuses, verdict.observing()))
@@ -529,9 +1286,10 @@ async fn list_monitors(State(state): State<AppState>) -> Result<Json<serde_json:
 
 async fn get_monitor(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<MonitorView>, ApiError> {
-    let row = find_monitor(&state, &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     Ok(Json(view_from_row(
         row,
         &state.statuses,
@@ -553,8 +1311,10 @@ pub struct CreateMonitor {
 async fn create_monitor(
     State(state): State<AppState>,
     axum::Extension(lock): axum::Extension<ScheduleLock>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Json(input): Json<CreateMonitor>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let view = member_for(&state, &principal)?;
     let url = url::Url::parse(&input.url).map_err(|_| ApiError::BadUrl)?;
     let new = match (input.interval_s, input.timeout_s) {
         (None, None) => NewMonitor::new(input.name, url),
@@ -576,11 +1336,13 @@ async fn create_monitor(
             )
             .map_err(ApiError::Validation)?,
     };
-    let monitor = new.into_monitor();
+    let monitor = new.into_monitor_for(principal.workspace());
     let _schedule = lock.0.lock().await;
-    check_capacity(&state, |monitors| monitors.push(monitor.clone())).await?;
-    if !state
-        .db
+    check_capacity(&state, &principal, |monitors| {
+        monitors.push(monitor.clone());
+    })
+    .await?;
+    if !view
         .insert_monitor_within(&monitor, state.max_monitors)
         .await?
     {
@@ -613,10 +1375,12 @@ pub struct PatchMonitor {
 async fn patch_monitor(
     State(state): State<AppState>,
     axum::Extension(lock): axum::Extension<ScheduleLock>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
     Json(input): Json<PatchMonitor>,
 ) -> Result<Json<MonitorView>, ApiError> {
-    let row = find_monitor(&state, &id).await?;
+    let view = member_for(&state, &principal)?;
+    let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     if input
         .generation
@@ -644,14 +1408,13 @@ async fn patch_monitor(
     }
     let merged = patch.apply(&monitor).map_err(ApiError::Validation)?;
     let _schedule = lock.0.lock().await;
-    check_capacity(&state, |monitors| {
+    check_capacity(&state, &principal, |monitors| {
         for stored in monitors.iter_mut().filter(|stored| stored.id == merged.id) {
             *stored = merged.clone();
         }
     })
     .await?;
-    if state
-        .db
+    if view
         .update_monitor(&merged, monitor.generation)
         .await?
         .is_none()
@@ -661,7 +1424,7 @@ async fn patch_monitor(
         ));
     }
     publish_registry(&state).await?;
-    let row = find_monitor(&state, &id).await?;
+    let row = find_monitor(&view, &id).await?;
     Ok(Json(view_from_row(
         row,
         &state.statuses,
@@ -673,11 +1436,13 @@ async fn patch_monitor(
 /// checks and incidents are the record; pause stops monitoring without erasing it.
 async fn delete_monitor(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let row = find_monitor(&state, &id).await?;
+    let view = member_for(&state, &principal)?;
+    let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    if !state.db.delete_monitor(monitor.id).await? {
+    if !view.delete_monitor(monitor.id).await? {
         return Err(ApiError::Conflict(
             "monitor has recorded history; pause it instead".into(),
         ));
@@ -735,13 +1500,13 @@ impl From<CheckRow> for CheckView {
 /// of the record, not something the API hides.
 async fn list_checks(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row = find_monitor(&state, &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    let checks = state
-        .db
+    let checks = viewer_for(&state, &principal)
         .list_checks(monitor.id, bounded_limit(params.limit, 50, 500))
         .await?;
     let checks: Vec<CheckView> = checks.into_iter().map(CheckView::from).collect();
@@ -776,10 +1541,11 @@ struct StatsView {
 
 async fn monitor_stats(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
     Query(params): Query<StatsParams>,
 ) -> Result<Json<StatsView>, ApiError> {
-    let row = find_monitor(&state, &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     let created_at = row.created_at;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     let window_s = params
@@ -798,7 +1564,9 @@ async fn monitor_stats(
     };
     let elapsed = u64::try_from((now - window_start).whole_seconds().max(0)).unwrap_or(0);
     let expected = elapsed / monitor.interval.as_secs().max(1);
-    let mut counts = state.db.check_stats(monitor.id, since).await?;
+    let mut counts = viewer_for(&state, &principal)
+        .check_stats(monitor.id, since)
+        .await?;
     counts.expected = expected;
     Ok(Json(StatsView {
         window_s,
@@ -895,16 +1663,17 @@ pub struct CreateWindow {
 /// so a new window suppresses starting with the *next* slot — never retroactively.
 async fn create_window(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
     Json(input): Json<CreateWindow>,
 ) -> Result<(StatusCode, Json<MaintenanceView>), ApiError> {
-    let row = find_monitor(&state, &id).await?;
+    let view = member_for(&state, &principal)?;
+    let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     if input.ends_at <= input.starts_at {
         return Err(ApiError::Invalid("ends_at must be after starts_at".into()));
     }
-    let created = state
-        .db
+    let created = view
         .create_window(
             monitor.id,
             input.starts_at,
@@ -927,13 +1696,13 @@ async fn create_window(
 
 async fn list_windows(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row = find_monitor(&state, &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     let now = OffsetDateTime::now_utc();
-    let windows: Vec<MaintenanceView> = state
-        .db
+    let windows: Vec<MaintenanceView> = viewer_for(&state, &principal)
         .list_windows(monitor.id)
         .await?
         .into_iter()
@@ -946,10 +1715,11 @@ async fn list_windows(
 /// nonexistent window is a 404, not a silent success.
 async fn delete_window(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let id: i64 = id.parse().map_err(|_| ApiError::NotFound)?;
-    if !state.db.delete_window(id).await? {
+    if !member_for(&state, &principal)?.delete_window(id).await? {
         return Err(ApiError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -959,6 +1729,7 @@ async fn delete_window(
 /// filter; a bogus state value is a bad request, not silently "all".
 async fn list_incidents(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Query(params): Query<IncidentParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let monitor_id = params
@@ -972,8 +1743,7 @@ async fn list_incidents(
         Some("resolved") => Some("resolved"),
         Some(_) => return Err(ApiError::BadId),
     };
-    let incidents = state
-        .db
+    let incidents = viewer_for(&state, &principal)
         .list_incidents(
             monitor_id,
             state_filter,
@@ -1007,8 +1777,16 @@ fn backup_stamp(now: OffsetDateTime) -> String {
 /// (the suffix is 32 random bits per draw); after three, something else is wrong.
 async fn backup(
     State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
     Json(input): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // The backup holds every workspace's rows — it is operator infrastructure (D-019),
+    // never something a tenant credential may pull.
+    if !matches!(principal, auth::Principal::Operator { .. }) {
+        return Err(ApiError::Forbidden(
+            "backups are an operator operation".into(),
+        ));
+    }
     if !input.as_object().is_some_and(serde_json::Map::is_empty) {
         return Err(ApiError::Invalid(
             "POST an empty object — backups land in SMON_BACKUP_DIR under a \
@@ -1037,14 +1815,10 @@ async fn backup(
     Err(ApiError::Corrupt)
 }
 
-async fn find_monitor(state: &AppState, id: &str) -> Result<MonitorRow, ApiError> {
+async fn find_monitor(view: &monitor_db::ViewerDb<'_>, id: &str) -> Result<MonitorRow, ApiError> {
     let id = Uuid::parse_str(id).map_err(|_| ApiError::NotFound)?;
-    state
-        .db
-        .list_monitors()
+    view.monitor_row(MonitorId(id))
         .await?
-        .into_iter()
-        .find(|row| row.id == id.to_string())
         .ok_or(ApiError::NotFound)
 }
 
@@ -1093,6 +1867,8 @@ pub enum ApiError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error("monitor limit reached ({0}); delete an unused monitor first")]
     LimitReached(u64),
     /// D-018: the schedule, with this write, is more than the coordinator can start.
@@ -1124,6 +1900,7 @@ impl ApiError {
                 "invalid_request"
             }
             Self::Conflict(_) => "conflict",
+            Self::Forbidden(_) => "forbidden",
             Self::LimitReached(_) => "limit_reached",
             Self::Capacity(_) => "capacity_exceeded",
             Self::RefusedTarget => "refused_target",
@@ -1141,6 +1918,7 @@ impl ApiError {
             | Self::Validation(_)
             | Self::Invalid(_)
             | Self::RefusedTarget => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) | Self::LimitReached(_) | Self::Capacity(_) => StatusCode::CONFLICT,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

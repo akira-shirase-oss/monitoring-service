@@ -10,6 +10,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use monitor_db::Db;
+use monitor_domain::WorkspaceId;
 use tower::ServiceExt;
 
 const TOKEN: &str = "limits-token-0123456789abcdef0123456789ab";
@@ -30,6 +31,8 @@ async fn app() -> anyhow::Result<(axum::Router, Db, tempfile::TempDir)> {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::ZERO,
         session_idle: Duration::from_hours(1),
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -110,7 +113,12 @@ async fn an_oversized_authed_write_is_413_and_stores_nothing() -> anyhow::Result
         )
         .await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(db.list_monitors().await?.is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 

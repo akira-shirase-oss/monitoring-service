@@ -2,6 +2,29 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-021 — Public status pages live at `/s/<workspace-slug>` on the same origin
+
+One page per workspace, served from the monitor's own origin — no wildcard DNS, no
+per-workspace certificate, nothing new for the Caddyfile to know. Subdomains stay
+possible later if asked for; nothing about `/s/` forecloses them. The slug is
+workspace data and therefore workspace-scoped like everything else (D-020).
+Closes SAAS_PLAN open question 2.
+
+## D-020 — Accounts, workspaces, members and tokens live in the same SQLite store
+
+SAAS_PLAN open question 1 — Neon for account records — is closed: **no second
+database**. Accounts, workspaces, members and API tokens join monitors, checks,
+incidents and the outbox in the one SQLite store the product already has. The
+engine never depends on a network database (a Neon outage can no longer stop
+anything), the product stays self-contained and self-hostable as a single
+binary plus a volume, and the existing backup endpoint and restore drill cover
+account records with the same evidence path — nothing new to back up, encrypt or
+restore. The cost carried on the record: no managed, multi-AZ database for
+account data; the volume snapshot story (`smon-backup.sh` → age → R2) is the
+whole story, and it is already drilled. Every tenant-owned row carries
+`workspace_id`; the store API takes a `WorkspaceId` so an unscoped query cannot
+compile.
+
 ## D-019 — Backups are confined to `SMON_BACKUP_DIR` under server-drawn names
 
 `POST /api/backup` took an absolute `path` — a write-anywhere primitive the admin token's
@@ -62,11 +85,33 @@ for a self-hosted monitor: only the operator writes `env`, they can reach those 
 anyway, and an internal alert relay is a normal receiver — so it is not a privilege
 boundary today.
 
-It becomes one the moment someone other than the operator can set a webhook URL. **Before
-tenants can (SaaS S1/S2, per-workspace alert channels), this is a P0 gate:** a tenant's
-URL goes through `ProbePolicy` and the validating resolver when it is saved and again at
-every send, with no redirects, exactly as a probe target does (docs/SAAS_PLAN.md, Alert
-channels).
+It becomes one the moment someone other than the operator can set a webhook URL — and it
+became one at S1d, when workspaces gained their own channels (`workspaces.webhook_url` /
+`webhook_secret`, the `tenant_webhook` outbox channel, `PUT /api/workspace/webhook`).
+The gate is built exactly as the paragraph above demanded:
+
+- **At save:** `ProbePolicy::check_resolved` — the scheme/literal check, then a bounded
+  lookup where every returned address must be public. A name that cannot be resolved is
+  refused (`invalid_request`); an unproven host is not a proven-public host.
+- **At every send:** the deliverer re-parses the row's URL, re-runs `check` for scheme
+  and literal (reqwest never consults DNS for an IP literal, so the literal gate is the
+  only thing between one and a socket), and lets the strict client re-resolve through
+  `PolicyResolver` — validation *is* the resolution, so there is no check/connect TOCTOU
+  and a name rebound to a private address is refused inside the connect.
+- **The strict client:** no proxy, no redirects (a 3xx is a failed `http_3xx` attempt,
+  never a followed hop), the shared per-attempt `attempt_deadline`, and the response
+  body is never read — the size cap is literal zero bytes.
+- **Refusals are evidence:** a send-time refusal is committed on the row as
+  `notify_outbox.last_error`, the probe taxonomy's stable words (`rejected_local`,
+  `rejected_scheme`, …) — never a URL, header or error string. Success clears it.
+
+**Scope: this guard applies to tenant URLs only.** The operator's own global channels
+(`webhook` from `SMON_WEBHOOK_URL`, `email` from `SMON_SMTP_*`) keep today's behaviour —
+operator configuration is not a privilege boundary. Pinned by
+`tenant_send_refuses_every_blocked_literal`,
+`a_rebound_name_is_refused_inside_the_connect_and_recorded`,
+`a_redirect_to_a_private_address_is_never_followed` (deliver.rs) and the save-gate
+matrix in `tests/webhooks.rs`.
 
 ## D-016 — Session rows hold a token-bound digest, never the cookie's id
 

@@ -217,7 +217,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         vitals.clone(),
         admin_token,
     );
-    let app = assemble(state, &config).await?;
+    let app = assemble_app(state, &config, &supervisor, &shutdown).await?;
 
     // Install the stop signals before serving: a registration failure is a boot error,
     // not a detached panic that would look like a clean shutdown (rust-mastery ch. 12).
@@ -338,6 +338,8 @@ fn app_state(
         admin_token,
         session_ttl: config.session_ttl,
         session_idle: config.session_idle,
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
         backup_dir: config.backup_dir.clone(),
@@ -563,6 +565,53 @@ fn spawn_retention(
     })
 }
 
+/// API-token last-used stamps (S1c): the auth path records them in `state.token_use`;
+/// every `TOKEN_USE_FLUSH` this lands the batch in one transaction — and once more at
+/// shutdown, so a restart loses at most the in-flight window.
+const TOKEN_USE_FLUSH: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn spawn_token_flusher(
+    state: &monitor_server::AppState,
+    shutdown: &CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(TOKEN_USE_FLUSH);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => {}
+                () = shutdown.cancelled() => break,
+            }
+            match monitor_server::flush_token_uses(&state).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(stamps = n, "flushed token last-used stamps"),
+                Err(error) => tracing::error!(%error, "token last-used flush failed"),
+            }
+        }
+        if let Err(error) = monitor_server::flush_token_uses(&state).await {
+            tracing::error!(%error, "final token last-used flush failed");
+        }
+    })
+}
+
+/// The HTTP tree plus the supervisor-owned last-used flusher (S1c): token stamps batch
+/// in `state.token_use` — a write per request would put SQLite on every call's hot path.
+async fn assemble_app(
+    state: monitor_server::AppState,
+    config: &Config,
+    supervisor: &Supervisor,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<axum::Router> {
+    supervisor.watch(
+        "token_use",
+        Role::Supporting,
+        spawn_token_flusher(&state, shutdown),
+    );
+    assemble(state, config).await
+}
+
 /// SIGTERM (systemd, launchd, `kill`) and SIGINT (Ctrl-C) mean the same thing: stop. Both
 /// are registered here, before the server starts; the returned future resolves with the
 /// signal's name.
@@ -632,6 +681,24 @@ fn spawn_deliverers(
         );
         supervisor.watch("email deliverer", Role::Supporting, email_deliverer);
     }
+    // Tenant webhooks (D-017) always run — rows exist only while a workspace keeps a
+    // webhook configured, so the loop is an idle poll when none does. The strict
+    // client inside re-validates DNS at every send; `lab` admits loopback receivers
+    // for fixtures and drills.
+    let tenant_deliverer = Deliverer::spawn(
+        db.clone(),
+        writer.clone(),
+        DelivererConfig::default(),
+        Sink::TenantWebhook {
+            resolver: monitor_server::probe::PolicyResolver::new(config.lab),
+        },
+        shutdown.clone(),
+    );
+    supervisor.watch(
+        "tenant webhook deliverer",
+        Role::Supporting,
+        tenant_deliverer,
+    );
 }
 
 /// The email alert channel (M7.1): `SMON_SMTP_DSN` selects the relay — prefer

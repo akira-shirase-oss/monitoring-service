@@ -1,0 +1,47 @@
+{
+  "run": {
+    "commit": "ed0d854",
+    "machine": "Darwin arm64",
+    "started": "2026-11-19T12:27:05.216Z",
+    "duration_s": 90,
+    "monitors": 100,
+    "interval_s": 15,
+    "timeout_s": 3,
+    "registered_ms": 65,
+    "bin": "release",
+    "mix": "ok",
+    "origins": 9,
+    "loadavg_before": null,
+    "loadavg_after": null
+  },
+  "checks": {
+    "total": 591,
+    "by_outcome": {
+      "pass": 591
+    },
+    "error_bps": 0
+  },
+  "commit_lag_ms": {
+    "all": {
+      "p50": 553,
+      "p95": 1421,
+      "max": 1999
+    },
+    "ok_targets": {
+      "p50": 553,
+      "p95": 1421,
+      "max": 1999
+    }
+  },
+  "incidents": [],
+  "outbox_rows": [],
+  "outbox_pending_max": 0,
+  "sink_hits": 0,
+  "db_bytes": 212992,
+  "log_bytes": 1986,
+  "rss_kb": {
+    "first": null,
+    "last": null,
+    "max": 0
+  }
+}

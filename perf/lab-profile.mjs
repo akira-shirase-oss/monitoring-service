@@ -79,14 +79,21 @@ const sqlite = (sql) =>
 	execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim() || '[]';
 
 function commit() {
-	try {
-		return execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
-			cwd: ROOT,
-			encoding: 'utf8',
-		}).trim();
-	} catch {
-		return 'unknown';
-	}
+	// SMON_COMMIT overrides the recorded hash for A/B runs against a staged binary —
+	// the label must tell the truth about what actually ran.
+	return (
+		process.env.SMON_COMMIT ??
+		(() => {
+			try {
+				return execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+					cwd: ROOT,
+					encoding: 'utf8',
+				}).trim();
+			} catch {
+				return 'unknown';
+			}
+		})()
+	);
 }
 
 // sysctl is denied in some sandboxes; the average is run metadata, so a run degrades to null.

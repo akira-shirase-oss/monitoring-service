@@ -19,6 +19,7 @@ monitor-db = { path = "crates/monitor-db" }
 # External crates: versions live here only (rust-mastery chapter 15). Minimal features;
 # one async runtime (Tokio); rustls is the one TLS stack.
 anyhow = "1.0.104"
+argon2 = "0.6"
 axum = "0.8.9"
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
 hmac = "0.13.0"
