@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use monitor_db::{Db, Observation, RetentionPolicy, WriteHealth, WriteOutcome, writer};
+use monitor_db::{
+    Db, Observation, QueryError, RetentionPolicy, WriteHealth, WriteOutcome, writer,
+};
 use monitor_domain::{
     CheckOutcome, Effect, Health, Monitor, MonitorId, NewMonitor, SlotObservation, Status,
     WorkspaceId,
@@ -1936,5 +1938,71 @@ async fn a_pooled_write_waits_out_a_held_write_lock() -> anyhow::Result<()> {
     );
     sqlx::query("COMMIT").execute(&mut holder).await?;
     writer.await??;
+    Ok(())
+}
+
+/// S1b store contract: `signup` consumes its invite atomically — the workspace, the
+/// account and the spent marker land together or not at all, and one code mints one
+/// account even when raced. `used_by` naming the new account is what forced the consume
+/// to run after the inserts (SQLite FKs are per-statement).
+#[tokio::test]
+async fn a_signup_consumes_its_invite_atomically() -> anyhow::Result<()> {
+    let (db, _, _) = store().await?;
+    let now = OffsetDateTime::now_utc();
+    let invite = db
+        .create_invite("digest-x", now, now + time::Duration::days(1))
+        .await?;
+    let account = monitor_db::NewAccount {
+        id: monitor_domain::AccountId::new(),
+        workspace: WorkspaceId::new(),
+        workspace_slug: "acme-123".into(),
+        workspace_name: "acme".into(),
+        email: "a@b.c".into(),
+        password_hash: "phc".into(),
+    };
+    let row = db.signup(&invite.id, &account, now).await?;
+    assert_eq!(row.email, "a@b.c");
+    assert_eq!(db.list_workspaces().await?.len(), 2, "default + account's");
+    let spent = db.invite_by_digest("digest-x").await?.expect("invite row");
+    assert!(spent.used_at.is_some() && spent.used_by.as_deref() == Some(row.id.as_str()));
+
+    // Spent: a second signup carrying the same code (different account ids, different
+    // email) is refused — and no second workspace appears.
+    let mut retry_account = account.clone();
+    retry_account.id = monitor_domain::AccountId::new();
+    retry_account.workspace = WorkspaceId::new();
+    retry_account.workspace_slug = "retry-1".into();
+    retry_account.email = "retry@b.c".into();
+    let retry = db.signup(&invite.id, &retry_account, now).await;
+    assert!(matches!(retry, Err(QueryError::Invalid(_))));
+    assert_eq!(db.list_workspaces().await?.len(), 2);
+
+    // Expired and forged ids are the same refusal; and a fresh invite raced by two
+    // signups mints exactly one account (the store's WHERE used_at IS NULL decides).
+    let dead = db
+        .create_invite(
+            "digest-dead",
+            now - time::Duration::days(2),
+            now - time::Duration::days(1),
+        )
+        .await?;
+    let mut second = account.clone();
+    second.id = monitor_domain::AccountId::new();
+    second.workspace = WorkspaceId::new();
+    second.workspace_slug = "other-1".into();
+    second.email = "b@b.c".into();
+    assert!(matches!(
+        db.signup(&dead.id, &second, now).await,
+        Err(QueryError::Invalid(_))
+    ));
+    let fresh = db
+        .create_invite("digest-y", now, now + time::Duration::days(1))
+        .await?;
+    let (won, lost) = (
+        db.signup(&fresh.id, &second, now).await,
+        db.signup(&fresh.id, &second, now).await,
+    );
+    assert!(won.is_ok());
+    assert!(matches!(lost, Err(QueryError::Invalid(_))));
     Ok(())
 }

@@ -14,8 +14,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use monitor_domain::{
-    CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation, Thresholds,
-    WorkspaceId,
+    AccountId, CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation,
+    Thresholds, WorkspaceId,
 };
 
 pub mod writer;
@@ -557,6 +557,225 @@ impl Db {
         .await
         .map_err(Into::into)
     }
+
+    /// Persist an invite: the row keeps the code's digest, never the code — the plaintext
+    /// is only ever in the response that showed it once (S1b).
+    pub async fn create_invite(
+        &self,
+        code_digest: &str,
+        now: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<InviteRow, QueryError> {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO invites (id, code_digest, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(code_digest)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        self.invite_by_digest(code_digest)
+            .await?
+            .ok_or_else(|| QueryError::Invalid("invite row missing after insert".into()))
+    }
+
+    /// The invite row behind a presented code's digest.
+    pub async fn invite_by_digest(
+        &self,
+        code_digest: &str,
+    ) -> Result<Option<InviteRow>, QueryError> {
+        sqlx::query_as::<_, InviteRow>(
+            "SELECT id, code_digest, created_at, expires_at, used_at, used_by
+               FROM invites WHERE code_digest = ?",
+        )
+        .bind(code_digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Signup: consume the invite and create the account's workspace and account in one
+    /// transaction (D-020 — the invite either mints a whole account or nothing). The
+    /// consume is `WHERE used_at IS NULL AND expires_at > now`, so a code raced by two
+    /// signups is won once; the loser sees the same "invalid" as an unknown code.
+    pub async fn signup(
+        &self,
+        invite_id: &str,
+        account: &NewAccount,
+        now: OffsetDateTime,
+    ) -> Result<AccountRow, QueryError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO workspaces (id, slug, name, created_at) VALUES (?, ?, ?, ?)")
+            .bind(account.workspace.0.to_string())
+            .bind(&account.workspace_slug)
+            .bind(&account.workspace_name)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                if let sqlx::Error::Database(db) = &e
+                    && db.is_unique_violation()
+                {
+                    return QueryError::Invalid("workspace slug is already taken".into());
+                }
+                QueryError::Sql(e)
+            })?;
+        sqlx::query(
+            "INSERT INTO accounts (id, workspace_id, email, password_hash, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(account.id.0.to_string())
+        .bind(account.workspace.0.to_string())
+        .bind(&account.email)
+        .bind(&account.password_hash)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db) = &e
+                && db.is_unique_violation()
+            {
+                return QueryError::Invalid("email is already registered".into());
+            }
+            QueryError::Sql(e)
+        })?;
+        // The account row must exist before `used_by` may name it (SQLite enforces the
+        // FK per-statement, not at commit) — the consume is last, still atomic.
+        let consumed = sqlx::query(
+            "UPDATE invites SET used_at = ?, used_by = ?
+             WHERE id = ? AND used_at IS NULL AND expires_at > ?",
+        )
+        .bind(now)
+        .bind(account.id.0.to_string())
+        .bind(invite_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() == 0 {
+            return Err(QueryError::Invalid(
+                "invite code is invalid or expired".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(AccountRow {
+            id: account.id.0.to_string(),
+            workspace_id: account.workspace.0.to_string(),
+            email: account.email.clone(),
+            password_hash: account.password_hash.clone(),
+            created_at: now,
+        })
+    }
+
+    /// An account row by its normalized email — the sign-in lookup. `password_hash` is
+    /// the argon2id PHC string; it never leaves the store's caller.
+    pub async fn account_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<AccountRow>, QueryError> {
+        sqlx::query_as::<_, AccountRow>(
+            "SELECT id, workspace_id, email, password_hash, created_at
+               FROM accounts WHERE email = ?",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// An account session: same expiry/idle/refresh rule as operator sessions (D-016),
+    /// keyed by the account-session digest and joined to the owning workspace so the
+    /// request resolves its tenancy without a second lookup.
+    pub async fn create_account_session_at(
+        &self,
+        key: &str,
+        account: AccountId,
+        now: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<(), QueryError> {
+        sqlx::query(
+            "INSERT INTO sessions (id, account_id, created_at, expires_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(key)
+        .bind(account.0.to_string())
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The account + workspace behind a valid account-session key, or `None` — expired
+    /// and idle rows are deleted on sight, same as `session_valid_at`.
+    pub async fn account_session_at(
+        &self,
+        key: &str,
+        now: OffsetDateTime,
+        idle: std::time::Duration,
+    ) -> Result<Option<(AccountId, WorkspaceId)>, QueryError> {
+        let Some(row) = self.session_row_at(key, now, idle).await? else {
+            return Ok(None);
+        };
+        let Some(account_id) = row.account_id else {
+            return Ok(None); // an operator session can't be claimed as an account's
+        };
+        let workspace: Option<String> = sqlx::query_scalar(
+            "SELECT workspace_id FROM accounts WHERE id = ?",
+        )
+        .bind(&account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let (Some(account), Some(ws)) = (
+            Uuid::parse_str(&account_id).ok(),
+            workspace.and_then(|w| Uuid::parse_str(&w).ok()),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some((AccountId(account), WorkspaceId(ws))))
+    }
+
+    /// The shared expiry/idle/refresh core for `session_valid_at` and
+    /// `account_session_at` — one rule, read by two callers.
+    async fn session_row_at(
+        &self,
+        key: &str,
+        now: OffsetDateTime,
+        idle: std::time::Duration,
+    ) -> Result<Option<SessionRow>, QueryError> {
+        let row: Option<SessionRow> = sqlx::query_as(
+            "SELECT id, account_id, created_at, expires_at, last_seen_at
+               FROM sessions WHERE id = ?",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let idle = time::Duration::try_from(idle).unwrap_or(time::Duration::MAX);
+        let unused = now - row.last_seen_at.unwrap_or(row.created_at);
+        if row.expires_at > now && unused < idle {
+            let refresh_every: time::Duration = (idle / 4_i32).min(time::Duration::minutes(1));
+            if unused >= refresh_every {
+                let touched = sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(key)
+                    .execute(&self.pool)
+                    .await;
+                if let Err(error) = touched {
+                    tracing::warn!(%error, "session last_seen refresh failed");
+                }
+            }
+            return Ok(Some(row));
+        }
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(None)
+    }
 }
 
 /// The workspace-scoped view of the store (D-020). Construction only happens through
@@ -889,36 +1108,7 @@ impl Db {
         now: OffsetDateTime,
         idle: std::time::Duration,
     ) -> Result<bool, QueryError> {
-        let row: Option<(OffsetDateTime, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
-            "SELECT expires_at, created_at, last_seen_at FROM sessions WHERE id = ?",
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((expires, created, last_seen)) = row else {
-            return Ok(false);
-        };
-        let idle = time::Duration::try_from(idle).unwrap_or(time::Duration::MAX);
-        let unused = now - last_seen.unwrap_or(created);
-        if expires > now && unused < idle {
-            let refresh_every: time::Duration = (idle / 4_i32).min(time::Duration::minutes(1));
-            if unused >= refresh_every {
-                let touched = sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE id = ?")
-                    .bind(now)
-                    .bind(key)
-                    .execute(&self.pool)
-                    .await;
-                if let Err(error) = touched {
-                    tracing::warn!(%error, "session last_seen refresh failed");
-                }
-            }
-            return Ok(true);
-        }
-        sqlx::query("DELETE FROM sessions WHERE id = ?")
-            .bind(key)
-            .execute(&self.pool)
-            .await?;
-        Ok(false)
+        Ok(self.session_row_at(key, now, idle).await?.is_some())
     }
 
     /// Logout deletes the row — an idempotent no-op on an already-gone session.
@@ -1647,6 +1837,55 @@ pub struct WorkspaceRow {
     pub slug: String,
     pub name: String,
     pub created_at: OffsetDateTime,
+}
+
+/// One `invites` row. `code_digest` is all the store ever knows of the code — the
+/// plaintext lives in the create response alone.
+#[derive(Debug, FromRow)]
+pub struct InviteRow {
+    pub id: String,
+    pub code_digest: String,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+    pub used_at: Option<OffsetDateTime>,
+    pub used_by: Option<String>,
+}
+
+/// One `accounts` row. `password_hash` is the argon2id PHC string — returned to the
+/// sign-in path for verification, never serialized outward.
+#[derive(Debug, FromRow)]
+pub struct AccountRow {
+    pub id: String,
+    pub workspace_id: String,
+    pub email: String,
+    #[sqlx(default)]
+    pub password_hash: String,
+    pub created_at: OffsetDateTime,
+}
+
+/// What `Db::signup` persists in one transaction: the new workspace, and the account
+/// whose credentials already hold an argon2id hash — hashing is the caller's job (it's
+/// the rate-limited part, and the store stays pure I/O).
+#[derive(Debug, Clone)]
+pub struct NewAccount {
+    pub id: AccountId,
+    pub workspace: WorkspaceId,
+    pub workspace_slug: String,
+    pub workspace_name: String,
+    pub email: String,
+    pub password_hash: String,
+}
+
+/// One `sessions` row as the guard sees it (S1b: `account_id` is `Some` for account
+/// sessions, `None` for operator sessions).
+#[derive(Debug, FromRow)]
+struct SessionRow {
+    #[allow(dead_code)]
+    id: String,
+    account_id: Option<String>,
+    created_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    last_seen_at: Option<OffsetDateTime>,
 }
 
 /// One `monitors` row, as stored. Converting to `Monitor` validates the stored strings again —

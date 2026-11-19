@@ -45,9 +45,27 @@ impl Default for MonitorId {
 #[serde(transparent)]
 pub struct WorkspaceId(pub Uuid);
 
+/// Identifies one account — a sign-in identity that owns a workspace (S1b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AccountId(pub Uuid);
+
+impl AccountId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for AccountId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkspaceId {
-    /// The workspace every pre-tenancy row was backfilled into — and, until accounts land
-    /// (S1b/c), the only workspace requests can resolve to.
+    /// The workspace every pre-tenancy row was backfilled into — and the one the operator
+    /// serves. Account sessions resolve to their own workspace instead (S1b).
     pub const DEFAULT: Self = Self(Uuid::from_u128(1));
 
     #[must_use]
