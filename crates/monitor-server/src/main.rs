@@ -338,6 +338,7 @@ fn app_state(
         admin_token,
         session_ttl: config.session_ttl,
         session_idle: config.session_idle,
+        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
         clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
         backup_dir: config.backup_dir.clone(),

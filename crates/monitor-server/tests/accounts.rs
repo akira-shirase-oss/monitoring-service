@@ -23,6 +23,12 @@ const PASSWORD: &str = "correct horse battery staple";
 type Fixture = (axum::Router, Db, TempDir);
 
 async fn fixture() -> anyhow::Result<Fixture> {
+    fixture_with_wait(monitor_server::auth::PASSWORD_WORK_WAIT).await
+}
+
+/// The production fixture, with the password-work queue deadline the caller picks —
+/// the flood test shortens it so a queued acquire overflows at once.
+async fn fixture_with_wait(password_work_wait: Duration) -> anyhow::Result<Fixture> {
     let tmp = tempfile::tempdir()?;
     let db = Db::connect(
         &format!("sqlite:{}", tmp.path().join("api.db").display()),
@@ -39,6 +45,7 @@ async fn fixture() -> anyhow::Result<Fixture> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
+        password_work_wait,
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -50,12 +57,26 @@ async fn fixture() -> anyhow::Result<Fixture> {
     Ok((app, db, tmp))
 }
 
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+    cookie: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+    call_from(app, None, method, uri, body, cookie).await
+}
+
+/// `call` as seen from `peer` — what makes the per-address throttle believe the
+/// request came from that address (`auth_inventory` uses the same `ConnectInfo`
+/// hook).
 #[expect(
     clippy::unwrap_used,
     reason = "test helper: a request that can't build is a failed test"
 )]
-async fn call(
+async fn call_from(
     app: &axum::Router,
+    peer: Option<std::net::SocketAddr>,
     method: &str,
     uri: &str,
     body: Option<serde_json::Value>,
@@ -72,11 +93,13 @@ async fn call(
     if let Some(cookie) = cookie {
         request = request.header(header::COOKIE, format!("smon_session={cookie}"));
     }
-    let response = app
-        .clone()
-        .oneshot(request.body(payload).unwrap())
-        .await
-        .unwrap();
+    let mut request = request.body(payload).unwrap();
+    if let Some(peer) = peer {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+    }
+    let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -325,5 +348,145 @@ async fn logout_ends_the_account_session() -> anyhow::Result<()> {
         StatusCode::OK,
         "dev mode still serves — without the workspace"
     );
+    Ok(())
+}
+
+/// The credential bucket is per address: one address that spends its guesses gets
+/// 429 + Retry-After, and the spend never touches another address's sign-in.
+#[tokio::test]
+async fn one_address_runs_out_of_guesses_and_another_still_signs_in() -> anyhow::Result<()> {
+    let (app, _db, _tmp) = fixture().await?;
+    let flood: std::net::SocketAddr = "198.51.100.7:40000".parse()?;
+    let honest: std::net::SocketAddr = "198.51.100.8:40000".parse()?;
+
+    // An account exists (signing up from the honest address spends none of the flood's
+    // budget), so the flood's misses are real wrong-password sign-in attempts.
+    let code = mint_invite(&app).await;
+    let (status, _, _) = call_from(
+        &app,
+        Some(honest),
+        "POST",
+        "/api/signup",
+        Some(serde_json::json!({
+            "email": "honest@tenant.example",
+            "password": PASSWORD,
+            "invite": code,
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The flood address spends its burst on a wrong password — every answer is the
+    // one-envelope 401. Each guess costs a real argon2 verify plus the penalty sleep,
+    // so the bucket refills ~0.3 tokens a guess and drains ~0.7: the 429 lands within
+    // eight guesses on any machine.
+    let wrong = serde_json::json!({
+        "email": "honest@tenant.example", "password": "not the password",
+    });
+    let mut denial: Option<(axum::http::HeaderMap, serde_json::Value)> = None;
+    for attempt_no in 1..=8 {
+        let (status, headers, body) = call_from(
+            &app,
+            Some(flood),
+            "POST",
+            "/api/login",
+            Some(wrong.clone()),
+            None,
+        )
+        .await;
+        if attempt_no <= 5 {
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "guess {attempt_no}: {body}"
+            );
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            denial = Some((headers, body));
+            break;
+        }
+    }
+    let Some((headers, body)) = denial else {
+        panic!("the bucket still had a token after eight wrong guesses");
+    };
+    assert_eq!(body["error"]["code"], "too_many_requests");
+    assert!(
+        headers.get(header::RETRY_AFTER).is_some(),
+        "a 429 must say when to retry"
+    );
+
+    // The other address's bucket is untouched: it still reaches the credential check
+    // and signs in.
+    let (status, _, _) = call_from(
+        &app,
+        Some(honest),
+        "POST",
+        "/api/login",
+        Some(serde_json::json!({
+            "email": "honest@tenant.example", "password": PASSWORD,
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    Ok(())
+}
+
+/// Password work is bounded: at most two hashes run, and the queue in front of them
+/// is bounded by a deadline. A sign-in burst beyond the queue gets 503 `busy` with
+/// Retry-After — a waiting request must never hold its connection permit forever —
+/// while the rest of the API keeps answering.
+#[tokio::test]
+async fn a_signin_flood_gets_busy_answers_and_the_api_stays_up() -> anyhow::Result<()> {
+    // A 1 ms deadline: every queued acquire overflows at once. How many requests win
+    // a permit first depends on what the other tests' parallel threads hold, so the
+    // assertion is that busy answers happen at all — not an exact split.
+    let (app, _db, _tmp) = fixture_with_wait(Duration::from_millis(1)).await?;
+
+    // Twelve addresses sign in at once. Two permits run; the queue deadline decides
+    // the rest — every request that cannot start inside the wait answers busy instead
+    // of parking on a connection forever.
+    let mut tasks = Vec::new();
+    for n in 0..12_u32 {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            let peer: std::net::SocketAddr =
+                std::net::SocketAddr::from((std::net::Ipv4Addr::from(0xC633_6400 + n), 40000));
+            call_from(
+                &app,
+                Some(peer),
+                "POST",
+                "/api/login",
+                Some(serde_json::json!({
+                    "email": format!("flood{n}@tenant.example"),
+                    "password": "any password at all",
+                })),
+                None,
+            )
+            .await
+            .0
+        }));
+    }
+    let mut busy = 0_u32;
+    let mut denied = 0_u32;
+    for task in tasks {
+        match task.await? {
+            StatusCode::SERVICE_UNAVAILABLE => busy += 1,
+            StatusCode::UNAUTHORIZED => denied += 1,
+            other => panic!("a flood answer is busy or denied, not {other}"),
+        }
+    }
+    assert_eq!(denied + busy, 12, "every request answered");
+    assert!(
+        busy >= 1,
+        "a 12-deep flood must overflow the queue: all {denied} denied"
+    );
+
+    // And while password work was saturated, an unrelated route never noticed.
+    let (status, _, _) = call(&app, "GET", "/livez", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call(&app, "GET", "/api/monitors", None, None).await;
+    assert_eq!(status, StatusCode::OK);
     Ok(())
 }

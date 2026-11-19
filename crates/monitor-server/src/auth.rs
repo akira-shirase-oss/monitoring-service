@@ -25,6 +25,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use monitor_domain::{AccountId, WorkspaceId};
 
@@ -416,6 +418,43 @@ impl Principal {
 /// matter how many clients arrive at once (S1b). A flood queues; it can't burn the CPU.
 static PASSWORD_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// The queue in front of the permits is bounded too: a request that can't start inside
+/// this wait is answered 503 `busy` instead of parking on its connection permit
+/// forever — a sign-in flood must not starve the rest of the API (S1c fix).
+pub const PASSWORD_WORK_WAIT: Duration = Duration::from_secs(2);
+
+/// Busy answers given so far. The `warn!` fires on the first and every 64th — the
+/// counter keeps the log honest under a flood without a line per request.
+static PASSWORD_WORK_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why password work couldn't run. `Busy` → the handler answers 503 `busy` with
+/// Retry-After; `Hash` is a hashing failure — a tooling bug, not the client's.
+#[derive(Debug)]
+pub enum PasswordWorkError {
+    Busy,
+    Hash(argon2::password_hash::Error),
+}
+
+/// Wait at most `wait` for a hashing slot; a full queue past the deadline is `Busy`.
+async fn password_work_permit(
+    wait: Duration,
+) -> Result<tokio::sync::SemaphorePermit<'static>, PasswordWorkError> {
+    match tokio::time::timeout(wait, PASSWORD_WORK.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => unreachable!("the password-work semaphore is never closed"),
+        Err(_elapsed) => {
+            let total = PASSWORD_WORK_BUSY.fetch_add(1, Ordering::Relaxed) + 1;
+            if total == 1 || total.is_multiple_of(64) {
+                tracing::warn!(
+                    busy_total = total,
+                    "password work queue saturated; answering busy"
+                );
+            }
+            Err(PasswordWorkError::Busy)
+        }
+    }
+}
+
 /// A fixed argon2id PHC string for the unknown-email path, so a sign-in for an address
 /// that has no account pays the same work as a wrong password (no existence oracle).
 pub const DUMMY_LOGIN_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2VvbGEwMDAwMDAwMDAwMA$\
@@ -425,12 +464,11 @@ fn argon2() -> argon2::Argon2<'static> {
     argon2::Argon2::default() // argon2id, m=19 MiB / t=2 / p=1 — fixed, bounded
 }
 
-/// The argon2id PHC string for a new password, computed under the work limit.
-/// A panicked blocking task is re-thrown — hashing must never silently "fail".
-pub async fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    let Ok(_permit) = PASSWORD_WORK.acquire().await else {
-        unreachable!("the password-work semaphore is never closed")
-    };
+/// The argon2id PHC string for a new password, computed under the work limit and
+/// inside `wait`. A panicked blocking task is re-thrown — hashing must never
+/// silently "fail".
+pub async fn hash_password(password: &str, wait: Duration) -> Result<String, PasswordWorkError> {
+    let _permit = password_work_permit(wait).await?;
     let owned = password.to_owned();
     match tokio::task::spawn_blocking(move || {
         use argon2::password_hash::PasswordHasher;
@@ -440,19 +478,22 @@ pub async fn hash_password(password: &str) -> Result<String, argon2::password_ha
     })
     .await
     {
-        Ok(result) => result,
+        Ok(result) => result.map_err(PasswordWorkError::Hash),
         Err(join) => std::panic::resume_unwind(join.into_panic()),
     }
 }
 
 /// Constant-work verify: `hash` comes from the store (or `DUMMY_HASH`), the password
-/// from the request. Malformed stored hashes fail closed (`Ok(false)`), never panic.
-pub async fn verify_password(hash: &str, password: &str) -> bool {
-    let Ok(_permit) = PASSWORD_WORK.acquire().await else {
-        unreachable!("the password-work semaphore is never closed")
-    };
+/// from the request, `wait` bounds the queue. Malformed stored hashes fail closed
+/// (`Ok(false)`), never panic.
+pub async fn verify_password(
+    hash: &str,
+    password: &str,
+    wait: Duration,
+) -> Result<bool, PasswordWorkError> {
+    let _permit = password_work_permit(wait).await?;
     let (hash, owned) = (hash.to_owned(), password.to_owned());
-    tokio::task::spawn_blocking(move || {
+    Ok(tokio::task::spawn_blocking(move || {
         use argon2::password_hash::PasswordVerifier;
         let Ok(parsed) = argon2::PasswordHash::new(&hash) else {
             return false;
@@ -460,7 +501,7 @@ pub async fn verify_password(hash: &str, password: &str) -> bool {
         argon2().verify_password(owned.as_bytes(), &parsed).is_ok()
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(false))
 }
 
 /// Test hook: the work limiter, so a test can prove the bound is real.
@@ -637,12 +678,40 @@ mod password_tests {
 
     #[tokio::test]
     async fn a_hash_verifies_and_a_wrong_password_does_not() {
-        let hash = hash_password("s3cret long password").await.expect("hash");
-        assert!(verify_password(&hash, "s3cret long password").await);
-        assert!(!verify_password(&hash, "wrong").await);
+        let hash = hash_password("s3cret long password", PASSWORD_WORK_WAIT)
+            .await
+            .expect("hash");
         assert!(
-            !verify_password("not-a-phc", "x").await,
+            verify_password(&hash, "s3cret long password", PASSWORD_WORK_WAIT)
+                .await
+                .expect("verify")
+        );
+        assert!(
+            !verify_password(&hash, "wrong", PASSWORD_WORK_WAIT)
+                .await
+                .expect("verify")
+        );
+        assert!(
+            !verify_password("not-a-phc", "x", PASSWORD_WORK_WAIT)
+                .await
+                .expect("verify"),
             "bad store → closed"
         );
+    }
+
+    /// A full queue must answer `Busy` inside the deadline — a waiter that parked
+    /// forever on its connection permit is how a sign-in flood starves the API.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_work_queue_answers_busy_within_the_deadline() {
+        let _p1 = PASSWORD_WORK.try_acquire().expect("permit 1");
+        let _p2 = PASSWORD_WORK.try_acquire().expect("permit 2");
+        match verify_password(DUMMY_LOGIN_HASH, "x", PASSWORD_WORK_WAIT).await {
+            Err(PasswordWorkError::Busy) => {}
+            other => panic!("a full queue is Busy, not {other:?}"),
+        }
+        match hash_password("x", PASSWORD_WORK_WAIT).await {
+            Err(PasswordWorkError::Busy) => {}
+            other => panic!("a full queue is Busy, not {other:?}"),
+        }
     }
 }

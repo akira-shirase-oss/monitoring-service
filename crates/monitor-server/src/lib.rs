@@ -88,6 +88,10 @@ pub struct AppState {
     /// `SMON_SESSION_IDLE_S`: a session unused for this long ends, inside its lifetime too
     /// (D-016). The dashboard's 15 s refresh keeps an open tab's session in use.
     pub session_idle: Duration,
+    /// How long a sign-in or signup may wait for a password-hashing slot before it is
+    /// answered 503 `busy` (`auth::PASSWORD_WORK_WAIT` in production). A bounded queue
+    /// keeps a credential flood from parking every connection the API has.
+    pub password_work_wait: Duration,
     /// "Now" for session creation, expiry and idleness.
     pub clock: Clock,
     /// `SMON_COOKIE_SECURE`: when the session cookie carries `Secure` (M7.2 hardening).
@@ -516,18 +520,28 @@ async fn login_account(
     let hash = account
         .as_ref()
         .map_or(auth::DUMMY_LOGIN_HASH, |row| row.password_hash.as_str());
-    if !auth::verify_password(hash, password).await {
-        drop(attempt);
-        if let Ok(_penalty) = penalties.try_acquire() {
-            tokio::time::sleep(WRONG_TOKEN_DELAY).await;
+    match auth::verify_password(hash, password, state.password_work_wait).await {
+        Ok(true) => {}
+        Ok(false) => {
+            drop(attempt);
+            if let Ok(_penalty) = penalties.try_acquire() {
+                tokio::time::sleep(WRONG_TOKEN_DELAY).await;
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": { "code": "unauthenticated", "message": "invalid credentials" }
+                })),
+            )
+                .into_response();
         }
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": { "code": "unauthenticated", "message": "invalid credentials" }
-            })),
-        )
-            .into_response();
+        Err(auth::PasswordWorkError::Busy) => {
+            drop(attempt);
+            return password_busy();
+        }
+        Err(auth::PasswordWorkError::Hash(_)) => {
+            unreachable!("verification never hashes")
+        }
     }
     let Some(account) = account else {
         // Dummy-hash path passed? A correct guess on a nonexistent address still has
@@ -617,6 +631,20 @@ fn signup_invalid(message: &str) -> Response {
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(serde_json::json!({
             "error": { "code": "invalid_request", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+/// 503 for a full password-work queue: `busy` + Retry-After — the client may retry in
+/// a moment; the API is not down, only the hashing slots are.
+fn password_busy() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": { "code": "busy",
+                       "message": "too many sign-ins in flight; retry in a moment" }
         })),
     )
         .into_response()
@@ -747,9 +775,13 @@ async fn signup(
         Ok(None) => {}
         Err(error) => return ApiError::Db(error).into_response(),
     }
-    let password_hash = match auth::hash_password(&body.password).await {
+    let password_hash = match auth::hash_password(&body.password, state.password_work_wait).await {
         Ok(hash) => hash,
-        Err(error) => {
+        Err(auth::PasswordWorkError::Busy) => {
+            drop(attempt);
+            return password_busy();
+        }
+        Err(auth::PasswordWorkError::Hash(error)) => {
             tracing::error!(%error, "password hashing failed");
             return ApiError::Corrupt.into_response();
         }
