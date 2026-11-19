@@ -363,7 +363,7 @@ fn the_drill_waits_only_on_its_own_processes() {
 }
 
 /// The freeze drill must register a monitor the API will accept: an interval below
-/// `MIN_INTERVAL` is refused with a validation error, and the drill then KeyErrors on
+/// `MIN_INTERVAL` is refused with a validation error, and the drill then `KeyError`s on
 /// `"id"` — the exact setup failure this pin exists to keep fixed.
 #[test]
 fn the_freeze_drill_registers_a_monitor_with_a_valid_interval() {
@@ -376,7 +376,7 @@ fn the_freeze_drill_registers_a_monitor_with_a_valid_interval() {
     let pos = FREEZE.find("INTERVAL=").expect("the drill sets INTERVAL");
     let digits: String = FREEZE[pos + "INTERVAL=".len()..]
         .chars()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect();
     let interval: u64 = digits.parse().expect("INTERVAL must be a literal number");
     assert!(
