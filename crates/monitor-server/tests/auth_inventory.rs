@@ -30,9 +30,17 @@ use tower::ServiceExt;
 const ROUTER_SOURCE: &str = include_str!("../src/lib.rs");
 const TOKEN: &str = "inventory-token-0123456789abcdef0123456789";
 
-/// The routes that are public by design: health, the build version, and the two
-/// endpoints that exchange the token for a session (they enforce their own rules).
-const PUBLIC: [&str; 5] = ["/livez", "/readyz", "/version", "/api/login", "/api/logout"];
+/// The routes that are public by design: health, the build version, and the
+/// endpoints that exchange a credential for a session (login, signup, logout —
+/// they enforce their own rules: invite validation, throttling, password work).
+const PUBLIC: [&str; 6] = [
+    "/livez",
+    "/readyz",
+    "/version",
+    "/api/login",
+    "/api/signup",
+    "/api/logout",
+];
 
 /// The string literal each `marker` call opens with, in source order.
 fn literals_after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {

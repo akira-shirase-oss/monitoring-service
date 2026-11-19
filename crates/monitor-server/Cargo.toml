@@ -27,6 +27,7 @@ rustls-pki-types = "1"
 webpki-roots = "1"
 serde.workspace = true
 sha2.workspace = true
+argon2.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true

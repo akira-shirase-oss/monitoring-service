@@ -26,6 +26,8 @@ use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+use monitor_domain::{AccountId, WorkspaceId};
+
 use crate::AppState;
 
 /// The configured credential. `None` is only reachable on a loopback listen — main.rs
@@ -113,10 +115,79 @@ pub async fn require_auth(
         );
     }
 
+    // A presented cookie is resolved before anything else (S1b): an account session
+    // authorizes in every mode — tokenless dev included — and resolves to the account's
+    // own workspace, never the operator's. Operator sessions are tried first when a
+    // token exists; the two key namespaces can't collide.
+    let mut principal: Option<Principal> = None;
+    if let Some(session) = session_cookie(request.headers().get(header::COOKIE)) {
+        if let Some(token) = &state.admin_token {
+            match state
+                .db
+                .session_valid_at(
+                    &session_key(token, session),
+                    (state.clock)(),
+                    state.session_idle,
+                )
+                .await
+            {
+                Ok(true) => principal = Some(Principal::Operator),
+                Ok(false) => {}
+                Err(error) => {
+                    // Failing closed would masquerade a broken store as "wrong
+                    // credential"; authorization cannot be decided right now.
+                    tracing::error!(%error, "session lookup failed");
+                    return deny(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "internal",
+                        "the session store is unavailable",
+                    );
+                }
+            }
+        }
+        if principal.is_none() {
+            match state
+                .db
+                .account_session_at(
+                    &account_session_key(session),
+                    (state.clock)(),
+                    state.session_idle,
+                )
+                .await
+            {
+                Ok(Some((account, workspace))) => {
+                    principal = Some(Principal::Account { account, workspace });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(%error, "account session lookup failed");
+                    return deny(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "internal",
+                        "the session store is unavailable",
+                    );
+                }
+            }
+        }
+    }
+
     let Some(token) = &state.admin_token else {
         // Dev-on-loopback mode (boot refuses it on any other listen). Whoever reaches the
         // listener is trusted — so only a loopback `Host` is: a page that rebinds its own
         // hostname to 127.0.0.1 is same-origin with us, but its `Host` is its own name.
+        // A resolved account cookie still binds its own workspace over the dev trust.
+        if let Some(principal) = principal {
+            if is_mutation(request.method()) && request.headers().get(header::ORIGIN).is_none() {
+                return deny(
+                    StatusCode::FORBIDDEN,
+                    "origin_required",
+                    "cookie-authenticated writes require a matching Origin",
+                );
+            }
+            request.extensions_mut().insert(CookieAuth);
+            request.extensions_mut().insert(principal);
+            return next.run(request).await;
+        }
         if let Some(authority) = authority.as_deref()
             && !is_loopback_authority(authority)
         {
@@ -126,6 +197,7 @@ pub async fn require_auth(
                 "without SMON_ADMIN_TOKEN only a loopback Host is served",
             );
         }
+        request.extensions_mut().insert(Principal::Operator);
         return next.run(request).await;
     };
 
@@ -155,35 +227,17 @@ pub async fn require_auth(
     };
     let credential = if bearer_ok {
         Some(Credential::Bearer)
-    } else if let Some(session) = session_cookie(request.headers().get(header::COOKIE)) {
-        match state
-            .db
-            .session_valid_at(
-                &session_key(token, session),
-                (state.clock)(),
-                state.session_idle,
-            )
-            .await
-        {
-            Ok(true) => Some(Credential::Cookie),
-            Ok(false) => None,
-            Err(error) => {
-                // Failing closed would masquerade a broken store as "wrong credential";
-                // the honest answer is that authorization cannot be decided right now.
-                tracing::error!(%error, "session lookup failed");
-                return deny(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "internal",
-                    "the session store is unavailable",
-                );
-            }
-        }
+    } else if principal.is_some() {
+        Some(Credential::Cookie)
     } else {
         None
     };
 
     match credential {
-        Some(Credential::Bearer) => next.run(request).await,
+        Some(Credential::Bearer) => {
+            request.extensions_mut().insert(Principal::Operator);
+            next.run(request).await
+        }
         Some(Credential::Cookie) => {
             if is_mutation(request.method()) && request.headers().get(header::ORIGIN).is_none() {
                 return deny(
@@ -193,6 +247,9 @@ pub async fn require_auth(
                 );
             }
             request.extensions_mut().insert(CookieAuth);
+            if let Some(p) = principal {
+                request.extensions_mut().insert(p);
+            }
             next.run(request).await
         }
         None => deny(
@@ -302,6 +359,106 @@ pub fn digests_match(presented: &[u8], configured: &[u8]) -> bool {
     let presented = Sha256::digest(presented);
     let configured = Sha256::digest(configured);
     presented == configured
+}
+
+/// The `invites` row key for a presented code (S1b): hex `SHA-256("smon-invite-v1\0" ‖
+/// code)`. The store holds only digests; comparison runs on fixed-length hashes.
+pub fn invite_key(code: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"smon-invite-v1\0");
+    digest.update(code.as_bytes());
+    crate::deliver::hex_lower(&digest.finalize())
+}
+
+/// The `sessions` row key for an account cookie: hex `SHA-256("smon-acct-session-v1\0" ‖
+/// id)`. Same digest-only rule as `session_key` (D-016) — the row can never be replayed
+/// as a cookie — namespaced apart so an account id collides with nothing an operator
+/// session could produce.
+pub fn account_session_key(cookie_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"smon-acct-session-v1\0");
+    digest.update(cookie_id.as_bytes());
+    crate::deliver::hex_lower(&digest.finalize())
+}
+
+/// Who authorized a request (S1b): the operator (bearer token, operator session, or
+/// loopback dev trust) sees the default workspace; an account session sees only its own.
+/// The auth middleware inserts this into request extensions; `tenant` resolves it.
+#[derive(Debug, Clone, Copy)]
+pub enum Principal {
+    Operator,
+    Account {
+        account: AccountId,
+        workspace: WorkspaceId,
+    },
+}
+
+impl Principal {
+    /// The workspace this principal may see.
+    pub fn workspace(&self) -> WorkspaceId {
+        match self {
+            Self::Operator => WorkspaceId::DEFAULT,
+            Self::Account { workspace, .. } => *workspace,
+        }
+    }
+}
+
+/// Password work is deliberately expensive — argon2id, RFC 9106's low-memory profile
+/// (19 MiB, t=2, p=1) — so it runs on the blocking pool behind a hard bound: at most
+/// `PASSWORD_WORK_PERMITS` hashes/verifications in flight for the whole process, no
+/// matter how many clients arrive at once (S1b). A flood queues; it can't burn the CPU.
+static PASSWORD_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// A fixed argon2id PHC string for the unknown-email path, so a sign-in for an address
+/// that has no account pays the same work as a wrong password (no existence oracle).
+pub const DUMMY_LOGIN_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2VvbGEwMDAwMDAwMDAwMA$\
+    0J7T0gVh8Z6J8n9m0bYb7Uo5m7G8X0F8J8yK8m0m0m0";
+
+fn argon2() -> argon2::Argon2<'static> {
+    argon2::Argon2::default() // argon2id, m=19 MiB / t=2 / p=1 — fixed, bounded
+}
+
+/// The argon2id PHC string for a new password, computed under the work limit.
+pub async fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    let permit = PASSWORD_WORK.acquire().await.expect("semaphore never closes");
+    let owned = password.to_owned();
+    let hash = tokio::task::spawn_blocking(move || {
+        use argon2::password_hash::PasswordHasher;
+        argon2()
+            .hash_password(owned.as_bytes())
+            .map(|h| h.to_string())
+    })
+    .await
+    .expect("blocking task panicked");
+    drop(permit);
+    hash
+}
+
+/// Constant-work verify: `hash` comes from the store (or `DUMMY_HASH`), the password
+/// from the request. Malformed stored hashes fail closed (`Ok(false)`), never panic.
+pub async fn verify_password(hash: &str, password: &str) -> bool {
+    let permit = PASSWORD_WORK.acquire().await.expect("semaphore never closes");
+    let (hash, owned) = (hash.to_owned(), password.to_owned());
+    let ok = tokio::task::spawn_blocking(move || {
+        use argon2::password_hash::PasswordVerifier;
+        let parsed = match argon2::PasswordHash::new(&hash) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
+        argon2()
+            .verify_password(owned.as_bytes(), &parsed)
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    drop(permit);
+    ok
+}
+
+/// Test hook: the work limiter, so a test can prove the bound is real.
+#[cfg(test)]
+pub fn password_work_permits() -> usize {
+    PASSWORD_WORK.available_permits()
 }
 
 #[cfg(test)]
@@ -441,5 +598,37 @@ mod tests {
         assert!(is_mutation(&Method::DELETE));
         assert!(!is_mutation(&Method::GET));
         assert!(!is_mutation(&Method::HEAD));
+    }
+}
+
+#[cfg(test)]
+mod password_tests {
+    use super::*;
+
+    /// The dummy hash must parse as argon2id PHC or the unknown-email path would skip
+    /// the work — a silent existence oracle. Pin its validity.
+    #[test]
+    fn the_dummy_hash_is_a_real_argon2id_phc() {
+        argon2::PasswordHash::new(DUMMY_LOGIN_HASH)
+            .expect("DUMMY_LOGIN_HASH must parse as a PHC string");
+    }
+
+    /// The limiter is a hard bound, not a queue hint: two permits, never more.
+    #[test]
+    fn password_work_is_bounded() {
+        assert_eq!(password_work_permits(), 2);
+        let first = PASSWORD_WORK.try_acquire().expect("permit 1");
+        let second = PASSWORD_WORK.try_acquire().expect("permit 2");
+        assert!(PASSWORD_WORK.try_acquire().is_err(), "a third burns nothing");
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn a_hash_verifies_and_a_wrong_password_does_not() {
+        let hash = hash_password("s3cret long password").await.expect("hash");
+        assert!(verify_password(&hash, "s3cret long password").await);
+        assert!(!verify_password(&hash, "wrong").await);
+        assert!(!verify_password("not-a-phc", "x").await, "bad store → closed");
     }
 }
