@@ -56,9 +56,15 @@ prune() {
   done < <(uploads | sort -r)
   for name in ${keep[@]+"${keep[@]}"}; do echo "keep   $name"; done
   for name in ${drop[@]+"${drop[@]}"}; do
-    if [[ "$mode" == dry ]]; then echo "prune  $name (dry run)"
-    elif r2 deletefile "r2:$bucket/snapshots/$name" 2>/dev/null; then echo "pruned $name"
-    else echo "kept   $name (inside the bucket's lock window)"; fi
+    if [[ "$mode" == dry ]]; then echo "prune  $name (dry run)"; continue; fi
+    if out=$(r2 deletefile "r2:$bucket/snapshots/$name" 2>&1); then
+      echo "pruned $name"
+    elif grep -qiE 'object.?lock|retention|immutab' <<<"$out"; then
+      echo "kept   $name (inside the bucket's lock window)"
+    else
+      echo "error: deleting $name: $out" >&2
+      exit 1
+    fi
   done
 }
 

@@ -22,5 +22,10 @@ monitor.example.com:443 {
 		}
 	}
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:58400
+	# lb_try_*: while the service restarts (upgrade.sh), in-flight requests are held and
+	# retried instead of failing — the serving gap a caller sees stays under ~5 s.
+	reverse_proxy 127.0.0.1:58400 {
+		lb_try_duration 15s
+		lb_try_interval 250ms
+	}
 }

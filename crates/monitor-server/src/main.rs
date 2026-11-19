@@ -36,6 +36,7 @@ enum Mode {
 const USAGE: &str = "usage: monitor-server            serve (the store must exist)
        monitor-server --init     create and migrate the store of a new install, then exit
        monitor-server --version  print the version
+       monitor-server --db-version  print the newest schema migration this build knows
        monitor-server --help     print this help
 configuration: SMON_* environment variables (README, Configuration)";
 
@@ -48,6 +49,10 @@ fn parse_mode() -> Result<Mode, std::process::ExitCode> {
         [flag] if flag == "--init" => Ok(Mode::Init),
         [flag] if flag == "--version" || flag == "-V" => {
             println!("monitor-server {}", env!("CARGO_PKG_VERSION"));
+            Err(std::process::ExitCode::SUCCESS)
+        }
+        [flag] if flag == "--db-version" => {
+            println!("{}", monitor_db::Db::known_schema_version());
             Err(std::process::ExitCode::SUCCESS)
         }
         [flag] if flag == "--help" || flag == "-h" => {

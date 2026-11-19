@@ -40,12 +40,16 @@ if [ -n "$beat" ]; then
   if jq -e '.expires_at' "$beat" >/dev/null 2>&1; then ok "status.json present with expires_at"; else bad "status.json has no expires_at"; fi
 else bad "no status.json under /opt/smon/status — the snapshot task isn't writing"; fi
 
+if [[ -n "${SMOKE_LOCAL:-}" ]]; then
+  echo "through Cloudflare — skipped (SMOKE_LOCAL; the upgrade path only proves the local side)"
+else
 echo "through Cloudflare"
 code=$(curl -sS -o /dev/null -w '%{http_code} %{ssl_verify_result}' --max-time 10 "$public/livez" || echo "000 x")
 [[ "$code" == "200 0" ]] && ok "$public/livez answers 200 over valid TLS" || bad "$public/livez: HTTP/verify $code"
 headers=$(curl -sSI --max-time 10 "$public/" || true)
 grep -qi '^server: cloudflare' <<<"$headers" && ok "served through Cloudflare" || bad "not through Cloudflare (no server: cloudflare header)"
 grep -qi '^content-security-policy:' <<<"$headers" && ok "the dashboard has a content security policy" || bad "no content-security-policy"
+fi
 
 echo "backups"
 if command -v smon-backup >/dev/null; then

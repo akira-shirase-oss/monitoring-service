@@ -411,6 +411,19 @@ impl Db {
         Ok(())
     }
 
+    /// The newest migration this build knows. Migrations are forward-only, so a
+    /// store whose applied set is newer than this must never be opened by this
+    /// binary — the deploy guard (`deploy/droplet/schema-guard.sh`) compares it
+    /// against the database's `_sqlx_migrations` before a `current` switch.
+    pub fn known_schema_version() -> i64 {
+        sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Online backup: `VACUUM INTO` writes one consistent snapshot file — the WAL-aware
     /// way to copy a live database without quiescing it. This reads the store; it does
     /// not write it, so the single-writer invariant is untouched. Returns the backup's

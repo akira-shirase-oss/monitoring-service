@@ -10,19 +10,26 @@ only on the droplet, into root-only files; nothing secret goes into chat, an iss
 `deploy/RUNBOOK.md` is the generic operator runbook (env reference, upgrade/rollback, the
 late-volume and full-store cases); this file is the concrete SFO3 install.
 
-**Speed targets** (the first-deploy gate records the actuals in `deploy/runbooks/install-feedback.md`):
+**Speed targets** — the same as the other products; the first-deploy gate records the
+actuals in `deploy/runbooks/install-feedback.md`:
 
 | Operation | Target |
 |---|---|
-| Fresh install (steps 1–11, operator time) | ≤ 45 min |
-| Upgrade (repoint `current` + restart) | ≤ 2 min wall clock, ≤ 30 s serving gap (the SIGTERM drain bounds it: 12 s HTTP + 15 s engine) |
-| Rollback | ≤ 60 s (repoint + restart; only across releases with no new migration) |
+| Fresh install | ≈ 15 min, through one idempotent `install.sh` (prompts only for secrets) |
+| Upgrade | < 2 min wall clock, < 5 s of request unavailability — Caddy's `lb_try_duration 15s` / `lb_try_interval 250ms` holds in-flight requests while the service restarts |
+| Rollback | < 1 min (schema-guard + atomic repoint + restart; refused — naming both versions — when the database's migrations are newer than the target binary's, see `schema-guard.sh`) |
 | `smoke.sh` | ≤ 60 s |
 | Restore drill (step 12) | ≤ 15 min |
 
-**Exit gate:** `smoke.sh` green, a restore drill from the R2 copy recorded (step 12), idle
-memory recorded, the first monitors registered (step 13), and the outside checker green
-(step 14).
+Honest accounting of the restart: the HTTP gap a caller sees is < 5 s, but the engine stops
+*observing* for the restart — every check slot whose deadline fell inside it is committed as
+a `missed` row on boot (D-014). At a 30 s interval a typical restart misses 0–1 slots per
+monitor; the monitor records its own downtime exactly the way it records a target's — the
+rows are evidence, not an error, and an open incident is never closed by missed slots.
+
+**Exit gate:** `smoke.sh` green, a restore drill from the R2 copy recorded (step 9), idle
+memory recorded, the first monitors registered (step 8), and the outside checker green
+(step 10).
 
 The commands run on the droplet as root unless they say otherwise. `$CHECKOUT` is a copy of
 this repository on the droplet (step 2).
@@ -52,120 +59,84 @@ Mount the data volume at `/opt/smon/data` (CREATE.md 3) — its fstab entry wait
 device (`nofail,x-systemd.device-timeout=10min`); the unit's `RequiresMountsFor` keeps the
 order, and D-015 refuses a bare mountpoint anyway.
 
-## 2. The binaries and the dashboard
-
-Build on a build host (a 2 GB droplet compiles Rust, slowly; the workspace builds releases),
-copy `target/release/{monitor-server,monitor}` and `apps/dashboard/build` up, or use
-`scripts/deploy.sh` from a checkout:
+## 2. A checkout and the release payload
 
 ```sh
 git clone --depth 1 https://github.com/akira-shirase-oss/service-monitor /opt/smon-src
 CHECKOUT=/opt/smon-src
-# On the build host: cargo build --release && npm --prefix apps/dashboard ci && npm --prefix apps/dashboard run build
-$CHECKOUT/scripts/deploy.sh --prefix /opt/smon    # releases/<ver>/, repoints current
-monitor-server --version && monitor --version
 ```
 
-## 3. The user, the store, the env file
+Build the binaries + dashboard on a build host (a 2 GB droplet compiles Rust, slowly) and
+stage a release dir in `scripts/deploy.sh`'s layout — `bin/monitor-server`, `bin/monitor`,
+`dashboard/` — then copy it up:
 
 ```sh
-useradd --system --home-dir /opt/smon --no-create-home --shell /usr/sbin/nologin smon
-install -d -o smon -g smon -m 0700 /opt/smon/data /opt/smon/status /opt/smon/data/backups
-install -d -m 0700 /opt/smon/credentials
-
-install -m 0644 $CHECKOUT/deploy/droplet/smon.env.template /opt/smon/env
-# Generate the admin token INTO the env file — it is never seen anywhere else:
-printf 'SMON_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>/opt/smon/env
-nano /opt/smon/env                       # webhook/SMTP if used; the rest is shipped
-chown root:root /opt/smon/env && chmod 600 /opt/smon/env
+# on the build host, from the checkout:
+cargo build --release -p monitor-server -p monitor-cli
+npm --prefix apps/dashboard ci && npm --prefix apps/dashboard run build
+mkdir -p release/bin && cp target/release/monitor-server target/release/monitor release/bin/
+cp -R apps/dashboard/build release/dashboard
+rsync -a release/ root@<droplet-ip>:/opt/release-candidate/
 ```
 
-`SMON_BACKUP_DIR=/opt/smon/data/backups` is already in the template — the only directory
-`/api/backup` may write (D-019), created 0700 at boot.
-
-## 4. The store (once — D-015)
+## 3. install.sh — the whole install, one command
 
 ```sh
-set -a; . /opt/smon/env; set +a
-sudo -u smon /opt/smon/current/bin/monitor-server --init
+$CHECKOUT/deploy/droplet/install.sh --release-dir /opt/release-candidate
 ```
 
-A normal start later refuses a missing or empty store: a volume that isn't mounted yet can
-never be mistaken for a new install.
+≈ 15 minutes, idempotent — re-runnable top to bottom, every step checks before it does —
+and under `umask 077`. It installs the packages, creates the `smon` user and the 0700
+directory layout, writes `/opt/smon/env` from `smon.env.template` (generating
+`SMON_ADMIN_TOKEN` into it — never echoed), installs the release under `releases/` and
+points `current` at it, runs `monitor-server --init` once (D-015 — an existing store is
+never re-initialised), installs and enables the units (server + `smon-backup.timer`),
+installs Caddy + the Caddyfile, prompts for the origin certificate pair only if missing,
+fetches Cloudflare's origin-pull CA (AOP), applies `cloudflare-ips.sh` (Caddy trusted
+proxies + ufw 443-from-Cloudflare), generates the age identity if missing, prompts for the
+R2 secret, and finishes with `smoke.sh`. Secrets are prompted for with echo off; nothing
+secret lands anywhere but the root-only files CREATE.md names.
 
-## 5. The service
-
-```sh
-install -m 0644 $CHECKOUT/deploy/monitor-server.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now monitor-server
-journalctl -u monitor-server -n 30 --no-pager
-curl -sf http://127.0.0.1:58400/readyz | jq .
-```
-
-## 6. Caddy, the origin certificate, AOP, Cloudflare's ranges
-
-```sh
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' >/etc/apt/sources.list.d/caddy-stable.list
-apt-get update && apt-get install -y caddy
-
-# Cloudflare's Origin Certificate (CREATE.md 7): paste each, Ctrl-D.
-umask 077; cat >/etc/caddy/origin.pem; cat >/etc/caddy/origin.key
-chown root:caddy /etc/caddy/origin.pem /etc/caddy/origin.key && chmod 0640 /etc/caddy/origin.pem /etc/caddy/origin.key
-
-# AOP: Cloudflare's published origin-pull CA — the origin then requires the TLS client to be Cloudflare.
-curl -fsSo /etc/caddy/cloudflare-origin-pull-ca.pem https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem
-chmod 0644 /etc/caddy/cloudflare-origin-pull-ca.pem
-
-install -m 0644 $CHECKOUT/deploy/droplet/Caddyfile /etc/caddy/Caddyfile
-$CHECKOUT/deploy/droplet/cloudflare-ips.sh       # Caddy's trusted ranges + ufw 443-from-Cloudflare
-caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy
-systemctl restart monitor-server
-```
+What it deliberately does **not** do: overwrite an existing `env`, re-initialise a store,
+or weaken the file modes.
 
 `SMON_TRUSTED_PROXY=127.0.0.1` (in the template) is right here: Caddy is the only proxy smon
-sees, and Caddy trusts Cloudflare's ranges, so `X-Forwarded-For` already carries the visitor.
+sees, and Caddy attributes the visitor over Cloudflare's trusted ranges.
 `SMON_COOKIE_SECURE=always` because every dashboard request arrives over TLS.
 
-## 7. Sign in once
+## 4. Sign in once
 
 `https://monitor.example.com` asks for the admin token — it is in `/opt/smon/env` (root-only).
 The session cookie it earns is HttpOnly, SameSite=Strict, Secure.
 
-## 8. Alert channels (optional)
+## 5. Alert channels (optional)
 
 `SMON_WEBHOOK_URL` + `SMON_WEBHOOK_SECRET` and/or the three `SMON_SMTP_*` go in `/opt/smon/env`
 (prefer `smtps://` — implicit TLS; `?tls=required` only where the provider offers no implicit
 TLS). Without a channel, incident events stay `pending` in the outbox — visible, never dropped.
 
-## 9. Backups: local snapshot, age, R2 with a 7-day lock
+## 6. Backups: local snapshot, age, R2 with a 7-day lock
+
+`install.sh` already installed `smon-backup` and its timer, generated the age identity, and
+prompted the R2 credentials into `/opt/smon/credentials/` (`s3_secret_key` 0400,
+`r2.env` 0644 — the ids aren't secret). One thing only you can do: **copy the
+`AGE-SECRET-KEY-…` line out of `/opt/smon/backup-age-identity` into a password manager or
+onto paper** — the off-box backups are unreadable without it.
 
 Daily: `monitor backup` draws a `VACUUM INTO` snapshot inside `SMON_BACKUP_DIR` (D-019), the
 script encrypts it with age to the droplet's recipient, uploads to `smon-backups/snapshots/`,
-then prunes remotely (14 daily + 8 weekly kept) and locally (3 newest kept). The bucket's 7-day
-object lock means nothing can delete or rewrite a week of snapshots — including root on a
-ransomed droplet. Everything pruned is always older than the lock window.
+then prunes remotely (14 daily + 8 weekly kept) and locally (3 newest kept). The bucket's
+7-day object lock means nothing can delete or rewrite a week of snapshots — including root
+on a ransomed droplet. Everything pruned is always older than the lock window; a refusal
+inside it is logged `kept`, and anything else fails the run.
 
 ```sh
-umask 077; cat >/opt/smon/credentials/s3_secret_key      # R2 secret, Ctrl-D
-chmod 0400 /opt/smon/credentials/s3_secret_key
-install -d -m 0755 /opt/smon/credentials
-printf 'SMON_R2_ENDPOINT=https://<r2-account-id>.r2.cloudflarestorage.com\nSMON_R2_ACCESS_KEY=<r2-access-key-id>\n' \
-  >/opt/smon/credentials/r2.env && chmod 0644 /opt/smon/credentials/r2.env
-
-age-keygen -o /opt/smon/backup-age-identity 2>/dev/null && chmod 0400 /opt/smon/backup-age-identity
-age-keygen -y /opt/smon/backup-age-identity >/opt/smon/backup-age-recipient
-cat /opt/smon/backup-age-identity    # copy the AGE-SECRET-KEY-… line offline, then clear the screen
-
-install -m 0755 $CHECKOUT/deploy/droplet/smon-backup.sh /usr/local/bin/smon-backup
-install -m 0644 $CHECKOUT/deploy/droplet/smon-backup.service /etc/systemd/system/
-install -m 0644 $CHECKOUT/deploy/droplet/smon-backup.timer /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now smon-backup.timer
 systemctl start smon-backup && journalctl -u smon-backup -n 10 --no-pager
 smon-backup latest           # the newest upload and its age in hours
+smon-backup prune --dry      # what retention would drop, without deleting
 ```
 
-## 10. The smoke check
+## 7. The smoke check
 
 ```sh
 $CHECKOUT/deploy/droplet/smoke.sh
@@ -181,7 +152,7 @@ curl -sS --max-time 5 --resolve monitor.example.com:443:<droplet-ip> https://mon
 (A passing direct curl means the ufw rule didn't land; AOP would still refuse it at TLS —
 check both.) Record the smoke output, including idle memory, in `deploy/runbooks/install-feedback.md`.
 
-## 11. The first monitors
+## 8. The first monitors
 
 Register through the dashboard or CLI (`monitor monitors add`). The first set, per the
 deploy decision — targets are placeholders for the real hostnames:
@@ -197,7 +168,7 @@ Each registration is checked by the SSRF guard — a name that resolves to a pri
 loopback address is refused at registration, which on this droplet means exactly the
 targets you intend.
 
-## 12. The restore drill (exit gate)
+## 9. The restore drill (exit gate)
 
 Prove the R2 copy is a restore, on any machine with `age` and `sqlite3` (your laptop is fine):
 
@@ -212,7 +183,7 @@ drill, `scripts/backup-drill.sh` (own ports, safe beside the live droplet) prove
 backup→destroy→restore path keeps an open incident. Record the numbers in
 `deploy/runbooks/install-feedback.md`.
 
-## 13. The outside checker
+## 10. The outside checker
 
 `deploy/github/outside-check.yml` is the proposed workflow: every 5 minutes a GitHub runner —
 outside both droplets — curls the public endpoints and republishes the status page to
@@ -223,20 +194,32 @@ never on the droplet. Move it to `.github/workflows/` and set the secrets to act
 
 ## Upgrading
 
-`scripts/deploy.sh --prefix /opt/smon` (new release dir, repoints `current`), `systemctl
-restart monitor-server`, then `smoke.sh`. A release that adds migrations can't be rolled back
-by repointing — `monitor backup` first (RUNBOOK). Boot rebuilds incidents and streaks from
-the store; a gap longer than a check interval is committed as `missed` rows, never hidden.
+`monitor backup` first if the release adds a migration (rollback can't repoint past it — see
+below), then:
+
+```sh
+$CHECKOUT/deploy/droplet/upgrade.sh --release-dir /opt/release-candidate
+# or a published artifact:
+$CHECKOUT/deploy/droplet/upgrade.sh --version <v> --url <tarball> --sha256 <hex>
+```
+
+Stages the release, verifies the download's SHA-256, runs `schema-guard.sh` **before**
+anything switches, repoints `current` with an atomic rename, restarts, polls readiness,
+runs the local smoke — and **rolls back automatically** on any post-switch failure. Keeps
+the newest 3 release dirs. Serving gap < 5 s (Caddy holds requests); check slots inside the
+restart are committed `missed` on boot — that's the monitor accounting for its own gap.
 
 ## Rollback
 
 ```sh
-ln -sfn /opt/smon/releases/<previous> /opt/smon/current
-systemctl restart monitor-server && curl -sf http://127.0.0.1:58400/readyz
+$CHECKOUT/deploy/droplet/rollback.sh            # the release before current
+$CHECKOUT/deploy/droplet/rollback.sh --to <v>   # or a named release
 ```
 
-Only across releases with no new migration — the honest failure is that an older binary
-refuses a newer schema (RUNBOOK, Rollback).
+The schema guard runs first: migrations are forward-only, so a store whose `_sqlx_migrations`
+is newer than the target binary's `--db-version` is **refused — naming both versions — before
+the switch**, and an unreadable database fails closed. That case is a restore-from-backup,
+not a repoint (RUNBOOK, Rollback; the same lesson as Durable Runner's D-056).
 
 ## When something is wrong
 
