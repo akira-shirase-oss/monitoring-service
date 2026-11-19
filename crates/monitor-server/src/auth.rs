@@ -927,25 +927,34 @@ mod password_tests {
         drop(permits);
     }
 
+    /// Retry a password-work call while a sibling test holds the permits — a `Busy`
+    /// is the bound doing its job, not a hash failure. The queue contract itself is
+    /// `a_full_work_queue_answers_busy_within_the_deadline`.
+    async fn until_slot<T, F, Fut>(call: F) -> T
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, PasswordWorkError>>,
+    {
+        for _ in 0..20 {
+            match call().await {
+                Err(PasswordWorkError::Busy) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                other => return other.expect("password work"),
+            }
+        }
+        panic!("the password-work permits never freed")
+    }
+
     #[tokio::test]
     async fn a_hash_verifies_and_a_wrong_password_does_not() {
-        let hash = hash_password("s3cret long password", PASSWORD_WORK_WAIT)
-            .await
-            .expect("hash");
+        let hash = until_slot(|| hash_password("s3cret long password", PASSWORD_WORK_WAIT)).await;
         assert!(
-            verify_password(&hash, "s3cret long password", PASSWORD_WORK_WAIT)
-                .await
-                .expect("verify")
+            until_slot(|| verify_password(&hash, "s3cret long password", PASSWORD_WORK_WAIT)).await
         );
+        assert!(!until_slot(|| verify_password(&hash, "wrong", PASSWORD_WORK_WAIT)).await);
         assert!(
-            !verify_password(&hash, "wrong", PASSWORD_WORK_WAIT)
-                .await
-                .expect("verify")
-        );
-        assert!(
-            !verify_password("not-a-phc", "x", PASSWORD_WORK_WAIT)
-                .await
-                .expect("verify"),
+            !until_slot(|| verify_password("not-a-phc", "x", PASSWORD_WORK_WAIT)).await,
             "bad store → closed"
         );
     }
