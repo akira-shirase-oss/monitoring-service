@@ -1,5 +1,6 @@
-/* The dashboard's styles: the copied design system (the components under
- * src/lib/components/ui — this app owns the copy) and this app's own motion. */
+/* The dashboard's styles: the copied component library's NEUTRAL PLACEHOLDER token file
+ * (src/lib/components/ui/styles.css — replaced wholesale when smon's own design system
+ * lands; components consume token names only) plus this app's own motion. */
 @import './lib/components/ui/styles.css';
 
 /* Motion: small, quick and purposeful — one-time or on-interaction only, never a scroll

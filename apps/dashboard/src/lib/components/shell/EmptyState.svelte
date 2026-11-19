@@ -1,4 +1,4 @@
-<!-- A list with nothing in it yet: a pixel-framed icon, one display-face line saying
+<!-- A list with nothing in it yet: a framed icon, one line saying
      what will be here, and the one action that fills it. Never a paragraph of apology. -->
 <script lang="ts">
 	import type { Component, Snippet } from 'svelte';

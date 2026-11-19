@@ -363,6 +363,12 @@ directly — bounded at 4 connections.
 shadcn-svelte ("sera" style), npm workspaces, and the Rust rules (typed errors in libs,
 `anyhow` only in binaries, every I/O await bounded, nothing external unwrapped).
 
+Scope (amended 2026-11-19): this covers structure and conventions only — never the visual
+system. Per the maintainer, Colophon's look is Colophon's: Service Monitor must not use its
+palette, its Geist Pixel + Inter pairing, its panels or its motifs. Smon's own design system
+is chosen later and replaces `apps/dashboard/src/lib/components/ui/styles.css`, which holds
+neutral placeholder tokens until then.
+
 ## D-001 — The old implementation's baseline is unavailable
 
 The rebuild guide's step 1 ("preserve the old repository; port the black-box failure fixtures")

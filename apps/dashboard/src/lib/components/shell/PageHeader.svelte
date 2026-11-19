@@ -1,4 +1,4 @@
-<!-- A page's title (Geist Pixel), a line of context under it, and its actions. The intro
+<!-- A page's title, a line of context under it, and its actions. The intro
      is one line that says what the page is for, not how the model behind it works. -->
 <script lang="ts">
 	import type { Snippet } from 'svelte';

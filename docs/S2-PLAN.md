@@ -6,9 +6,22 @@ monitor → test alert → public status page.* This document is the screen list
 inventory, the exact `@colophon/ui` copy list, the backend gaps, and the slice order with
 one Playwright journey each. No code in this document; it is the contract the slices build to.
 
-## Design contract (maintainer-confirmed, from Colophon's look)
+## Design contract — SUPERSEDED (maintainer correction, 2026-11-19)
 
-Pinned so every slice draws the same screen:
+**Binding correction:** Service Monitor must NOT use Colophon's look — not its palette, its
+Geist Pixel + Inter pairing, the inverted panel, the pixel motifs, or its surfaces. The
+instruction below to draw "in the maintainer's taste" was Colophon's taste and is withdrawn.
+Smon's own design system arrives later as maintainer-chosen screenshot options — after
+Colophon is done and deployed — and drops in by replacing ONE file,
+`src/lib/components/ui/styles.css`: every component consumes its token names, so no
+component changes when it lands. Until then that file holds deliberate neutral placeholder
+tokens (zero-chroma neutrals, one generic blue, platform font stacks — no webfonts at all).
+
+What stays from this plan: the copied shadcn-svelte component code and structure, the
+routes, the states, the data-testids and the Playwright journeys — the skeleton, not the
+skin. The historical contract follows for the record only.
+
+### Superseded contract (kept for the record)
 
 - **Type:** Geist Pixel for page titles and big figures; Inter everywhere else; JetBrains
   Mono for data — URLs, event ids, secrets, timestamps.
