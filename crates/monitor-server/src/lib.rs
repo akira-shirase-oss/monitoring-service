@@ -147,8 +147,30 @@ pub struct AppState {
     /// Pending API-token last-used stamps (S1c): the auth path writes here, the
     /// flusher lands them in one store write — never a write per request.
     pub token_use: auth::TokenUse,
+    /// `SMON_STATUS_DIR`: where the public snapshots live — `status.json` plus each
+    /// enabled workspace page at `s/<slug>.json` (S2, D-021). The public route reads
+    /// the files; the snapshot writer's heartbeat is their freshness.
+    pub status_dir: std::path::PathBuf,
+    /// Per-workspace "send test alert" cooldowns (S2): the test is a real network
+    /// send, so one per `TEST_SEND_EVERY` bounds what a member can aim at their
+    /// receiver. Bounded like `token_use`: workspaces are bounded, and the map
+    /// forgets spent cooldowns past a cap.
+    pub test_sends: TestSends,
     pub version: &'static str,
 }
+
+/// The pending test-alert cooldowns — `workspace → last send`.
+pub type TestSends = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<monitor_domain::WorkspaceId, tokio::time::Instant>>,
+>;
+
+/// One test alert per workspace this often (S2). A second call inside the window is
+/// 429 `too_many_requests` with `Retry-After`.
+pub const TEST_SEND_EVERY: Duration = Duration::from_secs(15);
+/// The test send's whole deadline — the outbox's own `attempt_deadline`.
+pub const TEST_SEND_DEADLINE: Duration = Duration::from_secs(5);
+/// Cooldown-map bound: past it, spent entries are forgotten before inserting.
+const TEST_SEND_CAP: usize = 4096;
 
 /// Drain the pending token-use stamps into the store in one transaction — the batched
 /// counterpart to `AppState::token_use` (S1c). The flusher task calls this on its
@@ -299,12 +321,21 @@ fn routes(state: AppState) -> Router {
         )
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{id}", delete(revoke_token))
+        // The workspace itself (S2): rename, the memberships the switcher lists, and
+        // the public status page's configuration (D-021).
+        .route("/workspaces", get(list_workspaces))
+        .route("/workspace", patch(patch_workspace))
+        .route(
+            "/workspace/status-page",
+            get(read_status_page).put(put_status_page),
+        )
         // The workspace's own webhook (S1d, D-017): member work — the URL is
         // SSRF-validated at save and revalidated inside every send.
         .route(
             "/workspace/webhook",
             get(read_webhook).put(put_webhook).delete(delete_webhook),
         )
+        .route("/workspace/webhook/test", post(test_webhook))
         .route("/backup", post(backup))
         // Auth wraps the whole API: /livez, /readyz and static files stay open —
         // the dashboard must load to *hold* a token, and readiness is not a secret.
@@ -322,6 +353,10 @@ fn routes(state: AppState) -> Router {
         .route("/api/login", post(login))
         .route("/api/signup", post(signup))
         .route("/api/logout", post(logout))
+        // The public status pages (S2, D-021): no credential — the slug is the page's
+        // public identity, the file's own expiry is its freshness, and the per-address
+        // throttle bounds what one client can ask for.
+        .route("/s/{slug}/status.json", get(public_status))
         .nest("/api", api)
         .with_state(state)
         .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
@@ -973,6 +1008,297 @@ async fn check_webhook_target(state: &AppState, url: &url::Url) -> Result<(), Ap
         )),
         Err(_) => Err(ApiError::RefusedTarget),
     }
+}
+
+/// The caller's workspaces (S2) — the memberships the sidebar switcher lists. Each
+/// principal answers for its own claim: an account its `members` rows plus the account
+/// identity the menu shows, a token the one workspace it was minted for, the operator
+/// the whole inventory at operator level. There is no wider view to ask for.
+async fn list_workspaces(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut account = serde_json::Value::Null;
+    let workspaces = match principal {
+        auth::Principal::Operator { .. } => state
+            .db
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .map(|w| {
+                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "role": "operator"})
+            })
+            .collect::<Vec<_>>(),
+        auth::Principal::Account { account: id, .. } => {
+            if let Some(row) = state.db.account_by_id(id).await? {
+                account = serde_json::json!({"id": row.id, "email": row.email});
+            }
+            state
+                .db
+                .memberships(id)
+                .await?
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({"id": m.id, "slug": m.slug, "name": m.name, "role": m.role})
+                })
+                .collect()
+        }
+        auth::Principal::Token {
+            workspace, role, ..
+        } => state
+            .db
+            .workspace_row(workspace)
+            .await?
+            .into_iter()
+            .map(|w| {
+                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "role": role.as_str()})
+            })
+            .collect(),
+    };
+    Ok(Json(
+        serde_json::json!({ "workspaces": workspaces, "account": account }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceBody {
+    pub name: String,
+}
+
+/// Rename the workspace (S2 onboarding step 1) — member work. The signup name is the
+/// account's email; the first-run flow names it something its owner recognizes.
+async fn patch_workspace(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<WorkspaceBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let view = member_for(&state, &principal)?;
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
+        return Err(ApiError::Invalid(
+            "a workspace name is 1-80 visible characters".into(),
+        ));
+    }
+    let row = view.rename_workspace(name).await?;
+    Ok(Json(serde_json::json!({
+        "workspace": { "id": row.id, "slug": row.slug, "name": row.name }
+    })))
+}
+
+/// The status-page config as the editor reads it (S2): `title: null` is the page's
+/// off switch; `monitor_ids` is the allowlist in display order.
+async fn read_status_page(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let view = viewer_for(&state, &principal);
+    let page = view.status_page().await?;
+    Ok(Json(serde_json::json!({
+        "status_page": {
+            "slug": page.slug,
+            "title": page.title,
+            "monitor_ids": page.monitors.iter().map(|m| &m.monitor_id).collect::<Vec<_>>(),
+        }
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StatusPageBody {
+    /// New public slug — optional; absent keeps the current one.
+    pub slug: Option<String>,
+    /// `null` or empty turns the page off (the monitor set is kept).
+    pub title: Option<String>,
+    /// The monitors the owner publishes, in display order.
+    pub monitor_ids: Vec<String>,
+}
+
+/// The public slug's charset — what `new_account` mints and the file name the writer
+/// uses (`s/<slug>.json`); anything else is refused rather than sanitized. `default`
+/// is a real slug (the seeded workspace's) — a tenant asking for it answers the same
+/// "already taken" conflict as any other owned slug.
+fn valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 64
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+}
+
+/// Write the status page (S2, D-021) — member work. The response is the *effective*
+/// config read back, so the client always shows what was stored.
+async fn put_status_page(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<StatusPageBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let view = member_for(&state, &principal)?;
+    if let Some(slug) = body.slug.as_deref()
+        && !valid_slug(slug)
+    {
+        return Err(ApiError::Invalid(
+            "a slug is 1-64 lowercase letters, digits and hyphens".into(),
+        ));
+    }
+    if let Some(title) = body.title.as_deref()
+        && (title.len() > 120 || title.chars().any(char::is_control))
+    {
+        return Err(ApiError::Invalid(
+            "a status page title is at most 120 visible characters".into(),
+        ));
+    }
+    let mut monitors = Vec::with_capacity(body.monitor_ids.len().min(64));
+    for id in &body.monitor_ids {
+        let uuid = Uuid::parse_str(id).map_err(|_| ApiError::BadId)?;
+        monitors.push(MonitorId(uuid));
+    }
+    view.set_status_page(
+        body.slug.as_deref(),
+        body.title.as_deref().map(str::trim),
+        &monitors,
+    )
+    .await
+    .map_err(|error| match error {
+        QueryError::Invalid(msg) => ApiError::Invalid(msg),
+        QueryError::Conflict(msg) => ApiError::Conflict(msg),
+        other => ApiError::Db(other),
+    })?;
+    let page = viewer_for(&state, &principal).status_page().await?;
+    Ok(Json(serde_json::json!({
+        "status_page": {
+            "slug": page.slug,
+            "title": page.title,
+            "monitor_ids": page.monitors.iter().map(|m| &m.monitor_id).collect::<Vec<_>>(),
+        }
+    })))
+}
+
+/// "Send test alert" (S2): one real send through the D-017 gate — the same
+/// literal/scheme check, a client built from the validating resolver, the
+/// workspace's own secret on the signature, the outbox's deadline — answered as a
+/// classified result, never an outbox row. One per `TEST_SEND_EVERY` per workspace.
+async fn test_webhook(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Response, ApiError> {
+    let view = member_for(&state, &principal)?;
+    let Some(webhook) = view.webhook().await? else {
+        return Err(ApiError::Invalid("save a webhook URL first".into()));
+    };
+    // The cooldown buys a real send: a call that can't reach the wire never spends it.
+    {
+        let now = tokio::time::Instant::now();
+        let mut sends = state
+            .test_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sends.len() >= TEST_SEND_CAP {
+            let cutoff = now - TEST_SEND_EVERY;
+            sends.retain(|_, last| *last > cutoff);
+        }
+        if let Some(last) = sends.get(&principal.workspace()) {
+            let wait = TEST_SEND_EVERY.saturating_sub(now.duration_since(*last));
+            if !wait.is_zero() {
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(
+                        axum::http::header::RETRY_AFTER,
+                        throttle::retry_after_secs(wait).to_string(),
+                    )],
+                    Json(serde_json::json!({
+                        "error": { "code": "too_many_requests",
+                                   "message": "one test alert every 15 seconds; retry shortly" }
+                    })),
+                )
+                    .into_response());
+            }
+        }
+        sends.insert(principal.workspace(), now);
+    }
+    let target = url::Url::parse(&webhook.url).map_err(|_| ApiError::BadUrl)?;
+    let result = deliver::test_send(
+        state.allow_local_targets,
+        &target,
+        Some(webhook.secret.as_bytes()),
+        TEST_SEND_DEADLINE,
+    )
+    .await;
+    Ok(Json(serde_json::json!({
+        "test": {
+            "ok": result.is_ok(),
+            "detail": result.as_ref().err().map_or("delivered", String::as_str),
+        }
+    }))
+    .into_response())
+}
+
+/// The public status page's payload (S2, D-021): no credential — the slug is the
+/// page's public identity. The address spends a token like any other anonymous
+/// route; the file's own `expires_at` is the freshness claim, and a missing file
+/// answers born-expired so "nothing written" can never read as healthy.
+async fn public_status(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    extensions: axum::http::Extensions,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(guard) = extensions.get::<throttle::Guard>() else {
+        tracing::error!("invariant: routes() installs the credential guard");
+        return ApiError::Corrupt.into_response();
+    };
+    // Anonymous reads spend a token and are never refunded — there is no credential
+    // whose correctness earns it back.
+    if let Err(wait) = guard.throttle.admit(guard.client(&extensions, &headers)) {
+        return throttle::too_many(wait);
+    }
+    let unavailable = |code: StatusCode, body: serde_json::Value| {
+        (
+            code,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response()
+    };
+    if !valid_slug(&slug) {
+        return unavailable(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": {"code": "not_found", "message": "no status page here"}}),
+        );
+    }
+    match state.db.status_page_by_slug(&slug).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return unavailable(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"error": {"code": "not_found", "message": "no status page here"}}),
+            );
+        }
+        Err(error) => return ApiError::Db(error).into_response(),
+    }
+    if let Ok(bytes) = std::fs::read(state.status_dir.join("s").join(format!("{slug}.json"))) {
+        return (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response();
+    }
+    // Enabled but never written — the writer died or hasn't beaten yet. The
+    // answer is the born-expired shape, timestamps RFC3339 like the writer's:
+    // a reader that trusts `expires_at` reads "monitoring unavailable".
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned());
+    unavailable(
+        StatusCode::OK,
+        serde_json::json!({
+            "generated_at": now,
+            "expires_at": now,
+            "monitoring": "unavailable",
+            "services": [],
+        }),
+    )
 }
 
 /// One 422 shape answer for every malformed signup field.

@@ -340,6 +340,8 @@ fn app_state(
         session_idle: config.session_idle,
         password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
         token_use: std::sync::Arc::default(),
+        status_dir: config.status_dir.clone().into(),
+        test_sends: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
         backup_dir: config.backup_dir.clone(),

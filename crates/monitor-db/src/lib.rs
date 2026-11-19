@@ -57,6 +57,9 @@ pub enum QueryError {
     OutOfRange(&'static str),
     #[error("invalid input: {0}")]
     Invalid(String),
+    /// A uniqueness or guard conflict — maps to the API's 409, not a validation 422.
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -692,6 +695,21 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// An account row by id — who a session belongs to (the `who` the account menu
+    /// shows). Reads no credential material: the hash column stays unselected.
+    pub async fn account_by_id(
+        &self,
+        account: AccountId,
+    ) -> Result<Option<AccountRow>, QueryError> {
+        sqlx::query_as::<_, AccountRow>(
+            "SELECT id, workspace_id, email, created_at FROM accounts WHERE id = ?",
+        )
+        .bind(account.0.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// An account session: same expiry/idle/refresh rule as operator sessions (D-016),
     /// keyed by the account-session digest and joined to the owning workspace so the
     /// request resolves its tenancy without a second lookup.
@@ -805,6 +823,76 @@ impl Db {
                     .ok_or_else(|| QueryError::Corrupt(format!("unreadable role {role:?}")))
             })
             .transpose()
+    }
+
+    /// Every workspace `account` belongs to, with its role in each (S2) — the credential's
+    /// own claim, so the lookup is scoped *by* it, like `member_role`. The workspace
+    /// switcher renders exactly this list; it can never name a workspace the account
+    /// isn't in.
+    pub async fn memberships(&self, account: AccountId) -> Result<Vec<MembershipRow>, QueryError> {
+        sqlx::query_as::<_, MembershipRow>(
+            "SELECT w.id, w.slug, w.name, m.role
+               FROM members m JOIN workspaces w ON w.id = m.workspace_id
+              WHERE m.account_id = ? ORDER BY w.name, w.created_at",
+        )
+        .bind(account.0.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// The enabled status pages — the snapshot writer's sweep (S2, D-021). A page is
+    /// enabled iff `status_title` is set non-empty; its monitors are the allowlist the
+    /// owner chose, in display order.
+    pub async fn status_pages(&self) -> Result<Vec<StatusPage>, QueryError> {
+        let workspaces = sqlx::query_as::<_, StatusPageRow>(
+            "SELECT id, slug, status_title AS title FROM workspaces
+              WHERE status_title IS NOT NULL AND status_title != ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut pages = Vec::with_capacity(workspaces.len());
+        for row in workspaces {
+            pages.push(self.status_page_of(row).await?);
+        }
+        Ok(pages)
+    }
+
+    /// The page behind one slug — the public route's lookup (S2). `None` covers both
+    /// "no such workspace" and "page off": the public answers them identically.
+    pub async fn status_page_by_slug(&self, slug: &str) -> Result<Option<StatusPage>, QueryError> {
+        let row = sqlx::query_as::<_, StatusPageRow>(
+            "SELECT id, slug, status_title AS title FROM workspaces
+              WHERE slug = ? AND status_title IS NOT NULL AND status_title != ''",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => Ok(Some(self.status_page_of(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// One enabled page's row plus its allowlisted monitors, ordered for display.
+    async fn status_page_of(&self, row: StatusPageRow) -> Result<StatusPage, QueryError> {
+        let workspace = Uuid::parse_str(&row.id)
+            .map(WorkspaceId)
+            .map_err(|_| QueryError::Corrupt(format!("workspace id {:?}", row.id)))?;
+        let monitors = sqlx::query_as::<_, StatusMonitorRow>(
+            "SELECT sm.monitor_id, m.name, sm.position
+               FROM status_monitors sm JOIN monitors m ON m.id = sm.monitor_id
+              WHERE sm.workspace_id = ? ORDER BY sm.position, m.name",
+        )
+        .bind(&row.id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(StatusPage {
+            workspace,
+            slug: row.slug,
+            title: row.title,
+            monitors,
+        })
     }
 
     /// The API-token row behind a presented token's digest (S1c). Unscoped on purpose:
@@ -1992,6 +2080,60 @@ pub struct MemberRow {
     pub created_at: OffsetDateTime,
 }
 
+/// One membership row of `GET /api/workspaces` — the workspace the account sits in
+/// and its role there (S2).
+#[derive(Debug, FromRow)]
+pub struct MembershipRow {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub role: String,
+}
+
+/// A `status_monitors` row joined to its monitor's name — the page's allowlist, in
+/// display order (S2).
+#[derive(Debug, FromRow)]
+pub struct StatusMonitorRow {
+    pub monitor_id: String,
+    pub name: String,
+    pub position: i64,
+}
+
+/// The workspaces row's page fields for the public/config lookups.
+#[derive(Debug, FromRow)]
+struct StatusPageRow {
+    id: String,
+    slug: String,
+    title: String,
+}
+
+/// The workspaces row's page fields for the member-facing config read.
+#[derive(Debug, FromRow)]
+struct PageConfigRow {
+    slug: String,
+    title: Option<String>,
+}
+
+/// An enabled public status page (S2, D-021): which workspace, at which slug, under
+/// which title, showing which monitors. `title` is always non-empty — enabled pages
+/// are the only ones this type represents.
+#[derive(Debug)]
+pub struct StatusPage {
+    pub workspace: WorkspaceId,
+    pub slug: String,
+    pub title: String,
+    pub monitors: Vec<StatusMonitorRow>,
+}
+
+/// The status-page configuration as the editor reads it (S2): title `None` means the
+/// page is off; the monitor set is kept so re-enabling restores it.
+#[derive(Debug)]
+pub struct StatusPageConfig {
+    pub slug: String,
+    pub title: Option<String>,
+    pub monitors: Vec<StatusMonitorRow>,
+}
+
 impl MemberRow {
     /// The member's role; `None` means the stored string isn't a role — corruption,
     /// never quietly a viewer.
@@ -2109,6 +2251,31 @@ impl ViewerDb<'_> {
         self.view.list_outbox(monitor).await
     }
 
+    /// The workspace's status-page configuration as saved (S2): slug, title (`None` =
+    /// the page is off) and the allowlisted monitors, in display order. Reads like this
+    /// are workspace state any member may see.
+    pub async fn status_page(&self) -> Result<StatusPageConfig, QueryError> {
+        let row = sqlx::query_as::<_, PageConfigRow>(
+            "SELECT slug, status_title AS title FROM workspaces WHERE id = ?",
+        )
+        .bind(self.view.workspace.0.to_string())
+        .fetch_one(&self.view.db.pool)
+        .await?;
+        let monitors = sqlx::query_as::<_, StatusMonitorRow>(
+            "SELECT sm.monitor_id, m.name, sm.position
+               FROM status_monitors sm JOIN monitors m ON m.id = sm.monitor_id
+              WHERE sm.workspace_id = ? ORDER BY sm.position, m.name",
+        )
+        .bind(self.view.workspace.0.to_string())
+        .fetch_all(&self.view.db.pool)
+        .await?;
+        Ok(StatusPageConfig {
+            slug: row.slug,
+            title: row.title,
+            monitors,
+        })
+    }
+
     /// The workspace's roster, oldest membership first — membership itself is
     /// workspace state every member may read (S1c).
     pub async fn list_members(&self) -> Result<Vec<MemberRow>, QueryError> {
@@ -2224,6 +2391,87 @@ impl MemberDb<'_> {
             .bind(self.view.view.workspace.0.to_string())
             .execute(&self.view.view.db.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Rename the workspace (S2 onboarding step 1: the signup name is the account's
+    /// email — the first thing a new tenant fixes). Returns the updated row.
+    pub async fn rename_workspace(&self, name: &str) -> Result<WorkspaceRow, QueryError> {
+        sqlx::query_as::<_, WorkspaceRow>(
+            "UPDATE workspaces SET name = ? WHERE id = ?
+             RETURNING id, slug, name, created_at",
+        )
+        .bind(name)
+        .bind(self.view.view.workspace.0.to_string())
+        .fetch_one(&self.view.view.db.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Write the status page configuration in one transaction (S2, D-021): `slug`
+    /// (`Some` renames the page's public path), `title` (`None` or empty turns the
+    /// page off without losing the monitor set), and the allowlisted monitors in
+    /// display order. Monitors that aren't this workspace's are refused — a PUT can
+    /// never publish another tenant's target.
+    pub async fn set_status_page(
+        &self,
+        slug: Option<&str>,
+        title: Option<&str>,
+        monitors: &[MonitorId],
+    ) -> Result<(), QueryError> {
+        let ws = &self.view.view;
+        let mut tx = ws.db.pool.begin().await?;
+        if let Some(slug) = slug {
+            let taken = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM workspaces WHERE slug = ? AND id != ?",
+            )
+            .bind(slug)
+            .bind(ws.workspace.0.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if taken > 0 {
+                return Err(QueryError::Conflict("that slug is already taken".into()));
+            }
+            sqlx::query("UPDATE workspaces SET slug = ? WHERE id = ?")
+                .bind(slug)
+                .bind(ws.workspace.0.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        let title = title.filter(|t| !t.is_empty());
+        sqlx::query("UPDATE workspaces SET status_title = ? WHERE id = ?")
+            .bind(title)
+            .bind(ws.workspace.0.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM status_monitors WHERE workspace_id = ?")
+            .bind(ws.workspace.0.to_string())
+            .execute(&mut *tx)
+            .await?;
+        for (position, monitor) in monitors.iter().enumerate() {
+            // The scoped insert is the isolation: a monitor_id outside this
+            // workspace matches nothing and cannot be published through this view.
+            let position = i64::try_from(position)
+                .map_err(|_| QueryError::Invalid("more monitors than a page can order".into()))?;
+            let inserted = sqlx::query(
+                "INSERT INTO status_monitors (workspace_id, monitor_id, position)
+                 SELECT ?, m.id, ? FROM monitors m
+                  WHERE m.id = ? AND m.workspace_id = ?",
+            )
+            .bind(ws.workspace.0.to_string())
+            .bind(position)
+            .bind(monitor.0.to_string())
+            .bind(ws.workspace.0.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if inserted == 0 {
+                return Err(QueryError::Invalid(
+                    "a listed monitor is not in this workspace".into(),
+                ));
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 }

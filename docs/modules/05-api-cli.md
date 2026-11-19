@@ -22,6 +22,15 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `backup_disabled`). Incidents are system-created evidence — there is deliberately no
   `POST`. `IncidentView` carries all four times (M6.3): `first_fail_at`, `opened_at`,
   `last_fail_at`, `resolved_at` — RFC3339, nullable for pre-M6.3 rows.
+  Workspace management (S1–S2, D-020/D-021): `GET|PUT|DELETE /api/workspace/webhook`
+  (the tenant channel, SSRF-validated at save); `POST /api/workspace/webhook/test`
+  (one real send through the same gate — no outbox row, classified result, one per
+  15 s per workspace); `PATCH /api/workspace` (rename, 1–80 visible chars);
+  `GET /api/workspaces` (the caller's memberships — account rows + account identity,
+  a token's one workspace, the operator's inventory); `GET|PUT
+  /api/workspace/status-page` (`{slug, title, monitor_ids}` — `title` empty/null is
+  the page's off switch, the monitor set is workspace-scoped, a taken slug is 409).
+  The public read is outside `/api`: `GET /s/{slug}/status.json` (module 07).
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
 - **Auth (M5.1 + M7.2, live):** every `/api/**` route requires a credential —
