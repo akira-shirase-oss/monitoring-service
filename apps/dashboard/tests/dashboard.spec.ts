@@ -118,7 +118,7 @@ test('three failures open an incident and the detail page tells the truth', asyn
 	await expect(page.getByText('down').first()).toBeVisible();
 	await expect(page.getByText('Recent checks')).toBeVisible();
 	await expect(page.getByText('HTTP 500').first()).toBeVisible();
-	await expect(page.getByText('Incidents')).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Incidents' })).toBeVisible();
 	await expect(page.getByText('still open').first()).toBeVisible();
 	// Coverage vs success are separate claims — success reads 0%, coverage is a number.
 	await expect(page.getByText(/coverage \d+\.\d%[\s\S]*success 0\.0%/)).toBeVisible();
@@ -363,7 +363,7 @@ test('a mutation 401 surfaces the token error, never silent', async ({ page }) =
 		.getByPlaceholder('https://example.com/healthz')
 		.fill('http://127.0.0.1/healthz');
 	await page.getByRole('button', { name: 'Create monitor' }).click();
-	await expect(page.getByText('The server rejected the token')).toBeVisible();
+	await expect(page.getByText('Your session ended — sign in again.')).toBeVisible();
 });
 
 test('an active maintenance window is visible, never silent', async ({ page, request }) => {
@@ -459,18 +459,22 @@ test('sign-in: wrong token refused, right token earns the session, sign-out ends
 	// The shared beforeEach already logged this context in — start truly signed out.
 	await context.clearCookies();
 	await page.goto('/');
-	await expect(page.getByText('Sign in to manage monitors.')).toBeVisible();
+	// A dead session is a redirect to the sign-in card — never a half-board.
+	await expect(page).toHaveURL(/\/login\?return=/);
+	await expect(page.getByTestId('auth-card')).toBeVisible();
 
-	// A wrong token is refused with an honest error, no cookie.
-	await page.getByPlaceholder('admin token').fill('wrong-token');
-	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-	await expect(page.getByText('That token was refused.')).toBeVisible();
-	await expect(page.getByText('Sign in to manage monitors.')).toBeVisible();
+	// The operator-token path folds under technical details.
+	await page.getByText('Technical details').click();
+
+	// A wrong token is refused with the server's own words, no cookie.
+	await page.getByTestId('token-input').fill('wrong-token');
+	await page.getByTestId('token-submit').click();
+	await expect(page.getByTestId('auth-error')).toHaveText(/invalid credentials/);
 
 	// The right token → 204 + cookie → reload → the real board, not a stored token.
-	await page.getByPlaceholder('admin token').fill(TOKEN);
-	await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-	await expect(page.getByText('Sign in to manage monitors.')).not.toBeVisible({
+	await page.getByTestId('token-input').fill(TOKEN);
+	await page.getByTestId('token-submit').click();
+	await expect(page.getByRole('heading', { name: 'Monitors' })).toBeVisible({
 		timeout: 10_000
 	});
 	// The session cookie is HttpOnly — document.cookie can never see it.
@@ -480,11 +484,10 @@ test('sign-in: wrong token refused, right token earns the session, sign-out ends
 	expect(session?.httpOnly).toBe(true);
 	expect(session?.sameSite).toBe('Strict');
 
-	// Sign out deletes the row server-side and expires the cookie — the gate returns.
-	await page.getByRole('button', { name: 'Sign out' }).click();
-	await expect(page.getByText('Sign in to manage monitors.')).toBeVisible({
-		timeout: 10_000
-	});
+	// Sign out deletes the row server-side and expires the cookie — the card returns.
+	await page.getByTestId('account-menu').click();
+	await page.getByTestId('sign-out').click();
+	await expect(page).toHaveURL(/\/login/, { timeout: 10_000 });
 	const after = await context.cookies();
 	expect(after.find((c) => c.name === 'smon_session')?.value ?? '').toBe('');
 });
