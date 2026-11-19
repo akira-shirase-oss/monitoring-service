@@ -90,8 +90,8 @@ Monitor token, Colophon registers its sites in that user's workspace through the
 
 ## Open questions
 
-1. Accounts in Neon, or keep the whole product on SQLite?
-2. Status pages on a path (`/s/<workspace>`) or on subdomains?
-3. Email provider for alerts and verification?
-4. Free-plan limits: monitors, minimum interval, retention?
+1. ~~Accounts in Neon, or keep the whole product on SQLite?~~ Decided (D-020): everything in the same SQLite store; no Neon.
+2. ~~Status pages on a path (`/s/<workspace>`) or on subdomains?~~ Decided (D-021): `/s/<workspace-slug>` on the same origin; subdomains only if asked later.
+3. Email provider for alerts and verification? Stays lettre SMTP; the provider is a deploy-time choice, not a code decision.
+4. Free-plan limits: monitors, minimum interval, retention? Deferred to S3.
 5. ~~S4's ≥1M checks: one server dispatches at most 20 probes per 1 s tick.~~ Decided (D-018): phases are spread per monitor and the global budget follows the schedule up to 512 slots, with a named refusal past it. One server now serves up to ~1,900 monitors at 15 s (~128 checks/s, ≈2.2 h for 1M checks); the long run itself is still to do.

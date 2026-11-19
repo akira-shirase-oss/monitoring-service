@@ -2,6 +2,29 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-021 — Public status pages live at `/s/<workspace-slug>` on the same origin
+
+One page per workspace, served from the monitor's own origin — no wildcard DNS, no
+per-workspace certificate, nothing new for the Caddyfile to know. Subdomains stay
+possible later if asked for; nothing about `/s/` forecloses them. The slug is
+workspace data and therefore workspace-scoped like everything else (D-020).
+Closes SAAS_PLAN open question 2.
+
+## D-020 — Accounts, workspaces, members and tokens live in the same SQLite store
+
+SAAS_PLAN open question 1 — Neon for account records — is closed: **no second
+database**. Accounts, workspaces, members and API tokens join monitors, checks,
+incidents and the outbox in the one SQLite store the product already has. The
+engine never depends on a network database (a Neon outage can no longer stop
+anything), the product stays self-contained and self-hostable as a single
+binary plus a volume, and the existing backup endpoint and restore drill cover
+account records with the same evidence path — nothing new to back up, encrypt or
+restore. The cost carried on the record: no managed, multi-AZ database for
+account data; the volume snapshot story (`smon-backup.sh` → age → R2) is the
+whole story, and it is already drilled. Every tenant-owned row carries
+`workspace_id`; the store API takes a `WorkspaceId` so an unscoped query cannot
+compile.
+
 ## D-019 — Backups are confined to `SMON_BACKUP_DIR` under server-drawn names
 
 `POST /api/backup` took an absolute `path` — a write-anywhere primitive the admin token's
