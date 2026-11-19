@@ -629,9 +629,10 @@ fn spawn_deliverers(
     }
 }
 
-/// The email alert channel (M7.1): `SMON_SMTP_DSN` selects the relay
-/// (`smtps://user:pass@host[:465]`, `smtp://user:pass@host[:587]?tls=required` for mandatory
-/// STARTTLS, or a bare `smtp://` for an explicitly plaintext local relay), `SMON_SMTP_FROM`
+/// The email alert channel (M7.1): `SMON_SMTP_DSN` selects the relay — prefer
+/// `smtps://user:pass@host[:465]` (implicit TLS, no cleartext preamble);
+/// `smtp://user:pass@host[:587]?tls=required` is mandatory STARTTLS where implicit TLS
+/// isn't offered, and a bare `smtp://` an explicitly plaintext local relay. `SMON_SMTP_FROM`
 /// is the sender mailbox, `SMON_SMTP_TO` a comma-separated recipient list. All three are
 /// required together; a partial configuration is a boot error, not a half-live channel.
 fn smtp_sink(config: &Config) -> anyhow::Result<Option<Sink>> {

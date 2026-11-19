@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use lettre::Tokio1Executor;
 use lettre::message::Mailbox;
 use lettre::transport::smtp::AsyncSmtpTransport;
 use lettre::transport::smtp::client::Tls;
+use lettre::{AsyncTransport, Tokio1Executor};
 use monitor_db::{Db, Observation, writer};
 use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation};
 use monitor_server::deliver::{Config, Deliverer, Sink};
@@ -358,6 +358,175 @@ async fn a_name_with_line_breaks_cannot_inject_a_header_or_a_line() -> anyhow::R
             .iter()
             .any(|line| line.starts_with("Bcc:") || line.starts_with("X-Injected")),
         "no line of the body starts with the injected text: {body:?}"
+    );
+    Ok(())
+}
+
+/// RUSTSEC-2026-0561: a `.` line inside the payload ends DATA early on a server that takes
+/// a bare LF for an ending, and everything after it is read as fresh SMTP commands — a
+/// second, attacker-written message over our authenticated session. Operator text can no
+/// longer place a lone `.` on the wire: `one_line` keeps it inside the Monitor line, and
+/// lettre 0.11.24 normalizes and dot-stuffs whatever the body does contain. The wire must
+/// show ONE message, one terminator, no extra commands.
+#[tokio::test]
+async fn a_dot_terminated_name_cannot_splice_a_second_message() -> anyhow::Result<()> {
+    let (db, writer) = rig().await?;
+    let name = "web\n.\r\nMAIL FROM:<x@evil>\r\nRCPT TO:<x@evil>\r\nDATA\r\n.\r\npwned";
+    let monitor = NewMonitor::new(name, url::Url::parse("https://example.com")?)?.into_monitor();
+    db.insert_monitor(&monitor).await?;
+    for _ in 0..3 {
+        writer
+            .record(Observation {
+                monitor_id: monitor.id,
+                generation: monitor.generation,
+                slot_at: OffsetDateTime::now_utc(),
+                slot: SlotObservation::Probe(CheckOutcome::Transport),
+                http_status: None,
+                latency_ms: None,
+                detail: None,
+            })
+            .await?;
+    }
+    let (port, mut wire) = smtp_stub(0).await?;
+    let shutdown = CancellationToken::new();
+    let task = Deliverer::spawn(
+        db.clone(),
+        writer,
+        fast_config(),
+        email_sink(port)?,
+        shutdown.clone(),
+    );
+    let mut lines = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), wire.recv()).await {
+            Ok(Some(line)) if line.eq_ignore_ascii_case("QUIT") => {
+                lines.push(line);
+                break;
+            }
+            Ok(Some(line)) => lines.push(line),
+            _ => break,
+        }
+    }
+    shutdown.cancel();
+    task.await?;
+
+    // Every captured line is client→server: exactly one MAIL (the real sender), one DATA,
+    // one `.` terminator, then QUIT — no second message was spliced in.
+    let commands = |prefix: &str| {
+        lines
+            .iter()
+            .filter(|line| line.to_ascii_uppercase().starts_with(prefix))
+            .count()
+    };
+    assert_eq!(commands("MAIL FROM"), 1, "{lines:?}");
+    assert_eq!(commands("DATA"), 1, "{lines:?}");
+    assert_eq!(commands("RCPT TO"), 1, "{lines:?}");
+    assert_eq!(
+        lines.iter().filter(|line| line.as_str() == ".").count(),
+        1,
+        "one DATA terminator: {lines:?}"
+    );
+    // The attacker's addresses may only ever appear inside the DATA window as body
+    // text — never on a command line.
+    assert!(
+        lines.iter().all(|line| {
+            !line.contains("x@evil")
+                || (!line.to_ascii_uppercase().starts_with("MAIL FROM")
+                    && !line.to_ascii_uppercase().starts_with("RCPT TO"))
+        }),
+        "x@evil must never appear on a command line: {lines:?}"
+    );
+    let terminator = lines
+        .iter()
+        .position(|line| line == ".")
+        .ok_or_else(|| anyhow::anyhow!("no DATA terminator: {lines:?}"))?;
+    assert!(
+        lines[terminator + 1..]
+            .iter()
+            .all(|line| line.eq_ignore_ascii_case("QUIT")),
+        "nothing follows the terminator but QUIT: {lines:?}"
+    );
+    // The injected text did land — flattened onto the Monitor line, harmless.
+    let data = lines
+        .iter()
+        .position(|line| line.eq_ignore_ascii_case("DATA"))
+        .unwrap();
+    assert!(
+        lines[data..terminator]
+            .iter()
+            .any(|line| line.contains("x@evil")),
+        "the payload is present as inert body text: {lines:?}"
+    );
+    Ok(())
+}
+
+/// The second layer under the one above: lettre 0.11.24 itself (RUSTSEC-2026-0561)
+/// normalizes a String body's bare CR/LF to CRLF and dot-stuffs at send time, so the
+/// defense does not rest on `one_line` alone. A body that DOES carry a bare `.` line —
+/// sent straight through the transport, not through `deliver_email` — must still arrive
+/// as one message: the `.` doubled, the command words inside the data window.
+#[tokio::test]
+async fn lettre_dot_stuffs_a_bare_dot_line_at_the_transport() -> anyhow::Result<()> {
+    let (port, mut wire) = smtp_stub(0).await?;
+    let mailer = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+        .port(port)
+        .tls(Tls::None)
+        .build();
+    let message = lettre::Message::builder()
+        .from("alerts@monitor.local".parse::<Mailbox>()?)
+        .to("oncall@example.com".parse::<Mailbox>()?)
+        .subject("x")
+        .body(
+            "before\n.\r\nMAIL FROM:<x@evil>\r\nRCPT TO:<x@evil>\r\nDATA\r\nafter\n".to_owned(),
+        )?;
+    mailer.send(message).await?;
+
+    let mut lines = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), wire.recv()).await {
+            Ok(Some(line)) if line.eq_ignore_ascii_case("QUIT") => {
+                lines.push(line);
+                break;
+            }
+            Ok(Some(line)) => lines.push(line),
+            _ => break,
+        }
+    }
+    // The stub records every wire line, commands and DATA payload alike — so verb counts
+    // only apply OUTSIDE the data window (before DATA and after its `.` terminator).
+    let data_at = lines
+        .iter()
+        .position(|line| line.eq_ignore_ascii_case("DATA"))
+        .ok_or_else(|| anyhow::anyhow!("no DATA command: {lines:?}"))?;
+    let terminator = lines
+        .iter()
+        .position(|line| line == ".")
+        .ok_or_else(|| anyhow::anyhow!("no DATA terminator: {lines:?}"))?;
+    let outside: Vec<&String> = lines[..data_at]
+        .iter()
+        .chain(lines[terminator + 1..].iter())
+        .collect();
+    let commands = |prefix: &str| {
+        outside
+            .iter()
+            .filter(|line| line.to_ascii_uppercase().starts_with(prefix))
+            .count()
+    };
+    assert_eq!(commands("MAIL FROM"), 1, "{lines:?}");
+    assert_eq!(commands("RCPT TO"), 1, "{lines:?}");
+    // The payload's `.` went over the wire doubled, so the stub never left DATA mode
+    // for it; the single `.` is the real terminator, followed only by QUIT.
+    assert!(
+        lines[data_at..terminator].iter().any(|line| line == ".."),
+        "the bare dot line arrived stuffed: {lines:?}"
+    );
+    assert!(
+        outside
+            .iter()
+            .all(|line| { line.eq_ignore_ascii_case("QUIT") || !line.contains("x@evil") }),
+        "nothing command-like follows or precedes the one message: {lines:?}"
     );
     Ok(())
 }

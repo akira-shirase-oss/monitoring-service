@@ -34,8 +34,9 @@ at-least-once to a receiver — without alerting ever being able to stall observ
   bookkeeping). Each deliverer polls only its own channel, so a dead SMTP relay can never
   stall webhooks or vice versa. No configured channel ⇒ no dead-plan rows.
 - **Email sink:** `Sink::Email` — lettre `AsyncSmtpTransport` on rustls+tokio
-  (`SMON_SMTP_DSN`: `smtps://user:pass@host[:465]`, `smtp://…?tls=required` for mandatory
-  STARTTLS, bare `smtp://` only for an explicitly plaintext local relay),
+  (`SMON_SMTP_DSN`: prefer `smtps://user:pass@host[:465]` — implicit TLS, no cleartext
+  preamble; `smtp://…?tls=required` for mandatory STARTTLS where implicit TLS isn't
+  offered; bare `smtp://` only for an explicitly plaintext local relay),
   `SMON_SMTP_FROM`, `SMON_SMTP_TO` (comma-separated). All three required together —
   partial config is a boot error, not a half-live channel. Subject carries
   `[service-monitor] <monitor>: <kind>` with CR/LF stripped (header injection never

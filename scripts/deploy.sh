@@ -58,8 +58,9 @@ ln -sfn "$DEST" "$PREFIX/current"
 # SMON_LOG_FILE=/opt/smon/data/monitor.log
 # SMON_WEBHOOK_URL=
 # SMON_WEBHOOK_SECRET=
-# Email channel — set all three or none (partial config refuses to boot). The DSN can
-# also be smtp://host:587?tls=required for mandatory STARTTLS.
+# Email channel — set all three or none (partial config refuses to boot). Prefer
+# smtps:// — implicit TLS on 465, no cleartext preamble at all. smtp://host:587?tls=required
+# (mandatory STARTTLS) works where the provider offers no implicit TLS.
 # SMON_SMTP_DSN=smtps://user:pass@smtp.example.com:465
 # SMON_SMTP_FROM=alerts@example.com
 # SMON_SMTP_TO=oncall@example.com,backup@example.com
