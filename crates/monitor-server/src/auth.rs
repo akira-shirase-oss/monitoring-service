@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use monitor_domain::{AccountId, WorkspaceId};
+use monitor_domain::{AccountId, ApiTokenId, Role, WorkspaceId};
 
 use crate::AppState;
 
@@ -86,13 +86,6 @@ fn came_over_tls(headers: &header::HeaderMap) -> bool {
     forwarded_proto || forwarded
 }
 
-/// Which credential authorized the request — decides whether Origin is mandatory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Credential {
-    Bearer,
-    Cookie,
-}
-
 pub async fn require_auth(
     State(state): State<AppState>,
     mut request: Request<axum::body::Body>,
@@ -118,10 +111,10 @@ pub async fn require_auth(
     }
 
     // A presented cookie is resolved before anything else (S1b): an account session
-    // authorizes in every mode — tokenless dev included — and resolves to the account's
-    // own workspace, never the operator's.
-    let principal = match session_principal(&state, request.headers().get(header::COOKIE)).await {
-        Ok(principal) => principal,
+    // authorizes in every mode — tokenless dev included — and scopes to a workspace
+    // the account belongs to, never the operator's.
+    let session = match session_principal(&state, request.headers().get(header::COOKIE)).await {
+        Ok(session) => session,
         Err(response) => return *response,
     };
 
@@ -130,17 +123,17 @@ pub async fn require_auth(
         // listener is trusted — so only a loopback `Host` is: a page that rebinds its own
         // hostname to 127.0.0.1 is same-origin with us, but its `Host` is its own name.
         // A resolved account cookie still binds its own workspace over the dev trust.
-        if let Some(principal) = principal {
-            if is_mutation(request.method()) && request.headers().get(header::ORIGIN).is_none() {
-                return deny(
-                    StatusCode::FORBIDDEN,
-                    "origin_required",
-                    "cookie-authenticated writes require a matching Origin",
-                );
-            }
-            request.extensions_mut().insert(CookieAuth);
-            request.extensions_mut().insert(principal);
-            return next.run(request).await;
+        if let Some(session) = session {
+            let principal =
+                cookie_principal(&state, request.headers(), request.method(), session).await;
+            return match principal {
+                Ok(principal) => {
+                    request.extensions_mut().insert(CookieAuth);
+                    request.extensions_mut().insert(principal);
+                    next.run(request).await
+                }
+                Err(response) => *response,
+            };
         }
         if let Some(authority) = authority.as_deref()
             && !is_loopback_authority(authority)
@@ -151,77 +144,289 @@ pub async fn require_auth(
                 "without SMON_ADMIN_TOKEN only a loopback Host is served",
             );
         }
-        request.extensions_mut().insert(Principal::Operator);
+        request.extensions_mut().insert(Principal::Operator {
+            workspace: WorkspaceId::DEFAULT,
+        });
         return next.run(request).await;
     };
 
     // A presented bearer draws on its address's guessing budget before it is compared
-    // (throttle.rs, L1); a right one gives the token back.
-    let bearer_ok = match request.headers().get(header::AUTHORIZATION) {
-        None => false,
-        Some(presented) => {
-            let Some(guard) = request.extensions().get::<crate::throttle::Guard>() else {
-                tracing::error!("invariant: routes() installs the credential guard");
-                return deny(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    "internal error",
-                );
-            };
-            let key = guard.client(request.extensions(), request.headers());
-            match guard.throttle.admit(key) {
-                Err(wait) => return crate::throttle::too_many(wait),
-                Ok(attempt) if bearer_matches(Some(presented), token) => {
-                    attempt.succeeded();
-                    true
-                }
-                Ok(_spent) => false,
-            }
-        }
-    };
-    let credential = if bearer_ok {
-        Some(Credential::Bearer)
-    } else if principal.is_some() {
-        Some(Credential::Cookie)
-    } else {
-        None
+    // (throttle.rs, L1); a right one gives the token back. An operator bearer wins;
+    // anything else is tried as a workspace API token by digest.
+    let bearer = match resolve_bearer(&state, request.extensions(), request.headers(), token).await
+    {
+        Ok(bearer) => bearer,
+        Err(response) => return *response,
     };
 
-    match credential {
-        Some(Credential::Bearer) => {
-            request.extensions_mut().insert(Principal::Operator);
+    match bearer {
+        Bearer::Operator => match scope_operator(&state, request.headers()).await {
+            Ok(workspace) => {
+                request
+                    .extensions_mut()
+                    .insert(Principal::Operator { workspace });
+                next.run(request).await
+            }
+            Err(response) => *response,
+        },
+        Bearer::Token(principal) => {
+            // A token's scope is the row that issued it — the picker can't move it.
+            if let Principal::Token { workspace, .. } = principal
+                && matches!(workspace_pick(request.headers()), Ok(Some(picked)) if picked != workspace)
+            {
+                return deny_not_a_member();
+            }
+            request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Some(Credential::Cookie) => {
-            if is_mutation(request.method()) && request.headers().get(header::ORIGIN).is_none() {
+        _ => {
+            let Some(session) = session else {
                 return deny(
-                    StatusCode::FORBIDDEN,
-                    "origin_required",
-                    "cookie-authenticated writes require a matching Origin",
+                    StatusCode::UNAUTHORIZED,
+                    "unauthenticated",
+                    "a valid Bearer token or session cookie is required",
                 );
+            };
+            match cookie_principal(&state, request.headers(), request.method(), session).await {
+                Ok(principal) => {
+                    request.extensions_mut().insert(CookieAuth);
+                    request.extensions_mut().insert(principal);
+                    next.run(request).await
+                }
+                Err(response) => *response,
             }
-            request.extensions_mut().insert(CookieAuth);
-            if let Some(p) = principal {
-                request.extensions_mut().insert(p);
-            }
-            next.run(request).await
         }
-        None => deny(
-            StatusCode::UNAUTHORIZED,
-            "unauthenticated",
-            "a valid Bearer token or session cookie is required",
-        ),
     }
+}
+
+/// A session cookie's principal (S1c): the Origin rule for cookie-authenticated writes
+/// holds in every mode, then the session scopes — an account to a workspace it's a
+/// member of, an operator to the picked workspace.
+async fn cookie_principal(
+    state: &AppState,
+    headers: &header::HeaderMap,
+    method: &Method,
+    session: Session,
+) -> Result<Principal, Box<Response>> {
+    if is_mutation(method) && headers.get(header::ORIGIN).is_none() {
+        return Err(Box::new(deny(
+            StatusCode::FORBIDDEN,
+            "origin_required",
+            "cookie-authenticated writes require a matching Origin",
+        )));
+    }
+    match session {
+        Session::Account(account, home) => scope_account(state, headers, account, home).await,
+        Session::Operator => match scope_operator(state, headers).await {
+            Ok(workspace) => Ok(Principal::Operator { workspace }),
+            Err(response) => Err(response),
+        },
+    }
+}
+
+/// The operator's workspace: the default, or one `X-Smon-Workspace` names — a
+/// superuser may act in any workspace that exists, but a misspelt id is still a miss.
+async fn scope_operator(
+    state: &AppState,
+    headers: &header::HeaderMap,
+) -> Result<WorkspaceId, Box<Response>> {
+    match workspace_pick(headers) {
+        Ok(Some(workspace)) => match state.db.workspace_row(workspace).await {
+            Ok(Some(_)) => Ok(workspace),
+            Ok(None) => Err(Box::new(deny_not_a_member())),
+            Err(error) => {
+                tracing::error!(%error, "workspace lookup failed");
+                Err(Box::new(deny(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "internal",
+                    "the workspace store is unavailable",
+                )))
+            }
+        },
+        Ok(None) => Ok(WorkspaceId::DEFAULT),
+        Err(()) => Err(Box::new(deny_not_a_member())),
+    }
+}
+
+/// What an `Authorization` header proved, if anything: the operator token, a live
+/// workspace API token (already a `Principal`), or a guess that didn't land.
+enum Bearer {
+    Operator,
+    Token(Principal),
+    Denied,
+    Absent,
+}
+
+/// The bearer verdict: a presented credential draws on its address's guessing budget
+/// before it's compared (throttle.rs, L1); a right one gives the token back. The
+/// operator token wins; anything else is tried as a workspace API token by digest.
+async fn resolve_bearer(
+    state: &AppState,
+    extensions: &axum::http::Extensions,
+    headers: &header::HeaderMap,
+    token: &Arc<str>,
+) -> Result<Bearer, Box<Response>> {
+    let Some(presented) = headers.get(header::AUTHORIZATION) else {
+        return Ok(Bearer::Absent);
+    };
+    let Some(guard) = extensions.get::<crate::throttle::Guard>() else {
+        tracing::error!("invariant: routes() installs the credential guard");
+        return Err(Box::new(deny(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal error",
+        )));
+    };
+    let key = guard.client(extensions, headers);
+    let attempt = match guard.throttle.admit(key) {
+        Err(wait) => return Err(Box::new(crate::throttle::too_many(wait))),
+        Ok(attempt) => attempt,
+    };
+    let Some(presented) = bearer_str(presented) else {
+        return Ok(Bearer::Denied);
+    };
+    if digests_match(presented.as_bytes(), token.as_bytes()) {
+        attempt.succeeded();
+        return Ok(Bearer::Operator);
+    }
+    match api_token_principal(state, presented).await {
+        Ok(Some(principal)) => {
+            attempt.succeeded();
+            Ok(Bearer::Token(principal))
+        }
+        Ok(None) => Ok(Bearer::Denied),
+        Err(response) => Err(response),
+    }
+}
+
+/// The bearer value itself, without the scheme — `None` when it isn't Bearer or isn't
+/// UTF-8 (a non-UTF-8 credential is a denial, not an error).
+fn bearer_str(value: &header::HeaderValue) -> Option<&str> {
+    value.to_str().ok()?.strip_prefix("Bearer ")
+}
+
+/// One deny for every workspace-pick failure — malformed id, workspace that doesn't
+/// exist, workspace the caller isn't a member of, workspace a token can't reach. Which
+/// it was stays in the server's logs, not the response.
+fn deny_not_a_member() -> Response {
+    deny(
+        StatusCode::FORBIDDEN,
+        "not_a_member",
+        "you are not a member of that workspace",
+    )
+}
+
+/// `X-Smon-Workspace` as a workspace id: absent → `Ok(None)`; unparseable → `Err`, a
+/// workspace the caller can't name is one they can't be a member of.
+fn workspace_pick(headers: &header::HeaderMap) -> Result<Option<WorkspaceId>, ()> {
+    let Some(value) = headers.get(WORKSPACE_HEADER) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .to_str()
+        .ok()
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+    match parsed {
+        Some(id) => Ok(Some(WorkspaceId(id))),
+        None => Err(()),
+    }
+}
+
+/// The account session's scope (S1c): the picked workspace or the session's own,
+/// and the role the `members` row grants there — no row, no request.
+async fn scope_account(
+    state: &AppState,
+    headers: &header::HeaderMap,
+    account: AccountId,
+    home: WorkspaceId,
+) -> Result<Principal, Box<Response>> {
+    let workspace = match workspace_pick(headers) {
+        Ok(picked) => picked.unwrap_or(home),
+        Err(()) => return Err(Box::new(deny_not_a_member())),
+    };
+    match state.db.member_role(workspace, account).await {
+        Ok(Some(role)) => Ok(Principal::Account {
+            account,
+            workspace,
+            role,
+        }),
+        Ok(None) => Err(Box::new(deny_not_a_member())),
+        Err(error) => {
+            tracing::error!(%error, "membership lookup failed");
+            Err(Box::new(deny(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "internal",
+                "the membership store is unavailable",
+            )))
+        }
+    }
+}
+
+/// A workspace API token by digest (S1c): the row is the credential — its workspace,
+/// its minted role, its revocation. `live()` is the whole liveness check; a revoked
+/// token answers like an unknown one. Last-use is stamped in memory and flushed in
+/// batches, never written per request.
+async fn api_token_principal(
+    state: &AppState,
+    presented: &str,
+) -> Result<Option<Principal>, Box<Response>> {
+    let digest = api_token_key(presented);
+    let row = match state.db.api_token_by_digest(&digest).await {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(%error, "api token lookup failed");
+            return Err(Box::new(deny(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "internal",
+                "the credential store is unavailable",
+            )));
+        }
+    };
+    let Some(row) = row else { return Ok(None) };
+    if !row.live() || !digests_match(digest.as_bytes(), row.token_digest.as_bytes()) {
+        return Ok(None);
+    }
+    let (Some(token), Some(workspace), Some(role)) = (row.token(), row.workspace(), row.role())
+    else {
+        tracing::error!(id = %row.id, "unreadable api token row");
+        return Err(Box::new(deny(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "internal",
+            "the credential store is unavailable",
+        )));
+    };
+    {
+        let mut pending = state
+            .token_use
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.len() < TOKEN_USE_CAP || pending.contains_key(&token) {
+            pending.insert(token, (state.clock)());
+        }
+    }
+    Ok(Some(Principal::Token {
+        token,
+        workspace,
+        role,
+    }))
 }
 
 /// Resolve a presented session cookie into its principal (S1b): operator sessions are
 /// tried first when a token exists, then account sessions — the two key namespaces
 /// can't collide. `Err` is the honest "the store can't answer right now", never a 401
 /// that would masquerade a broken store as a wrong credential.
+/// What a presented session cookie proved: an operator session, or an account session
+/// carrying the account and its home workspace — `require_auth` turns it into a
+/// scoped `Principal` after the workspace picker and the members row have their say.
+enum Session {
+    Operator,
+    Account(AccountId, WorkspaceId),
+}
+
 async fn session_principal(
     state: &AppState,
     cookie: Option<&header::HeaderValue>,
-) -> Result<Option<Principal>, Box<Response>> {
+) -> Result<Option<Session>, Box<Response>> {
     let Some(session) = session_cookie(cookie) else {
         return Ok(None);
     };
@@ -235,7 +440,7 @@ async fn session_principal(
             )
             .await
         {
-            Ok(true) => return Ok(Some(Principal::Operator)),
+            Ok(true) => return Ok(Some(Session::Operator)),
             Ok(false) => {}
             Err(error) => {
                 tracing::error!(%error, "session lookup failed");
@@ -256,7 +461,7 @@ async fn session_principal(
         )
         .await
     {
-        Ok(Some((account, workspace))) => Ok(Some(Principal::Account { account, workspace })),
+        Ok(Some((account, home))) => Ok(Some(Session::Account(account, home))),
         Ok(None) => Ok(None),
         Err(error) => {
             tracing::error!(%error, "account session lookup failed");
@@ -334,13 +539,6 @@ pub fn session_cookie(cookie: Option<&header::HeaderValue>) -> Option<&str> {
     })
 }
 
-fn bearer_matches(header: Option<&header::HeaderValue>, token: &Arc<str>) -> bool {
-    header
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|presented| digests_match(presented.as_bytes(), token.as_bytes()))
-}
-
 fn deny(status: StatusCode, code: &'static str, message: &'static str) -> Response {
     (
         status,
@@ -390,15 +588,26 @@ pub fn account_session_key(cookie_id: &str) -> String {
     crate::deliver::hex_lower(&digest.finalize())
 }
 
-/// Who authorized a request (S1b): the operator (bearer token, operator session, or
-/// loopback dev trust) sees the default workspace; an account session sees only its own.
-/// The auth middleware inserts this into request extensions; `tenant` resolves it.
+/// Who authorized a request (S1b/S1c): the operator (bearer token, operator session,
+/// or loopback dev trust) acts at owner level on the default workspace — or on one
+/// named by `X-Smon-Workspace`; an account session acts at its member role in the
+/// workspace it picked; a workspace API token acts at the role minted into it, in the
+/// workspace row that issued it and nowhere else. The middleware inserts this into
+/// request extensions; `viewer_for`/`member_for`/`owner_for` resolve the store view.
 #[derive(Debug, Clone, Copy)]
 pub enum Principal {
-    Operator,
+    Operator {
+        workspace: WorkspaceId,
+    },
     Account {
         account: AccountId,
         workspace: WorkspaceId,
+        role: Role,
+    },
+    Token {
+        token: ApiTokenId,
+        workspace: WorkspaceId,
+        role: Role,
     },
 }
 
@@ -406,10 +615,35 @@ impl Principal {
     /// The workspace this principal may see.
     pub fn workspace(&self) -> WorkspaceId {
         match self {
-            Self::Operator => WorkspaceId::DEFAULT,
-            Self::Account { workspace, .. } => *workspace,
+            Self::Operator { workspace }
+            | Self::Account { workspace, .. }
+            | Self::Token { workspace, .. } => *workspace,
         }
     }
+}
+
+/// `X-Smon-Workspace`: an account may act in any workspace it belongs to, not only the
+/// one it signed up with. The header names the workspace by id; membership — and the
+/// role the request gets — comes from the `members` row, never the header.
+pub const WORKSPACE_HEADER: &str = "X-Smon-Workspace";
+
+/// Batched last-used bookkeeping for workspace API tokens (S1c): the auth path stamps
+/// `token → now` in memory; `crate::flush_token_uses` lands the batch in one write —
+/// a write per request would put SQLite on the hot path of every API call. Bounded:
+/// past `TOKEN_USE_CAP` pending stamps, tracking is skipped rather than grown.
+pub type TokenUse =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<ApiTokenId, time::OffsetDateTime>>>;
+
+/// The pending-map bound — same headroom as the credential throttle's table.
+pub const TOKEN_USE_CAP: usize = 4096;
+
+/// The API-token lookup key: `SHA-256("smon-api-token-v1\0" ‖ token)` — same
+/// namespaced-digest rule as invites and sessions; the store never sees the token.
+pub fn api_token_key(token: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"smon-api-token-v1\0");
+    digest.update(token.as_bytes());
+    crate::deliver::hex_lower(&digest.finalize())
 }
 
 /// Password work is deliberately expensive — argon2id, RFC 9106's low-memory profile
@@ -662,18 +896,36 @@ mod password_tests {
             .expect("DUMMY_LOGIN_HASH must parse as a PHC string");
     }
 
+    /// Both work permits, however long a sibling test's real hashing keeps them — the
+    /// semaphore is process-global and unit tests run in parallel, so a plain
+    /// `try_acquire` can find it spent. `try_acquire_many` is atomic — a retry never
+    /// strands one permit. Bounded: a real leak still fails.
+    async fn hold_both_permits() -> tokio::sync::SemaphorePermit<'static> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match PASSWORD_WORK.try_acquire_many(2) {
+                Ok(permits) => return permits,
+                Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the password-work permits never freed"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
     /// The limiter is a hard bound, not a queue hint: two permits, never more.
-    #[test]
-    fn password_work_is_bounded() {
+    #[tokio::test]
+    async fn password_work_is_bounded() {
         assert_eq!(password_work_permits(), 2);
-        let first = PASSWORD_WORK.try_acquire().expect("permit 1");
-        let second = PASSWORD_WORK.try_acquire().expect("permit 2");
+        let permits = hold_both_permits().await;
         assert!(
             PASSWORD_WORK.try_acquire().is_err(),
             "a third burns nothing"
         );
-        drop(first);
-        drop(second);
+        drop(permits);
     }
 
     #[tokio::test]
@@ -701,10 +953,9 @@ mod password_tests {
 
     /// A full queue must answer `Busy` inside the deadline — a waiter that parked
     /// forever on its connection permit is how a sign-in flood starves the API.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_full_work_queue_answers_busy_within_the_deadline() {
-        let _p1 = PASSWORD_WORK.try_acquire().expect("permit 1");
-        let _p2 = PASSWORD_WORK.try_acquire().expect("permit 2");
+        let _permits = hold_both_permits().await;
         match verify_password(DUMMY_LOGIN_HASH, "x", PASSWORD_WORK_WAIT).await {
             Err(PasswordWorkError::Busy) => {}
             other => panic!("a full queue is Busy, not {other:?}"),

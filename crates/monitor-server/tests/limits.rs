@@ -32,6 +32,7 @@ async fn app() -> anyhow::Result<(axum::Router, Db, tempfile::TempDir)> {
         session_ttl: Duration::ZERO,
         session_idle: Duration::from_hours(1),
         password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        token_use: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,

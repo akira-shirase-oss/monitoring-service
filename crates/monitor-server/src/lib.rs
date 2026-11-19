@@ -24,7 +24,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -40,7 +40,8 @@ use monitor_db::{
     CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses,
 };
 use monitor_domain::{
-    AccountId, Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError,
+    AccountId, ApiTokenId, Monitor, MonitorId, MonitorPatch, NewMonitor, Role, Status,
+    ValidationError,
 };
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
@@ -54,12 +55,47 @@ const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
 /// uses [`system_clock`].
 pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
-/// The request's tenant scope comes from its credential (S1b): the operator sees the
-/// default workspace, an account session its own — a monitor in any other workspace is
-/// exactly as absent as one that never existed, which is the isolation the API owes
-/// (D-020). Routes outside the auth layer (none call `tenant`) have no principal.
-fn tenant<'a>(state: &'a AppState, principal: &auth::Principal) -> monitor_db::WorkspaceDb<'a> {
-    state.db.workspace(principal.workspace())
+/// The request's store view comes from its credential *and* role (S1b/S1c): the
+/// operator sees the default workspace (or one it picked), an account or API token
+/// its own — a monitor in any other workspace is exactly as absent as one that never
+/// existed, which is the isolation the API owes (D-020). `viewer_for` is the read
+/// view every principal holds; `member_for` adds resource writes (member+ roles);
+/// `owner_for` adds roster and token administration (owner, or the operator).
+/// A view the role doesn't hold simply doesn't exist — denial by type, not a flag.
+fn viewer_for<'a>(state: &'a AppState, principal: &auth::Principal) -> monitor_db::ViewerDb<'a> {
+    state.db.viewer(principal.workspace())
+}
+
+fn member_for<'a>(
+    state: &'a AppState,
+    principal: &auth::Principal,
+) -> Result<monitor_db::MemberDb<'a>, ApiError> {
+    match principal {
+        auth::Principal::Operator { .. } => Ok(state.db.member(principal.workspace())),
+        auth::Principal::Account { role, .. } | auth::Principal::Token { role, .. }
+            if role.at_least(Role::Member) =>
+        {
+            Ok(state.db.member(principal.workspace()))
+        }
+        _ => Err(ApiError::Forbidden(
+            "a viewer can read this workspace but not change it".into(),
+        )),
+    }
+}
+
+fn owner_for<'a>(
+    state: &'a AppState,
+    principal: &auth::Principal,
+) -> Result<monitor_db::OwnerDb<'a>, ApiError> {
+    match principal {
+        auth::Principal::Operator { .. } => Ok(state.db.owner(principal.workspace())),
+        auth::Principal::Account { role, .. } if role.at_least(Role::Owner) => {
+            Ok(state.db.owner(principal.workspace()))
+        }
+        _ => Err(ApiError::Forbidden(
+            "roster and API tokens are owner work".into(),
+        )),
+    }
 }
 
 /// The real clock.
@@ -108,7 +144,27 @@ pub struct AppState {
     /// `SMON_PROFILE=lab`: local/private targets may be registered (fixtures). Otherwise
     /// a URL the SSRF guard would refuse is refused at registration (D-013).
     pub allow_local_targets: bool,
+    /// Pending API-token last-used stamps (S1c): the auth path writes here, the
+    /// flusher lands them in one store write — never a write per request.
+    pub token_use: auth::TokenUse,
     pub version: &'static str,
+}
+
+/// Drain the pending token-use stamps into the store in one transaction — the batched
+/// counterpart to `AppState::token_use` (S1c). The flusher task calls this on its
+/// interval; tests call it directly.
+pub async fn flush_token_uses(state: &AppState) -> Result<u64, QueryError> {
+    let pending: Vec<(ApiTokenId, OffsetDateTime)> = {
+        let mut map = state
+            .token_use
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.drain().collect()
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    state.db.touch_api_tokens(&pending).await
 }
 
 /// Re-read the store and publish the monitor set the coordinator schedules against.
@@ -234,6 +290,15 @@ fn routes(state: AppState) -> Router {
         .route("/incidents", get(list_incidents))
         // Invites are minted inside the authed API — operator-only in the handler.
         .route("/invites", post(create_invite))
+        // Roster and workspace API tokens (S1c): reads any member, writes owner-only —
+        // `member_for`/`owner_for` decide by the request's role, not by route table.
+        .route("/members", get(list_members).post(add_member))
+        .route(
+            "/members/{id}",
+            patch(set_member_role).delete(remove_member),
+        )
+        .route("/tokens", get(list_tokens).post(create_token))
+        .route("/tokens/{id}", delete(revoke_token))
         .route("/backup", post(backup))
         // Auth wraps the whole API: /livez, /readyz and static files stay open —
         // the dashboard must load to *hold* a token, and readiness is not a secret.
@@ -291,10 +356,10 @@ async fn check_capacity(
             // The origin name would tell a tenant about another tenant's targets —
             // operators get it, accounts get the shape of the limit instead (D-020).
             let detail = match principal {
-                auth::Principal::Operator => {
+                auth::Principal::Operator { .. } => {
                     format!("{origin} would need {per_tick:.1} probe starts a second")
                 }
-                auth::Principal::Account { .. } => {
+                auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
                     "one origin would exceed its probe rate".to_owned()
                 }
             };
@@ -599,7 +664,7 @@ async fn create_invite(
     Json(body): Json<InviteBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     const MAX_TTL_HOURS: u64 = 24 * 30;
-    if !matches!(principal, auth::Principal::Operator) {
+    if !matches!(principal, auth::Principal::Operator { .. }) {
         return Err(ApiError::Forbidden(
             "invites are an operator operation".into(),
         ));
@@ -623,6 +688,219 @@ async fn create_invite(
             "invite": { "code": code, "expires_at": row.expires_at }
         })),
     ))
+}
+
+/// The roster as the API shows it — account id, email, role, when they joined.
+fn member_view(row: &monitor_db::MemberRow) -> Result<serde_json::Value, ApiError> {
+    let account = row.account().ok_or(ApiError::Corrupt)?;
+    let role = row.role().ok_or(ApiError::Corrupt)?;
+    Ok(serde_json::json!({
+        "account": account.0,
+        "email": row.email,
+        "role": role.as_str(),
+        "created_at": row.created_at,
+    }))
+}
+
+/// Token metadata as the API shows it — never the digest, and the secret itself only
+/// ever existed in the mint response.
+fn token_view(row: &monitor_db::ApiTokenRow) -> Result<serde_json::Value, ApiError> {
+    let token = row.token().ok_or(ApiError::Corrupt)?;
+    let role = row.role().ok_or(ApiError::Corrupt)?;
+    Ok(serde_json::json!({
+        "id": token.0,
+        "name": row.name,
+        "role": role.as_str(),
+        "created_at": row.created_at,
+        "revoked_at": row.revoked_at,
+        "last_used_at": row.last_used_at,
+    }))
+}
+
+/// The workspace roster — every member may read it (S1c).
+async fn list_members(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let members = viewer_for(&state, &principal)
+        .list_members()
+        .await?
+        .iter()
+        .map(member_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(serde_json::json!({ "members": members })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemberBody {
+    pub email: Option<String>,
+    pub role: Option<Role>,
+}
+
+/// Seat an existing account in this workspace at `role` — owner work (S1c). The email
+/// is normalized exactly like signup's; an unknown one is a 404, never a silent seat.
+async fn add_member(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<MemberBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let (Some(email), Some(role)) = (body.email, body.role) else {
+        return Err(ApiError::Invalid("email and role are required".into()));
+    };
+    let account = state
+        .db
+        .account_by_email(&email.trim().to_lowercase())
+        .await?
+        .ok_or_else(|| ApiError::Invalid("no account with that email".into()))?;
+    let id = Uuid::parse_str(&account.id).map_err(|_| ApiError::Corrupt)?;
+    view.add_member(AccountId(id), role, (state.clock)())
+        .await
+        .map_err(|e| match e {
+            QueryError::Invalid(msg) => ApiError::Conflict(msg),
+            other => ApiError::Db(other),
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "member": { "account": id, "email": account.email, "role": role.as_str() }
+        })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemberRoleBody {
+    pub role: Option<Role>,
+}
+
+/// Change a member's role. The last-owner rule lives in the store transaction — a
+/// demotion that would orphan the workspace comes back a conflict (S1c).
+async fn set_member_role(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<MemberRoleBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let account = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound)?;
+    let Some(role) = body.role else {
+        return Err(ApiError::Invalid("role is required".into()));
+    };
+    let changed = view
+        .set_member_role(AccountId(account), role)
+        .await
+        .map_err(|e| match e {
+            QueryError::Invalid(msg) => ApiError::Conflict(msg),
+            other => ApiError::Db(other),
+        })?;
+    if !changed {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(
+        serde_json::json!({ "member": { "account": account, "role": role.as_str() } }),
+    ))
+}
+
+/// Take a member's seat away — same last-owner guard as a demotion (S1c).
+async fn remove_member(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let account = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound)?;
+    let removed = view
+        .remove_member(AccountId(account))
+        .await
+        .map_err(|e| match e {
+            QueryError::Invalid(msg) => ApiError::Conflict(msg),
+            other => ApiError::Db(other),
+        })?;
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// This workspace's token metadata — owner-only: names and lifetimes are automation
+/// intel a member doesn't need (S1c).
+async fn list_tokens(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tokens = owner_for(&state, &principal)?
+        .list_api_tokens()
+        .await?
+        .iter()
+        .map(token_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(serde_json::json!({ "tokens": tokens })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenBody {
+    pub name: Option<String>,
+    pub role: Option<Role>,
+}
+
+/// Mint a workspace API token (S1c): the secret is shown once here and kept as a
+/// digest — same rule as invites. Tokens hold member or viewer, never owner: a
+/// credential must not administer the workspace that issued it.
+async fn create_token(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<TokenBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let (Some(name), Some(role)) = (body.name, body.role) else {
+        return Err(ApiError::Invalid("name and role are required".into()));
+    };
+    let name = name.trim().to_owned();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(ApiError::Invalid("name must be 1..=80 chars".into()));
+    }
+    if role == Role::Owner {
+        return Err(ApiError::Invalid(
+            "tokens hold member or viewer, never owner".into(),
+        ));
+    }
+    let created_by = match principal {
+        auth::Principal::Account { account, .. } => Some(account),
+        _ => None,
+    };
+    let secret = format!("smon_wst_{}", Uuid::new_v4().simple());
+    let row = view
+        .create_api_token(
+            &name,
+            role,
+            &auth::api_token_key(&secret),
+            created_by,
+            (state.clock)(),
+        )
+        .await?;
+    let mut view_json = token_view(&row)?;
+    view_json["secret"] = serde_json::Value::String(secret);
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "token": view_json })),
+    ))
+}
+
+/// Revoke a token: `revoked_at` stamps it dead and the row stays as history (S1c).
+async fn revoke_token(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let token = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound)?;
+    if !view
+        .revoke_api_token(ApiTokenId(token), (state.clock)())
+        .await?
+    {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// One 422 shape answer for every malformed signup field.
@@ -923,7 +1201,7 @@ async fn list_monitors(
     axum::Extension(principal): axum::Extension<auth::Principal>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let verdict = state.vitals.verdict();
-    let rows = tenant(&state, &principal).list_monitors().await?;
+    let rows = viewer_for(&state, &principal).list_monitors().await?;
     let monitors: Vec<MonitorView> = rows
         .into_iter()
         .map(|row| view_from_row(row, &state.statuses, verdict.observing()))
@@ -939,7 +1217,7 @@ async fn get_monitor(
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<MonitorView>, ApiError> {
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     Ok(Json(view_from_row(
         row,
         &state.statuses,
@@ -964,6 +1242,7 @@ async fn create_monitor(
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Json(input): Json<CreateMonitor>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let view = member_for(&state, &principal)?;
     let url = url::Url::parse(&input.url).map_err(|_| ApiError::BadUrl)?;
     let new = match (input.interval_s, input.timeout_s) {
         (None, None) => NewMonitor::new(input.name, url),
@@ -991,7 +1270,7 @@ async fn create_monitor(
         monitors.push(monitor.clone());
     })
     .await?;
-    if !tenant(&state, &principal)
+    if !view
         .insert_monitor_within(&monitor, state.max_monitors)
         .await?
     {
@@ -1028,7 +1307,8 @@ async fn patch_monitor(
     Path(id): Path<String>,
     Json(input): Json<PatchMonitor>,
 ) -> Result<Json<MonitorView>, ApiError> {
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let view = member_for(&state, &principal)?;
+    let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     if input
         .generation
@@ -1062,7 +1342,7 @@ async fn patch_monitor(
         }
     })
     .await?;
-    if tenant(&state, &principal)
+    if view
         .update_monitor(&merged, monitor.generation)
         .await?
         .is_none()
@@ -1072,7 +1352,7 @@ async fn patch_monitor(
         ));
     }
     publish_registry(&state).await?;
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let row = find_monitor(&view, &id).await?;
     Ok(Json(view_from_row(
         row,
         &state.statuses,
@@ -1087,12 +1367,10 @@ async fn delete_monitor(
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let view = member_for(&state, &principal)?;
+    let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    if !tenant(&state, &principal)
-        .delete_monitor(monitor.id)
-        .await?
-    {
+    if !view.delete_monitor(monitor.id).await? {
         return Err(ApiError::Conflict(
             "monitor has recorded history; pause it instead".into(),
         ));
@@ -1154,9 +1432,9 @@ async fn list_checks(
     Path(id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    let checks = tenant(&state, &principal)
+    let checks = viewer_for(&state, &principal)
         .list_checks(monitor.id, bounded_limit(params.limit, 50, 500))
         .await?;
     let checks: Vec<CheckView> = checks.into_iter().map(CheckView::from).collect();
@@ -1195,7 +1473,7 @@ async fn monitor_stats(
     Path(id): Path<String>,
     Query(params): Query<StatsParams>,
 ) -> Result<Json<StatsView>, ApiError> {
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     let created_at = row.created_at;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     let window_s = params
@@ -1214,7 +1492,7 @@ async fn monitor_stats(
     };
     let elapsed = u64::try_from((now - window_start).whole_seconds().max(0)).unwrap_or(0);
     let expected = elapsed / monitor.interval.as_secs().max(1);
-    let mut counts = tenant(&state, &principal)
+    let mut counts = viewer_for(&state, &principal)
         .check_stats(monitor.id, since)
         .await?;
     counts.expected = expected;
@@ -1317,12 +1595,13 @@ async fn create_window(
     Path(id): Path<String>,
     Json(input): Json<CreateWindow>,
 ) -> Result<(StatusCode, Json<MaintenanceView>), ApiError> {
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let view = member_for(&state, &principal)?;
+    let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     if input.ends_at <= input.starts_at {
         return Err(ApiError::Invalid("ends_at must be after starts_at".into()));
     }
-    let created = tenant(&state, &principal)
+    let created = view
         .create_window(
             monitor.id,
             input.starts_at,
@@ -1348,10 +1627,10 @@ async fn list_windows(
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row = find_monitor(&tenant(&state, &principal), &id).await?;
+    let row = find_monitor(&viewer_for(&state, &principal), &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     let now = OffsetDateTime::now_utc();
-    let windows: Vec<MaintenanceView> = tenant(&state, &principal)
+    let windows: Vec<MaintenanceView> = viewer_for(&state, &principal)
         .list_windows(monitor.id)
         .await?
         .into_iter()
@@ -1368,7 +1647,7 @@ async fn delete_window(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let id: i64 = id.parse().map_err(|_| ApiError::NotFound)?;
-    if !tenant(&state, &principal).delete_window(id).await? {
+    if !member_for(&state, &principal)?.delete_window(id).await? {
         return Err(ApiError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1392,7 +1671,7 @@ async fn list_incidents(
         Some("resolved") => Some("resolved"),
         Some(_) => return Err(ApiError::BadId),
     };
-    let incidents = tenant(&state, &principal)
+    let incidents = viewer_for(&state, &principal)
         .list_incidents(
             monitor_id,
             state_filter,
@@ -1431,7 +1710,7 @@ async fn backup(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The backup holds every workspace's rows — it is operator infrastructure (D-019),
     // never something a tenant credential may pull.
-    if !matches!(principal, auth::Principal::Operator) {
+    if !matches!(principal, auth::Principal::Operator { .. }) {
         return Err(ApiError::Forbidden(
             "backups are an operator operation".into(),
         ));
@@ -1464,10 +1743,7 @@ async fn backup(
     Err(ApiError::Corrupt)
 }
 
-async fn find_monitor(
-    view: &monitor_db::WorkspaceDb<'_>,
-    id: &str,
-) -> Result<MonitorRow, ApiError> {
+async fn find_monitor(view: &monitor_db::ViewerDb<'_>, id: &str) -> Result<MonitorRow, ApiError> {
     let id = Uuid::parse_str(id).map_err(|_| ApiError::NotFound)?;
     view.monitor_row(MonitorId(id))
         .await?
