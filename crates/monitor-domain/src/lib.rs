@@ -37,6 +37,33 @@ impl Default for MonitorId {
     }
 }
 
+/// Identifies one workspace — the tenancy boundary every store query is scoped by (D-020).
+/// Every monitor, check, incident, maintenance window, outbox row and daily aggregate
+/// carries one; `monitor-db` only exposes tenant data through `Db::workspace(_)`, so a
+/// query that cannot name its workspace does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkspaceId(pub Uuid);
+
+impl WorkspaceId {
+    /// The workspace every pre-tenancy row was backfilled into — and, until accounts land
+    /// (S1b/c), the only workspace requests can resolve to.
+    pub const DEFAULT: Self = Self(Uuid::from_u128(1));
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+/// Unlike `MonitorId`, `default()` is the seeded *default workspace*, not a fresh id — a
+/// workspace you haven't named is the one workspace that already exists.
+impl Default for WorkspaceId {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// The smallest interval the contract allows; the lab profile runs at 60 seconds.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(15);
 /// The default probe interval from the guide's probe contract.
@@ -101,6 +128,8 @@ impl Default for Thresholds {
 #[derive(Debug, Clone)]
 pub struct Monitor {
     pub id: MonitorId,
+    /// The workspace that owns this monitor — everything it records is scoped by it.
+    pub workspace: WorkspaceId,
     pub name: String,
     /// The health URL. Only `http`/`https` survive validation — probes are safe `GET`/`HEAD`.
     pub url: Url,
@@ -200,10 +229,17 @@ impl NewMonitor {
         Ok(self)
     }
 
+    /// A monitor belongs to a workspace from the moment it exists (D-020).
     #[must_use]
     pub fn into_monitor(self) -> Monitor {
+        self.into_monitor_for(WorkspaceId::DEFAULT)
+    }
+
+    #[must_use]
+    pub fn into_monitor_for(self, workspace: WorkspaceId) -> Monitor {
         Monitor {
             id: MonitorId::new(),
+            workspace,
             name: self.name,
             url: self.url,
             interval: self.interval,
@@ -235,6 +271,7 @@ impl MonitorPatch {
     pub fn apply(&self, monitor: &Monitor) -> Result<Monitor, ValidationError> {
         let merged = Monitor {
             id: monitor.id,
+            workspace: monitor.workspace,
             name: self.name.clone().unwrap_or_else(|| monitor.name.clone()),
             url: self.url.clone().unwrap_or_else(|| monitor.url.clone()),
             interval: self.interval.unwrap_or(monitor.interval),

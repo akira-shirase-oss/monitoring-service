@@ -249,6 +249,7 @@ fn delay_to_phase(
 /// What the coordinator hands to a spawned probe worker.
 struct Dispatch {
     monitor_id: MonitorId,
+    workspace: monitor_domain::WorkspaceId,
     generation: u64,
     slot_at: OffsetDateTime,
     url: Url,
@@ -410,6 +411,7 @@ fn plan_due(
         entry.in_flight = true;
         plan.dispatches.push(Dispatch {
             monitor_id: entry.monitor.id,
+            workspace: entry.monitor.workspace,
             generation: entry.monitor.generation,
             slot_at: entry.next_slot_at,
             url: entry.monitor.url.clone(),
@@ -425,6 +427,7 @@ fn plan_due(
 fn missed_slot(entry: &Runtime) -> Observation {
     Observation {
         monitor_id: entry.monitor.id,
+        workspace: entry.monitor.workspace,
         generation: entry.monitor.generation,
         slot_at: entry.next_slot_at,
         slot: SlotObservation::Missed,
@@ -473,6 +476,7 @@ impl Plan {
                 // and pages like any failure (D-013). Only registration refuses literals.
                 let observation = Observation {
                     monitor_id: dispatch.monitor_id,
+                    workspace: dispatch.workspace,
                     generation: dispatch.generation,
                     slot_at: dispatch.slot_at,
                     slot: SlotObservation::Probe(result.outcome),
@@ -573,7 +577,7 @@ mod tests {
     use axum::response::Redirect;
     use axum::routing::get;
     use monitor_db::{Db, writer};
-    use monitor_domain::NewMonitor;
+    use monitor_domain::{NewMonitor, WorkspaceId};
 
     use super::*;
     use crate::probe::ProbePolicy;
@@ -601,7 +605,7 @@ mod tests {
         let stored = NewMonitor::new("guarded", Url::parse(url).expect("url"))
             .expect("monitor")
             .into_monitor();
-        db.insert_monitor(&stored).await.expect("insert");
+        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&stored).await.expect("insert");
         let mut monitor = stored.clone();
         monitor.interval = Duration::from_millis(60);
         monitor.timeout = Duration::from_millis(400);
@@ -637,15 +641,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(900)).await;
         shutdown.cancel();
         let _ = task.await;
-        let rows = db
-            .list_checks(monitor.id, 100)
+        let rows = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 100)
             .await
             .expect("checks")
             .into_iter()
             .map(|row| (row.outcome, row.detail))
             .collect();
-        let open = db
-            .open_incident(monitor.id)
+        let open = db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id)
             .await
             .expect("incident")
             .is_some();
@@ -722,7 +724,7 @@ mod tests {
         let monitor = NewMonitor::new("backlog", Url::parse("https://example.com/").expect("url"))
             .expect("monitor")
             .into_monitor();
-        db.insert_monitor(&monitor).await.expect("insert");
+        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await.expect("insert");
         let (writer, _task) = writer::spawn(
             db.clone(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -740,6 +742,7 @@ mod tests {
         for n in 0..200 {
             plan.misses.push(Observation {
                 monitor_id: monitor.id,
+                workspace: monitor.workspace,
                 generation: monitor.generation,
                 slot_at: start + time::Duration::seconds(15 * n),
                 slot: SlotObservation::Missed,
@@ -766,7 +769,7 @@ mod tests {
             "the heartbeat went {silence:?} without a beat while the backlog committed"
         );
         assert_eq!(
-            db.list_checks(monitor.id, 500).await.expect("checks").len(),
+            db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 500).await.expect("checks").len(),
             200
         );
     }

@@ -15,7 +15,9 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
-use monitor_domain::{Effect, Health, MonitorId, SlotObservation, Statuses};
+use monitor_domain::{
+    Effect, Health, MonitorId, SlotObservation, Statuses, WorkspaceId,
+};
 
 use crate::{Db, QueryError, RetainReport, RetentionCutoffs};
 
@@ -38,6 +40,8 @@ pub type WriteHealth = Arc<AtomicU64>;
 #[derive(Debug)]
 pub struct Observation {
     pub monitor_id: MonitorId,
+    /// The workspace the monitor belongs to — its evidence lands scoped by it (D-020).
+    pub workspace: WorkspaceId,
     /// The monitor generation the slot was claimed under; stale results are dropped.
     pub generation: u64,
     /// The scheduled slot time — not when the row lands.
@@ -268,7 +272,11 @@ async fn record(
     queue_email: bool,
     observation: Observation,
 ) -> Result<WriteOutcome, QueryError> {
-    let Some(gate) = db.monitor_gate(observation.monitor_id).await? else {
+    let Some(gate) = db
+        .workspace(observation.workspace)
+        .monitor_gate(observation.monitor_id)
+        .await?
+    else {
         warn!(monitor = %observation.monitor_id.0, "dropping observation for unknown monitor");
         return Ok(WriteOutcome::DroppedUnknownMonitor);
     };

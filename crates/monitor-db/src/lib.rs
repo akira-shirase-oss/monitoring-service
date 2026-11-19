@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use monitor_domain::{
     CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, SlotObservation, Thresholds,
+    WorkspaceId,
 };
 
 pub mod writer;
@@ -483,6 +484,89 @@ impl Db {
         Ok(())
     }
 
+    /// The tenant-scoped view of the store (D-020). Everything a workspace owns —
+    /// monitors, checks, incidents, windows, outbox rows, aggregates — is only reachable
+    /// through this view, so a query that cannot name its workspace does not compile.
+    /// Store-internal sweeps that legitimately span workspaces are named `*_engine`.
+    pub fn workspace(&self, workspace: WorkspaceId) -> WorkspaceDb<'_> {
+        WorkspaceDb {
+            db: self,
+            workspace,
+        }
+    }
+
+    /// Every monitor across every workspace — the scheduler's registry and the engine's
+    /// rebuild source. Engine internals only: request paths scope by `Db::workspace`.
+    pub async fn list_monitors_engine(&self) -> Result<Vec<MonitorRow>, QueryError> {
+        let rows = sqlx::query_as::<_, MonitorRow>(
+            "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
+                    recover_threshold, generation, paused, created_at
+             FROM monitors ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Create a workspace and return its id. `slug` is unique — it names the workspace's
+    /// public status page (`/s/<slug>`, D-021).
+    pub async fn create_workspace(&self, slug: &str, name: &str) -> Result<WorkspaceId, QueryError> {
+        let id = WorkspaceId::new();
+        sqlx::query("INSERT INTO workspaces (id, slug, name, created_at) VALUES (?, ?, ?, ?)")
+            .bind(id.0.to_string())
+            .bind(slug)
+            .bind(name)
+            .bind(OffsetDateTime::now_utc())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                if let sqlx::Error::Database(db) = &e {
+                    if db.is_unique_violation() {
+                        return QueryError::Invalid("workspace slug is already taken".into());
+                    }
+                }
+                QueryError::Sql(e)
+            })?;
+        Ok(id)
+    }
+
+    /// One workspace row by id.
+    pub async fn workspace_row(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceRow>, QueryError> {
+        sqlx::query_as::<_, WorkspaceRow>(
+            "SELECT id, slug, name, created_at FROM workspaces WHERE id = ?",
+        )
+        .bind(workspace.0.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Every workspace, oldest first — an inventory for the (single-tenant-today) console.
+    pub async fn list_workspaces(&self) -> Result<Vec<WorkspaceRow>, QueryError> {
+        sqlx::query_as::<_, WorkspaceRow>(
+            "SELECT id, slug, name, created_at FROM workspaces ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+}
+
+/// The workspace-scoped view of the store (D-020). Construction only happens through
+/// `Db::workspace(_)`; every query below carries `workspace_id` in its predicate or its
+/// column list, so the tenant boundary is enforced by the type, not by convention.
+pub struct WorkspaceDb<'a> {
+    db: &'a Db,
+    workspace: WorkspaceId,
+}
+
+impl WorkspaceDb<'_> {
+    /// The bound workspace, for callers that need the value itself (a scope check on
+    /// rows, an outbox insert keyed by monitor).
+    pub fn id(&self) -> WorkspaceId {
+        self.workspace
+    }
+
     pub async fn insert_monitor(&self, monitor: &Monitor) -> Result<(), QueryError> {
         if self.insert_monitor_within(monitor, u64::MAX).await? {
             Ok(())
@@ -492,19 +576,26 @@ impl Db {
     }
 
     /// Insert unless `max_monitors` already exist — one conditional statement, so two
-    /// concurrent creates can't both slip under the cap. `false` = the cap held.
+    /// concurrent creates can't both slip under the cap. `false` = the cap held. The cap
+    /// counts the workspace's own monitors; a row always lands in this view's workspace.
     pub async fn insert_monitor_within(
         &self,
         monitor: &Monitor,
         max_monitors: u64,
     ) -> Result<bool, QueryError> {
+        if monitor.workspace != self.workspace {
+            return Err(QueryError::Invalid(
+                "monitor belongs to a different workspace than this view".into(),
+            ));
+        }
         let inserted = sqlx::query(
-            "INSERT INTO monitors (id, name, url, interval_s, timeout_s, fail_threshold,
-                                  recover_threshold, generation, paused, created_at)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0, ?
-             WHERE (SELECT COUNT(*) FROM monitors) < ?",
+            "INSERT INTO monitors (id, workspace_id, name, url, interval_s, timeout_s,
+                                  fail_threshold, recover_threshold, generation, paused, created_at)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?
+             WHERE (SELECT COUNT(*) FROM monitors WHERE workspace_id = ?) < ?",
         )
         .bind(monitor.id.0.to_string())
+        .bind(monitor.workspace.0.to_string())
         .bind(&monitor.name)
         .bind(monitor.url.as_str())
         .bind(
@@ -519,21 +610,38 @@ impl Db {
         .bind(i64::from(monitor.thresholds.passes_to_recover))
         .bind(i64::try_from(monitor.generation).map_err(|_| QueryError::OutOfRange("generation"))?)
         .bind(OffsetDateTime::now_utc())
+        .bind(self.workspace.0.to_string())
         .bind(i64::try_from(max_monitors).unwrap_or(i64::MAX))
-        .execute(&self.pool)
+        .execute(&self.db.pool)
         .await?;
         Ok(inserted.rows_affected() == 1)
     }
 
     pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
         let rows = sqlx::query_as::<_, MonitorRow>(
-            "SELECT id, name, url, interval_s, timeout_s, fail_threshold, recover_threshold,
-                    generation, paused, created_at
-             FROM monitors ORDER BY created_at",
+            "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
+                    recover_threshold, generation, paused, created_at
+             FROM monitors WHERE workspace_id = ? ORDER BY created_at",
         )
-        .fetch_all(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_all(&self.db.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// The monitor row itself, or `None` — absent and other-workspace look the same to a
+    /// caller, which is exactly the point of the scope.
+    pub async fn monitor_row(&self, monitor: MonitorId) -> Result<Option<MonitorRow>, QueryError> {
+        let row = sqlx::query_as::<_, MonitorRow>(
+            "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
+                    recover_threshold, generation, paused, created_at
+             FROM monitors WHERE id = ? AND workspace_id = ?",
+        )
+        .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
+        .fetch_optional(&self.db.pool)
+        .await?;
+        Ok(row)
     }
 
     /// The single open incident for a monitor, if one exists — what a restart rebuilds
@@ -544,10 +652,11 @@ impl Db {
     ) -> Result<Option<IncidentRow>, QueryError> {
         let row = sqlx::query_as::<_, IncidentRow>(
             "SELECT id, monitor_id, opened_at, first_fail_at, last_fail_at, resolved_at, state
-             FROM incidents WHERE monitor_id = ? AND state = 'open'",
+             FROM incidents WHERE monitor_id = ? AND workspace_id = ? AND state = 'open'",
         )
         .bind(monitor.0.to_string())
-        .fetch_optional(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_optional(&self.db.pool)
         .await?;
         Ok(row)
     }
@@ -560,12 +669,17 @@ impl Db {
         monitor: &Monitor,
         expected_generation: u64,
     ) -> Result<Option<u64>, QueryError> {
+        if monitor.workspace != self.workspace {
+            return Err(QueryError::Invalid(
+                "monitor belongs to a different workspace than this view".into(),
+            ));
+        }
         let result = sqlx::query(
             "UPDATE monitors
              SET name = ?, url = ?, interval_s = ?, timeout_s = ?, paused = ?,
                  fail_threshold = ?, recover_threshold = ?,
                  generation = generation + 1
-             WHERE id = ? AND generation = ?",
+             WHERE id = ? AND generation = ? AND workspace_id = ?",
         )
         .bind(&monitor.name)
         .bind(monitor.url.as_str())
@@ -582,7 +696,8 @@ impl Db {
         .bind(i64::from(monitor.thresholds.passes_to_recover))
         .bind(monitor.id.0.to_string())
         .bind(i64::try_from(expected_generation).map_err(|_| QueryError::OutOfRange("generation"))?)
-        .execute(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .execute(&self.db.pool)
         .await?;
         if result.rows_affected() == 0 {
             return Ok(None);
@@ -596,14 +711,15 @@ impl Db {
     /// distinguishes with `has_history` for the response code.
     pub async fn delete_monitor(&self, monitor: MonitorId) -> Result<bool, QueryError> {
         let result = sqlx::query(
-            "DELETE FROM monitors WHERE id = ?
+            "DELETE FROM monitors WHERE id = ? AND workspace_id = ?
              AND NOT EXISTS (SELECT 1 FROM checks WHERE monitor_id = ?)
              AND NOT EXISTS (SELECT 1 FROM incidents WHERE monitor_id = ?)",
         )
         .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
         .bind(monitor.0.to_string())
         .bind(monitor.0.to_string())
-        .execute(&self.pool)
+        .execute(&self.db.pool)
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -613,13 +729,15 @@ impl Db {
     /// answer the API can translate to a `conflict` response.
     pub async fn has_history(&self, monitor: MonitorId) -> Result<bool, QueryError> {
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM checks WHERE monitor_id = ?
+            "SELECT EXISTS(SELECT 1 FROM checks WHERE monitor_id = ? AND workspace_id = ?
                            UNION ALL
-                           SELECT 1 FROM incidents WHERE monitor_id = ? LIMIT 1)",
+                           SELECT 1 FROM incidents WHERE monitor_id = ? AND workspace_id = ? LIMIT 1)",
         )
         .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
         .bind(monitor.0.to_string())
-        .fetch_one(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_one(&self.db.pool)
         .await?;
         Ok(exists)
     }
@@ -628,9 +746,10 @@ impl Db {
     /// "which services are in a recorded outage".
     pub async fn open_incidents(&self) -> Result<HashMap<MonitorId, OffsetDateTime>, QueryError> {
         let rows = sqlx::query_as::<_, (String, OffsetDateTime)>(
-            "SELECT monitor_id, opened_at FROM incidents WHERE state = 'open'",
+            "SELECT monitor_id, opened_at FROM incidents WHERE state = 'open' AND workspace_id = ?",
         )
-        .fetch_all(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_all(&self.db.pool)
         .await?;
         rows.into_iter()
             .map(|(id, opened_at)| {
@@ -652,13 +771,14 @@ impl Db {
         let state = state.map(str::to_owned);
         let rows = sqlx::query_as::<_, IncidentRow>(
             "SELECT id, monitor_id, opened_at, first_fail_at, last_fail_at, resolved_at, state FROM incidents
-             WHERE (?1 IS NULL OR monitor_id = ?1) AND (?2 IS NULL OR state = ?2)
+             WHERE workspace_id = ?4 AND (?1 IS NULL OR monitor_id = ?1) AND (?2 IS NULL OR state = ?2)
              ORDER BY opened_at DESC, id DESC LIMIT ?3",
         )
         .bind(&monitor_id)
         .bind(&state)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_all(&self.db.pool)
         .await?;
         Ok(rows)
     }
@@ -675,12 +795,13 @@ impl Db {
                     EXISTS(SELECT 1 FROM maintenance_windows w
                            WHERE w.monitor_id = monitors.id
                              AND w.starts_at <= ? AND w.ends_at > ?)
-             FROM monitors WHERE id = ?",
+             FROM monitors WHERE id = ? AND workspace_id = ?",
         )
         .bind(OffsetDateTime::now_utc())
         .bind(OffsetDateTime::now_utc())
         .bind(monitor.0.to_string())
-        .fetch_optional(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_optional(&self.db.pool)
         .await?;
         row.map(|(generation, fail, recover, maintenance)| {
             let generation = u64::try_from(generation)
@@ -708,7 +829,9 @@ impl Db {
             .await?
             .map(|gate| gate.generation))
     }
+}
 
+impl Db {
     /// Register a dashboard session (M7.2). The cookie carries only the id — the store
     /// decides validity, so a session survives a restart and dies on its own `expires_at`.
     pub async fn create_session(
@@ -809,7 +932,9 @@ impl Db {
             .await?;
         Ok(done.rows_affected())
     }
+}
 
+impl WorkspaceDb<'_> {
     /// Register a maintenance window. `starts_at < ends_at` is enforced by the table's
     /// CHECK; a wholly-past window is accepted — it is a record explaining evidence, not
     /// dead config (the same reason resolved incidents are kept).
@@ -820,19 +945,28 @@ impl Db {
         ends_at: OffsetDateTime,
         reason: &str,
     ) -> Result<MaintenanceRow, QueryError> {
+        // The EXISTS keeps a window from being planted on another workspace's monitor —
+        // absent and other-workspace are both "unknown monitor" to this view.
         let row = sqlx::query_as::<_, MaintenanceRow>(
-            "INSERT INTO maintenance_windows (monitor_id, starts_at, ends_at, reason, created_at)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO maintenance_windows (monitor_id, workspace_id, starts_at, ends_at, reason, created_at)
+             SELECT ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (SELECT 1 FROM monitors WHERE id = ? AND workspace_id = ?)
              RETURNING id, monitor_id, starts_at, ends_at, reason, created_at",
         )
         .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
         .bind(starts_at)
         .bind(ends_at)
         .bind(reason)
         .bind(OffsetDateTime::now_utc())
-        .fetch_one(&self.pool)
+        .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
+        .fetch_one(&self.db.pool)
         .await
         .map_err(|e| {
+            if let sqlx::Error::RowNotFound = e {
+                return QueryError::Invalid("unknown monitor".into());
+            }
             if let sqlx::Error::Database(db) = &e {
                 if db.is_check_violation() {
                     return QueryError::Invalid("window ends_at must be after starts_at".into());
@@ -854,11 +988,12 @@ impl Db {
     ) -> Result<Vec<MaintenanceRow>, QueryError> {
         sqlx::query_as::<_, MaintenanceRow>(
             "SELECT id, monitor_id, starts_at, ends_at, reason, created_at
-             FROM maintenance_windows WHERE monitor_id = ?
+             FROM maintenance_windows WHERE monitor_id = ? AND workspace_id = ?
              ORDER BY ends_at ASC, id ASC",
         )
         .bind(monitor.0.to_string())
-        .fetch_all(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_all(&self.db.pool)
         .await
         .map_err(Into::into)
     }
@@ -867,11 +1002,14 @@ impl Db {
     /// slot; deleting a future or past one just removes the record. Returns whether a row
     /// was deleted so the API can distinguish 204 from 404.
     pub async fn delete_window(&self, window_id: i64) -> Result<bool, QueryError> {
-        let deleted = sqlx::query("DELETE FROM maintenance_windows WHERE id = ?")
-            .bind(window_id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        let deleted = sqlx::query(
+            "DELETE FROM maintenance_windows WHERE id = ? AND workspace_id = ?",
+        )
+        .bind(window_id)
+        .bind(self.workspace.0.to_string())
+        .execute(&self.db.pool)
+        .await?
+        .rows_affected();
         Ok(deleted > 0)
     }
 
@@ -880,11 +1018,13 @@ impl Db {
         &self,
         monitor: MonitorId,
     ) -> Result<Option<OffsetDateTime>, QueryError> {
-        let last: Option<OffsetDateTime> =
-            sqlx::query_scalar("SELECT MAX(slot_at) FROM checks WHERE monitor_id = ?")
-                .bind(monitor.0.to_string())
-                .fetch_one(&self.pool)
-                .await?;
+        let last: Option<OffsetDateTime> = sqlx::query_scalar(
+            "SELECT MAX(slot_at) FROM checks WHERE monitor_id = ? AND workspace_id = ?",
+        )
+        .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
+        .fetch_one(&self.db.pool)
+        .await?;
         Ok(last)
     }
 
@@ -897,11 +1037,12 @@ impl Db {
     ) -> Result<Vec<SlotObservation>, QueryError> {
         let rows = sqlx::query_as::<_, (String, Option<i64>)>(
             "SELECT outcome, http_status FROM checks
-             WHERE monitor_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
+             WHERE monitor_id = ? AND workspace_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
         )
         .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.db.pool)
         .await?;
         rows.iter()
             .rev()
@@ -922,23 +1063,24 @@ impl Db {
         let rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT outcome, SUM(c) FROM (
                SELECT outcome, COUNT(*) AS c FROM checks
-                WHERE monitor_id = ?1 AND slot_at >= ?2 GROUP BY outcome
+                WHERE monitor_id = ?1 AND workspace_id = ?4 AND slot_at >= ?2 GROUP BY outcome
                UNION ALL SELECT 'pass', pass FROM check_stats_daily
-                WHERE monitor_id = ?1 AND day >= ?3
+                WHERE monitor_id = ?1 AND workspace_id = ?4 AND day >= ?3
                UNION ALL SELECT 'http_fail', http_fail FROM check_stats_daily
-                WHERE monitor_id = ?1 AND day >= ?3
+                WHERE monitor_id = ?1 AND workspace_id = ?4 AND day >= ?3
                UNION ALL SELECT 'transport', transport FROM check_stats_daily
-                WHERE monitor_id = ?1 AND day >= ?3
+                WHERE monitor_id = ?1 AND workspace_id = ?4 AND day >= ?3
                UNION ALL SELECT 'timeout', timeout FROM check_stats_daily
-                WHERE monitor_id = ?1 AND day >= ?3
+                WHERE monitor_id = ?1 AND workspace_id = ?4 AND day >= ?3
                UNION ALL SELECT 'missed', missed FROM check_stats_daily
-                WHERE monitor_id = ?1 AND day >= ?3
+                WHERE monitor_id = ?1 AND workspace_id = ?4 AND day >= ?3
              ) GROUP BY outcome",
         )
         .bind(monitor.0.to_string())
         .bind(since)
         .bind(day)
-        .fetch_all(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_all(&self.db.pool)
         .await?;
         let (mut observed, mut missed, mut passed) = (0_u64, 0_u64, 0_u64);
         for (outcome, count) in rows {
@@ -960,7 +1102,9 @@ impl Db {
             passed,
         })
     }
+}
 
+impl Db {
     /// Retention pass (D-012), one transaction so a crash can't produce history that is
     /// neither raw nor aggregated, or an outbox row whose incident is gone:
     ///
@@ -1020,12 +1164,17 @@ impl Db {
         }
         result
     }
+}
 
+impl WorkspaceDb<'_> {
     /// How many monitors exist (paused ones included — they keep history).
     pub async fn monitor_count(&self) -> Result<u64, QueryError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM monitors")
-            .fetch_one(&self.pool)
-            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM monitors WHERE workspace_id = ?",
+        )
+        .bind(self.workspace.0.to_string())
+        .fetch_one(&self.db.pool)
+        .await?;
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
@@ -1038,11 +1187,13 @@ impl Db {
         let rows = sqlx::query_as::<_, CheckRow>(
             "SELECT id, monitor_id, generation, slot_at, outcome, http_status, latency_ms,
                     detail, recorded_at
-             FROM checks WHERE monitor_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
+             FROM checks WHERE monitor_id = ? AND workspace_id = ?
+             ORDER BY slot_at DESC, id DESC LIMIT ?",
         )
         .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.db.pool)
         .await?;
         Ok(rows)
     }
@@ -1052,13 +1203,17 @@ impl Db {
         let rows = sqlx::query_as::<_, OutboxRow>(
             "SELECT id, event_id, monitor_id, incident_id, kind, channel, attempts, next_attempt_at,
                     delivered_at, created_at
-             FROM notify_outbox WHERE monitor_id = ? ORDER BY id",
+             FROM notify_outbox WHERE monitor_id = ? AND workspace_id = ? ORDER BY id",
         )
         .bind(monitor.0.to_string())
-        .fetch_all(&self.pool)
+        .bind(self.workspace.0.to_string())
+        .fetch_all(&self.db.pool)
         .await?;
         Ok(rows)
     }
+}
+
+impl Db {
 
     /// Outbox rows due for delivery: not yet delivered, not exhausted (`attempts < max`), and
     /// either never attempted or past their scheduled retry. `max` belongs to the deliverer's
@@ -1131,10 +1286,11 @@ impl Db {
         let (outcome, http_status) = encode_slot(observation.slot, observation.http_status);
         sqlx::query(
             "INSERT INTO checks
-                (monitor_id, generation, slot_at, outcome, http_status, latency_ms, detail, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (monitor_id, workspace_id, generation, slot_at, outcome, http_status, latency_ms, detail, recorded_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(observation.monitor_id.0.to_string())
+        .bind(observation.workspace.0.to_string())
         .bind(i64::try_from(observation.generation).map_err(|_| QueryError::OutOfRange("generation"))?)
         .bind(observation.slot_at)
         .bind(outcome)
@@ -1173,10 +1329,11 @@ impl Db {
                 .fetch_one(&mut *tx)
                 .await?;
                 let incident_id: i64 = sqlx::query_scalar(
-                    "INSERT INTO incidents (monitor_id, opened_at, first_fail_at, last_fail_at, state)
-                     VALUES (?, ?, ?, ?, 'open') RETURNING id",
+                    "INSERT INTO incidents (monitor_id, workspace_id, opened_at, first_fail_at, last_fail_at, state)
+                     VALUES (?, ?, ?, ?, ?, 'open') RETURNING id",
                 )
                 .bind(observation.monitor_id.0.to_string())
+                .bind(observation.workspace.0.to_string())
                 .bind(observation.slot_at)
                 .bind(first_fail_at.unwrap_or(observation.slot_at))
                 .bind(observation.slot_at)
@@ -1185,6 +1342,7 @@ impl Db {
                 enqueue_outbox(
                     &mut tx,
                     observation.monitor_id,
+                    observation.workspace,
                     incident_id,
                     "incident_opened",
                     queue_email,
@@ -1208,6 +1366,7 @@ impl Db {
                 enqueue_outbox(
                     &mut tx,
                     observation.monitor_id,
+                    observation.workspace,
                     incident_id,
                     "incident_recovered",
                     queue_email,
@@ -1256,7 +1415,7 @@ async fn retain_batch(
         .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TEMP TABLE expiring AS
-         SELECT id, monitor_id, date(slot_at) AS day, outcome FROM checks
+         SELECT id, monitor_id, workspace_id, date(slot_at) AS day, outcome FROM checks
          WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
          ORDER BY id LIMIT ?2"
     )))
@@ -1272,14 +1431,14 @@ async fn retain_batch(
     // Space is free now; write the aggregates of what was deleted.
     let aggregated = sqlx::query(
         "INSERT INTO check_stats_daily
-            (monitor_id, day, pass, http_fail, transport, timeout, missed)
-         SELECT monitor_id, day,
+            (monitor_id, workspace_id, day, pass, http_fail, transport, timeout, missed)
+         SELECT monitor_id, workspace_id, day,
                 SUM(outcome = 'pass'), SUM(outcome = 'http_fail'),
                 SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
                 SUM(outcome = 'missed')
          FROM temp.expiring
          WHERE day >= ?1
-         GROUP BY monitor_id, day
+         GROUP BY monitor_id, workspace_id, day
          ON CONFLICT (monitor_id, day) DO UPDATE SET
             pass = check_stats_daily.pass + excluded.pass,
             http_fail = check_stats_daily.http_fail + excluded.http_fail,
@@ -1393,6 +1552,7 @@ async fn apply_max_bytes(conn: &mut sqlx::SqliteConnection, bytes: u64) -> Resul
 async fn enqueue_outbox(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     monitor: MonitorId,
+    workspace: WorkspaceId,
     incident_id: i64,
     kind: &'static str,
     queue_email: bool,
@@ -1407,11 +1567,12 @@ async fn enqueue_outbox(
     };
     for channel in channels {
         sqlx::query(
-            "INSERT INTO notify_outbox (event_id, monitor_id, incident_id, kind, channel, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notify_outbox (event_id, monitor_id, workspace_id, incident_id, kind, channel, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(monitor.0.to_string())
+        .bind(workspace.0.to_string())
         .bind(incident_id)
         .bind(kind)
         .bind(*channel)
@@ -1476,12 +1637,22 @@ pub struct MaintenanceRow {
     pub created_at: OffsetDateTime,
 }
 
+/// One `workspaces` row — the tenancy root (D-020).
+#[derive(Debug, FromRow)]
+pub struct WorkspaceRow {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub created_at: OffsetDateTime,
+}
+
 /// One `monitors` row, as stored. Converting to `Monitor` validates the stored strings again —
 /// the database is local but the domain contract still holds ("parse, don't validate" works at
 /// every boundary, including our own store).
 #[derive(Debug, FromRow)]
 pub struct MonitorRow {
     pub id: String,
+    pub workspace_id: String,
     pub name: String,
     pub url: String,
     pub interval_s: i64,
@@ -1514,8 +1685,11 @@ impl TryFrom<MonitorRow> for Monitor {
                 .map_err(|_| QueryError::Corrupt("recover_threshold".into()))?,
         )
         .map_err(|_| QueryError::Corrupt("thresholds out of range".into()))?;
+        let workspace = Uuid::parse_str(&row.workspace_id)
+            .map_err(|e| QueryError::Corrupt(format!("workspace id: {e}")))?;
         Ok(Self {
             id: MonitorId(id),
+            workspace: WorkspaceId(workspace),
             name: row.name,
             url,
             interval: std::time::Duration::from_secs(interval),

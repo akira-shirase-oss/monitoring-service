@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use monitor_db::{Db, writer};
-use monitor_domain::{Monitor, NewMonitor};
+use monitor_domain::{Monitor, NewMonitor, WorkspaceId};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config, Coordinator};
 use monitor_server::vitals::Vitals;
@@ -45,7 +45,7 @@ async fn monitor(
     timeout: Duration,
 ) -> anyhow::Result<Monitor> {
     let stored = NewMonitor::new("fixture", url.clone())?.into_monitor();
-    db.insert_monitor(&stored).await?;
+    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&stored).await?;
     let mut scheduled = stored.clone();
     scheduled.interval = interval;
     scheduled.timeout = timeout;
@@ -94,7 +94,7 @@ fn rig(
 }
 
 async fn outcomes(db: &Db, monitor: &Monitor) -> anyhow::Result<Vec<String>> {
-    let checks = db.list_checks(monitor.id, 200).await?;
+    let checks = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 200).await?;
     Ok(checks.into_iter().map(|row| row.outcome).collect())
 }
 

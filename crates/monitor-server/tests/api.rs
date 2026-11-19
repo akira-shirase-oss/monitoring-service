@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use monitor_db::Db;
+use monitor_domain::WorkspaceId;
 use monitor_server::{AppState, router};
 use tokio::sync::watch;
 use tower::ServiceExt;
@@ -486,10 +487,11 @@ async fn seed_check(
     outcome: monitor_domain::CheckOutcome,
 ) -> anyhow::Result<monitor_db::WriteOutcome> {
     let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(id)?);
-    let generation = db.monitor_generation(monitor_id).await?.unwrap_or(1);
+    let generation = db.workspace(WorkspaceId::DEFAULT).monitor_generation(monitor_id).await?.unwrap_or(1);
     Ok(writer
         .record(monitor_db::Observation {
             monitor_id,
+            workspace: WorkspaceId::DEFAULT,
             generation,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Probe(outcome),
@@ -608,6 +610,7 @@ async fn a_stale_observation_after_edit_is_dropped() {
     let outcome = writer
         .record(monitor_db::Observation {
             monitor_id,
+            workspace: WorkspaceId::DEFAULT,
             generation: 1,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Probe(monitor_domain::CheckOutcome::Pass),
@@ -618,7 +621,7 @@ async fn a_stale_observation_after_edit_is_dropped() {
         .await
         .unwrap();
     assert_eq!(outcome, monitor_db::WriteOutcome::DroppedStaleGeneration);
-    assert!(db.list_checks(monitor_id, 10).await.unwrap().is_empty());
+    assert!(db.workspace(WorkspaceId::DEFAULT).list_checks(monitor_id, 10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -637,6 +640,7 @@ async fn stats_separates_coverage_from_success() {
         seed_check(&db, &writer, &id, outcome).await.unwrap();
     }
     let generation = db
+        .workspace(WorkspaceId::DEFAULT)
         .monitor_generation(monitor_id)
         .await
         .unwrap()
@@ -644,6 +648,7 @@ async fn stats_separates_coverage_from_success() {
     writer
         .record(monitor_db::Observation {
             monitor_id,
+            workspace: WorkspaceId::DEFAULT,
             generation,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Missed,
@@ -1219,7 +1224,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
     let monitor =
         monitor_domain::NewMonitor::new("watched", url::Url::parse("https://example.com/health")?)?
             .into_monitor();
-    db.insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
 
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let write_health: monitor_db::WriteHealth = Arc::default();
@@ -1256,6 +1261,7 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
     writer
         .record(monitor_db::Observation {
             monitor_id: monitor.id,
+            workspace: monitor.workspace,
             generation: monitor.generation,
             slot_at: time::OffsetDateTime::now_utc(),
             slot: monitor_domain::SlotObservation::Probe(monitor_domain::CheckOutcome::Pass),
@@ -1338,7 +1344,7 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "limit_reached");
     assert_eq!(
-        db.monitor_count().await?,
+        db.workspace(WorkspaceId::DEFAULT).monitor_count().await?,
         2,
         "nothing was inserted past the cap"
     );
@@ -1929,7 +1935,7 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
         .into_monitor())
     };
     for i in 0..479 {
-        db.insert_monitor(&slow(format!("m{i}"), &format!("https://o{i}.example/"))?)
+        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&slow(format!("m{i}"), &format!("https://o{i}.example/"))?)
             .await?;
     }
     let app = uncapped(&db);
@@ -1949,7 +1955,7 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     let (status, body) = send(&app, "POST", "/api/monitors", Some(one_more)).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "capacity_exceeded");
-    assert_eq!(db.list_monitors().await?.len(), 480, "nothing was stored");
+    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_monitors().await?.len(), 480, "nothing was stored");
 
     // Per origin, in a fresh store.
     let tmp2 = tempfile::tempdir()?;
@@ -1958,7 +1964,7 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     for i in 0..30 {
         let mut monitor = slow(format!("p{i}"), &format!("https://api.example/{i}"))?;
         monitor.timeout = Duration::from_secs(3);
-        db.insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
     }
     let app = uncapped(&db);
     let same_origin = serde_json::json!({
@@ -1981,8 +1987,7 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
 
     // An edit that would overload the origin is refused the same way.
     let faster = serde_json::json!({ "interval_s": 15, "url": "https://api.example/again" });
-    let other_id = db
-        .list_monitors()
+    let other_id = db.workspace(WorkspaceId::DEFAULT).list_monitors()
         .await?
         .into_iter()
         .find(|row| row.url.contains("other.example"))
@@ -2020,7 +2025,7 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
             Duration::from_secs(3),
         )?
         .into_monitor();
-        db.insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
     }
     let app = monitor_server::router(monitor_server::AppState {
         db: db.clone(),

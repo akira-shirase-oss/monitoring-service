@@ -39,7 +39,9 @@ use uuid::Uuid;
 use monitor_db::{
     CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses,
 };
-use monitor_domain::{Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError};
+use monitor_domain::{
+    Monitor, MonitorId, MonitorPatch, NewMonitor, Status, ValidationError, WorkspaceId,
+};
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
 const BODY_LIMIT: usize = 16 * 1024;
@@ -51,6 +53,13 @@ const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
 /// Wall-clock time for session expiry (D-016). Injected so tests can move it; the server
 /// uses [`system_clock`].
 pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
+/// Every request's tenant scope until accounts land (S1b): the seeded default workspace
+/// is the only one a request can reach, and a monitor in any other workspace is exactly
+/// as absent as one that never existed — which is the isolation the API owes (D-020).
+fn tenant(state: &AppState) -> monitor_db::WorkspaceDb<'_> {
+    state.db.workspace(WorkspaceId::DEFAULT)
+}
 
 /// The real clock.
 pub fn system_clock() -> Clock {
@@ -108,9 +117,10 @@ pub async fn publish_registry(state: &AppState) -> Result<(), ApiError> {
 }
 
 /// The registry is the stored monitor set converted through the domain — corrupt rows are
-/// corruption, not a monitor to skip quietly.
+/// corruption, not a monitor to skip quietly. The engine sweeps *every* workspace: tenancy
+/// scopes what a request can reach, never what the scheduler observes (D-020).
 pub async fn load_registry(db: &Db) -> Result<Vec<Monitor>, QueryError> {
-    db.list_monitors()
+    db.list_monitors_engine()
         .await?
         .into_iter()
         .map(Monitor::try_from)
@@ -127,8 +137,9 @@ pub async fn rebuild_health(
 ) -> Result<std::collections::HashMap<MonitorId, monitor_domain::Health>, QueryError> {
     let mut health = std::collections::HashMap::with_capacity(monitors.len());
     for monitor in monitors {
-        let open = db.open_incident(monitor.id).await?.is_some();
-        let tail = db
+        let scoped = db.workspace(monitor.workspace);
+        let open = scoped.open_incident(monitor.id).await?.is_some();
+        let tail = scoped
             .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
             .await?;
         let rebuilt = monitor_domain::Health::rebuild(open, &tail, monitor.thresholds);
@@ -162,7 +173,11 @@ pub async fn record_downtime(
 ) -> Result<usize, monitor_db::WriterError> {
     let mut gaps = 0;
     for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
-        let Some(last) = db.last_slot_at(monitor.id).await? else {
+        let Some(last) = db
+            .workspace(monitor.workspace)
+            .last_slot_at(monitor.id)
+            .await?
+        else {
             continue; // never observed: nothing to be stale about
         };
         let interval = time::Duration::try_from(monitor.interval).unwrap_or(time::Duration::MAX);
@@ -174,6 +189,7 @@ pub async fn record_downtime(
         writer
             .record(monitor_db::Observation {
                 monitor_id: monitor.id,
+                workspace: monitor.workspace,
                 generation: monitor.generation,
                 slot_at: last + interval,
                 slot: monitor_domain::SlotObservation::Missed,
@@ -516,7 +532,7 @@ struct MonitorView {
 /// status is `unknown` — the last committed value is history, not current evidence.
 async fn list_monitors(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let verdict = state.vitals.verdict();
-    let rows = state.db.list_monitors().await?;
+    let rows = tenant(&state).list_monitors().await?;
     let monitors: Vec<MonitorView> = rows
         .into_iter()
         .map(|row| view_from_row(row, &state.statuses, verdict.observing()))
@@ -579,9 +595,7 @@ async fn create_monitor(
     let monitor = new.into_monitor();
     let _schedule = lock.0.lock().await;
     check_capacity(&state, |monitors| monitors.push(monitor.clone())).await?;
-    if !state
-        .db
-        .insert_monitor_within(&monitor, state.max_monitors)
+    if !tenant(&state).insert_monitor_within(&monitor, state.max_monitors)
         .await?
     {
         return Err(ApiError::LimitReached(state.max_monitors));
@@ -650,9 +664,7 @@ async fn patch_monitor(
         }
     })
     .await?;
-    if state
-        .db
-        .update_monitor(&merged, monitor.generation)
+    if tenant(&state).update_monitor(&merged, monitor.generation)
         .await?
         .is_none()
     {
@@ -677,7 +689,7 @@ async fn delete_monitor(
 ) -> Result<StatusCode, ApiError> {
     let row = find_monitor(&state, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    if !state.db.delete_monitor(monitor.id).await? {
+    if !tenant(&state).delete_monitor(monitor.id).await? {
         return Err(ApiError::Conflict(
             "monitor has recorded history; pause it instead".into(),
         ));
@@ -740,9 +752,7 @@ async fn list_checks(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let row = find_monitor(&state, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    let checks = state
-        .db
-        .list_checks(monitor.id, bounded_limit(params.limit, 50, 500))
+    let checks = tenant(&state).list_checks(monitor.id, bounded_limit(params.limit, 50, 500))
         .await?;
     let checks: Vec<CheckView> = checks.into_iter().map(CheckView::from).collect();
     Ok(Json(serde_json::json!({ "checks": checks })))
@@ -798,7 +808,7 @@ async fn monitor_stats(
     };
     let elapsed = u64::try_from((now - window_start).whole_seconds().max(0)).unwrap_or(0);
     let expected = elapsed / monitor.interval.as_secs().max(1);
-    let mut counts = state.db.check_stats(monitor.id, since).await?;
+    let mut counts = tenant(&state).check_stats(monitor.id, since).await?;
     counts.expected = expected;
     Ok(Json(StatsView {
         window_s,
@@ -903,9 +913,7 @@ async fn create_window(
     if input.ends_at <= input.starts_at {
         return Err(ApiError::Invalid("ends_at must be after starts_at".into()));
     }
-    let created = state
-        .db
-        .create_window(
+    let created = tenant(&state).create_window(
             monitor.id,
             input.starts_at,
             input.ends_at,
@@ -932,9 +940,7 @@ async fn list_windows(
     let row = find_monitor(&state, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     let now = OffsetDateTime::now_utc();
-    let windows: Vec<MaintenanceView> = state
-        .db
-        .list_windows(monitor.id)
+    let windows: Vec<MaintenanceView> = tenant(&state).list_windows(monitor.id)
         .await?
         .into_iter()
         .map(|row| MaintenanceView::from_row(row, now))
@@ -949,7 +955,7 @@ async fn delete_window(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let id: i64 = id.parse().map_err(|_| ApiError::NotFound)?;
-    if !state.db.delete_window(id).await? {
+    if !tenant(&state).delete_window(id).await? {
         return Err(ApiError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -972,9 +978,7 @@ async fn list_incidents(
         Some("resolved") => Some("resolved"),
         Some(_) => return Err(ApiError::BadId),
     };
-    let incidents = state
-        .db
-        .list_incidents(
+    let incidents = tenant(&state).list_incidents(
             monitor_id,
             state_filter,
             bounded_limit(params.limit, 50, 500),
@@ -1039,12 +1043,9 @@ async fn backup(
 
 async fn find_monitor(state: &AppState, id: &str) -> Result<MonitorRow, ApiError> {
     let id = Uuid::parse_str(id).map_err(|_| ApiError::NotFound)?;
-    state
-        .db
-        .list_monitors()
+    tenant(state)
+        .monitor_row(MonitorId(id))
         .await?
-        .into_iter()
-        .find(|row| row.id == id.to_string())
         .ok_or(ApiError::NotFound)
 }
 

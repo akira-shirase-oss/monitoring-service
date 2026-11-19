@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use monitor_db::{Db, Observation, writer};
-use monitor_domain::{CheckOutcome, NewMonitor, SlotObservation};
+use monitor_domain::{CheckOutcome, NewMonitor, SlotObservation, WorkspaceId};
 use monitor_server::deliver::{Config, Deliverer, Sink};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use time::OffsetDateTime;
@@ -116,7 +116,7 @@ fn child() -> anyhow::Result<()> {
         db.migrate().await?;
         let monitor =
             NewMonitor::new("proxied", url::Url::parse("https://example.com")?)?.into_monitor();
-        db.insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
         let (writer, _task) = writer::spawn(
             db.clone(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -129,6 +129,7 @@ fn child() -> anyhow::Result<()> {
             writer
                 .record(Observation {
                     monitor_id: monitor.id,
+                    workspace: monitor.workspace,
                     generation: monitor.generation,
                     slot_at: OffsetDateTime::now_utc(),
                     slot: SlotObservation::Probe(CheckOutcome::Transport),

@@ -12,7 +12,7 @@ use lettre::transport::smtp::AsyncSmtpTransport;
 use lettre::transport::smtp::client::Tls;
 use lettre::{AsyncTransport, Tokio1Executor};
 use monitor_db::{Db, Observation, writer};
-use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation};
+use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation, WorkspaceId};
 use monitor_server::deliver::{Config, Deliverer, Sink};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -102,11 +102,12 @@ async fn rig() -> anyhow::Result<(Db, writer::WriterHandle)> {
 async fn monitor_with_events(db: &Db, writer: &writer::WriterHandle) -> anyhow::Result<Monitor> {
     let monitor =
         NewMonitor::new("fixture", url::Url::parse("https://example.com")?)?.into_monitor();
-    db.insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
     for _ in 0..3 {
         writer
             .record(Observation {
                 monitor_id: monitor.id,
+                workspace: monitor.workspace,
                 generation: monitor.generation,
                 slot_at: OffsetDateTime::now_utc(),
                 slot: SlotObservation::Probe(CheckOutcome::Transport),
@@ -148,7 +149,7 @@ fn fast_config() -> Config {
 async fn an_email_event_is_delivered_and_marked() -> anyhow::Result<()> {
     let (db, writer) = rig().await?;
     let monitor = monitor_with_events(&db, &writer).await?;
-    let rows = db.list_outbox(monitor.id).await?;
+    let rows = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
     assert_eq!(rows.len(), 2, "one outbox row per configured channel");
 
     let (port, mut wire) = smtp_stub(0).await?;
@@ -172,7 +173,7 @@ async fn an_email_event_is_delivered_and_marked() -> anyhow::Result<()> {
         transcript.push('\n');
     }
     let (email_event_id, email_attempts) = loop {
-        let rows = db.list_outbox(monitor.id).await?;
+        let rows = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
         let email = rows.iter().find(|row| row.channel == "email");
         if let Some(row) = email
             && row.delivered_at.is_some()
@@ -234,7 +235,7 @@ async fn a_rejected_email_is_a_scheduled_retry() -> anyhow::Result<()> {
     // First attempt fails; the retry lands and delivers.
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     let email_attempts = loop {
-        let rows = db.list_outbox(monitor.id).await?;
+        let rows = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
         let email = rows.iter().find(|row| row.channel == "email");
         if let Some(row) = email
             && row.delivered_at.is_some()
@@ -273,11 +274,12 @@ async fn a_name_with_line_breaks_cannot_inject_a_header_or_a_line() -> anyhow::R
     let (db, writer) = rig().await?;
     let name = "web\r\nBcc: attacker@example.net\nX-Injected: 1";
     let monitor = NewMonitor::new(name, url::Url::parse("https://example.com")?)?.into_monitor();
-    db.insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
     for _ in 0..3 {
         writer
             .record(Observation {
                 monitor_id: monitor.id,
+                workspace: monitor.workspace,
                 generation: monitor.generation,
                 slot_at: OffsetDateTime::now_utc(),
                 slot: SlotObservation::Probe(CheckOutcome::Transport),
@@ -373,11 +375,12 @@ async fn a_dot_terminated_name_cannot_splice_a_second_message() -> anyhow::Resul
     let (db, writer) = rig().await?;
     let name = "web\n.\r\nMAIL FROM:<x@evil>\r\nRCPT TO:<x@evil>\r\nDATA\r\n.\r\npwned";
     let monitor = NewMonitor::new(name, url::Url::parse("https://example.com")?)?.into_monitor();
-    db.insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
     for _ in 0..3 {
         writer
             .record(Observation {
                 monitor_id: monitor.id,
+                workspace: monitor.workspace,
                 generation: monitor.generation,
                 slot_at: OffsetDateTime::now_utc(),
                 slot: SlotObservation::Probe(CheckOutcome::Transport),

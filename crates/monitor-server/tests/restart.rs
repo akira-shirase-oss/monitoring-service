@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use monitor_db::{Db, Observation, SharedStatuses, WriteOutcome, writer};
-use monitor_domain::{CheckOutcome, Effect, NewMonitor, SlotObservation, Status};
+use monitor_domain::{CheckOutcome, Effect, NewMonitor, SlotObservation, Status, WorkspaceId};
 use monitor_server::{rebuild_health, record_downtime};
 use time::OffsetDateTime;
 
@@ -17,6 +17,7 @@ fn probe(
 ) -> Observation {
     Observation {
         monitor_id: monitor.id,
+        workspace: monitor.workspace,
         generation: monitor.generation,
         slot_at: at,
         slot: SlotObservation::Probe(outcome),
@@ -38,7 +39,7 @@ async fn downtime_is_a_gap_failures_either_side_are_not_consecutive() -> anyhow:
     db.migrate().await?;
     let monitor = NewMonitor::new("restarted", url::Url::parse("https://example.com/health")?)?
         .into_monitor();
-    db.insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
     let now = OffsetDateTime::now_utc();
     let minutes = |m: i64| now - time::Duration::minutes(m);
 
@@ -84,7 +85,7 @@ async fn downtime_is_a_gap_failures_either_side_are_not_consecutive() -> anyhow:
         Status::Unknown,
         "pre-outage evidence is not current"
     );
-    let newest = db.list_checks(monitor.id, 1).await?;
+    let newest = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 1).await?;
     assert_eq!(newest[0].outcome, "missed", "the gap is part of the record");
     assert_eq!(newest[0].slot_at, minutes(10) + time::Duration::minutes(1));
 
@@ -93,7 +94,7 @@ async fn downtime_is_a_gap_failures_either_side_are_not_consecutive() -> anyhow:
         .record(probe(&monitor, CheckOutcome::Transport, now))
         .await?;
     assert_eq!(outcome, WriteOutcome::Committed(Effect::Unchanged));
-    assert!(db.open_incident(monitor.id).await?.is_none());
+    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_none());
     Ok(())
 }
 
@@ -105,7 +106,7 @@ async fn a_restart_inside_the_interval_writes_no_gap() -> anyhow::Result<()> {
     db.migrate().await?;
     let monitor =
         NewMonitor::new("quick", url::Url::parse("https://example.com/health")?)?.into_monitor();
-    db.insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
     let now = OffsetDateTime::now_utc();
     let statuses: SharedStatuses = Arc::new(RwLock::new(HashMap::new()));
     let (writer, _task) = writer::spawn(
@@ -132,7 +133,7 @@ async fn a_restart_inside_the_interval_writes_no_gap() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(gaps, 0);
-    assert_eq!(db.list_checks(monitor.id, 10).await?.len(), 1);
+    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 10).await?.len(), 1);
     assert_eq!(statuses.read().expect("statuses")[&monitor.id], Status::Up);
     Ok(())
 }
