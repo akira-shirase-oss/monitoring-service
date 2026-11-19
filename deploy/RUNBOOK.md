@@ -1,5 +1,10 @@
 # Deploy runbook — Service Monitor
 
+This is the operator runbook: env reference, upgrade/rollback, backup/restore, and the
+honest-failure cases. The concrete first production install — SFO3 droplet, Cloudflare,
+Caddy with the origin cert + AOP, the R2+age backup timer, smoke and restore drill — is
+[`deploy/droplet/`](droplet/DEPLOY.md), which defers to this file for the internals.
+
 The monitor's whole job is watching other things; running it on the same box it watches
 means a shared failure reports nothing — or worse, lies about both. Run it on its own
 host, and host the public status page somewhere else again (`SMON_STATUS_DIR` is just a

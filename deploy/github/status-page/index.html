@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status · Service Monitor</title>
+<style>
+  body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 42rem; margin: 4rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  .beat { padding: .6rem .8rem; border: 1px solid #ddd; border-radius: .4rem; margin: .4rem 0; display: flex; justify-content: space-between; }
+  .up { border-left: 4px solid #2e7d32; }
+  .down { border-left: 4px solid #c62828; }
+  .unknown { border-left: 4px solid #9e9e9e; }
+  #verdict { font-weight: 600; }
+  .unavailable #verdict { color: #c62828; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+<h1>Service status</h1>
+<p id="verdict">Loading…</p>
+<div id="monitors"></div>
+<p><small>Rendered from <code>status.json</code>, republished by an outside checker. A stale beat is shown, never a fresh lie.</small></p>
+<script>
+(async () => {
+  const verdict = document.getElementById('verdict');
+  const list = document.getElementById('monitors');
+  const unavail = () => { document.body.classList.add('unavailable'); verdict.textContent = 'Monitoring unavailable — this says nothing about the targets.'; };
+  try {
+    const res = await fetch('status.json', { cache: 'no-store' });
+    if (!res.ok) return unavail();
+    const beat = await res.json();
+    if (beat.monitoring === 'unavailable' || new Date(beat.expires_at) < new Date()) {
+      verdict.textContent = 'Monitoring unavailable — this snapshot is stale.';
+      document.body.classList.add('unavailable');
+    } else {
+      verdict.textContent = 'Monitoring ' + (beat.monitoring === 'degraded' ? 'degraded' : 'operational');
+    }
+    for (const m of beat.monitors ?? []) {
+      const row = document.createElement('div');
+      row.className = 'beat ' + (m.status ?? 'unknown');
+      row.innerHTML = '<span>' + (m.name ?? m.id) + '</span><b>' + (m.status ?? 'unknown') + '</b>';
+      list.appendChild(row);
+    }
+  } catch { unavail(); }
+})();
+</script>
+</body>
+</html>

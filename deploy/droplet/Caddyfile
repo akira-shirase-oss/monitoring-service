@@ -1,0 +1,26 @@
+# Caddy for the Service Monitor droplet (deploy/droplet/DEPLOY.md): Cloudflare terminates
+# visitors' TLS and connects here over TLS with "Full (strict)", so Caddy serves Cloudflare's
+# Origin Certificate (no ACME: port 80 stays closed). Only Cloudflare reaches 443 (the
+# firewall, cloudflare-ips.sh) — and Authenticated Origin Pulls makes the TLS client prove
+# it is Cloudflare anyway, so a direct hit on the IP fails the handshake.
+{
+	auto_https off
+	servers {
+		# Cloudflare's ranges, so Caddy passes the visitor's address on in X-Forwarded-For
+		# (cloudflare-ips.sh writes this file).
+		import /etc/caddy/cloudflare-trusted.caddy
+	}
+}
+
+monitor.example.com:443 {
+	tls /etc/caddy/origin.pem /etc/caddy/origin.key {
+		# AOP (CREATE.md 7): the peer must present a certificate from Cloudflare's
+		# origin-pull CA — defense in depth under the CF-only firewall rule.
+		client_auth {
+			mode require_and_verify
+			trusted_ca_cert_file /etc/caddy/cloudflare-origin-pull-ca.pem
+		}
+	}
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:58400
+}

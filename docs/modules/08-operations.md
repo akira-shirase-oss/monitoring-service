@@ -25,8 +25,9 @@ not a process only the author can babysit.
   only, under server-drawn names — a client-chosen path is refused (D-019); restore drill
   proves open incidents and outbox rows survive; restore is documented and rehearsed
   before M4 exits.
-- **Deploy:** the monitor runs off the target host (independence is the point); upgrade and
-  rollback are scripted; the public status page is hosted elsewhere (module 07). The
+- **Deploy:** the monitor runs off the target host (independence is the point — its own
+  droplet in a different region, `deploy/droplet/`); upgrade and rollback are scripted;
+  the public status page is hosted elsewhere (module 07). The
   systemd unit runs as the system user `smon` with no capabilities and a read-only
   system except `data/` and `status/`; `TimeoutStopSec=40s` outlasts the SIGTERM drain
   (pinned by `tests/deploy_unit.rs`).
