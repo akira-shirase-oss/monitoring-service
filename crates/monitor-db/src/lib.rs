@@ -330,7 +330,14 @@ impl Db {
         let options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(create)
             .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Without this every connection carries SQLite's default busy_timeout of 0:
+            // an API write (a session insert) meeting the writer's commit returns
+            // SQLITE_BUSY instantly — the session-churn run caught two logins and a
+            // delete failing that way. Five seconds absorbs a commit's whole window
+            // (measured at tens of ms) with room to spare; the deadline stays honest —
+            // a lock held longer still fails, just after waiting instead of instantly.
+            .busy_timeout(std::time::Duration::from_secs(5));
         // sqlx renames an in-memory database to a shared-cache `file:` name — decide from
         // the URL the caller wrote, never from that name.
         let in_memory = url.contains(":memory:") || url.contains("mode=memory");

@@ -46,8 +46,9 @@ const BIN =
 	BIN_PROFILE === 'release' ? `${ROOT}/target/release/monitor-server` : `${ROOT}/target/debug/monitor-server`;
 const MIX = arg('mix', 'lab');
 if (!['lab', 'ok'].includes(MIX)) throw new Error(`--mix ${MIX}: expected lab or ok`);
-const DB = `/tmp/smon-load-${process.pid}.db`;
-const LOG = `/tmp/smon-load-${process.pid}.log`;
+const TMP = process.env.SMON_TMP ?? '/tmp';
+const DB = `${TMP}/smon-load-${process.pid}.db`;
+const LOG = `${TMP}/smon-load-${process.pid}.log`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -88,8 +89,14 @@ function commit() {
 	}
 }
 
-const loadavg = () =>
-	execFileSync('sysctl', ['-n', 'vm.loadavg'], { encoding: 'utf8' }).trim().replace(/[{}]/g, '').trim().split(/\s+/).map(Number);
+// sysctl is denied in some sandboxes; the average is run metadata, so a run degrades to null.
+const loadavg = () => {
+	try {
+		return execFileSync('sysctl', ['-n', 'vm.loadavg'], { encoding: 'utf8' }).trim().replace(/[{}]/g, '').trim().split(/\s+/).map(Number);
+	} catch {
+		return null;
+	}
+};
 
 function pct(sorted, p) {
 	if (sorted.length === 0) return null;

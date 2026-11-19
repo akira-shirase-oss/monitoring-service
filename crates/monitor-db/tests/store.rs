@@ -1640,3 +1640,32 @@ async fn the_writers_commits_never_queue_behind_api_reads() -> anyhow::Result<()
     );
     Ok(())
 }
+
+/// The session-churn run caught it: a session insert meeting a held write lock used to
+/// return SQLITE_BUSY instantly — SQLite's default busy_timeout is 0. Pooled connections
+/// now wait out the lock and then succeed; the churn gate wants zero login failures.
+#[tokio::test]
+async fn a_pooled_write_waits_out_a_held_write_lock() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("store.db").display());
+    let db = Db::connect(&url, 2).await?;
+    db.migrate().await?;
+
+    // A lock holder outside our pool: an immediate transaction keeps the write lock.
+    use sqlx::Connection as _;
+    let mut holder = sqlx::SqliteConnection::connect(&url).await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut holder).await?;
+
+    let writer = {
+        let db = db.clone();
+        tokio::spawn(async move { db.create_session("s1", OffsetDateTime::now_utc()).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        !writer.is_finished(),
+        "the write finished while the lock was held — it failed instantly"
+    );
+    sqlx::query("COMMIT").execute(&mut holder).await?;
+    writer.await??;
+    Ok(())
+}

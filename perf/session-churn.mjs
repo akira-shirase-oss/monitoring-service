@@ -16,7 +16,8 @@ const DURATION_S = Number(arg('duration-s', 300));
 const OUT_DIR = resolve(ROOT, arg('out', 'perf/results'));
 // Its own ports — never 58400, where an installed monitor listens (perf/lib-ports.mjs).
 const FIXTURE_PORT = Number(arg('fixture-port', 58740)), SERVER_PORT = Number(arg('server-port', 58440));
-const DB = `/tmp/smon-churn-${process.pid}.db`, LOG = `/tmp/smon-churn-${process.pid}.log`;
+const TMP = process.env.SMON_TMP ?? '/tmp';
+const DB = `${TMP}/smon-churn-${process.pid}.db`, LOG = `${TMP}/smon-churn-${process.pid}.log`;
 const BASE = `http://127.0.0.1:${SERVER_PORT}`, TOKEN = 'churn-secret-for-the-session-churn-run-01';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sqlite = (sql) => execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8' }).trim() || '[]';
