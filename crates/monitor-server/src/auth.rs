@@ -903,23 +903,22 @@ mod password_tests {
     async fn hold_both_permits() -> tokio::sync::SemaphorePermit<'static> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            match PASSWORD_WORK.try_acquire_many(2) {
-                Ok(permits) => return permits,
-                Err(_) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the password-work permits never freed"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+            if let Ok(permits) = PASSWORD_WORK.try_acquire_many(2) {
+                return permits;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the password-work permits never freed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
-    /// The limiter is a hard bound, not a queue hint: two permits, never more.
+    /// The limiter is a hard bound, not a queue hint: two permits, never more. A sibling
+    /// test's real hashing can hold one, so the free count is `<= 2`, not `== 2`.
     #[tokio::test]
     async fn password_work_is_bounded() {
-        assert_eq!(password_work_permits(), 2);
+        assert!(password_work_permits() <= 2, "the bound is two permits");
         let permits = hold_both_permits().await;
         assert!(
             PASSWORD_WORK.try_acquire().is_err(),

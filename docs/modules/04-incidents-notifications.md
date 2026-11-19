@@ -29,10 +29,21 @@ at-least-once to a receiver — without alerting ever being able to stall observ
 - **Uncertainty is explicit:** a timed-out delivery is `uncertain` — retried under the same
   `event_id`, so a receiver may see a duplicate but never a second *logical* event.
 - **Channels (M7.1):** `notify_outbox.channel` selects the transport — `webhook` always,
-  `email` when SMTP is configured. One transition enqueues one row *per configured
-  channel* (same incident/kind, distinct `event_id`s — each channel owns its delivery
-  bookkeeping). Each deliverer polls only its own channel, so a dead SMTP relay can never
-  stall webhooks or vice versa. No configured channel ⇒ no dead-plan rows.
+  `email` when SMTP is configured, `tenant_webhook` while the row's workspace keeps a
+  webhook (S1d). One transition enqueues one row *per configured channel* (same
+  incident/kind, distinct `event_id`s — each channel owns its delivery bookkeeping).
+  Each deliverer polls only its own channel, so a dead SMTP relay can never stall
+  webhooks or vice versa. No configured channel ⇒ no dead-plan rows.
+- **Tenant webhook channel (S1d, D-017):** each workspace may store its own
+  `webhook_url` + `webhook_secret` (`PUT/GET/DELETE /api/workspace/webhook`,
+  member work; the secret signs `x-smon-signature` like the operator's does). The URL
+  is SSRF-guarded at save (`ProbePolicy::check_resolved`) and at every send — the
+  strict client re-resolves through `PolicyResolver` inside the connect, re-runs
+  `check` for IP literals, follows no redirects, honours `attempt_deadline`, and never
+  reads the response body. A send-time refusal lands on the row as
+  `notify_outbox.last_error` (`rejected_local` & friends) and the payload is never
+  sent. The tenant deliverer always runs; with no workspace configured it is an idle
+  poll.
 - **Email sink:** `Sink::Email` — lettre `AsyncSmtpTransport` on rustls+tokio
   (`SMON_SMTP_DSN`: prefer `smtps://user:pass@host[:465]` — implicit TLS, no cleartext
   preamble; `smtp://…?tls=required` for mandatory STARTTLS where implicit TLS isn't
@@ -46,10 +57,9 @@ at-least-once to a receiver — without alerting ever being able to stall observ
   reports the recipient count, not addresses.
 - **No proxies:** the webhook client ignores proxy environment variables and dials the
   receiver directly; SMTP (lettre) never used them. Egress proxies are not supported.
-- **The webhook URL is not SSRF-guarded** (D-017): it is operator configuration —
-  `SMON_WEBHOOK_URL` must be http(s) with a host, nothing more, so an internal relay
-  works. It is a P0 gate before tenants can set webhook URLs: then they go through
-  `ProbePolicy` and the validating resolver at save and at send.
+- **The operator webhook URL is not SSRF-guarded** (D-017): `SMON_WEBHOOK_URL` is
+  operator configuration — http(s) with a host, nothing more, so an internal relay
+  works. Tenant URLs *are* guarded (the bullet above); the scope split is the D entry.
 - **No redirects:** the webhook client follows none. A 307/308 would re-send the payload
   and its signature wherever the receiver points; a 3xx is a failed attempt, retried with
   backoff like a 5xx (`a_receivers_redirect_is_not_followed_and_nothing_is_re_sent`).
@@ -71,6 +81,8 @@ at-least-once to a receiver — without alerting ever being able to stall observ
 | One channel's relay down | other channel's rows still drain; failing channel retries under its own event_id |
 | Crash after commit before delivery | outbox row survives; delivered on restart |
 | Receiver 500s / flaps | bounded retries, then visible `undelivered` |
+| Tenant URL rebinds private at send | refused inside the connect; `rejected_local` on the row; payload never sent |
+| Tenant channel cleared after enqueue | row answers `no_target` — visible, never a silent drop |
 | Deliverer dies | probes + incidents continue; backlog drains on restart |
 
 ## Testing parameters
