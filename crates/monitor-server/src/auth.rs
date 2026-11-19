@@ -117,59 +117,11 @@ pub async fn require_auth(
 
     // A presented cookie is resolved before anything else (S1b): an account session
     // authorizes in every mode — tokenless dev included — and resolves to the account's
-    // own workspace, never the operator's. Operator sessions are tried first when a
-    // token exists; the two key namespaces can't collide.
-    let mut principal: Option<Principal> = None;
-    if let Some(session) = session_cookie(request.headers().get(header::COOKIE)) {
-        if let Some(token) = &state.admin_token {
-            match state
-                .db
-                .session_valid_at(
-                    &session_key(token, session),
-                    (state.clock)(),
-                    state.session_idle,
-                )
-                .await
-            {
-                Ok(true) => principal = Some(Principal::Operator),
-                Ok(false) => {}
-                Err(error) => {
-                    // Failing closed would masquerade a broken store as "wrong
-                    // credential"; authorization cannot be decided right now.
-                    tracing::error!(%error, "session lookup failed");
-                    return deny(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "internal",
-                        "the session store is unavailable",
-                    );
-                }
-            }
-        }
-        if principal.is_none() {
-            match state
-                .db
-                .account_session_at(
-                    &account_session_key(session),
-                    (state.clock)(),
-                    state.session_idle,
-                )
-                .await
-            {
-                Ok(Some((account, workspace))) => {
-                    principal = Some(Principal::Account { account, workspace });
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(%error, "account session lookup failed");
-                    return deny(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "internal",
-                        "the session store is unavailable",
-                    );
-                }
-            }
-        }
-    }
+    // own workspace, never the operator's.
+    let principal = match session_principal(&state, request.headers().get(header::COOKIE)).await {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
 
     let Some(token) = &state.admin_token else {
         // Dev-on-loopback mode (boot refuses it on any other listen). Whoever reaches the
@@ -257,6 +209,61 @@ pub async fn require_auth(
             "unauthenticated",
             "a valid Bearer token or session cookie is required",
         ),
+    }
+}
+
+/// Resolve a presented session cookie into its principal (S1b): operator sessions are
+/// tried first when a token exists, then account sessions — the two key namespaces
+/// can't collide. `Err` is the honest "the store can't answer right now", never a 401
+/// that would masquerade a broken store as a wrong credential.
+async fn session_principal(
+    state: &AppState,
+    cookie: Option<&header::HeaderValue>,
+) -> Result<Option<Principal>, Box<Response>> {
+    let Some(session) = session_cookie(cookie) else {
+        return Ok(None);
+    };
+    if let Some(token) = &state.admin_token {
+        match state
+            .db
+            .session_valid_at(
+                &session_key(token, session),
+                (state.clock)(),
+                state.session_idle,
+            )
+            .await
+        {
+            Ok(true) => return Ok(Some(Principal::Operator)),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(%error, "session lookup failed");
+                return Err(Box::new(deny(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "internal",
+                    "the session store is unavailable",
+                )));
+            }
+        }
+    }
+    match state
+        .db
+        .account_session_at(
+            &account_session_key(session),
+            (state.clock)(),
+            state.session_idle,
+        )
+        .await
+    {
+        Ok(Some((account, workspace))) => Ok(Some(Principal::Account { account, workspace })),
+        Ok(None) => Ok(None),
+        Err(error) => {
+            tracing::error!(%error, "account session lookup failed");
+            Err(Box::new(deny(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "internal",
+                "the session store is unavailable",
+            )))
+        }
     }
 }
 
@@ -419,40 +426,41 @@ fn argon2() -> argon2::Argon2<'static> {
 }
 
 /// The argon2id PHC string for a new password, computed under the work limit.
+/// A panicked blocking task is re-thrown — hashing must never silently "fail".
 pub async fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    let permit = PASSWORD_WORK.acquire().await.expect("semaphore never closes");
+    let Ok(_permit) = PASSWORD_WORK.acquire().await else {
+        unreachable!("the password-work semaphore is never closed")
+    };
     let owned = password.to_owned();
-    let hash = tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         use argon2::password_hash::PasswordHasher;
         argon2()
             .hash_password(owned.as_bytes())
             .map(|h| h.to_string())
     })
     .await
-    .expect("blocking task panicked");
-    drop(permit);
-    hash
+    {
+        Ok(result) => result,
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
 }
 
 /// Constant-work verify: `hash` comes from the store (or `DUMMY_HASH`), the password
 /// from the request. Malformed stored hashes fail closed (`Ok(false)`), never panic.
 pub async fn verify_password(hash: &str, password: &str) -> bool {
-    let permit = PASSWORD_WORK.acquire().await.expect("semaphore never closes");
+    let Ok(_permit) = PASSWORD_WORK.acquire().await else {
+        unreachable!("the password-work semaphore is never closed")
+    };
     let (hash, owned) = (hash.to_owned(), password.to_owned());
-    let ok = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         use argon2::password_hash::PasswordVerifier;
-        let parsed = match argon2::PasswordHash::new(&hash) {
-            Ok(parsed) => parsed,
-            Err(_) => return false,
+        let Ok(parsed) = argon2::PasswordHash::new(&hash) else {
+            return false;
         };
-        argon2()
-            .verify_password(owned.as_bytes(), &parsed)
-            .is_ok()
+        argon2().verify_password(owned.as_bytes(), &parsed).is_ok()
     })
     .await
-    .unwrap_or(false);
-    drop(permit);
-    ok
+    .unwrap_or(false)
 }
 
 /// Test hook: the work limiter, so a test can prove the bound is real.
@@ -619,7 +627,10 @@ mod password_tests {
         assert_eq!(password_work_permits(), 2);
         let first = PASSWORD_WORK.try_acquire().expect("permit 1");
         let second = PASSWORD_WORK.try_acquire().expect("permit 2");
-        assert!(PASSWORD_WORK.try_acquire().is_err(), "a third burns nothing");
+        assert!(
+            PASSWORD_WORK.try_acquire().is_err(),
+            "a third burns nothing"
+        );
         drop(first);
         drop(second);
     }
@@ -629,6 +640,9 @@ mod password_tests {
         let hash = hash_password("s3cret long password").await.expect("hash");
         assert!(verify_password(&hash, "s3cret long password").await);
         assert!(!verify_password(&hash, "wrong").await);
-        assert!(!verify_password("not-a-phc", "x").await, "bad store → closed");
+        assert!(
+            !verify_password("not-a-phc", "x").await,
+            "bad store → closed"
+        );
     }
 }

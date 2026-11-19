@@ -5,9 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use monitor_db::{
-    Db, Observation, QueryError, RetentionPolicy, WriteHealth, WriteOutcome, writer,
-};
+use monitor_db::{Db, Observation, QueryError, RetentionPolicy, WriteHealth, WriteOutcome, writer};
 use monitor_domain::{
     CheckOutcome, Effect, Health, Monitor, MonitorId, NewMonitor, SlotObservation, Status,
     WorkspaceId,

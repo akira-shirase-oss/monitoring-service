@@ -670,10 +670,7 @@ impl Db {
 
     /// An account row by its normalized email — the sign-in lookup. `password_hash` is
     /// the argon2id PHC string; it never leaves the store's caller.
-    pub async fn account_by_email(
-        &self,
-        email: &str,
-    ) -> Result<Option<AccountRow>, QueryError> {
+    pub async fn account_by_email(&self, email: &str) -> Result<Option<AccountRow>, QueryError> {
         sqlx::query_as::<_, AccountRow>(
             "SELECT id, workspace_id, email, password_hash, created_at
                FROM accounts WHERE email = ?",
@@ -721,12 +718,11 @@ impl Db {
         let Some(account_id) = row.account_id else {
             return Ok(None); // an operator session can't be claimed as an account's
         };
-        let workspace: Option<String> = sqlx::query_scalar(
-            "SELECT workspace_id FROM accounts WHERE id = ?",
-        )
-        .bind(&account_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let workspace: Option<String> =
+            sqlx::query_scalar("SELECT workspace_id FROM accounts WHERE id = ?")
+                .bind(&account_id)
+                .fetch_optional(&self.pool)
+                .await?;
         let (Some(account), Some(ws)) = (
             Uuid::parse_str(&account_id).ok(),
             workspace.and_then(|w| Uuid::parse_str(&w).ok()),
@@ -1880,7 +1876,10 @@ pub struct NewAccount {
 /// sessions, `None` for operator sessions).
 #[derive(Debug, FromRow)]
 struct SessionRow {
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "FromRow needs the column; the guard never reads it"
+    )]
     id: String,
     account_id: Option<String>,
     created_at: OffsetDateTime,

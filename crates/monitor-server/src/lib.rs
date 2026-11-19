@@ -515,8 +515,7 @@ async fn login_account(
     // Unknown address verifies against the dummy hash — same work, no existence oracle.
     let hash = account
         .as_ref()
-        .map(|row| row.password_hash.as_str())
-        .unwrap_or(auth::DUMMY_LOGIN_HASH);
+        .map_or(auth::DUMMY_LOGIN_HASH, |row| row.password_hash.as_str());
     if !auth::verify_password(hash, password).await {
         drop(attempt);
         if let Ok(_penalty) = penalties.try_acquire() {
@@ -585,12 +584,12 @@ async fn create_invite(
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Json(body): Json<InviteBody>,
 ) -> Result<impl IntoResponse, ApiError> {
+    const MAX_TTL_HOURS: u64 = 24 * 30;
     if !matches!(principal, auth::Principal::Operator) {
         return Err(ApiError::Forbidden(
             "invites are an operator operation".into(),
         ));
     }
-    const MAX_TTL_HOURS: u64 = 24 * 30;
     let ttl_hours = body.ttl_hours.unwrap_or(72);
     if ttl_hours == 0 || ttl_hours > MAX_TTL_HOURS {
         return Err(ApiError::Invalid(format!(
@@ -610,6 +609,77 @@ async fn create_invite(
             "invite": { "code": code, "expires_at": row.expires_at }
         })),
     ))
+}
+
+/// One 422 shape answer for every malformed signup field.
+fn signup_invalid(message: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "error": { "code": "invalid_request", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+/// One 403 for every unusable code — unknown, spent and expired read the same.
+fn invite_denied(attempt: throttle::Attempt) -> Response {
+    drop(attempt);
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": { "code": "invalid_invite",
+                       "message": "invite code is invalid or expired" }
+        })),
+    )
+        .into_response()
+}
+
+/// The field-shape gate before anything is looked up; the normalized email is what
+/// persists (lowercase, trimmed — `accounts.email` is UNIQUE on that form). `Err` is
+/// the message the 422 carries.
+fn check_signup_fields(body: &SignupBody) -> Result<String, &'static str> {
+    let email = body.email.trim().to_ascii_lowercase();
+    if !email.contains('@') || email.len() > 254 {
+        return Err("`email` must be an email address");
+    }
+    if body.password.len() < 8 || body.password.len() > 256 {
+        return Err("`password` must be 8..=256 characters");
+    }
+    if body.invite.is_empty() || body.invite.len() > 128 {
+        return Err("`invite` is required");
+    }
+    Ok(email)
+}
+
+/// The workspace and account a valid signup mints. The slug derives from the email's
+/// local part plus account-id entropy, so two signups can't collide on it.
+fn new_account(email: &str, password_hash: String) -> monitor_db::NewAccount {
+    let local = email.split('@').next().unwrap_or("ws");
+    let slug_base: String = local
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(20)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let id = AccountId::new();
+    monitor_db::NewAccount {
+        id,
+        workspace: monitor_domain::WorkspaceId::new(),
+        workspace_slug: format!(
+            "{}-{}",
+            if slug_base.is_empty() {
+                "ws"
+            } else {
+                &slug_base
+            },
+            &id.0.simple().to_string()[..6]
+        ),
+        workspace_name: email.to_owned(),
+        email: email.to_owned(),
+        password_hash,
+    }
 }
 
 /// Invite-gated signup (S1b): a valid, unused, unexpired code mints a workspace and an
@@ -644,49 +714,23 @@ async fn signup(
         Ok(attempt) => attempt,
         Err(wait) => return throttle::too_many(wait),
     };
-    let email = body.email.trim().to_ascii_lowercase();
-    let invalid = |message: &str| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": { "code": "invalid_request", "message": message }
-            })),
-        )
-            .into_response()
-    };
-    if !email.contains('@') || email.len() > 254 {
-        drop(attempt);
-        return invalid("`email` must be an email address");
-    }
-    if body.password.len() < 8 || body.password.len() > 256 {
-        drop(attempt);
-        return invalid("`password` must be 8..=256 characters");
-    }
-    if body.invite.is_empty() || body.invite.len() > 128 {
-        drop(attempt);
-        return invalid("`invite` is required");
-    }
-    let denied = |attempt: throttle::Attempt| {
-        drop(attempt);
-        (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": { "code": "invalid_invite",
-                           "message": "invite code is invalid or expired" }
-            })),
-        )
-            .into_response()
+    let email = match check_signup_fields(&body) {
+        Ok(email) => email,
+        Err(message) => {
+            drop(attempt);
+            return signup_invalid(message);
+        }
     };
     let digest = auth::invite_key(&body.invite);
     let invite = match state.db.invite_by_digest(&digest).await {
         Ok(Some(row)) if auth::digests_match(digest.as_bytes(), row.code_digest.as_bytes()) => row,
-        Ok(_) => return denied(attempt),
+        Ok(_) => return invite_denied(attempt),
         Err(error) => return ApiError::Db(error).into_response(),
     };
     // Used and expired deny the same as unknown — before the email check can say
     // anything else, so a spent code never reads differently than a forged one.
     if invite.used_at.is_some() || invite.expires_at <= (state.clock)() {
-        return denied(attempt);
+        return invite_denied(attempt);
     }
     // A taken email is told before the invite burns — the invite stays spendable.
     match state.db.account_by_email(&email).await {
@@ -710,29 +754,7 @@ async fn signup(
             return ApiError::Corrupt.into_response();
         }
     };
-    let account_id = AccountId::new();
-    let workspace = monitor_domain::WorkspaceId::new();
-    let local = email.split('@').next().unwrap_or("ws");
-    let slug_base: String = local
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .take(20)
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned();
-    let slug = format!(
-        "{}-{}",
-        if slug_base.is_empty() { "ws" } else { &slug_base },
-        &account_id.0.simple().to_string()[..6]
-    );
-    let new = monitor_db::NewAccount {
-        id: account_id,
-        workspace,
-        workspace_slug: slug,
-        workspace_name: email.clone(),
-        email: email.clone(),
-        password_hash,
-    };
+    let new = new_account(&email, password_hash);
     match state.db.signup(&invite.id, &new, (state.clock)()).await {
         Ok(_) => {
             attempt.succeeded();
@@ -740,15 +762,17 @@ async fn signup(
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "account": {
-                        "id": account_id.0,
+                        "id": new.id.0,
                         "email": email,
-                        "workspace": workspace.0,
+                        "workspace": new.workspace.0,
                     }
                 })),
             )
                 .into_response()
         }
-        Err(QueryError::Invalid(message)) if message.contains("email") || message.contains("slug") => {
+        Err(QueryError::Invalid(message))
+            if message.contains("email") || message.contains("slug") =>
+        {
             drop(attempt);
             (
                 StatusCode::CONFLICT,
@@ -758,7 +782,7 @@ async fn signup(
             )
                 .into_response()
         }
-        Err(QueryError::Invalid(_)) => denied(attempt),
+        Err(QueryError::Invalid(_)) => invite_denied(attempt),
         Err(error) => ApiError::Db(error).into_response(),
     }
 }
@@ -932,7 +956,7 @@ async fn create_monitor(
     let monitor = new.into_monitor_for(principal.workspace());
     let _schedule = lock.0.lock().await;
     check_capacity(&state, &principal, |monitors| {
-        monitors.push(monitor.clone())
+        monitors.push(monitor.clone());
     })
     .await?;
     if !tenant(&state, &principal)
@@ -1033,7 +1057,10 @@ async fn delete_monitor(
 ) -> Result<StatusCode, ApiError> {
     let row = find_monitor(&tenant(&state, &principal), &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    if !tenant(&state, &principal).delete_monitor(monitor.id).await? {
+    if !tenant(&state, &principal)
+        .delete_monitor(monitor.id)
+        .await?
+    {
         return Err(ApiError::Conflict(
             "monitor has recorded history; pause it instead".into(),
         ));
@@ -1155,7 +1182,9 @@ async fn monitor_stats(
     };
     let elapsed = u64::try_from((now - window_start).whole_seconds().max(0)).unwrap_or(0);
     let expected = elapsed / monitor.interval.as_secs().max(1);
-    let mut counts = tenant(&state, &principal).check_stats(monitor.id, since).await?;
+    let mut counts = tenant(&state, &principal)
+        .check_stats(monitor.id, since)
+        .await?;
     counts.expected = expected;
     Ok(Json(StatsView {
         window_s,

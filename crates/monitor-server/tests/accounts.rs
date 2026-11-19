@@ -50,6 +50,10 @@ async fn fixture() -> anyhow::Result<Fixture> {
     Ok((app, db, tmp))
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper: a request that can't build is a failed test"
+)]
 async fn call(
     app: &axum::Router,
     method: &str,
@@ -80,6 +84,10 @@ async fn call(
     (status, headers, json)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a sign-in without its cookie is a failed test"
+)]
 fn set_cookie(headers: &axum::http::HeaderMap) -> String {
     let raw = headers
         .get(header::SET_COOKIE)
@@ -96,9 +104,19 @@ fn set_cookie(headers: &axum::http::HeaderMap) -> String {
 }
 
 /// Operator helper: mint an invite through the API (dev mode ⇒ Operator principal).
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a mint without a code is a failed test"
+)]
 async fn mint_invite(app: &axum::Router) -> String {
-    let (status, _, body) =
-        call(app, "POST", "/api/invites", Some(serde_json::json!({})), None).await;
+    let (status, _, body) = call(
+        app,
+        "POST",
+        "/api/invites",
+        Some(serde_json::json!({})),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     body["invite"]["code"].as_str().expect("code").to_owned()
 }
@@ -199,7 +217,7 @@ async fn signup_then_signin_then_a_workspace_of_ones_own() -> anyhow::Result<()>
     // merely unnamed, it is unreachable through this credential (D-020).
     let (status, _, body) = call(&app, "GET", "/api/monitors", None, Some(&cookie_id)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["monitors"].as_array().unwrap().len(), 0);
+    assert_eq!(body["monitors"], serde_json::json!([]));
     // And the operator's monitor by id is a 404, not a 200 with a foreign name.
     let (status, _, _) = call(
         &app,
@@ -213,7 +231,15 @@ async fn signup_then_signin_then_a_workspace_of_ones_own() -> anyhow::Result<()>
 
     // The digest key in the store is not the cookie id (D-016).
     assert_ne!(key, cookie_id);
-    assert!(db.account_session_at(&key, time::OffsetDateTime::now_utc(), Duration::from_secs(60)).await?.is_some());
+    assert!(
+        db.account_session_at(
+            &key,
+            time::OffsetDateTime::now_utc(),
+            Duration::from_secs(60)
+        )
+        .await?
+        .is_some()
+    );
     Ok(())
 }
 
@@ -294,6 +320,10 @@ async fn logout_ends_the_account_session() -> anyhow::Result<()> {
         "logout deletes the account session row"
     );
     let (status, _, _) = call(&app, "GET", "/api/monitors", None, Some(&cookie_id)).await;
-    assert_eq!(status, StatusCode::OK, "dev mode still serves — without the workspace");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "dev mode still serves — without the workspace"
+    );
     Ok(())
 }
