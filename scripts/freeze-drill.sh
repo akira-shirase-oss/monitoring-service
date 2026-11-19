@@ -46,9 +46,11 @@ wait_own_http "http://127.0.0.1:$FIXTURE_PORT/ok" "$FIXTURE_PID"
 SERVER_PID=$!
 wait_own_http "$BASE/livez" "$SERVER_PID"
 
+# interval_s must respect the domain minimum (MIN_INTERVAL, 15 s): below it the API
+# answers a validation error and there is no monitor to drill.
 MONITOR=$(curl -s -X POST "$BASE/api/monitors" \
     -H 'content-type: application/json' \
-    -d "{\"name\":\"freeze-drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/ok\",\"interval_s\":5,\"timeout_s\":2}" \
+    -d "{\"name\":\"freeze-drill\",\"url\":\"http://127.0.0.1:$FIXTURE_PORT/ok\",\"interval_s\":15,\"timeout_s\":2}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 echo "monitor: $MONITOR — waiting for the first fresh probes…"
 
@@ -80,13 +82,15 @@ for i in $(seq 1 30); do
     MISSED=$(curl -s "$BASE/api/monitors/$MONITOR/checks?limit=100" \
         | python3 -c 'import json,sys; print(sum(1 for c in json.load(sys.stdin)["checks"] if c["outcome"]=="missed"))' 2>/dev/null || echo 0)
     STATE=$(curl -s "$BASE/api/monitors/$MONITOR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' 2>/dev/null || echo "?")
-    [ -n "$MISSED" ] && [ "$MISSED" -ge 10 ] && [ "$STATE" = "up" ] && break
+    [ -n "$MISSED" ] && [ "$MISSED" -ge 5 ] && [ "$STATE" = "up" ] && break
 done
 
 READY=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/readyz")
 echo "after resume: readyz=$READY missed_rows=$MISSED status=$STATE"
 
 [ "$READY" = "200" ] || { echo "FAIL: readyz answered $READY after the freeze"; exit 1; }
-[ "${MISSED:-0}" -ge 10 ] || { echo "FAIL: only $MISSED missed rows — the gap was not recorded"; exit 1; }
+# ~9 slots fall inside a 135 s freeze at the 15 s minimum interval; 5 leaves room for
+# slot-phase jitter without letting an unrecorded gap pass.
+[ "${MISSED:-0}" -ge 5 ] || { echo "FAIL: only $MISSED missed rows — the gap was not recorded"; exit 1; }
 [ "$STATE" = "up" ] || { echo "FAIL: status reads $STATE after resume, not recovered up"; exit 1; }
 echo "DRILL PASSED: ${FREEZE_S}s freeze → no exit, $MISSED missed slots recorded, serving resumes honest"

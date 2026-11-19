@@ -361,3 +361,23 @@ fn the_drill_waits_only_on_its_own_processes() {
         );
     }
 }
+
+/// The freeze drill must register a monitor the API will accept: an interval below
+/// `MIN_INTERVAL` is refused with a validation error, and the drill then KeyErrors on
+/// `"id"` — the exact setup failure this pin exists to keep fixed.
+#[test]
+fn the_freeze_drill_registers_a_monitor_with_a_valid_interval() {
+    // The payload lives inside a double-quoted bash string, so the file carries `\"interval_s\":`.
+    let marker = "interval_s\\\":";
+    let pos = FREEZE.find(marker).expect("the drill sets interval_s");
+    let digits: String = FREEZE[pos + marker.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let interval: u64 = digits.parse().expect("interval_s must be a literal number");
+    assert!(
+        interval >= monitor_domain::MIN_INTERVAL.as_secs(),
+        "freeze-drill interval_s={interval} is below the domain minimum {}",
+        monitor_domain::MIN_INTERVAL.as_secs()
+    );
+}
