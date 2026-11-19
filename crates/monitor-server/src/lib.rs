@@ -299,6 +299,12 @@ fn routes(state: AppState) -> Router {
         )
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{id}", delete(revoke_token))
+        // The workspace's own webhook (S1d, D-017): member work — the URL is
+        // SSRF-validated at save and revalidated inside every send.
+        .route(
+            "/workspace/webhook",
+            get(read_webhook).put(put_webhook).delete(delete_webhook),
+        )
         .route("/backup", post(backup))
         // Auth wraps the whole API: /livez, /readyz and static files stay open —
         // the dashboard must load to *hold* a token, and readiness is not a secret.
@@ -901,6 +907,72 @@ async fn revoke_token(
         return Err(ApiError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The workspace's own webhook as members see it — URL and the signing secret a
+/// receiver verifies with. Viewer principals have no method for it (member work).
+async fn read_webhook(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let view = member_for(&state, &principal)?;
+    let webhook = view
+        .webhook()
+        .await?
+        .map(|row| serde_json::json!({ "url": row.url, "secret": row.secret }));
+    Ok(Json(serde_json::json!({ "webhook": webhook })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebhookBody {
+    pub url: String,
+}
+
+/// Store a tenant webhook (S1d, D-017): the URL passes the probe policy *and* the
+/// validating resolver before it lands — scheme, literal addresses, and every address
+/// the name currently resolves to. The send side re-runs the resolver on every
+/// attempt, so what is proven public today is re-proven before each POST.
+async fn put_webhook(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Json(body): Json<WebhookBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let view = member_for(&state, &principal)?;
+    let url = url::Url::parse(&body.url).map_err(|_| ApiError::BadUrl)?;
+    check_webhook_target(&state, &url).await?;
+    let row = view.set_webhook(url.as_str()).await?;
+    Ok(Json(serde_json::json!({
+        "webhook": { "url": row.url, "secret": row.secret }
+    })))
+}
+
+/// Remove the workspace's webhook — pending `tenant_webhook` rows then fail their
+/// next attempt visibly (`no_target`) instead of being silently dropped.
+async fn delete_webhook(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<StatusCode, ApiError> {
+    let view = member_for(&state, &principal)?;
+    view.clear_webhook().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The D-017 save gate: scheme and literal checks, then a bounded DNS resolution —
+/// every returned address must be public, the same gate the send-time resolver runs.
+/// `Unresolvable` is its own message: a name that cannot resolve is not proof of
+/// a public target, but it isn't a policy refusal either.
+async fn check_webhook_target(state: &AppState, url: &url::Url) -> Result<(), ApiError> {
+    let policy = probe::ProbePolicy {
+        allow_local_targets: state.allow_local_targets,
+        extra_roots: Vec::new(),
+    };
+    match policy.check_resolved(url).await {
+        Ok(()) => Ok(()),
+        Err(probe::Rejected::Unresolvable) => Err(ApiError::Invalid(
+            "the webhook host did not resolve to a public address".into(),
+        )),
+        Err(_) => Err(ApiError::RefusedTarget),
+    }
 }
 
 /// One 422 shape answer for every malformed signup field.
