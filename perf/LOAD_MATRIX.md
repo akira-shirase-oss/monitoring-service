@@ -10,11 +10,11 @@ fixtures; never on a public bind.
 
 | Module | Scenario | What it proves | Evidence status |
 |---|---|---|---|
-| Probe engine | `perf/lab-profile.mjs` | 100 monitors @ 15s phase-locked, 10 fixture origins — bounded pools, counted misses, commit lag | committed (4000 checks, 0 missed, p95 lag 4.9s); 2026-11-17 ceiling probe (200 `/ok` monitors, release, `304edd5`): 800 pass + 800 missed — see below; **≥1M checks not run**; **fixed in D-018** (phase spread, schedule-sized budget, named refusal): re-run pending a quiet machine |
+| Probe engine | `perf/lab-profile.mjs` | 100 monitors @ 15s phase-locked, 10 fixture origins — bounded pools, counted misses, commit lag | committed (4000 checks, 0 missed, p95 lag 4.9s); 2026-11-17 ceiling probe (200 `/ok` monitors, release, `304edd5`): 800 pass + 800 missed — see below; **≥1M checks not run**; **post-D-018 ceiling re-run 2026-11-19, release, `078cfed`: 200 `/ok` monitors, 1,574 committed checks, 0 missed, lag p95 2.51 s** — D-018's phase spread holds |
 | End-to-end truth | `perf/real-app.mjs` + `real-app-load.mjs` | real Node app under rising load with `__ctl` degradation — monitor's readings vs app's own ground truth | committed (3.84M requests, 0 missed, incident times honest, both alert channels) |
-| Failure/incident storm | mass-failure drill (define) | N targets fail together → N incidents + outbox rows in bounded transactions; delivery pool never starves probes | gap — define + run |
-| API read surface | `perf/api-load.mjs` (k6 `perf/k6/api-reads.js`) | `/api/**` reads at sustained rate while probes run — token auth, RLS-free SQLite reads | **committed 2026-11-17, release, `304edd5`: 1,000,000/1,000,000 answered 200 (gate passed), 1,647 rps @32 VUs, p50 15.7 / p95 30.9 / p99 32.6 ms; probes beneath: 4,000 checks, 0 missed, commit-lag p95 5.14 s (over the 5 s target)** |
-| Session churn | login-rate scenario (define) | `POST /api/login` + cookie-authed writes at rate — store-side sessions bounded, sweep keeps up | gap — define + run |
+| Failure/incident storm | `perf/storm.mjs` | N targets fail together → N incidents + outbox rows in bounded transactions; delivery pool never starves probes | **post-D-018 re-run 2026-11-19, debug, `078cfed`** (see below): 40 dead → 40 incidents, survivor kept checking (20), 4,582 API reads 0 failures — PASS |
+| API read surface | `perf/api-load.mjs` (k6 `perf/k6/api-reads.js`) | `/api/**` reads at sustained rate while probes run — token auth, RLS-free SQLite reads | **committed 2026-11-17, release, `304edd5`: 1,000,000/1,000,000 answered 200 (gate passed), 1,647 rps @32 VUs, p50 15.7 / p95 30.9 / p99 32.6 ms; probes beneath: 4,000 checks, 0 missed, commit-lag p95 5.14 s (over the 5 s target)**; **post-D-018 re-run 2026-11-19, release, `078cfed`: 1,000,000/1,000,000 answered 200 (gate passed), 1,569 rps @32 VUs, p50 16.1 / p95 32.4 / p99 42.4 ms; probes beneath: 4,256 checks, 0 missed, commit-lag p95 1.32 s — the over-target lag is gone** |
+| Session churn | `perf/session-churn.mjs` | `POST /api/login` + cookie-authed writes at rate — store-side sessions bounded, sweep keeps up | **post-D-018 re-run 2026-11-19, debug, `078cfed`→`ca8dcd5`** (see below): first run caught 2 login failures (SQLITE_BUSY, `busy_timeout` was 0 → fixed); re-run 306,500 logins 0 fails — PASS |
 | Retention under load | retention drill (define) | aggregates roll while checks land — stats union stays honest mid-sweep | partially covered by tests — live drill |
 | Backup under load | `scripts/backup-drill.sh` during lab profile | `VACUUM INTO` beside a writing workload — snapshot consistent | drill exists — run under load |
 | Restart under load | kill mid-profile → `Health::rebuild` | streaks + open incidents rebuilt from committed evidence | partially covered — rerun |
@@ -65,3 +65,30 @@ missed, every miss counted; RSS flat at 24 MB. It also explains the 100-monitor 
 p95 lag of 4.9 s: that profile sits exactly at the 100-per-wave ceiling. Whether to run
 ~14 h, add phase jitter, or dispatch on probe completion as well as on the tick is a
 maintainer decision, not a harness change.
+
+## 2026-11-19 post-D-018 re-runs (`078cfed`, machine apple-m2-pro-12c, Darwin arm64)
+
+- **Ceiling probe** — `perf/results/2026-11-19T02-39-34.901Z-078cfed.json`:
+  `lab-profile.mjs --bin release --mix ok --monitors 200 --duration-s 120 --origins 9`:
+  1,574 committed checks (1,570 pass, 4 transport), **0 missed** — vs 800 missed at
+  `304edd5`. Commit-lag p50 0.58 / p95 2.51 / max 4.60 s. The phase spread + schedule-sized
+  budget closed the 100-per-wave ceiling the 2026-11-17 run proved. (`--origins 9`: one
+  band port was occupied; origin count is recorded in the run header.)
+- **API read surface** — `perf/results/api-load-2026-11-19T025448868Z-078cfed.json`:
+  `--bin release --requests 1000000 --vus 32 --monitors 100 --origins 9`: gate passed —
+  1,000,000/1,000,000 answered 200, 1,569 rps, p50 16.1 / p95 32.4 / p99 42.4 ms; probes
+  beneath: 4,256 checks, **0 missed**, commit-lag p95 1.32 s (the prior run's 5.14 s
+  over-target lag is gone).
+- **Storm** — `perf/results/storm-2026-11-19T031356653Z.json`: `--duration-s 300 --origins 8`,
+  debug: 40 dead monitors → 40 incidents, the survivor kept its probe slots (20 checks),
+  4,582 API reads 0 failures — PASS.
+- **Session churn** — `perf/results/session-churn-2026-11-19T033002864Z.json` (re-run) and
+  `…032135006Z.json` (the run that caught it): first run at `078cfed` **failed its
+  `logins_work` gate — 2 of 310,678 logins and a delete returned SQLITE_BUSY**; pooled
+  connections carried SQLite's default `busy_timeout` of 0. Fixed in `ca8dcd5`
+  (`busy_timeout` 5 s + regression test); re-run: 306,500 logins, 0 fails, sessions bounded,
+  probes unstarved — PASS.
+
+Caveats: runs are development observations on this machine — never public capacity claims.
+`sysctl`/`ps` are denied in the run environment, so `loadavg_*`/`rss_kb` fields are null.
+The 24 h soak + ≥1M-check run remain droplet work, not local.

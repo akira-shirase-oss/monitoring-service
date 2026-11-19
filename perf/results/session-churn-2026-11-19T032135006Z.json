@@ -1,0 +1,24 @@
+{
+  "date": "2026-11-19T03:21:35.006Z",
+  "scenario": "session-churn",
+  "duration_s": 300,
+  "logins": 310678,
+  "login_fails": 2,
+  "logins_throttled": 0,
+  "authed_reads": 310678,
+  "read_fails": 0,
+  "bad_token_401s": 23756,
+  "unauthed_refusals": 23756,
+  "sessions_rows": 2,
+  "survivor_checks": 19,
+  "machine": "apple-m2-pro-12c",
+  "commit": "078cfed",
+  "gates": {
+    "logins_work": false,
+    "authed_reads_ok": true,
+    "negatives_enforced": true,
+    "sessions_bounded": true,
+    "probes_unstarved": true
+  },
+  "passed": false
+}
