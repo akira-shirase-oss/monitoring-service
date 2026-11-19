@@ -524,10 +524,10 @@ impl Db {
             .execute(&self.pool)
             .await
             .map_err(|e| {
-                if let sqlx::Error::Database(db) = &e {
-                    if db.is_unique_violation() {
-                        return QueryError::Invalid("workspace slug is already taken".into());
-                    }
+                if let sqlx::Error::Database(db) = &e
+                    && db.is_unique_violation()
+                {
+                    return QueryError::Invalid("workspace slug is already taken".into());
                 }
                 QueryError::Sql(e)
             })?;

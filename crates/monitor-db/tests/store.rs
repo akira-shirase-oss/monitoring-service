@@ -1250,44 +1250,30 @@ async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow
 async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows()
 -> anyhow::Result<()> {
     let (db, ancient, writer) = store().await?;
+    let w = db.workspace(WorkspaceId::DEFAULT);
     let recent =
         NewMonitor::new("recent", url::Url::parse("https://two.example.com")?)?.into_monitor();
     let open =
         NewMonitor::new("open", url::Url::parse("https://three.example.com")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT)
-        .insert_monitor(&recent)
-        .await?;
-    db.workspace(WorkspaceId::DEFAULT)
-        .insert_monitor(&open)
-        .await?;
+    w.insert_monitor(&recent).await?;
+    w.insert_monitor(&open).await?;
 
-    // An incident opened and resolved ~400 days ago: past every horizon.
-    for minute in 0..3 {
-        writer
-            .record(at(&ancient, CheckOutcome::Transport, 400, minute))
-            .await?;
+    // An incident opened and resolved ~400 days ago: past every horizon. One resolved
+    // ~20 days ago: kept, but its opened-event was delivered 40 days ago (prunable) while
+    // the recovered-event is still pending (kept).
+    for (monitor, days) in [(&ancient, 400), (&recent, 20)] {
+        for minute in 0..3 {
+            writer
+                .record(at(monitor, CheckOutcome::Transport, days, minute))
+                .await?;
+        }
+        for minute in 3..5 {
+            writer
+                .record(at(monitor, CheckOutcome::Pass, days, minute))
+                .await?;
+        }
     }
-    for minute in 3..5 {
-        writer
-            .record(at(&ancient, CheckOutcome::Pass, 400, minute))
-            .await?;
-    }
-    // One resolved ~20 days ago: kept, but its opened-event was delivered 40 days ago
-    // (prunable) while the recovered-event is still pending (kept).
-    for minute in 0..3 {
-        writer
-            .record(at(&recent, CheckOutcome::Transport, 20, minute))
-            .await?;
-    }
-    for minute in 3..5 {
-        writer
-            .record(at(&recent, CheckOutcome::Pass, 20, minute))
-            .await?;
-    }
-    let recent_events = db
-        .workspace(WorkspaceId::DEFAULT)
-        .list_outbox(recent.id)
-        .await?;
+    let recent_events = w.list_outbox(recent.id).await?;
     assert_eq!(recent_events.len(), 2);
     writer
         .mark_delivery(
@@ -1305,22 +1291,20 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
     }
     // Maintenance windows: one ended 400 days ago, one ended yesterday.
     let now = OffsetDateTime::now_utc();
-    db.workspace(WorkspaceId::DEFAULT)
-        .create_window(
-            ancient.id,
-            now - time::Duration::days(401),
-            now - time::Duration::days(400),
-            "old",
-        )
-        .await?;
-    db.workspace(WorkspaceId::DEFAULT)
-        .create_window(
-            ancient.id,
-            now - time::Duration::days(2),
-            now - time::Duration::days(1),
-            "new",
-        )
-        .await?;
+    w.create_window(
+        ancient.id,
+        now - time::Duration::days(401),
+        now - time::Duration::days(400),
+        "old",
+    )
+    .await?;
+    w.create_window(
+        ancient.id,
+        now - time::Duration::days(2),
+        now - time::Duration::days(1),
+        "new",
+    )
+    .await?;
 
     let report = writer
         .retain(RetentionPolicy::default().cutoffs(now))
@@ -1337,65 +1321,31 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
     assert_eq!(report.windows_deleted, 1);
 
     assert!(
-        db.workspace(WorkspaceId::DEFAULT)
-            .list_incidents(Some(ancient.id), None, 10)
+        w.list_incidents(Some(ancient.id), None, 10)
             .await?
             .is_empty()
     );
-    assert!(
-        db.workspace(WorkspaceId::DEFAULT)
-            .list_outbox(ancient.id)
-            .await?
-            .is_empty()
-    );
-    let ancient_stats = db
-        .workspace(WorkspaceId::DEFAULT)
+    assert!(w.list_outbox(ancient.id).await?.is_empty());
+    let ancient_stats = w
         .check_stats(ancient.id, now - time::Duration::days(500))
         .await?;
     assert_eq!(
         ancient_stats.observed, 0,
         "aggregates past 365 days are gone"
     );
-    assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT)
-            .list_windows(ancient.id)
-            .await?
-            .len(),
-        1
-    );
+    assert_eq!(w.list_windows(ancient.id).await?.len(), 1);
 
-    assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT)
-            .list_incidents(Some(recent.id), None, 10)
-            .await?
-            .len(),
-        1
-    );
-    let left = db
-        .workspace(WorkspaceId::DEFAULT)
-        .list_outbox(recent.id)
-        .await?;
+    assert_eq!(w.list_incidents(Some(recent.id), None, 10).await?.len(), 1);
+    let left = w.list_outbox(recent.id).await?;
     assert_eq!(left.len(), 1);
     assert!(left[0].delivered_at.is_none(), "the pending event survives");
-    let recent_stats = db
-        .workspace(WorkspaceId::DEFAULT)
+    let recent_stats = w
         .check_stats(recent.id, now - time::Duration::days(30))
         .await?;
     assert_eq!(recent_stats.observed, 5, "young aggregates are kept");
 
-    assert!(
-        db.workspace(WorkspaceId::DEFAULT)
-            .open_incident(open.id)
-            .await?
-            .is_some()
-    );
-    assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT)
-            .list_outbox(open.id)
-            .await?
-            .len(),
-        1
-    );
+    assert!(w.open_incident(open.id).await?.is_some());
+    assert_eq!(w.list_outbox(open.id).await?.len(), 1);
 
     Ok(())
 }

@@ -24,6 +24,17 @@ use url::Url;
 
 const A: WorkspaceId = WorkspaceId::DEFAULT;
 
+async fn status_of(app: &axum::Router, method: &str, uri: &str) -> anyhow::Result<StatusCode> {
+    let mut request = Request::builder().method(method).uri(uri);
+    let body = if method == "GET" || method == "DELETE" {
+        Body::empty()
+    } else {
+        request = request.header("content-type", "application/json");
+        Body::from("{}")
+    };
+    Ok(app.clone().oneshot(request.body(body)?).await?.status())
+}
+
 async fn store() -> anyhow::Result<Db> {
     let db = Db::connect("sqlite::memory:", 1).await?;
     db.migrate().await?;
@@ -96,7 +107,8 @@ async fn a_workspace_cannot_read_another_workspaces_rows() -> anyhow::Result<()>
     assert!(a.monitor_gate(foreign.id).await?.is_none());
     assert!(a.monitor_generation(foreign.id).await?.is_none());
     assert!(a.list_checks(foreign.id, 50).await?.is_empty());
-    assert!(a.recent_outcomes(foreign.id, 5).await?.is_empty());
+    let outcomes: Vec<SlotObservation> = a.recent_outcomes(foreign.id, 5).await?;
+    assert!(outcomes.is_empty(), "{outcomes:?}");
     assert!(a.last_slot_at(foreign.id).await?.is_none());
     let stats = a
         .check_stats(
@@ -215,43 +227,28 @@ async fn the_api_never_reaches_another_workspaces_monitor() -> anyhow::Result<()
     record(&db, &foreign, CheckOutcome::HttpFail { status: 500 }).await?;
     let id = foreign.id.0;
 
-    async fn status_of(app: &axum::Router, method: &str, uri: &str) -> StatusCode {
-        let mut request = Request::builder().method(method).uri(uri);
-        let body = if method == "GET" || method == "DELETE" {
-            Body::empty()
-        } else {
-            request = request.header("content-type", "application/json");
-            Body::from("{}")
-        };
-        app.clone()
-            .oneshot(request.body(body).unwrap())
-            .await
-            .unwrap()
-            .status()
-    }
-
     assert_eq!(
-        status_of(&app, "GET", &format!("/api/monitors/{id}")).await,
+        status_of(&app, "GET", &format!("/api/monitors/{id}")).await?,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        status_of(&app, "PATCH", &format!("/api/monitors/{id}")).await,
+        status_of(&app, "PATCH", &format!("/api/monitors/{id}")).await?,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        status_of(&app, "DELETE", &format!("/api/monitors/{id}")).await,
+        status_of(&app, "DELETE", &format!("/api/monitors/{id}")).await?,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        status_of(&app, "GET", &format!("/api/monitors/{id}/checks")).await,
+        status_of(&app, "GET", &format!("/api/monitors/{id}/checks")).await?,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        status_of(&app, "GET", &format!("/api/monitors/{id}/stats")).await,
+        status_of(&app, "GET", &format!("/api/monitors/{id}/stats")).await?,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        status_of(&app, "GET", &format!("/api/monitors/{id}/maintenance")).await,
+        status_of(&app, "GET", &format!("/api/monitors/{id}/maintenance")).await?,
         StatusCode::NOT_FOUND
     );
 
@@ -277,7 +274,7 @@ async fn the_api_never_reaches_another_workspaces_monitor() -> anyhow::Result<()
         .clone()
         .oneshot(
             Request::builder()
-                .uri(&format!("/api/incidents?monitor_id={id}"))
+                .uri(format!("/api/incidents?monitor_id={id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -304,10 +301,7 @@ async fn the_engine_observes_every_workspace_with_independent_coverage() -> anyh
     let url = Url::parse(&format!("http://127.0.0.1:{port}/ok"))?;
 
     let db = store().await?;
-    let (b, _) = {
-        let ws = db.create_workspace("tenant-b", "Tenant B").await?;
-        (ws, ())
-    };
+    let b = db.create_workspace("tenant-b", "Tenant B").await?;
     // Stored rows ride the 15 s schema floor; the scheduled structs get fast timings.
     let mut a_mon = NewMonitor::new("a", url.clone())?.into_monitor_for(A);
     let mut b_mon = NewMonitor::new("b", url)?.into_monitor_for(b);
