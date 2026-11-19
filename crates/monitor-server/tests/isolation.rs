@@ -12,9 +12,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::{Router, get};
 use http_body_util::BodyExt;
 use monitor_db::{Db, Observation, writer};
-use monitor_domain::{
-    CheckOutcome, Monitor, NewMonitor, SlotObservation, WorkspaceId,
-};
+use monitor_domain::{CheckOutcome, Monitor, NewMonitor, SlotObservation, WorkspaceId};
 use monitor_server::probe::{ProbeClient, ProbePolicy};
 use monitor_server::schedule::{Config, Coordinator};
 use monitor_server::vitals::Vitals;
@@ -35,9 +33,8 @@ async fn store() -> anyhow::Result<Db> {
 /// A second workspace, with a monitor that exists only in it.
 async fn second_workspace(db: &Db) -> anyhow::Result<(WorkspaceId, Monitor)> {
     let ws = db.create_workspace("tenant-b", "Tenant B").await?;
-    let monitor =
-        NewMonitor::new("b's monitor", Url::parse("https://b.example/health")?)?
-            .into_monitor_for(ws);
+    let monitor = NewMonitor::new("b's monitor", Url::parse("https://b.example/health")?)?
+        .into_monitor_for(ws);
     db.workspace(ws).insert_monitor(&monitor).await?;
     Ok((ws, monitor))
 }
@@ -102,10 +99,17 @@ async fn a_workspace_cannot_read_another_workspaces_rows() -> anyhow::Result<()>
     assert!(a.recent_outcomes(foreign.id, 5).await?.is_empty());
     assert!(a.last_slot_at(foreign.id).await?.is_none());
     let stats = a
-        .check_stats(foreign.id, OffsetDateTime::now_utc() - time::Duration::days(1))
+        .check_stats(
+            foreign.id,
+            OffsetDateTime::now_utc() - time::Duration::days(1),
+        )
         .await?;
     assert_eq!((stats.observed, stats.missed), (0, 0));
-    assert!(a.list_incidents(Some(foreign.id), None, 50).await?.is_empty());
+    assert!(
+        a.list_incidents(Some(foreign.id), None, 50)
+            .await?
+            .is_empty()
+    );
     assert!(!a.open_incidents().await?.contains_key(&foreign.id));
     assert!(a.list_windows(foreign.id).await?.is_empty());
     assert!(a.list_outbox(foreign.id).await?.is_empty());
@@ -219,7 +223,11 @@ async fn the_api_never_reaches_another_workspaces_monitor() -> anyhow::Result<()
             request = request.header("content-type", "application/json");
             Body::from("{}")
         };
-        app.clone().oneshot(request.body(body).unwrap()).await.unwrap().status()
+        app.clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+            .status()
     }
 
     assert_eq!(
@@ -348,15 +356,24 @@ async fn the_engine_observes_every_workspace_with_independent_coverage() -> anyh
     // Both workspaces' monitors ran and committed — under their own workspace ids.
     let a_checks = db.workspace(A).list_checks(a_mon.id, 200).await?;
     let b_checks = db.workspace(b).list_checks(b_mon.id, 200).await?;
-    assert!(a_checks.iter().any(|c| c.outcome == "pass"), "A: {a_checks:?}");
-    assert!(b_checks.iter().any(|c| c.outcome == "pass"), "B: {b_checks:?}");
+    assert!(
+        a_checks.iter().any(|c| c.outcome == "pass"),
+        "A: {a_checks:?}"
+    );
+    assert!(
+        b_checks.iter().any(|c| c.outcome == "pass"),
+        "B: {b_checks:?}"
+    );
 
     // Coverage is per workspace: A cannot see B's committed slots, and vice versa.
     assert!(db.workspace(A).list_checks(b_mon.id, 200).await?.is_empty());
     assert!(db.workspace(b).list_checks(a_mon.id, 200).await?.is_empty());
     let a_stats = db
         .workspace(A)
-        .check_stats(b_mon.id, OffsetDateTime::now_utc() - time::Duration::days(1))
+        .check_stats(
+            b_mon.id,
+            OffsetDateTime::now_utc() - time::Duration::days(1),
+        )
         .await?;
     assert_eq!((a_stats.observed, a_stats.missed), (0, 0));
     Ok(())

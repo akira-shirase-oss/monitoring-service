@@ -116,7 +116,9 @@ fn child() -> anyhow::Result<()> {
         db.migrate().await?;
         let monitor =
             NewMonitor::new("proxied", url::Url::parse("https://example.com")?)?.into_monitor();
-        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
         let (writer, _task) = writer::spawn(
             db.clone(),
             Arc::new(RwLock::new(HashMap::new())),

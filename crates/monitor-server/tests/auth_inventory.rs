@@ -293,7 +293,13 @@ async fn every_api_route_and_method_denies_a_request_without_a_valid_credential(
     }
 
     // Nothing happened: no monitor, no backup file.
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_monitors().await.expect("list").is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await
+            .expect("list")
+            .is_empty()
+    );
     assert!(!backup.exists(), "an unauthenticated backup was written");
 
     // And the same requests with the token are not refused by the layer — the 401s above

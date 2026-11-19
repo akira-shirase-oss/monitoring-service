@@ -17,7 +17,9 @@ async fn store() -> anyhow::Result<(Db, Monitor, writer::WriterHandle)> {
     db.migrate().await?;
     let monitor =
         NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let (handle, _task) = writer::spawn(
         db.clone(),
@@ -77,12 +79,19 @@ async fn per_monitor_thresholds_drive_the_incident_machine() -> anyhow::Result<(
     let strict = NewMonitor::new("strict", url::Url::parse("https://strict.example.com")?)?
         .with_thresholds(1, 1)?
         .into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&strict).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&strict)
+        .await?;
 
     // One failure on the strict monitor opens its incident immediately.
     let outcome = writer.record(fail(&strict)).await?;
     assert_eq!(outcome, WriteOutcome::Committed(Effect::IncidentOpened));
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(strict.id).await?.is_some());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(strict.id)
+            .await?
+            .is_some()
+    );
     // And its single fresh pass recovers it (passes_to_recover = 1).
     let outcome = writer.record(pass(&strict)).await?;
     assert_eq!(outcome, WriteOutcome::Committed(Effect::IncidentRecovered));
@@ -91,8 +100,14 @@ async fn per_monitor_thresholds_drive_the_incident_machine() -> anyhow::Result<(
     // bump passes_to_recover to 3, re-open, then prove two passes are not enough.
     let mut edited = strict.clone();
     edited.thresholds = monitor_domain::Thresholds::new(1, 3)?;
-    db.workspace(WorkspaceId::DEFAULT).update_monitor(&edited, strict.generation).await?;
-    let gate = db.workspace(WorkspaceId::DEFAULT).monitor_gate(strict.id).await?.expect("gate");
+    db.workspace(WorkspaceId::DEFAULT)
+        .update_monitor(&edited, strict.generation)
+        .await?;
+    let gate = db
+        .workspace(WorkspaceId::DEFAULT)
+        .monitor_gate(strict.id)
+        .await?
+        .expect("gate");
     assert_eq!(gate.thresholds.passes_to_recover, 3);
     let at_gen = |outcome| Observation {
         monitor_id: strict.id,
@@ -127,7 +142,9 @@ async fn per_monitor_thresholds_drive_the_incident_machine() -> anyhow::Result<(
 async fn a_maintenance_window_suppresses_opens_but_not_evidence() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
     let now = OffsetDateTime::now_utc();
-    let window = db.workspace(WorkspaceId::DEFAULT).create_window(
+    let window = db
+        .workspace(WorkspaceId::DEFAULT)
+        .create_window(
             monitor.id,
             now - time::Duration::seconds(10),
             now + time::Duration::seconds(600),
@@ -136,13 +153,17 @@ async fn a_maintenance_window_suppresses_opens_but_not_evidence() -> anyhow::Res
         .await?;
     assert_eq!(window.reason, "kernel rebuild");
     assert!(
-        db.workspace(WorkspaceId::DEFAULT).monitor_gate(monitor.id)
+        db.workspace(WorkspaceId::DEFAULT)
+            .monitor_gate(monitor.id)
             .await?
             .expect("gate")
             .maintenance,
         "an enclosing window must show active in the gate"
     );
-    let listed = db.workspace(WorkspaceId::DEFAULT).list_windows(monitor.id).await?;
+    let listed = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_windows(monitor.id)
+        .await?;
     assert_eq!(listed.len(), 1);
 
     // Three failures inside the window — every check commits as evidence, none opens
@@ -158,19 +179,42 @@ async fn a_maintenance_window_suppresses_opens_but_not_evidence() -> anyhow::Res
         writer.record(fail(&monitor)).await?,
         WriteOutcome::Committed(Effect::IncidentSuppressed)
     );
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_none());
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 10).await?.len(), 3);
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?.is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(monitor.id)
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 10)
+            .await?
+            .len(),
+        3
+    );
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_outbox(monitor.id)
+            .await?
+            .is_empty()
+    );
 
     // Deleting the window early stands in for expiry — it's the same gate flag. The
     // very next failure opens immediately: the streak counted through the window.
-    assert!(db.workspace(WorkspaceId::DEFAULT).delete_window(window.id).await?);
     assert!(
-        !db.workspace(WorkspaceId::DEFAULT).delete_window(window.id).await?,
+        db.workspace(WorkspaceId::DEFAULT)
+            .delete_window(window.id)
+            .await?
+    );
+    assert!(
+        !db.workspace(WorkspaceId::DEFAULT)
+            .delete_window(window.id)
+            .await?,
         "second delete is 404-truth"
     );
     assert!(
-        !db.workspace(WorkspaceId::DEFAULT).monitor_gate(monitor.id)
+        !db.workspace(WorkspaceId::DEFAULT)
+            .monitor_gate(monitor.id)
             .await?
             .expect("gate")
             .maintenance,
@@ -180,8 +224,19 @@ async fn a_maintenance_window_suppresses_opens_but_not_evidence() -> anyhow::Res
         writer.record(fail(&monitor)).await?,
         WriteOutcome::Committed(Effect::IncidentOpened)
     );
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_some());
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?.len(), 1);
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(monitor.id)
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_outbox(monitor.id)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -201,7 +256,9 @@ async fn incident_tracks_first_fail_open_last_fail_and_resolve_separately() -> a
             .await?;
     }
 
-    let incident = db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id)
+    let incident = db
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
         .await?
         .expect("incident open after 5 failures");
     assert_eq!(
@@ -227,7 +284,9 @@ async fn incident_tracks_first_fail_open_last_fail_and_resolve_separately() -> a
             .record(probe_at(&monitor, CheckOutcome::Pass, slot(offset)))
             .await?;
     }
-    let incidents = db.workspace(WorkspaceId::DEFAULT).list_incidents(Some(monitor.id), Some("resolved"), 5)
+    let incidents = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_incidents(Some(monitor.id), Some("resolved"), 5)
         .await?;
     let resolved = &incidents[0];
     assert_eq!(
@@ -256,17 +315,26 @@ async fn three_failures_commit_check_incident_and_outbox_together() -> anyhow::R
         );
     }
 
-    let checks = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 10).await?;
+    let checks = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_checks(monitor.id, 10)
+        .await?;
     assert_eq!(checks.len(), 3);
     assert!(checks.iter().all(|row| row.outcome == "http_fail"));
 
-    let incident = db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?;
+    let incident = db
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
+        .await?;
     assert!(
         incident.is_some(),
         "incident must open with the third commit"
     );
 
-    let outbox = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
+    let outbox = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].kind, "incident_opened");
     Ok(())
@@ -286,8 +354,16 @@ async fn two_fresh_passes_resolve_the_incident_in_one_commit() -> anyhow::Result
         );
     }
 
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_none());
-    let outbox = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(monitor.id)
+            .await?
+            .is_none()
+    );
+    let outbox = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
     assert_eq!(
         outbox
             .iter()
@@ -308,8 +384,16 @@ async fn a_missed_slot_is_stored_but_resets_the_streak() -> anyhow::Result<()> {
     writer.record(fail(&monitor)).await?;
     writer.record(fail(&monitor)).await?;
 
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_none());
-    let outcomes = db.workspace(WorkspaceId::DEFAULT).recent_outcomes(monitor.id, 10).await?;
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(monitor.id)
+            .await?
+            .is_none()
+    );
+    let outcomes = db
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, 10)
+        .await?;
     assert!(outcomes.contains(&SlotObservation::Missed));
     Ok(())
 }
@@ -327,7 +411,9 @@ async fn check_stats_counts_window_rows_and_leaves_expected_to_the_caller() -> a
     writer.record(fail(&monitor)).await?;
     writer.record(missed(&monitor)).await?;
 
-    let stats = db.workspace(WorkspaceId::DEFAULT).check_stats(
+    let stats = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(
             monitor.id,
             OffsetDateTime::now_utc() - time::Duration::hours(1),
         )
@@ -346,7 +432,9 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
     let (db, monitor, writer) = store().await?;
     let second =
         NewMonitor::new("second", url::Url::parse("https://two.example.com")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&second).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&second)
+        .await?;
 
     let old = OffsetDateTime::now_utc() - time::Duration::days(9);
     let aged = |m: &Monitor, outcome: CheckOutcome| {
@@ -373,7 +461,12 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
             .record(aged(&second, CheckOutcome::Transport))
             .await?;
     }
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(second.id).await?.is_some());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(second.id)
+            .await?
+            .is_some()
+    );
     // Recent rows for A — inside the window, must stay raw.
     writer.record(pass(&monitor)).await?;
 
@@ -384,9 +477,14 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
     assert_eq!(report.days_written, 1, "one monitor-day aggregated");
 
     // A: raw expired rows are gone, aggregates carry their counts; the recent row is raw.
-    let checks = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 50).await?;
+    let checks = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_checks(monitor.id, 50)
+        .await?;
     assert_eq!(checks.len(), 1);
-    let stats = db.workspace(WorkspaceId::DEFAULT).check_stats(
+    let stats = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(
             monitor.id,
             OffsetDateTime::now_utc() - time::Duration::days(10),
         )
@@ -394,8 +492,16 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
     assert_eq!((stats.observed, stats.passed, stats.missed), (4, 3, 1));
 
     // B: open incident → every raw row preserved, nothing aggregated away.
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_checks(second.id, 50).await?.len(), 3);
-    let stats_b = db.workspace(WorkspaceId::DEFAULT).check_stats(
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(second.id, 50)
+            .await?
+            .len(),
+        3
+    );
+    let stats_b = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(
             second.id,
             OffsetDateTime::now_utc() - time::Duration::days(10),
         )
@@ -403,7 +509,13 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
     assert_eq!(stats_b.observed, 3);
 
     // Outbox is never expired: monitor B's incident_opened event is still there.
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_outbox(second.id).await?.len(), 1);
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_outbox(second.id)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -425,7 +537,12 @@ async fn stale_and_unknown_observations_are_dropped() -> anyhow::Result<()> {
         WriteOutcome::DroppedUnknownMonitor
     );
 
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 10).await?.is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 10)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -435,7 +552,9 @@ async fn statuses_only_move_on_commits() -> anyhow::Result<()> {
     let db = Db::connect("sqlite::memory:", 1).await?;
     db.migrate().await?;
     let monitor = NewMonitor::new("m", url::Url::parse("https://example.com")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     let (writer, _task) = writer::spawn(
         db.clone(),
         Arc::clone(&statuses),
@@ -481,14 +600,22 @@ async fn update_monitor_bumps_generation_and_rejects_stale_writes() -> anyhow::R
     let mut edited = monitor.clone();
     edited.name = "edited".to_owned();
     edited.paused = true;
-    let generation = db.workspace(WorkspaceId::DEFAULT).update_monitor(&edited, monitor.generation).await?;
+    let generation = db
+        .workspace(WorkspaceId::DEFAULT)
+        .update_monitor(&edited, monitor.generation)
+        .await?;
     assert_eq!(generation, Some(monitor.generation + 1));
 
     // A second write carrying the pre-edit generation is a stale write: it must not apply.
-    let stale = db.workspace(WorkspaceId::DEFAULT).update_monitor(&edited, monitor.generation).await?;
+    let stale = db
+        .workspace(WorkspaceId::DEFAULT)
+        .update_monitor(&edited, monitor.generation)
+        .await?;
     assert_eq!(stale, None);
 
-    let stored = db.workspace(WorkspaceId::DEFAULT).list_monitors()
+    let stored = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_monitors()
         .await?
         .into_iter()
         .find(|row| row.id == monitor.id.0.to_string())
@@ -502,17 +629,46 @@ async fn update_monitor_bumps_generation_and_rejects_stale_writes() -> anyhow::R
 #[tokio::test]
 async fn delete_only_succeeds_without_history() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
-    assert!(!db.workspace(WorkspaceId::DEFAULT).has_history(monitor.id).await?);
-    assert!(db.workspace(WorkspaceId::DEFAULT).delete_monitor(monitor.id).await?);
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_monitors().await?.is_empty());
+    assert!(
+        !db.workspace(WorkspaceId::DEFAULT)
+            .has_history(monitor.id)
+            .await?
+    );
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .delete_monitor(monitor.id)
+            .await?
+    );
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .is_empty()
+    );
 
     // With a committed check, delete is refused — the row and its evidence both survive.
     let monitor = NewMonitor::new("kept", url::Url::parse("https://example.com")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     writer.record(pass(&monitor)).await?;
-    assert!(db.workspace(WorkspaceId::DEFAULT).has_history(monitor.id).await?);
-    assert!(!db.workspace(WorkspaceId::DEFAULT).delete_monitor(monitor.id).await?);
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 10).await?.len(), 1);
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .has_history(monitor.id)
+            .await?
+    );
+    assert!(
+        !db.workspace(WorkspaceId::DEFAULT)
+            .delete_monitor(monitor.id)
+            .await?
+    );
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 10)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -522,7 +678,10 @@ async fn outbox_lifecycle_pending_retry_exhausted_delivered() -> anyhow::Result<
     for _ in 0..3 {
         writer.record(fail(&monitor)).await?;
     }
-    let outbox = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
+    let outbox = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
     assert_eq!(outbox.len(), 1);
     let event_id = outbox[0].event_id.clone();
 
@@ -549,7 +708,13 @@ async fn outbox_lifecycle_pending_retry_exhausted_delivered() -> anyhow::Result<
     // row stays in the table.
     writer.mark_delivery(&event_id, 3, None, None).await?;
     assert!(db.pending_outbox("webhook", 3, 10).await?.is_empty());
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?.len(), 1);
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_outbox(monitor.id)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -559,7 +724,12 @@ async fn a_delivered_event_cannot_be_rewritten() -> anyhow::Result<()> {
     for _ in 0..3 {
         writer.record(fail(&monitor)).await?;
     }
-    let event_id = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?[0].event_id.clone();
+    let event_id = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?[0]
+        .event_id
+        .clone();
 
     let now = OffsetDateTime::now_utc();
     writer.mark_delivery(&event_id, 1, None, Some(now)).await?;
@@ -569,7 +739,10 @@ async fn a_delivered_event_cannot_be_rewritten() -> anyhow::Result<()> {
         .mark_delivery(&event_id, 99, Some(later), None)
         .await?;
 
-    let row = &db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?[0];
+    let row = &db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?[0];
     assert_eq!(row.attempts, 1);
     assert!(row.delivered_at.is_some());
     assert!(row.next_attempt_at.is_none());
@@ -583,12 +756,20 @@ async fn mark_delivery_goes_through_the_single_writer() -> anyhow::Result<()> {
     for _ in 0..3 {
         writer.record(fail(&monitor)).await?;
     }
-    let event_id = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?[0].event_id.clone();
+    let event_id = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?[0]
+        .event_id
+        .clone();
 
     writer
         .mark_delivery(&event_id, 1, None, Some(OffsetDateTime::now_utc()))
         .await?;
-    let row = &db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?[0];
+    let row = &db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?[0];
     assert_eq!(row.attempts, 1);
     assert!(row.delivered_at.is_some());
     Ok(())
@@ -598,7 +779,9 @@ async fn mark_delivery_goes_through_the_single_writer() -> anyhow::Result<()> {
 async fn list_incidents_filters_by_monitor_and_state() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
     let other = NewMonitor::new("other", url::Url::parse("https://example.org")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&other).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&other)
+        .await?;
 
     for _ in 0..3 {
         writer.record(fail(&monitor)).await?;
@@ -611,20 +794,31 @@ async fn list_incidents_filters_by_monitor_and_state() -> anyhow::Result<()> {
         writer.record(pass(&monitor)).await?;
     }
 
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_incidents(None, None, 10).await?.len(), 2);
     assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT).list_incidents(None, Some("open"), 10).await?.len(),
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_incidents(None, None, 10)
+            .await?
+            .len(),
+        2
+    );
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_incidents(None, Some("open"), 10)
+            .await?
+            .len(),
         1,
         "only `other` is still open — `monitor` recovered"
     );
     assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT).list_incidents(Some(monitor.id), Some("resolved"), 10)
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_incidents(Some(monitor.id), Some("resolved"), 10)
             .await?
             .len(),
         1
     );
     assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT).list_incidents(Some(other.id), Some("open"), 10)
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_incidents(Some(other.id), Some("open"), 10)
             .await?
             .len(),
         1
@@ -639,8 +833,15 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
     writer.record(fail(&monitor)).await?;
     drop(writer); // "restart": only the store survives.
 
-    let open = db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_some();
-    let tail = db.workspace(WorkspaceId::DEFAULT).recent_outcomes(monitor.id, 4).await?;
+    let open = db
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
+        .await?
+        .is_some();
+    let tail = db
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, 4)
+        .await?;
     let mut health = Health::rebuild(open, &tail, monitor.thresholds);
     // Two stored failures + one fresh failure must open the incident — streaks survived.
     assert_eq!(
@@ -658,8 +859,15 @@ async fn restart_rebuilds_streaks_and_open_incidents_from_the_store() -> anyhow:
         writer.record(fail(&monitor)).await?;
     }
     drop(writer);
-    let open = db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_some();
-    let tail = db.workspace(WorkspaceId::DEFAULT).recent_outcomes(monitor.id, 4).await?;
+    let open = db
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
+        .await?
+        .is_some();
+    let tail = db
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, 4)
+        .await?;
     let mut health = Health::rebuild(open, &tail, monitor.thresholds);
     assert_eq!(health.status(), Status::Down);
     // One pass is not enough; the second fresh pass recovers.
@@ -690,7 +898,10 @@ async fn writes_past_the_page_ceiling_fail_and_flag_unhealthy() -> anyhow::Resul
     setup.migrate().await?;
     let monitor =
         NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
-    setup.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    setup
+        .workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     // SQLite clamps max_page_count up to the current size, so cap at exactly the used
     // bytes: the database may not grow, and writes fail once free space runs out. The
     // production pool size (4) — the ceiling must hold on whichever connection commits.
@@ -769,7 +980,9 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
     db.migrate().await?;
     let monitor =
         NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
 
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let (handle, _task) = writer::spawn(
@@ -784,7 +997,12 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
     for _ in 0..3 {
         handle.record(fail(&monitor)).await?;
     }
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_some());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(monitor.id)
+            .await?
+            .is_some()
+    );
 
     // Backup while the incident is open, then "restore": open the backup as the store.
     let backup = tmp.path().join("backup.db");
@@ -794,7 +1012,10 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
     drop(db);
 
     let restored = Db::connect(&format!("sqlite:{}", backup.display()), 1).await?;
-    let open = restored.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?;
+    let open = restored
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
+        .await?;
     assert!(open.is_some(), "restored open incident stays open");
     let due = restored.pending_outbox("webhook", 10, 10).await?;
     assert_eq!(
@@ -803,7 +1024,10 @@ async fn backup_restore_preserves_open_incidents_and_outbox() -> anyhow::Result<
         "the pending outbox event survives the restore"
     );
     // Boot rebuild from the restored store reproduces `down` — not a fresh unknown.
-    let tail = restored.workspace(WorkspaceId::DEFAULT).recent_outcomes(monitor.id, 4).await?;
+    let tail = restored
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, 4)
+        .await?;
     let health = Health::rebuild(open.is_some(), &tail, monitor.thresholds);
     assert_eq!(health.status(), Status::Down);
     Ok(())
@@ -817,7 +1041,9 @@ async fn an_incident_enqueues_one_row_per_configured_channel() -> anyhow::Result
     db.migrate().await?;
     let monitor =
         NewMonitor::new("fixture", url::Url::parse("https://example.com")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     // The email channel is what production gets when SMON_SMTP_DSN is set.
     let (handle, _task) = writer::spawn(
@@ -833,7 +1059,10 @@ async fn an_incident_enqueues_one_row_per_configured_channel() -> anyhow::Result
         handle.record(fail(&monitor)).await?;
     }
 
-    let rows = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
+    let rows = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
     assert_eq!(rows.len(), 2, "one outbox row per configured channel");
     let mut channels: Vec<&str> = rows.iter().map(|row| row.channel.as_str()).collect();
     channels.sort_unstable();
@@ -953,7 +1182,9 @@ async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow
             .record(at(&monitor, CheckOutcome::Transport, 9, minute))
             .await?;
     }
-    let incident = db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id)
+    let incident = db
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
         .await?
         .expect("incident opened");
     // 8 days ago: still failing while open; then one recent failure.
@@ -972,7 +1203,10 @@ async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow
         "5 old passes + 4 old open-period failures"
     );
 
-    let kept = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 50).await?;
+    let kept = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_checks(monitor.id, 50)
+        .await?;
     let first_fail = incident.first_fail_at.expect("first_fail_at");
     let birth: Vec<_> = kept
         .iter()
@@ -989,7 +1223,9 @@ async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow
         "birth streak + the row inside the raw window"
     );
     // Nothing expired was lost: aggregates carry it, so coverage stays honest.
-    let stats = db.workspace(WorkspaceId::DEFAULT).check_stats(
+    let stats = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(
             monitor.id,
             OffsetDateTime::now_utc() - time::Duration::days(30),
         )
@@ -997,7 +1233,10 @@ async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow
     assert_eq!(stats.observed, 13);
     assert_eq!(stats.passed, 5);
     assert!(
-        db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id).await?.is_some(),
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(monitor.id)
+            .await?
+            .is_some(),
         "the incident itself is untouched"
     );
     Ok(())
@@ -1015,8 +1254,12 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
         NewMonitor::new("recent", url::Url::parse("https://two.example.com")?)?.into_monitor();
     let open =
         NewMonitor::new("open", url::Url::parse("https://three.example.com")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&recent).await?;
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&open).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&recent)
+        .await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&open)
+        .await?;
 
     // An incident opened and resolved ~400 days ago: past every horizon.
     for minute in 0..3 {
@@ -1041,7 +1284,10 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
             .record(at(&recent, CheckOutcome::Pass, 20, minute))
             .await?;
     }
-    let recent_events = db.workspace(WorkspaceId::DEFAULT).list_outbox(recent.id).await?;
+    let recent_events = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(recent.id)
+        .await?;
     assert_eq!(recent_events.len(), 2);
     writer
         .mark_delivery(
@@ -1059,20 +1305,22 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
     }
     // Maintenance windows: one ended 400 days ago, one ended yesterday.
     let now = OffsetDateTime::now_utc();
-    db.workspace(WorkspaceId::DEFAULT).create_window(
-        ancient.id,
-        now - time::Duration::days(401),
-        now - time::Duration::days(400),
-        "old",
-    )
-    .await?;
-    db.workspace(WorkspaceId::DEFAULT).create_window(
-        ancient.id,
-        now - time::Duration::days(2),
-        now - time::Duration::days(1),
-        "new",
-    )
-    .await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .create_window(
+            ancient.id,
+            now - time::Duration::days(401),
+            now - time::Duration::days(400),
+            "old",
+        )
+        .await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .create_window(
+            ancient.id,
+            now - time::Duration::days(2),
+            now - time::Duration::days(1),
+            "new",
+        )
+        .await?;
 
     let report = writer
         .retain(RetentionPolicy::default().cutoffs(now))
@@ -1089,29 +1337,65 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
     assert_eq!(report.windows_deleted, 1);
 
     assert!(
-        db.workspace(WorkspaceId::DEFAULT).list_incidents(Some(ancient.id), None, 10)
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_incidents(Some(ancient.id), None, 10)
             .await?
             .is_empty()
     );
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_outbox(ancient.id).await?.is_empty());
-    let ancient_stats = db.workspace(WorkspaceId::DEFAULT).check_stats(ancient.id, now - time::Duration::days(500))
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_outbox(ancient.id)
+            .await?
+            .is_empty()
+    );
+    let ancient_stats = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(ancient.id, now - time::Duration::days(500))
         .await?;
     assert_eq!(
         ancient_stats.observed, 0,
         "aggregates past 365 days are gone"
     );
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_windows(ancient.id).await?.len(), 1);
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_windows(ancient.id)
+            .await?
+            .len(),
+        1
+    );
 
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_incidents(Some(recent.id), None, 10).await?.len(), 1);
-    let left = db.workspace(WorkspaceId::DEFAULT).list_outbox(recent.id).await?;
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_incidents(Some(recent.id), None, 10)
+            .await?
+            .len(),
+        1
+    );
+    let left = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(recent.id)
+        .await?;
     assert_eq!(left.len(), 1);
     assert!(left[0].delivered_at.is_none(), "the pending event survives");
-    let recent_stats = db.workspace(WorkspaceId::DEFAULT).check_stats(recent.id, now - time::Duration::days(30))
+    let recent_stats = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(recent.id, now - time::Duration::days(30))
         .await?;
     assert_eq!(recent_stats.observed, 5, "young aggregates are kept");
 
-    assert!(db.workspace(WorkspaceId::DEFAULT).open_incident(open.id).await?.is_some());
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_outbox(open.id).await?.len(), 1);
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .open_incident(open.id)
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_outbox(open.id)
+            .await?
+            .len(),
+        1
+    );
 
     Ok(())
 }
@@ -1129,7 +1413,10 @@ async fn retention_frees_space_in_a_store_filled_to_its_cap() -> anyhow::Result<
     setup.migrate().await?;
     let monitor =
         NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?.into_monitor();
-    setup.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    setup
+        .workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     let used = setup.used_bytes().await?;
     drop(setup);
 
@@ -1168,7 +1455,9 @@ async fn retention_frees_space_in_a_store_filled_to_its_cap() -> anyhow::Result<
         .await
         .expect("retention must run at the cap");
     assert_eq!(report.rows_deleted, stored, "every expired row is freed");
-    let stats = db.workspace(WorkspaceId::DEFAULT).check_stats(
+    let stats = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(
             monitor.id,
             OffsetDateTime::now_utc() - time::Duration::days(365),
         )
@@ -1198,7 +1487,8 @@ async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
         .await?;
     assert_eq!((first.rows_deleted, first.aggregates_deleted), (4, 0));
     assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT).check_stats(monitor.id, now - time::Duration::days(30))
+        db.workspace(WorkspaceId::DEFAULT)
+            .check_stats(monitor.id, now - time::Duration::days(30))
             .await?
             .observed,
         4
@@ -1211,7 +1501,8 @@ async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
     let second = writer.retain(short.cutoffs(now)).await?;
     assert!(second.aggregates_deleted >= 1, "{second:?}");
     assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT).check_stats(monitor.id, now - time::Duration::days(30))
+        db.workspace(WorkspaceId::DEFAULT)
+            .check_stats(monitor.id, now - time::Duration::days(30))
             .await?
             .observed,
         0
@@ -1269,8 +1560,16 @@ async fn retention_runs_in_bounded_batches_and_converges() -> anyhow::Result<()>
     let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
     let report = writer.retain_in_batches(cutoffs, 10).await?;
     assert_eq!(report.rows_deleted, 25);
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 100).await?.len(), 0);
-    let stats = db.workspace(WorkspaceId::DEFAULT).check_stats(
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 100)
+            .await?
+            .len(),
+        0
+    );
+    let stats = db
+        .workspace(WorkspaceId::DEFAULT)
+        .check_stats(
             monitor.id,
             OffsetDateTime::now_utc() - time::Duration::days(30),
         )
@@ -1305,7 +1604,11 @@ async fn an_observation_lands_while_a_large_retention_pass_is_still_running() ->
     writer.record(pass(&monitor)).await?;
     // The observation is committed; how much expired history was still waiting? With
     // batches, nearly all of it (the record waited for at most a batch or two).
-    let waiting = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 5_000).await?.len();
+    let waiting = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_checks(monitor.id, 5_000)
+        .await?
+        .len();
     assert!(
         waiting > 1_000,
         "the observation waited for the whole pass ({waiting} rows left when it landed)"
@@ -1313,7 +1616,10 @@ async fn an_observation_lands_while_a_large_retention_pass_is_still_running() ->
     let report = retention.await??;
     assert_eq!(report.rows_deleted, 2_000);
     assert_eq!(
-        db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 10).await?.len(),
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 10)
+            .await?
+            .len(),
         1,
         "the fresh row stays"
     );
@@ -1342,7 +1648,10 @@ async fn retention_at_the_cap_has_room_for_summaries_of_a_thin_expired_slice() -
         })
         .collect::<anyhow::Result<_>>()?;
     for monitor in &monitors {
-        setup.workspace(WorkspaceId::DEFAULT).insert_monitor(monitor).await?;
+        setup
+            .workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(monitor)
+            .await?;
     }
     let (writer, _task) = writer::spawn(
         setup.clone(),
@@ -1420,7 +1729,9 @@ async fn a_new_store_and_its_backups_are_owner_only() -> anyhow::Result<()> {
     db.migrate().await?;
     let monitor =
         NewMonitor::new("private", url::Url::parse("https://example.com/health")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     assert_eq!(mode(&path)?, 0o600, "the store");
     let wal = tmp.path().join("private.db-wal");
     if wal.exists() {
@@ -1468,7 +1779,13 @@ async fn a_backup_path_with_quotes_writes_exactly_that_file() -> anyhow::Result<
         .collect();
     names.sort();
     assert_eq!(names, [name], "and nothing else was written");
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_monitors().await.is_ok(), "the store is intact");
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await
+            .is_ok(),
+        "the store is intact"
+    );
     Ok(())
 }
 
@@ -1488,7 +1805,9 @@ async fn opening_an_existing_store_makes_it_and_its_sidecars_owner_only() -> any
         db.migrate().await?;
         let monitor =
             NewMonitor::new("old", url::Url::parse("https://example.com/")?)?.into_monitor();
-        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
         db.close().await;
     }
     let files: Vec<_> = ["old.db", "old.db-wal", "old.db-shm"]
@@ -1506,7 +1825,14 @@ async fn opening_an_existing_store_makes_it_and_its_sidecars_owner_only() -> any
         let mode = std::fs::metadata(file)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{}", file.display());
     }
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_monitors().await?.len(), 1, "the store is untouched");
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .len(),
+        1,
+        "the store is untouched"
+    );
     Ok(())
 }
 
@@ -1557,7 +1883,9 @@ async fn commit_p50_under_reads(api: &Db, writer_db: Db) -> anyhow::Result<u128>
             url::Url::parse(&format!("https://r{i}.example/"))?,
         )?
         .into_monitor();
-        api.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+        api.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
         monitors.push(monitor);
     }
     let (handle, _task) = writer::spawn(

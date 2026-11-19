@@ -45,7 +45,9 @@ async fn monitor(
     timeout: Duration,
 ) -> anyhow::Result<Monitor> {
     let stored = NewMonitor::new("fixture", url.clone())?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&stored).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&stored)
+        .await?;
     let mut scheduled = stored.clone();
     scheduled.interval = interval;
     scheduled.timeout = timeout;
@@ -94,7 +96,10 @@ fn rig(
 }
 
 async fn outcomes(db: &Db, monitor: &Monitor) -> anyhow::Result<Vec<String>> {
-    let checks = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 200).await?;
+    let checks = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_checks(monitor.id, 200)
+        .await?;
     Ok(checks.into_iter().map(|row| row.outcome).collect())
 }
 

@@ -111,7 +111,12 @@ async fn an_oversized_authed_write_is_413_and_stores_nothing() -> anyhow::Result
         )
         .await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_monitors().await?.is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 

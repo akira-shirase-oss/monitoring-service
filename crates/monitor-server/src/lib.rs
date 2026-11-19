@@ -595,7 +595,8 @@ async fn create_monitor(
     let monitor = new.into_monitor();
     let _schedule = lock.0.lock().await;
     check_capacity(&state, |monitors| monitors.push(monitor.clone())).await?;
-    if !tenant(&state).insert_monitor_within(&monitor, state.max_monitors)
+    if !tenant(&state)
+        .insert_monitor_within(&monitor, state.max_monitors)
         .await?
     {
         return Err(ApiError::LimitReached(state.max_monitors));
@@ -664,7 +665,8 @@ async fn patch_monitor(
         }
     })
     .await?;
-    if tenant(&state).update_monitor(&merged, monitor.generation)
+    if tenant(&state)
+        .update_monitor(&merged, monitor.generation)
         .await?
         .is_none()
     {
@@ -752,7 +754,8 @@ async fn list_checks(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let row = find_monitor(&state, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    let checks = tenant(&state).list_checks(monitor.id, bounded_limit(params.limit, 50, 500))
+    let checks = tenant(&state)
+        .list_checks(monitor.id, bounded_limit(params.limit, 50, 500))
         .await?;
     let checks: Vec<CheckView> = checks.into_iter().map(CheckView::from).collect();
     Ok(Json(serde_json::json!({ "checks": checks })))
@@ -913,7 +916,8 @@ async fn create_window(
     if input.ends_at <= input.starts_at {
         return Err(ApiError::Invalid("ends_at must be after starts_at".into()));
     }
-    let created = tenant(&state).create_window(
+    let created = tenant(&state)
+        .create_window(
             monitor.id,
             input.starts_at,
             input.ends_at,
@@ -940,7 +944,8 @@ async fn list_windows(
     let row = find_monitor(&state, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     let now = OffsetDateTime::now_utc();
-    let windows: Vec<MaintenanceView> = tenant(&state).list_windows(monitor.id)
+    let windows: Vec<MaintenanceView> = tenant(&state)
+        .list_windows(monitor.id)
         .await?
         .into_iter()
         .map(|row| MaintenanceView::from_row(row, now))
@@ -978,7 +983,8 @@ async fn list_incidents(
         Some("resolved") => Some("resolved"),
         Some(_) => return Err(ApiError::BadId),
     };
-    let incidents = tenant(&state).list_incidents(
+    let incidents = tenant(&state)
+        .list_incidents(
             monitor_id,
             state_filter,
             bounded_limit(params.limit, 50, 500),

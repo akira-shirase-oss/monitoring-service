@@ -605,7 +605,10 @@ mod tests {
         let stored = NewMonitor::new("guarded", Url::parse(url).expect("url"))
             .expect("monitor")
             .into_monitor();
-        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&stored).await.expect("insert");
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&stored)
+            .await
+            .expect("insert");
         let mut monitor = stored.clone();
         monitor.interval = Duration::from_millis(60);
         monitor.timeout = Duration::from_millis(400);
@@ -641,13 +644,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(900)).await;
         shutdown.cancel();
         let _ = task.await;
-        let rows = db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 100)
+        let rows = db
+            .workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 100)
             .await
             .expect("checks")
             .into_iter()
             .map(|row| (row.outcome, row.detail))
             .collect();
-        let open = db.workspace(WorkspaceId::DEFAULT).open_incident(monitor.id)
+        let open = db
+            .workspace(WorkspaceId::DEFAULT)
+            .open_incident(monitor.id)
             .await
             .expect("incident")
             .is_some();
@@ -724,7 +731,10 @@ mod tests {
         let monitor = NewMonitor::new("backlog", Url::parse("https://example.com/").expect("url"))
             .expect("monitor")
             .into_monitor();
-        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await.expect("insert");
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await
+            .expect("insert");
         let (writer, _task) = writer::spawn(
             db.clone(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -769,7 +779,11 @@ mod tests {
             "the heartbeat went {silence:?} without a beat while the backlog committed"
         );
         assert_eq!(
-            db.workspace(WorkspaceId::DEFAULT).list_checks(monitor.id, 500).await.expect("checks").len(),
+            db.workspace(WorkspaceId::DEFAULT)
+                .list_checks(monitor.id, 500)
+                .await
+                .expect("checks")
+                .len(),
             200
         );
     }

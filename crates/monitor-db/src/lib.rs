@@ -510,7 +510,11 @@ impl Db {
 
     /// Create a workspace and return its id. `slug` is unique — it names the workspace's
     /// public status page (`/s/<slug>`, D-021).
-    pub async fn create_workspace(&self, slug: &str, name: &str) -> Result<WorkspaceId, QueryError> {
+    pub async fn create_workspace(
+        &self,
+        slug: &str,
+        name: &str,
+    ) -> Result<WorkspaceId, QueryError> {
         let id = WorkspaceId::new();
         sqlx::query("INSERT INTO workspaces (id, slug, name, created_at) VALUES (?, ?, ?, ?)")
             .bind(id.0.to_string())
@@ -531,7 +535,10 @@ impl Db {
     }
 
     /// One workspace row by id.
-    pub async fn workspace_row(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceRow>, QueryError> {
+    pub async fn workspace_row(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Option<WorkspaceRow>, QueryError> {
         sqlx::query_as::<_, WorkspaceRow>(
             "SELECT id, slug, name, created_at FROM workspaces WHERE id = ?",
         )
@@ -1002,14 +1009,13 @@ impl WorkspaceDb<'_> {
     /// slot; deleting a future or past one just removes the record. Returns whether a row
     /// was deleted so the API can distinguish 204 from 404.
     pub async fn delete_window(&self, window_id: i64) -> Result<bool, QueryError> {
-        let deleted = sqlx::query(
-            "DELETE FROM maintenance_windows WHERE id = ? AND workspace_id = ?",
-        )
-        .bind(window_id)
-        .bind(self.workspace.0.to_string())
-        .execute(&self.db.pool)
-        .await?
-        .rows_affected();
+        let deleted =
+            sqlx::query("DELETE FROM maintenance_windows WHERE id = ? AND workspace_id = ?")
+                .bind(window_id)
+                .bind(self.workspace.0.to_string())
+                .execute(&self.db.pool)
+                .await?
+                .rows_affected();
         Ok(deleted > 0)
     }
 
@@ -1169,12 +1175,10 @@ impl Db {
 impl WorkspaceDb<'_> {
     /// How many monitors exist (paused ones included — they keep history).
     pub async fn monitor_count(&self) -> Result<u64, QueryError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM monitors WHERE workspace_id = ?",
-        )
-        .bind(self.workspace.0.to_string())
-        .fetch_one(&self.db.pool)
-        .await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM monitors WHERE workspace_id = ?")
+            .bind(self.workspace.0.to_string())
+            .fetch_one(&self.db.pool)
+            .await?;
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
@@ -1214,7 +1218,6 @@ impl WorkspaceDb<'_> {
 }
 
 impl Db {
-
     /// Outbox rows due for delivery: not yet delivered, not exhausted (`attempts < max`), and
     /// either never attempted or past their scheduled retry. `max` belongs to the deliverer's
     /// config — the store just records what the deliverer asked it to.

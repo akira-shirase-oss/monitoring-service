@@ -15,9 +15,7 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
-use monitor_domain::{
-    Effect, Health, MonitorId, SlotObservation, Statuses, WorkspaceId,
-};
+use monitor_domain::{Effect, Health, MonitorId, SlotObservation, Statuses, WorkspaceId};
 
 use crate::{Db, QueryError, RetainReport, RetentionCutoffs};
 

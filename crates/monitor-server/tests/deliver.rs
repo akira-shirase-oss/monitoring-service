@@ -100,7 +100,9 @@ async fn monitor_with_event(
     name: &str,
 ) -> anyhow::Result<(Monitor, OutboxRow)> {
     let monitor = NewMonitor::new(name, url::Url::parse("https://example.com")?)?.into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     for _ in 0..3 {
         writer
             .record(Observation {
@@ -115,7 +117,10 @@ async fn monitor_with_event(
             })
             .await?;
     }
-    let outbox = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?;
+    let outbox = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?;
     assert_eq!(outbox.len(), 1);
     let row = outbox
         .into_iter()
@@ -152,7 +157,9 @@ async fn wait_row(
 ) -> anyhow::Result<OutboxRow> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let row = db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id)
+        let row = db
+            .workspace(WorkspaceId::DEFAULT)
+            .list_outbox(monitor.id)
             .await?
             .into_iter()
             .next()
@@ -313,7 +320,13 @@ async fn exhaustion_is_terminal_and_the_row_stays_visible() -> anyhow::Result<()
     assert!(row.next_attempt_at.is_none());
     assert!(db.pending_outbox("webhook", 2, 10).await?.is_empty());
     // But it stays in the table — visible, not silently dropped.
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?.len(), 1);
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_outbox(monitor.id)
+            .await?
+            .len(),
+        1
+    );
     shutdown.cancel();
     task.await?;
     Ok(())
@@ -326,7 +339,10 @@ async fn no_target_means_pending_not_dropped() -> anyhow::Result<()> {
     // With no sink configured the deliverer is simply never spawned — the pending row is
     // the visible "no receiver" signal, so nothing is attempted and nothing is dropped.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let row = &db.workspace(WorkspaceId::DEFAULT).list_outbox(monitor.id).await?[0];
+    let row = &db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_outbox(monitor.id)
+        .await?[0];
     assert!(row.delivered_at.is_none());
     assert_eq!(row.attempts, 0, "nothing was attempted");
     Ok(())
@@ -411,7 +427,9 @@ async fn alert_payloads_strip_credentials_from_the_monitor_url() -> anyhow::Resu
         url::Url::parse("https://probe:pa55word@api.example.com/health?api_key=K3Y#x")?,
     )?
     .into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
     for _ in 0..3 {
         writer
             .record(Observation {

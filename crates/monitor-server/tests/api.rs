@@ -487,7 +487,11 @@ async fn seed_check(
     outcome: monitor_domain::CheckOutcome,
 ) -> anyhow::Result<monitor_db::WriteOutcome> {
     let monitor_id = monitor_domain::MonitorId(uuid::Uuid::parse_str(id)?);
-    let generation = db.workspace(WorkspaceId::DEFAULT).monitor_generation(monitor_id).await?.unwrap_or(1);
+    let generation = db
+        .workspace(WorkspaceId::DEFAULT)
+        .monitor_generation(monitor_id)
+        .await?
+        .unwrap_or(1);
     Ok(writer
         .record(monitor_db::Observation {
             monitor_id,
@@ -621,7 +625,13 @@ async fn a_stale_observation_after_edit_is_dropped() {
         .await
         .unwrap();
     assert_eq!(outcome, monitor_db::WriteOutcome::DroppedStaleGeneration);
-    assert!(db.workspace(WorkspaceId::DEFAULT).list_checks(monitor_id, 10).await.unwrap().is_empty());
+    assert!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1224,7 +1234,9 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
     let monitor =
         monitor_domain::NewMonitor::new("watched", url::Url::parse("https://example.com/health")?)?
             .into_monitor();
-    db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&monitor)
+        .await?;
 
     let statuses = Arc::new(RwLock::new(HashMap::new()));
     let write_health: monitor_db::WriteHealth = Arc::default();
@@ -1935,7 +1947,8 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
         .into_monitor())
     };
     for i in 0..479 {
-        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&slow(format!("m{i}"), &format!("https://o{i}.example/"))?)
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&slow(format!("m{i}"), &format!("https://o{i}.example/"))?)
             .await?;
     }
     let app = uncapped(&db);
@@ -1955,7 +1968,14 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     let (status, body) = send(&app, "POST", "/api/monitors", Some(one_more)).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "capacity_exceeded");
-    assert_eq!(db.workspace(WorkspaceId::DEFAULT).list_monitors().await?.len(), 480, "nothing was stored");
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .len(),
+        480,
+        "nothing was stored"
+    );
 
     // Per origin, in a fresh store.
     let tmp2 = tempfile::tempdir()?;
@@ -1964,7 +1984,9 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     for i in 0..30 {
         let mut monitor = slow(format!("p{i}"), &format!("https://api.example/{i}"))?;
         monitor.timeout = Duration::from_secs(3);
-        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
     }
     let app = uncapped(&db);
     let same_origin = serde_json::json!({
@@ -1987,7 +2009,9 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
 
     // An edit that would overload the origin is refused the same way.
     let faster = serde_json::json!({ "interval_s": 15, "url": "https://api.example/again" });
-    let other_id = db.workspace(WorkspaceId::DEFAULT).list_monitors()
+    let other_id = db
+        .workspace(WorkspaceId::DEFAULT)
+        .list_monitors()
         .await?
         .into_iter()
         .find(|row| row.url.contains("other.example"))
@@ -2025,7 +2049,9 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
             Duration::from_secs(3),
         )?
         .into_monitor();
-        db.workspace(WorkspaceId::DEFAULT).insert_monitor(&monitor).await?;
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
     }
     let app = monitor_server::router(monitor_server::AppState {
         db: db.clone(),
