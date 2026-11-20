@@ -208,6 +208,37 @@ impl<F: Fn(&str) -> Option<String>> Reader<F> {
         }
     }
 
+    /// `SMON_COOKIE_SECURE` — the emitted session cookie's `Secure`/name mode.
+    /// `off` is the plain-HTTP development escape only (the emitted cookie drops
+    /// `Secure` and the `__Host-` name so a self-hosted install on
+    /// http://<host>:<port> can still sign in). S3 review: behind a trusted proxy
+    /// or on a routable listen a plain `smon_session` is a session-fixation hole —
+    /// a sibling subdomain can plant `Domain=<parent>; Path=/api` and the victim
+    /// works in the attacker's session (no `Secure`, no HSTS) — so it is refused.
+    fn cookie_secure(&mut self, proxied: bool, listen: &SocketAddr) -> crate::auth::CookieSecure {
+        let secure = match self.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
+            None | Some("auto") => crate::auth::CookieSecure::Auto,
+            Some("always") => crate::auth::CookieSecure::Always,
+            Some("off") => crate::auth::CookieSecure::Off,
+            Some(other) => {
+                self.problems.push(format!(
+                    "SMON_COOKIE_SECURE={other:?}: expected `auto`, `always` or `off`"
+                ));
+                crate::auth::CookieSecure::Auto
+            }
+        };
+        if matches!(secure, crate::auth::CookieSecure::Off)
+            && (proxied || !listen.ip().is_loopback())
+        {
+            self.problems.push(
+                "SMON_COOKIE_SECURE=off is refused behind a trusted proxy or a \
+                 non-loopback listen — it is a development escape, not a mode"
+                    .to_owned(),
+            );
+        }
+        secure
+    }
+
     /// The backup confinement root (D-019): absolute only — a relative one would let
     /// the service's cwd decide where an admin write lands.
     fn backup_dir(&mut self) -> Option<std::path::PathBuf> {
@@ -415,20 +446,7 @@ impl Config {
             Duration::from_hours(1),
             60..=MAX_HORIZON_S,
         );
-        let cookie_secure = match env.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
-            None | Some("auto") => crate::auth::CookieSecure::Auto,
-            Some("always") => crate::auth::CookieSecure::Always,
-            // `off` is the plain-HTTP development escape — the emitted cookie drops
-            // `Secure` and the `__Host-` name, so a self-hosted install on
-            // http://<host>:<port> can still sign in. Production is HTTPS-only.
-            Some("off") => crate::auth::CookieSecure::Off,
-            Some(other) => {
-                env.problems.push(format!(
-                    "SMON_COOKIE_SECURE={other:?}: expected `auto`, `always` or `off`"
-                ));
-                crate::auth::CookieSecure::Auto
-            }
-        };
+        let cookie_secure = env.cookie_secure(trusted_proxy.is_some(), &listen);
         let max_monitors = env.ranged("SMON_MAX_MONITORS", 100, 1..=100_000);
         let max_connections =
             usize::try_from(env.ranged("SMON_MAX_CONNECTIONS", 1024, 8..=65_535)).unwrap_or(1024);
@@ -636,6 +654,42 @@ mod tests {
         assert!(error.to_string().contains("must exceed"));
         let error = load(&[("SMON_SMTP_FROM", "a@example.com")]).expect_err("partial smtp");
         assert!(error.to_string().contains("set together"));
+    }
+
+    /// S3 re-review: `off` is the plain-HTTP development escape only — never a
+    /// production shape. Behind a trusted proxy or on a routable listen a plain
+    /// `smon_session` is a session-fixation hole: a sibling subdomain can plant
+    /// `Domain=<parent>; Path=/api` and the victim works in the attacker's
+    /// session (no `Secure`, no HSTS). Refuse to boot instead of shipping it.
+    #[test]
+    fn the_cookie_off_escape_is_refused_in_production_shapes() {
+        for pairs in [
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_LISTEN", "0.0.0.0:8080"),
+            ][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_TRUSTED_PROXY", "127.0.0.1"),
+            ][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_LISTEN", "203.0.113.5:80"),
+            ][..],
+        ] {
+            let error = load(pairs).expect_err("off must be refused in production shapes");
+            assert!(error.to_string().contains("SMON_COOKIE_SECURE"), "{error}");
+        }
+        // The development escape itself still works: loopback, no proxy.
+        let config = load(&[
+            ("SMON_COOKIE_SECURE", "off"),
+            ("SMON_LISTEN", "127.0.0.1:8080"),
+        ])
+        .expect("off on loopback with no proxy is the development escape");
+        assert_eq!(config.cookie_secure, crate::auth::CookieSecure::Off);
+        let config = load(&[("SMON_COOKIE_SECURE", "off"), ("SMON_LISTEN", "[::1]:8080")])
+            .expect("v6 loopback is still loopback");
+        assert_eq!(config.cookie_secure, crate::auth::CookieSecure::Off);
     }
 
     #[test]
