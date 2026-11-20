@@ -40,7 +40,7 @@ use monitor_db::{
     CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses,
 };
 use monitor_domain::{
-    AccountId, ApiTokenId, Monitor, MonitorId, MonitorPatch, NewMonitor, Role, Status,
+    AccountId, ApiTokenId, Monitor, MonitorId, MonitorPatch, NewMonitor, Plan, Role, Status,
     ValidationError,
 };
 
@@ -349,6 +349,7 @@ fn routes(state: AppState) -> Router {
         // The workspace itself (S2): rename, the memberships the switcher lists, and
         // the public status page's configuration (D-021).
         .route("/workspaces", get(list_workspaces))
+        .route("/workspaces/{id}/plan", patch(patch_workspace_plan))
         .route("/workspace", patch(patch_workspace))
         .route(
             "/workspace/status-page",
@@ -1069,7 +1070,7 @@ async fn list_workspaces(
             .await?
             .into_iter()
             .map(|w| {
-                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "role": "operator"})
+                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "plan": w.plan, "role": "operator"})
             })
             .collect::<Vec<_>>(),
         auth::Principal::Account { account: id, .. } => {
@@ -1082,7 +1083,7 @@ async fn list_workspaces(
                 .await?
                 .into_iter()
                 .map(|m| {
-                    serde_json::json!({"id": m.id, "slug": m.slug, "name": m.name, "role": m.role})
+                    serde_json::json!({"id": m.id, "slug": m.slug, "name": m.name, "plan": m.plan, "role": m.role})
                 })
                 .collect()
         }
@@ -1094,7 +1095,7 @@ async fn list_workspaces(
             .await?
             .into_iter()
             .map(|w| {
-                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "role": role.as_str()})
+                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "plan": w.plan, "role": role.as_str()})
             })
             .collect(),
     };
@@ -1125,6 +1126,44 @@ async fn patch_workspace(
     let row = view.rename_workspace(name).await?;
     Ok(Json(serde_json::json!({
         "workspace": { "id": row.id, "slug": row.slug, "name": row.name }
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlanBody {
+    pub plan: String,
+}
+
+/// Move a workspace between plan tiers (S3, D-022) — operator work, never tenant
+/// work: a member can't lift its own limits. The new tier gates the workspace's
+/// next write; nothing already running is paused or deleted by moving it.
+async fn patch_workspace_plan(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<PlanBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !matches!(principal, auth::Principal::Operator { .. }) {
+        return Err(ApiError::Forbidden(
+            "only the operator moves a workspace between plans".into(),
+        ));
+    }
+    let workspace = Uuid::parse_str(&id)
+        .map(monitor_domain::WorkspaceId)
+        .map_err(|_| ApiError::BadId)?;
+    let Some(plan) = Plan::parse(body.plan.trim()) else {
+        return Err(ApiError::Invalid("plan is `free` or `operator`".into()));
+    };
+    if !state.db.set_workspace_plan(workspace, plan).await? {
+        return Err(ApiError::NotFound);
+    }
+    let row = state
+        .db
+        .workspace_row(workspace)
+        .await?
+        .ok_or(ApiError::Corrupt)?;
+    Ok(Json(serde_json::json!({
+        "workspace": { "id": row.id, "slug": row.slug, "name": row.name, "plan": row.plan }
     })))
 }
 
@@ -1762,17 +1801,25 @@ async fn create_monitor(
             )
             .map_err(ApiError::Validation)?,
     };
+    let limits = view.plan().await?.limits();
+    if new.interval < limits.min_interval {
+        return Err(ApiError::PlanLimit(format!(
+            "interval {}s is below the {}s minimum on the workspace's plan",
+            new.interval.as_secs(),
+            limits.min_interval.as_secs()
+        )));
+    }
     let monitor = new.into_monitor_for(principal.workspace());
     let _schedule = lock.0.lock().await;
     check_capacity(&state, &principal, |monitors| {
         monitors.push(monitor.clone());
     })
     .await?;
-    if !view
-        .insert_monitor_within(&monitor, state.max_monitors)
-        .await?
-    {
-        return Err(ApiError::LimitReached(state.max_monitors));
+    // The plan caps the workspace's own count first; the server's `SMON_MAX_MONITORS`
+    // ceiling still bounds every tier (S3).
+    let cap = limits.max_monitors.min(state.max_monitors);
+    if !view.insert_monitor_within(&monitor, cap).await? {
+        return Err(ApiError::LimitReached(cap));
     }
     publish_registry(&state).await?;
     Ok((
@@ -1833,6 +1880,20 @@ async fn patch_monitor(
         check_target(&state, url)?;
     }
     let merged = patch.apply(&monitor).map_err(ApiError::Validation)?;
+    // The plan floor gates the proposed interval, not the stored one — a rename or
+    // pause on a monitor already below the floor isn't made worse by landing (S3).
+    // It sits after `apply`, so an interval below the absolute domain floor stays a
+    // 422 whatever the tier: the plan floor only governs the band above it.
+    if input.interval_s.is_some() {
+        let limits = view.plan().await?.limits();
+        if merged.interval < limits.min_interval {
+            return Err(ApiError::PlanLimit(format!(
+                "interval {}s is below the {}s minimum on the workspace's plan",
+                merged.interval.as_secs(),
+                limits.min_interval.as_secs()
+            )));
+        }
+    }
     let _schedule = lock.0.lock().await;
     check_capacity(&state, &principal, |monitors| {
         for stored in monitors.iter_mut().filter(|stored| stored.id == merged.id) {
@@ -2295,6 +2356,9 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     Forbidden(String),
+    /// S3: the write crossed the workspace's own plan tier (interval floor today).
+    #[error("{0}")]
+    PlanLimit(String),
     #[error("monitor limit reached ({0}); delete an unused monitor first")]
     LimitReached(u64),
     /// D-018: the schedule, with this write, is more than the coordinator can start.
@@ -2327,6 +2391,7 @@ impl ApiError {
             }
             Self::Conflict(_) => "conflict",
             Self::Forbidden(_) => "forbidden",
+            Self::PlanLimit(_) => "plan_limit",
             Self::LimitReached(_) => "limit_reached",
             Self::Capacity(_) => "capacity_exceeded",
             Self::RefusedTarget => "refused_target",
@@ -2345,7 +2410,9 @@ impl ApiError {
             | Self::Invalid(_)
             | Self::RefusedTarget => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::Conflict(_) | Self::LimitReached(_) | Self::Capacity(_) => StatusCode::CONFLICT,
+            Self::Conflict(_) | Self::PlanLimit(_) | Self::LimitReached(_) | Self::Capacity(_) => {
+                StatusCode::CONFLICT
+            }
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

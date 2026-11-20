@@ -908,6 +908,16 @@ async fn a_workspace_cannot_claim_the_whole_probe_budget() -> anyhow::Result<()>
     let (app, _state, db, _tmp) = fixture_with(false, 4).await?;
     let owner = sign_up(&app, "owner@a.example").await;
     let neighbour = sign_up(&app, "neighbour@b.example").await;
+    // The share check needs 15 s monitors — below the free plan's 60 s floor — so
+    // both workspaces run on the operator tier for this test (S3, D-022).
+    for email in ["owner@a.example", "neighbour@b.example"] {
+        let ws = workspace_of(&db, email).await?;
+        db.set_workspace_plan(
+            monitor_domain::WorkspaceId(uuid::Uuid::parse_str(&ws)?),
+            monitor_domain::Plan::Operator,
+        )
+        .await?;
+    }
 
     // interval = timeout = 15 s: each monitor needs (tick + 15)/15 ≈ 1.07 slots.
     // Three fit under a 4-slot share; the fourth makes the workspace need 4.27.
@@ -965,6 +975,195 @@ async fn a_workspace_cannot_claim_the_whole_probe_budget() -> anyhow::Result<()>
         let (status, _, body) = create(&neighbour, &format!("n{n}")).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
     }
+    Ok(())
+}
+
+/// S3 plan tiers (D-022): a signed-up workspace starts `free` — ten monitors and a
+/// 60 s interval floor, enforced on the server at write time with a named refusal.
+/// Only the operator moves a workspace between plans; a tenant can't.
+#[tokio::test]
+async fn a_workspace_s_plan_gates_its_limits() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let owner = sign_up(&app, "plan-owner@a.example").await;
+    let ws = workspace_of(&db, "plan-owner@a.example").await?;
+
+    // The plan rides in the switcher row — a workspace always knows its tier.
+    let (status, _, body) = call(
+        &app,
+        "GET",
+        "/api/workspaces",
+        None,
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspaces"][0]["plan"], "free", "{body}");
+
+    // At the floor a create lands; below it a named 409 refuses.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "at the floor", "url": "https://example.com/a", "interval_s": 60
+        })),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first = body["id"].as_str().expect("monitor id").to_owned();
+
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "below the floor", "url": "https://example.com/b", "interval_s": 59
+        })),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "plan_limit", "{body}");
+
+    // An edit below the floor is refused the same way; one that doesn't touch the
+    // schedule still lands.
+    for (patch, want) in [
+        (serde_json::json!({"interval_s": 30}), StatusCode::CONFLICT),
+        (serde_json::json!({"name": "renamed"}), StatusCode::OK),
+    ] {
+        let (status, _, body) = call(
+            &app,
+            "PATCH",
+            &format!("/api/monitors/{first}"),
+            Some(patch),
+            Some(Cred::Cookie(&owner)),
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(status, want, "{body}");
+        if want == StatusCode::CONFLICT {
+            assert_eq!(body["error"]["code"], "plan_limit", "{body}");
+        }
+    }
+
+    // The plan's count cap: nine more monitors fill the ten; the next is refused.
+    for n in 2..=10 {
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            "/api/monitors",
+            Some(serde_json::json!({
+                "name": format!("m{n}"), "url": "https://example.com/m"
+            })),
+            Some(Cred::Cookie(&owner)),
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "m{n}: {body}");
+    }
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({"name": "over the cap", "url": "https://example.com/over"})),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "limit_reached", "{body}");
+    Ok(())
+}
+
+/// `PATCH /api/workspaces/{id}/plan` is operator work: a member can't lift its own
+/// limits, a nonsense tier is a 422, an unknown workspace a 404 — and once moved,
+/// the operator tier's floors (15 s, the server's count cap) apply to new writes.
+#[tokio::test]
+async fn only_the_operator_moves_a_workspace_between_plans() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let owner = sign_up(&app, "move-owner@a.example").await;
+    let ws = workspace_of(&db, "move-owner@a.example").await?;
+
+    // A below-floor create is refused first, so the upgrade has something to prove.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "too fast", "url": "https://example.com/a", "interval_s": 15
+        })),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "plan_limit", "{body}");
+
+    for (cred, payload, want) in [
+        // A member asking for its own workspace's upgrade is forbidden.
+        (
+            Cred::Cookie(&owner),
+            serde_json::json!({"plan": "operator"}),
+            StatusCode::FORBIDDEN,
+        ),
+        // The operator with a nonsense tier is a 422.
+        (
+            Cred::Bearer(OPERATOR),
+            serde_json::json!({"plan": "gold"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let (status, _, body) = call(
+            &app,
+            "PATCH",
+            &format!("/api/workspaces/{ws}/plan"),
+            Some(payload),
+            Some(cred),
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(status, want, "{body}");
+    }
+    let (status, _, body) = call(
+        &app,
+        "PATCH",
+        "/api/workspaces/00000000-0000-0000-0000-000000000099/plan",
+        Some(serde_json::json!({"plan": "operator"})),
+        Some(Cred::Bearer(OPERATOR)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // The operator's move lands — and the refused write now succeeds (the 15 s
+    // interval is the domain floor's business again, and the count cap the server's).
+    let (status, _, body) = call(
+        &app,
+        "PATCH",
+        &format!("/api/workspaces/{ws}/plan"),
+        Some(serde_json::json!({"plan": "operator"})),
+        Some(Cred::Bearer(OPERATOR)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workspace"]["plan"], "operator", "{body}");
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "fine now", "url": "https://example.com/c", "interval_s": 15
+        })),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     Ok(())
 }
 

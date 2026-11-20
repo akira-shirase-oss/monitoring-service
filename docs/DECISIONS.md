@@ -2,6 +2,23 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-022 — Plan tiers live on the workspace row; limits enforce at write time
+
+`workspaces.plan` is the closed set `free`/`operator` (migration 0015). Signup mints
+`free`; the seeded default workspace is `operator`, so migrating never downgrades
+the maintainer's own monitoring. A plan is a `monitor_domain::Plan` resolved
+server-side on every write that could cross a limit: monitor count and interval
+floor (`409 limit_reached` / `plan_limit`), evidence horizons (a plan-fixed
+`RetentionPolicy`), while `operator` defers to the server's configured ceilings
+(`SMON_MAX_MONITORS`, the 15 s domain floor, `SMON_RETENTION_*`). Retention reads
+each workspace's resolved cutoffs per pass — a `free` workspace's rows expire on
+the free clocks while an `operator` workspace's same-age rows are kept — and every
+delete stays bounded per batch (D-012), sessions included. Only the operator moves
+a workspace between plans (`PATCH /api/workspaces/{id}/plan`); a downgrade changes
+what the next write may do, never pauses or deletes what already runs. Every
+number on the free tier is provisional until droplet measurements exist.
+Closes SAAS_PLAN open question 4.
+
 ## D-021 — Public status pages live at `/s/<workspace-slug>` on the same origin
 
 One page per workspace, served from the monitor's own origin — no wildcard DNS, no

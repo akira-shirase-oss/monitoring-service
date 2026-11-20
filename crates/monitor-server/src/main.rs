@@ -500,9 +500,11 @@ fn spawn_snapshot(
 }
 
 /// Retention (M4.1, D-012): one pass every `SMON_RETENTION_INTERVAL_S` (default hourly)
-/// through the single writer — raw checks past `SMON_RETENTION_S` roll into daily
-/// aggregates (an open incident keeps only its birth streak raw), then old aggregates,
-/// resolved incidents, ended windows and delivered outbox rows are pruned per the policy.
+/// through the single writer — raw checks past their workspace's own horizon roll into
+/// daily aggregates (an open incident keeps only its birth streak raw), then old
+/// aggregates, resolved incidents, ended windows and delivered outbox rows are pruned.
+/// Each workspace ages on its plan's policy (S3, D-022): `free` sheds evidence earlier,
+/// `operator` keeps the configured `SMON_RETENTION_*` horizons.
 fn spawn_retention(
     config: &Config,
     db: &monitor_db::Db,
@@ -532,8 +534,10 @@ fn spawn_retention(
                 _ = ticks.tick() => {}
                 () = shutdown.cancelled() => return,
             }
-            let cutoffs = policy.cutoffs(time::OffsetDateTime::now_utc());
-            let pass = writer.retain(cutoffs).await;
+            let pass = match workspace_cutoffs(&db, &policy).await {
+                Ok(cutoffs) => writer.retain(&cutoffs).await,
+                Err(error) => Err(error),
+            };
             // A failing pass degrades the monitor (D-011) until a pass succeeds again; the
             // error is logged there, and `faults` gets a fixed cause (it is public).
             vitals.retention_outcome(pass.as_ref().map(|_| ()));
@@ -559,14 +563,60 @@ fn spawn_retention(
                 Ok(_) | Err(_) => {}
             }
             // Expired dashboard sessions are the same class of garbage: honest expiry
-            // needs no lazy-lookup to be correct, it just keeps the table small.
-            match db.sweep_expired_sessions().await {
-                Ok(n) if n > 0 => tracing::debug!(sessions = n, "swept expired sessions"),
-                Ok(_) => {}
-                Err(error) => tracing::error!(%error, "session sweep failed"),
+            // needs no lazy-lookup to be correct, it just keeps the table small. The
+            // sweep is bounded per call (D-012) — a backlog clears across iterations,
+            // never in one long delete.
+            let mut swept = 0;
+            loop {
+                match db.sweep_expired_sessions(SESSION_SWEEP_BATCH).await {
+                    Ok(n) => {
+                        swept += n;
+                        if n < u64::from(SESSION_SWEEP_BATCH) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "session sweep failed");
+                        break;
+                    }
+                }
+            }
+            if swept > 0 {
+                tracing::debug!(sessions = swept, "swept expired sessions");
             }
         }
     })
+}
+
+/// Sessions a single sweep call may delete — the same "bounded per batch" rule the
+/// rest of retention follows, so a backlog never holds a lock long.
+const SESSION_SWEEP_BATCH: u32 = 500;
+
+/// The per-workspace expiry instants for one pass (S3, D-022): each workspace's plan
+/// resolves to a policy (`for_plan`), and a workspace with an unreadable id or plan
+/// fails the whole pass — guessing a tenant's horizon is worse than keeping data.
+async fn workspace_cutoffs(
+    db: &monitor_db::Db,
+    configured: &monitor_db::RetentionPolicy,
+) -> Result<
+    Vec<(monitor_domain::WorkspaceId, monitor_db::RetentionCutoffs)>,
+    monitor_db::writer::WriterError,
+> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut cutoffs = Vec::new();
+    for row in db.list_workspaces().await? {
+        let workspace = uuid::Uuid::parse_str(&row.id)
+            .map(monitor_domain::WorkspaceId)
+            .map_err(|_| monitor_db::QueryError::Corrupt(format!("workspace id {:?}", row.id)))?;
+        let plan = monitor_domain::Plan::parse(&row.plan).ok_or_else(|| {
+            monitor_db::QueryError::Corrupt(format!("unreadable plan {:?}", row.plan))
+        })?;
+        cutoffs.push((
+            workspace,
+            monitor_db::RetentionPolicy::for_plan(plan, configured).cutoffs(now),
+        ));
+    }
+    Ok(cutoffs)
 }
 
 /// API-token last-used stamps (S1c): the auth path records them in `state.token_use`;

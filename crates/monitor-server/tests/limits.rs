@@ -79,7 +79,7 @@ async fn an_oversized_login_is_413_before_parsing_and_creates_no_session() -> an
         );
         assert!(response.headers().get("set-cookie").is_none());
     }
-    assert_eq!(db.sweep_expired_sessions().await?, 0, "no session row");
+    assert_eq!(db.sweep_expired_sessions(100).await?, 0, "no session row");
 
     // Control: the same token with padding under the limit logs in — the padding is not
     // what refused the big one.
@@ -94,7 +94,7 @@ async fn an_oversized_login_is_413_before_parsing_and_creates_no_session() -> an
         .await?;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        db.sweep_expired_sessions().await?,
+        db.sweep_expired_sessions(100).await?,
         1,
         "the control made one"
     );
@@ -153,7 +153,7 @@ async fn a_request_whose_body_never_finishes_is_408_at_the_deadline() -> anyhow:
         "answered after {waited:?}, expected the 10 s deadline"
     );
     tokio::time::resume();
-    assert_eq!(db.sweep_expired_sessions().await?, 0, "no session row");
+    assert_eq!(db.sweep_expired_sessions(100).await?, 0, "no session row");
     Ok(())
 }
 
@@ -203,7 +203,7 @@ async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Res
         login_from(&app, OWNER, TOKEN).await?.0,
         StatusCode::NO_CONTENT
     );
-    assert_eq!(db.sweep_expired_sessions().await?, 1);
+    assert_eq!(db.sweep_expired_sessions(100).await?, 1);
     Ok(())
 }
 

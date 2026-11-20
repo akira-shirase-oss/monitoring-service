@@ -39,7 +39,18 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `capacity_exceeded` (409) when the workspace's *own* unpaused schedule would need
   more than `MAX_WORKSPACE_SLOTS` (= `MAX_GLOBAL_SLOTS` / 4 = 128) probes in
   flight — one tenant's schedule can't silently crowd the engine; pausing frees
-  the share. The per-workspace monitor-count cap remains `SMON_MAX_MONITORS`.
+  the share.
+- **Plan tiers (S3, D-022):** `workspaces.plan` is `free` (signup's default) or
+  `operator`; `PATCH /api/workspaces/{id}/plan` moves a workspace — operator-only
+  (a tenant gets 403 trying to lift its own limits). Free is provisionally
+  10 monitors and a 60 s interval floor: a create below the floor, or an edit
+  proposing one, is refused 409 `plan_limit`; the eleventh monitor is 409
+  `limit_reached` on the plan cap. `operator` defers to the server's ceilings —
+  the 15 s domain floor, `SMON_MAX_MONITORS` — and to the configured
+  `SMON_RETENTION_*` horizons, while `free` sheds evidence on shorter plan-fixed
+  ones (2 d checks / 90 d aggregates+incidents / 7 d delivered outbox). Floors
+  gate writes only: downgrading a workspace never pauses or deletes what runs.
+  `GET /api/workspaces` rows carry `plan`.
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
 - **Auth (M5.1 + M7.2, live):** every `/api/**` route requires a credential —
