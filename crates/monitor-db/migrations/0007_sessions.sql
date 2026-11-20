@@ -1,5 +1,5 @@
 -- Dashboard sessions (M7.2): server-side session rows behind the HttpOnly
--- `smon_session` cookie. The store is the authority — sessions survive restarts and
+-- `__Host-smon_session` cookie. The store is the authority — sessions survive restarts and
 -- expire on their own timestamp, never on a client claim.
 CREATE TABLE sessions (
     id         TEXT PRIMARY KEY,

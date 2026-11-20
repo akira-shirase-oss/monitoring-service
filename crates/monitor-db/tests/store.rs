@@ -2374,3 +2374,30 @@ async fn the_session_sweep_deletes_in_bounded_batches() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// S3-8: a plan's horizons are a *ceiling*, not an override — `for_plan` takes the
+/// field-wise minimum of the plan's retention and the operator's configured
+/// ceilings, so a configured value shorter than the free plan's still wins, and
+/// the operator tier keeps the configured policy whole.
+#[test]
+fn plan_retention_never_exceeds_the_operator_ceiling() {
+    let configured = RetentionPolicy {
+        checks: std::time::Duration::from_secs(3_600), // under free's 2 d
+        aggregates: std::time::Duration::from_hours(9_600), // over free's 90 d
+        incidents: std::time::Duration::from_hours(9_600), // over free's 90 d
+        delivered_outbox: std::time::Duration::from_secs(3_600), // under free's 7 d
+    };
+    let free = RetentionPolicy::for_plan(monitor_domain::Plan::Free, &configured);
+    let free_fixed = monitor_domain::Plan::Free
+        .limits()
+        .retention
+        .expect("the free tier fixes horizons");
+    // Shorter configured values win; longer ones clamp to the plan's own horizon.
+    assert_eq!(free.checks, configured.checks);
+    assert_eq!(free.delivered_outbox, configured.delivered_outbox);
+    assert_eq!(free.aggregates, free_fixed.aggregates);
+    assert_eq!(free.incidents, free_fixed.incidents);
+    // The operator tier defers entirely: configured is the whole policy.
+    let operator = RetentionPolicy::for_plan(monitor_domain::Plan::Operator, &configured);
+    assert_eq!(operator, configured);
+}

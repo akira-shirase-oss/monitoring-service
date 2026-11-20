@@ -23,6 +23,10 @@ pub use writer::{
     Observation, SharedStatuses, WriteHealth, WriteOutcome, WriterError, WriterHandle,
 };
 
+/// How long an unaccepted workspace invitation lives (S2-4): long enough for a
+/// real person to find it, short enough that a forgotten ask can't seat later.
+const INVITATION_TTL: time::Duration = time::Duration::hours(72);
+
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error("invalid database URL: {0}")]
@@ -162,15 +166,15 @@ impl Default for RetentionPolicy {
 
 impl RetentionPolicy {
     /// The policy one workspace's plan resolves to (S3, D-022): a plan that fixes its
-    /// own horizons uses them; one that defers (`operator`) keeps the configured policy.
-    /// Plans can only ever shed evidence earlier than the server, never keep it longer —
-    /// the free tier's constants are all below the defaults.
+    /// own horizons uses them *bounded by the configured ceilings* — a plan may shed
+    /// earlier than the server's policy, never keep longer. One that defers
+    /// (`operator`) keeps the configured policy whole.
     pub fn for_plan(plan: Plan, configured: &Self) -> Self {
         plan.limits().retention.map_or(*configured, |plan| Self {
-            checks: plan.checks,
-            aggregates: plan.aggregates,
-            incidents: plan.incidents,
-            delivered_outbox: plan.delivered_outbox,
+            checks: plan.checks.min(configured.checks),
+            aggregates: plan.aggregates.min(configured.aggregates),
+            incidents: plan.incidents.min(configured.incidents),
+            delivered_outbox: plan.delivered_outbox.min(configured.delivered_outbox),
         })
     }
 
@@ -710,6 +714,91 @@ impl Db {
         })
     }
 
+    /// Every invitation addressed to `account`'s own stored email (S2-4). The match
+    /// is on the account's email, so an invitation sent to a mistyped address can
+    /// never be claimed by whoever it bounced to.
+    pub async fn invitations_for_account(
+        &self,
+        account: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<Vec<PendingInvitation>, QueryError> {
+        sqlx::query_as::<_, PendingInvitation>(
+            "SELECT i.id, i.workspace_id, w.name AS workspace_name, i.role, i.created_at
+               FROM workspace_invitations i
+               JOIN accounts a ON lower(a.email) = lower(i.email)
+               JOIN workspaces w ON w.id = i.workspace_id
+              WHERE a.id = ? AND i.expires_at > ? ORDER BY i.created_at",
+        )
+        .bind(account.0.to_string())
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Accept an invitation — only ever one addressed to `account`'s email, and the
+    /// seat it grants is the invitation's stored role, not anything the request
+    /// asked for. `Some(role)` = seated; `None` = no such invitation or it was
+    /// addressed to someone else — the answer stays uniform (S2-4). Already-seated
+    /// is success too: the acceptance is idempotent and the invitation still clears.
+    pub async fn accept_invitation(
+        &self,
+        id: &str,
+        account: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<Option<String>, QueryError> {
+        let mut tx = self.pool.begin().await?;
+        let invitation = sqlx::query_as::<_, (String, String)>(
+            "SELECT i.workspace_id, i.role FROM workspace_invitations i
+               JOIN accounts a ON lower(a.email) = lower(i.email)
+              WHERE i.id = ? AND a.id = ? AND i.expires_at > ?",
+        )
+        .bind(id)
+        .bind(account.0.to_string())
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workspace, role)) = invitation else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO members (workspace_id, account_id, role, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&workspace)
+        .bind(account.0.to_string())
+        .bind(&role)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM workspace_invitations WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(role))
+    }
+
+    /// Decline an invitation — same addressing rule as accept: only one addressed to
+    /// `account`'s email may be touched. `bool` = it was there (S2-4).
+    pub async fn decline_invitation(
+        &self,
+        id: &str,
+        account: AccountId,
+    ) -> Result<bool, QueryError> {
+        let gone = sqlx::query(
+            "DELETE FROM workspace_invitations
+              WHERE id = ?
+                AND lower(email) IN (SELECT lower(email) FROM accounts WHERE id = ?)",
+        )
+        .bind(id)
+        .bind(account.0.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(gone > 0)
+    }
+
     /// An account row by its normalized email — the sign-in lookup. `password_hash` is
     /// the argon2id PHC string; it never leaves the store's caller.
     pub async fn account_by_email(&self, email: &str) -> Result<Option<AccountRow>, QueryError> {
@@ -909,7 +998,8 @@ impl Db {
             .map_err(|_| QueryError::Corrupt(format!("workspace id {:?}", row.id)))?;
         let monitors = sqlx::query_as::<_, StatusMonitorRow>(
             "SELECT sm.monitor_id, m.name, sm.position
-               FROM status_monitors sm JOIN monitors m ON m.id = sm.monitor_id
+               FROM status_monitors sm JOIN monitors m
+                 ON m.id = sm.monitor_id AND m.workspace_id = sm.workspace_id
               WHERE sm.workspace_id = ? ORDER BY sm.position, m.name",
         )
         .bind(&row.id)
@@ -2147,6 +2237,26 @@ pub struct NewAccount {
     pub password_hash: String,
 }
 
+/// A pending invitation as the inviting workspace's owner sees it (S2-4).
+#[derive(Debug, FromRow)]
+pub struct InvitationRow {
+    pub id: String,
+    pub email: String,
+    pub role: String,
+    pub created_at: String,
+}
+
+/// A pending invitation as the invitee sees it: the workspace's name, never more of
+/// the inviter's side than the seat being offered needs (S2-4).
+#[derive(Debug, FromRow)]
+pub struct PendingInvitation {
+    pub id: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub role: String,
+    pub created_at: String,
+}
+
 /// One `members` row joined to its account's email — the roster the API lists (S1c).
 /// `role()` parses the stored role; an unreadable one is corruption, not a viewer.
 #[derive(Debug, FromRow)]
@@ -2346,7 +2456,8 @@ impl ViewerDb<'_> {
         .await?;
         let monitors = sqlx::query_as::<_, StatusMonitorRow>(
             "SELECT sm.monitor_id, m.name, sm.position
-               FROM status_monitors sm JOIN monitors m ON m.id = sm.monitor_id
+               FROM status_monitors sm JOIN monitors m
+                 ON m.id = sm.monitor_id AND m.workspace_id = sm.workspace_id
               WHERE sm.workspace_id = ? ORDER BY sm.position, m.name",
         )
         .bind(self.view.workspace.0.to_string())
@@ -2505,15 +2616,44 @@ impl MemberDb<'_> {
         let ws = &self.view.view;
         let mut tx = ws.db.pool.begin().await?;
         if let Some(slug) = slug {
+            // Held slugs count as taken — except ones this workspace itself released,
+            // which it may pick back up (S2 review).
             let taken = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM workspaces WHERE slug = ? AND id != ?",
+                "SELECT (SELECT COUNT(*) FROM workspaces WHERE slug = ? AND id != ?)
+                      + (SELECT COUNT(*) FROM status_held_slugs
+                          WHERE slug = ? AND workspace_id != ?)",
             )
+            .bind(slug)
+            .bind(ws.workspace.0.to_string())
             .bind(slug)
             .bind(ws.workspace.0.to_string())
             .fetch_one(&mut *tx)
             .await?;
             if taken > 0 {
                 return Err(QueryError::Conflict("that slug is already taken".into()));
+            }
+            // The name being left behind stays held by this workspace — another
+            // tenant can never serve their page under a name readers associate with
+            // the previous owner's.
+            let released =
+                sqlx::query_scalar::<_, String>("SELECT slug FROM workspaces WHERE id = ?")
+                    .bind(ws.workspace.0.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if released != slug {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO status_held_slugs (slug, workspace_id, released_at)
+                     VALUES (?, ?, ?)",
+                )
+                .bind(&released)
+                .bind(ws.workspace.0.to_string())
+                .bind(
+                    OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|e| QueryError::Corrupt(format!("released_at: {e}")))?,
+                )
+                .execute(&mut *tx)
+                .await?;
             }
             sqlx::query("UPDATE workspaces SET slug = ? WHERE id = ?")
                 .bind(slug)
@@ -2601,6 +2741,62 @@ impl OwnerDb<'_> {
             QueryError::Sql(e)
         })?;
         Ok(())
+    }
+
+    /// Record an invitation for `email` at `role` (S2-4): the seat is earned by the
+    /// invitee's acceptance — this only ever queues one. Re-inviting the same
+    /// address refreshes the pending row, which is what lets the handler's answer
+    /// stay uniform. An invitation can never carry `owner` — ownership is granted
+    /// by `set_member_role` on a seated member, never by consent of the inviter alone.
+    pub async fn invite_member(
+        &self,
+        email: &str,
+        role: Role,
+        invited_by: &str,
+    ) -> Result<(), QueryError> {
+        if role == Role::Owner {
+            return Err(QueryError::Invalid(
+                "an invitation can grant member or viewer, never owner".into(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        sqlx::query(
+            "INSERT INTO workspace_invitations
+                 (id, workspace_id, email, role, invited_by, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workspace_id, email)
+             DO UPDATE SET role = excluded.role,
+                           invited_by = excluded.invited_by,
+                           created_at = excluded.created_at,
+                           expires_at = excluded.expires_at",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(self.view.view.view.workspace.0.to_string())
+        .bind(email)
+        .bind(role.as_str())
+        .bind(invited_by)
+        .bind(now)
+        .bind(now + INVITATION_TTL)
+        .execute(&self.view.view.view.db.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// This workspace's pending invitations, oldest first — owner visibility, so a
+    /// roster read shows who has been asked but not yet seated (S2-4).
+    pub async fn list_invitations(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Vec<InvitationRow>, QueryError> {
+        sqlx::query_as::<_, InvitationRow>(
+            "SELECT id, email, role, created_at FROM workspace_invitations
+              WHERE workspace_id = ? AND expires_at > ? ORDER BY created_at",
+        )
+        .bind(self.view.view.view.workspace.0.to_string())
+        .bind(now)
+        .fetch_all(&self.view.view.view.db.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Change `account`'s role. The last-owner rule is enforced inside the
