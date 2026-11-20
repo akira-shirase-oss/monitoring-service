@@ -50,6 +50,9 @@ async fn fixture_with_wait(password_work_wait: Duration) -> anyhow::Result<Fixtu
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -96,7 +99,7 @@ async fn call_from(
         None => Body::empty(),
     };
     if let Some(cookie) = cookie {
-        request = request.header(header::COOKIE, format!("smon_session={cookie}"));
+        request = request.header(header::COOKIE, format!("__Host-smon_session={cookie}"));
     }
     let mut request = request.body(payload).unwrap();
     if let Some(peer) = peer {
@@ -123,8 +126,8 @@ fn set_cookie(headers: &axum::http::HeaderMap) -> String {
         .to_str()
         .expect("cookie header is text")
         .to_owned();
-    raw.strip_prefix("smon_session=")
-        .expect("the smon_session cookie")
+    raw.strip_prefix("__Host-smon_session=")
+        .expect("the __Host-smon_session cookie")
         .split(';')
         .next()
         .expect("cookie id")

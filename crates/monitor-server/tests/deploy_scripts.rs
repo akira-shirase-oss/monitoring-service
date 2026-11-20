@@ -89,6 +89,39 @@ fn the_deploy_scripts_carry_their_promised_properties() {
     for pin in ["--db-version", "_sqlx_migrations", "success = 1", "CLOSED"] {
         assert!(guard.contains(pin), "schema-guard.sh is missing '{pin}'");
     }
+
+    // S3-9: nothing a local user can read via `ps`/proc ever carries a credential,
+    // and every fetched trust root is pinned by its own fingerprint before use.
+    let backup = read("smon-backup.sh");
+    assert!(
+        backup.contains("-H \"@") || backup.contains("--header \"@"),
+        "the admin Bearer token must travel in a header *file*, never argv"
+    );
+    assert!(
+        !backup.contains("Bearer $token\"") && !backup.contains("Bearer ${token}"),
+        "the Bearer token must not be an argv fragment"
+    );
+    assert!(
+        backup.contains("mktemp") && backup.contains("trap"),
+        "the header file is temporary and cleaned up"
+    );
+    for pin in [
+        "65760C51EDEA2017CEA2CA15155B6D79CA56EA34", // caddy repo key, by fingerprint
+        "9A1AC2B4BE15F9F27EEE20A734CBA4E9898F61001B3BD7C84B69B56A3E25A2B9", // CF origin-pull CA, DER sha256
+        "--show-keys --with-fingerprint", // key checked before dearmor
+        "openssl x509",                   // CA checked before install
+    ] {
+        assert!(install.contains(pin), "install.sh is missing '{pin}'");
+    }
+
+    // S2-1: the edge forwards the visitor's address — without it every Cloudflare
+    // edge IP would share one anonymous-read bucket.
+    let caddyfile = read("Caddyfile");
+    assert!(
+        caddyfile.contains("header_up X-Forwarded-For {client_ip}")
+            && caddyfile.contains("trusted_proxies"),
+        "the Caddyfile must forward {{client_ip}} through the trusted CF proxies"
+    );
 }
 
 #[test]

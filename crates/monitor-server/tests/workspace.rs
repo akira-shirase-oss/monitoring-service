@@ -50,6 +50,9 @@ async fn fixture_with(lab: bool, workspace_slots: usize) -> anyhow::Result<Fixtu
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -87,7 +90,7 @@ async fn call(
         }
         Some(Cred::Cookie(cookie)) => {
             request = request
-                .header(header::COOKIE, format!("smon_session={cookie}"))
+                .header(header::COOKIE, format!("__Host-smon_session={cookie}"))
                 .header(header::HOST, "api.test")
                 .header(header::ORIGIN, "http://api.test");
         }
@@ -190,8 +193,8 @@ async fn sign_up(app: &axum::Router, email: &str) -> String {
         .to_str()
         .expect("cookie header is text")
         .to_owned();
-    raw.strip_prefix("smon_session=")
-        .expect("the smon_session cookie")
+    raw.strip_prefix("__Host-smon_session=")
+        .expect("the __Host-smon_session cookie")
         .split(';')
         .next()
         .expect("cookie id")
@@ -212,22 +215,58 @@ async fn roster(app: &axum::Router) -> anyhow::Result<(String, String, String)> 
     let owner = sign_up(app, "owner@a.example").await;
     let member = sign_up(app, "member@b.example").await;
     let viewer = sign_up(app, "viewer@c.example").await;
-    for (email, role) in [
-        ("member@b.example", "member"),
-        ("viewer@c.example", "viewer"),
+    for (invitee, email, role) in [
+        (&member, "member@b.example", "member"),
+        (&viewer, "viewer@c.example", "viewer"),
     ] {
-        let (status, _, body) = call(
-            app,
-            "POST",
-            "/api/members",
-            Some(serde_json::json!({"email": email, "role": role})),
-            Some(Cred::Cookie(&owner)),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "{role}: {body}");
+        seat(app, &owner, invitee, email, role).await;
     }
     Ok((owner, member, viewer))
+}
+
+/// The S2-4 seat: the owner invites (a uniform 202 either way), the invitee finds the
+/// invitation addressed to them and accepts it — the seat exists only after consent.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: the invitation was just sent"
+)]
+async fn seat(app: &axum::Router, owner: &str, invitee: &str, email: &str, role: &str) {
+    let (status, _, body) = call(
+        app,
+        "POST",
+        "/api/members",
+        Some(serde_json::json!({"email": email, "role": role})),
+        Some(Cred::Cookie(owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{role}: {body}");
+    let (status, _, body) = call(
+        app,
+        "GET",
+        "/api/invitations",
+        None,
+        Some(Cred::Cookie(invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["invitations"]
+        .as_array()
+        .and_then(|all| all.last())
+        .and_then(|invite| invite["id"].as_str())
+        .expect("an invitation is pending")
+        .to_owned();
+    let (status, _, body) = call(
+        app,
+        "POST",
+        &format!("/api/invitations/{id}/accept"),
+        None,
+        Some(Cred::Cookie(invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "accept: {body}");
 }
 
 /// Lowercase hex — the `x-smon-signature` encoding the receiver verifies.
@@ -724,8 +763,8 @@ async fn public_status_page_serves_the_beat_or_unavailable() -> anyhow::Result<(
         assert_eq!(body["error"]["code"], "not_found", "{body}");
     }
 
-    // Page off: the next beat removes the file and the route is 404 — never
-    // last-known data dressed as current.
+    // Page off: the PUT itself removes the workspace's file — never last-known data
+    // dressed as current, even for the beat's whole interval.
     let (status, _, _) = call(
         &app,
         "PUT",
@@ -736,12 +775,15 @@ async fn public_status_page_serves_the_beat_or_unavailable() -> anyhow::Result<(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert!(
+        !state.status_dir.join(format!("s/{ws}.json")).exists(),
+        "the snapshot dies with the page, not with the next beat"
+    );
     monitor_server::snapshot::write_beat(&db, &state.statuses, &config, true).await?;
-    assert!(!state.status_dir.join("s/acme-status.json").exists());
+    assert!(!state.status_dir.join(format!("s/{ws}.json")).exists());
     let (status, _, body) = call(&app, "GET", "/s/acme-status/status.json", None, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
-    let _ = ws;
     Ok(())
 }
 
@@ -1198,4 +1240,511 @@ async fn receiver() -> (String, mpsc::Receiver<(HeaderMap, Vec<u8>)>) {
         let _ = axum::serve(listener, app).await;
     });
     (format!("http://127.0.0.1:{port}/"), rx)
+}
+
+/// S2-1: the public page's anonymous budget is its own bucket — a viewer loop can
+/// spend the whole read allowance and sign-in's credential check is untouched.
+#[tokio::test]
+async fn public_reads_spend_their_own_budget() -> anyhow::Result<()> {
+    let (app, _state, _db, _tmp) = fixture(true).await?;
+    let _owner = sign_up(&app, "owner@a.example").await;
+    for _ in 0..30 {
+        let (status, _, _) =
+            call(&app, "GET", "/s/no-such-page/status.json", None, None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    // The 31st read is refused — by the read budget, with a wait hint.
+    let (status, headers, body) =
+        call(&app, "GET", "/s/no-such-page/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "too_many_requests", "{body}");
+    assert!(headers.get(header::RETRY_AFTER).is_some());
+    // And the credential path's separate bucket is full: sign-in still runs its
+    // password check and answers honestly — the read loop never spent it.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/login",
+        Some(serde_json::json!({"email": "owner@a.example", "password": PASSWORD})),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    Ok(())
+}
+
+/// S2-1, the other direction: burning the credential budget must not starve the
+/// public page's viewers — the two budgets never share a token.
+#[tokio::test]
+async fn credential_guessing_never_starves_public_reads() -> anyhow::Result<()> {
+    let (app, _state, _db, _tmp) = fixture(true).await?;
+    // Burn the credential bucket until it refuses — argon verification takes long
+    // enough that tokens refill along the way, so the loop drives to the 429.
+    let mut refused = false;
+    for _ in 0..20 {
+        let (status, _, _) = call(
+            &app,
+            "POST",
+            "/api/login",
+            Some(serde_json::json!({"email": "owner@a.example", "password": "wrong"})),
+            None,
+            None,
+        )
+        .await;
+        refused |= status == StatusCode::TOO_MANY_REQUESTS;
+        if refused {
+            break;
+        }
+    }
+    assert!(refused, "the credential budget never refused a guess loop");
+    // The credential bucket is empty — the read budget is untouched.
+    let (status, _, _) = call(&app, "GET", "/s/no-such-page/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// S2-2: monitor mutations carry a per-workspace write budget — one tenant's loop
+/// gets its own 429 + Retry-After; nobody else's writes queue behind it.
+#[tokio::test]
+async fn monitor_writes_are_bounded_per_workspace() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(true).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let ws = workspace_of(&db, "owner@a.example").await?;
+    // Operator tier: this test measures the write budget, not the free count cap.
+    db.set_workspace_plan(
+        WorkspaceId(uuid::Uuid::parse_str(&ws)?),
+        monitor_domain::Plan::Operator,
+    )
+    .await?;
+    for i in 0..12 {
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            "/api/monitors",
+            Some(serde_json::json!({
+                "name": format!("m{i}"), "url": "http://127.0.0.1:9/", "interval_s": 60,
+            })),
+            Some(Cred::Cookie(&owner)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create {i}: {body}");
+    }
+    let (status, headers, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "over", "url": "http://127.0.0.1:9/", "interval_s": 60,
+        })),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "too_many_requests", "{body}");
+    assert!(headers.get(header::RETRY_AFTER).is_some());
+    // Another workspace's budget is its own — writes don't queue behind a hot tenant.
+    let other = sign_up(&app, "other@b.example").await;
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "fine", "url": "http://127.0.0.1:9/", "interval_s": 60,
+        })),
+        Some(Cred::Cookie(&other)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    Ok(())
+}
+
+/// S2-3: capacity refuses *added* load only — an origin one tenant already pushed
+/// over doesn't block an unrelated workspace's write, a pause is never refused,
+/// and the refusal never names another tenant's target.
+#[tokio::test]
+async fn capacity_refuses_only_the_added_load() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let other = sign_up(&app, "other@b.example").await;
+    let (ws, other_ws) = (
+        workspace_of(&db, "owner@a.example").await?,
+        workspace_of(&db, "other@b.example").await?,
+    );
+    // Operator tier for 15 s probes on both.
+    for id in [&ws, &other_ws] {
+        db.set_workspace_plan(
+            WorkspaceId(uuid::Uuid::parse_str(id)?),
+            monitor_domain::Plan::Operator,
+        )
+        .await?;
+    }
+    // The per-origin bound is *starts per tick* (2/s at the 1 s tick): 31 unpaused
+    // 15 s probes on one origin need 31/15 ≈ 2.07 starts/tick — already over.
+    let ws_id = WorkspaceId(uuid::Uuid::parse_str(&ws)?);
+    let mut seeded = Vec::new();
+    for i in 0..31 {
+        let monitor = monitor_domain::NewMonitor::with_schedule(
+            format!("s{i}"),
+            url::Url::parse("https://shared.example/")?,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+        )?
+        .into_monitor_for(ws_id);
+        seeded.push(monitor.id);
+        db.workspace(ws_id).insert_monitor(&monitor).await?;
+    }
+    // An unrelated tenant's write — a different origin entirely — is its own
+    // business: the overloaded origin must not refuse it.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "fine", "url": "https://elsewhere.example/", "interval_s": 15,
+        })),
+        Some(Cred::Cookie(&other)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // The write that *adds* to the overloaded origin is the one refused.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "more", "url": "https://shared.example/more", "interval_s": 15,
+        })),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded", "{body}");
+    // Privacy: the refusal carries numbers, never another tenant's target name.
+    assert!(!body.to_string().contains("shared.example"), "{body}");
+    // And a pause only ever frees — it lands even while the origin is over.
+    let (status, _, body) = call(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{}", seeded[0].0),
+        Some(serde_json::json!({"paused": true})),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a pause is never capacity-refused: {body}"
+    );
+    Ok(())
+}
+
+/// POST /api/members — every ask answers the same 202 envelope, whatever the
+/// address turns out to be (S2-4).
+async fn invite(app: &axum::Router, owner: &str, email: &str, role: &str) {
+    let (status, _, body) = call(
+        app,
+        "POST",
+        "/api/members",
+        Some(serde_json::json!({"email": email, "role": role})),
+        Some(Cred::Cookie(owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{email}: {body}");
+    assert_eq!(body["invited"], true, "{email}: {body}");
+}
+
+/// The pending invitation the account was addressed (S2-4).
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: the invitation was just sent"
+)]
+async fn pending_id(app: &axum::Router, cookie: &str) -> String {
+    let (_, _, body) = call(
+        app,
+        "GET",
+        "/api/invitations",
+        None,
+        Some(Cred::Cookie(cookie)),
+        None,
+    )
+    .await;
+    body["invitations"][0]["id"]
+        .as_str()
+        .expect("a pending invitation")
+        .to_owned()
+}
+
+/// S2-4: a seat is an invitation the invitee accepts — known, unknown and
+/// already-asked emails all answer the same 202, and nothing seats before
+/// consent.
+#[tokio::test]
+async fn invitations_are_uniform_until_the_invitee_accepts() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let invitee = sign_up(&app, "member@b.example").await;
+    let stranger = sign_up(&app, "s@d.example").await;
+    let ws = workspace_of(&db, "owner@a.example").await?;
+
+    // Known, unknown and duplicate emails all answer identically — the response
+    // never says whether the account exists.
+    for email in ["member@b.example", "ghost@e.example", "member@b.example"] {
+        invite(&app, &owner, email, "member").await;
+    }
+    // And nothing seats: the invitee's switcher still lists only its own workspace.
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/api/workspaces",
+        None,
+        Some(Cred::Cookie(&invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        body["workspaces"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+
+    // The owner sees two pendings — member@b deduped by re-invite, ghost waiting
+    // for its account to exist; the invitee sees theirs addressed to them.
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/api/members/invitations",
+        None,
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(body["invitations"].as_array().map(Vec::len), Some(2));
+    let id = pending_id(&app, &invitee).await;
+    // Only the invitee can accept: a stranger's accept answers the same 404.
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        &format!("/api/invitations/{id}/accept"),
+        None,
+        Some(Cred::Cookie(&stranger)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Consent: the seat exists only now, at the invited role — and the
+    // invitation is single-use: a second accept is the same 404 as a stranger's.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        &format!("/api/invitations/{id}/accept"),
+        None,
+        Some(Cred::Cookie(&invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/api/workspaces",
+        None,
+        Some(Cred::Cookie(&invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        body["workspaces"].as_array().map(Vec::len),
+        Some(2),
+        "{body}"
+    );
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        &format!("/api/invitations/{id}/accept"),
+        None,
+        Some(Cred::Cookie(&invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// S2-4: a declined invitation is gone for good, owner is never an invitable
+/// role, and the endpoint is write-budgeted like every other mutation.
+#[tokio::test]
+async fn invitations_decline_and_the_asking_is_bounded() -> anyhow::Result<()> {
+    let (app, _state, _db, _tmp) = fixture(false).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let declinee = sign_up(&app, "declinee@f.example").await;
+    invite(&app, &owner, "declinee@f.example", "viewer").await;
+    let did = pending_id(&app, &declinee).await;
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        &format!("/api/invitations/{did}/decline"),
+        None,
+        Some(Cred::Cookie(&declinee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/api/invitations",
+        None,
+        Some(Cred::Cookie(&declinee)),
+        None,
+    )
+    .await;
+    assert_eq!(body["invitations"].as_array().map(Vec::len), Some(0));
+
+    // Only member/viewer roles can ever be invited — an owner seat needs a
+    // promotion after consent, never a mailed crown.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/members",
+        Some(serde_json::json!({"email": "x@g.example", "role": "owner"})),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // The budget paces the asking itself — four more spends exhaust it and the
+    // next invite is paced with a Retry-After, whether or not the email exists.
+    for _ in 0..4 {
+        invite(&app, &owner, "y@h.example", "viewer").await;
+    }
+    let (status, headers, body) = call(
+        &app,
+        "POST",
+        "/api/members",
+        Some(serde_json::json!({"email": "z@i.example", "role": "viewer"})),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(headers.get(header::RETRY_AFTER).is_some());
+    Ok(())
+}
+
+/// S3-5: renaming the page releases the old name to nobody — it stops answering
+/// the instant the PUT lands (the file is the workspace's, the slug only its
+/// current name), and another workspace can never claim the name it held.
+#[tokio::test]
+async fn a_renamed_slug_serves_the_new_name_only() -> anyhow::Result<()> {
+    let (app, state, db, _tmp) = fixture(true).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let mon = monitor(&app, &owner, "api").await;
+    let ws = workspace_of(&db, "owner@a.example").await?;
+    for slug in ["old-slug", "new-slug"] {
+        let (status, _, body) = call(
+            &app,
+            "PUT",
+            "/api/workspace/status-page",
+            Some(serde_json::json!({
+                "slug": slug, "title": "Acme", "monitor_ids": [&mon],
+            })),
+            Some(Cred::Cookie(&owner)),
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{slug}: {body}");
+    }
+    // The old name answers 404 the moment it is renamed — no stale file, no stale
+    // cache entry — while the workspace's file serves under the new name.
+    let (status, _, _) = call(&app, "GET", "/s/old-slug/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let config = monitor_server::snapshot::Config {
+        dir: state.status_dir.clone(),
+        interval: Duration::from_secs(30),
+        ttl: Duration::from_secs(90),
+    };
+    monitor_server::snapshot::write_beat(&db, &state.statuses, &config, true).await?;
+    let (status, _, body) = call(&app, "GET", "/s/new-slug/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["title"], "Acme");
+    // And a second workspace can never claim the released name — it stays held.
+    let other = sign_up(&app, "other@b.example").await;
+    let other_ws = workspace_of(&db, "other@b.example").await?;
+    let (status, _, body) = call(
+        &app,
+        "PUT",
+        "/api/workspace/status-page",
+        Some(serde_json::json!({
+            "slug": "old-slug", "title": "Impostor", "monitor_ids": [],
+        })),
+        Some(Cred::Cookie(&other)),
+        Some(&other_ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    Ok(())
+}
+
+/// S3-10: publishing the workspace's public face is owner work — a member can
+/// operate monitors but cannot put the page up, rename it, or take it down.
+#[tokio::test]
+async fn members_cannot_publish_the_status_page() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(true).await?;
+    let (owner, member, _viewer) = roster(&app).await?;
+    let mon = monitor(&app, &owner, "api").await;
+    let ws = workspace_of(&db, "owner@a.example").await?;
+    let (status, _, body) = call(
+        &app,
+        "PUT",
+        "/api/workspace/status-page",
+        Some(serde_json::json!({
+            "slug": "acme-status", "title": "Acme", "monitor_ids": [&mon],
+        })),
+        Some(Cred::Cookie(&member)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    Ok(())
+}
+
+/// S3-6: a signup's public face says nothing about the address behind it — the
+/// slug is a random `ws-` token, the name a neutral default, neither derived from
+/// the email.
+#[tokio::test]
+async fn signup_mints_a_random_slug_and_neutral_name() -> anyhow::Result<()> {
+    let (app, _state, _db, _tmp) = fixture(true).await?;
+    let owner = sign_up(&app, "alice.smith@a.example").await;
+    let (status, _, body) = call(
+        &app,
+        "GET",
+        "/api/workspaces",
+        None,
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let workspace = &body["workspaces"][0];
+    assert_eq!(workspace["name"], "Personal workspace", "{body}");
+    let slug = workspace["slug"].as_str().expect("slug");
+    assert!(
+        slug.starts_with("ws-")
+            && slug.len() == 15
+            && slug[3..].chars().all(|c| c.is_ascii_hexdigit()),
+        "the slug is a random ws- token, not an address part: {slug}"
+    );
+    assert!(
+        !slug.contains("alice") && !workspace["name"].as_str().is_some_and(|n| n.contains('@')),
+        "nothing of the email leaks into the public face: {body}"
+    );
+    Ok(())
 }

@@ -167,6 +167,9 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         status_dir: dir.join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -205,7 +208,10 @@ async fn assert_denied(app: &axum::Router, method: &str, template: &str, path: &
         ("wrong bearer", Some(("authorization", "Bearer wrong"))),
         ("lower-case scheme", Some(("authorization", "bearer x"))),
         ("bare token", Some(("authorization", TOKEN))),
-        ("unknown session", Some(("cookie", "smon_session=deadbeef"))),
+        (
+            "unknown session",
+            Some(("cookie", "__Host-smon_session=deadbeef")),
+        ),
     ] {
         let mut request = Request::builder()
             .method(Method::from_bytes(method.as_bytes()).expect("method"))

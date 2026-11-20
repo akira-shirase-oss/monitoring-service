@@ -50,6 +50,9 @@ async fn app() -> anyhow::Result<(
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: Some(backup_dir),
@@ -789,6 +792,9 @@ async fn two_backups_in_one_second_get_distinct_names() -> anyhow::Result<()> {
         status_dir: std::env::temp_dir(),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: Arc::new(move || stamp),
         trusted_proxy: None,
         backup_dir: Some(tmp.path().join("backups")),
@@ -831,6 +837,9 @@ async fn backup_is_disabled_without_a_configured_dir() -> anyhow::Result<()> {
         status_dir: std::env::temp_dir(),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -894,6 +903,9 @@ async fn auth_denies_without_a_valid_bearer_token() {
         status_dir: std::env::temp_dir(),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -975,6 +987,9 @@ async fn authed_with(
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1295,6 +1310,9 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1380,6 +1398,9 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1438,38 +1459,26 @@ async fn cookie_header(
         .to_owned())
 }
 
-/// Behind a TLS-terminating proxy the session cookie must be `Secure`, or a browser sends
-/// it over any plain-http request to the same host (a downgraded link, a captive portal)
-/// where it can be read. The proxy says the hop was TLS in `X-Forwarded-Proto` /
-/// `Forwarded: proto=https`; `SMON_COOKIE_SECURE=always` forces the flag regardless.
-/// Plain-http dev keeps working: no TLS signal, no flag.
+/// The session cookie is `__Host-` pinned (S2 review): `Secure`, `Path=/`, no
+/// `Domain`, on every response — a subdomain can't shadow it and a plain-http hop
+/// can never carry it. The contract no longer depends on what scheme the proxy
+/// reported, so plain-http loopback dev still works (localhost is a trustworthy
+/// origin; browsers store `Secure` cookies there).
 #[tokio::test]
-async fn the_session_cookie_is_secure_whenever_the_request_came_over_tls() {
-    use monitor_server::auth::CookieSecure;
-
+async fn the_session_cookie_is_host_pinned_and_always_secure() {
     let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
-    let plain = cookie_header(&app, "/api/login", &[]).await.unwrap();
-    assert!(!plain.contains("Secure"), "plain http: {plain}");
-    for tls in [
-        [("x-forwarded-proto", "https")],
-        [(
-            "forwarded",
-            "for=203.0.113.9;proto=https;host=mon.example.com",
-        )],
+    for headers in [
+        vec![],
+        vec![("x-forwarded-proto", "http")],
+        vec![("x-forwarded-proto", "https")],
     ] {
         for path in ["/api/login", "/api/logout"] {
-            let cookie = cookie_header(&app, path, &tls).await.unwrap();
-            assert!(cookie.contains("; Secure"), "{path} {tls:?}: {cookie}");
+            let cookie = cookie_header(&app, path, &headers).await.unwrap();
+            assert!(cookie.starts_with("__Host-smon_session="), "{cookie}");
+            assert!(cookie.contains("; Secure"), "{cookie}");
+            assert!(cookie.contains("; Path=/"), "{cookie}");
+            assert!(!cookie.contains("Domain="), "{cookie}");
         }
-    }
-
-    let (always, _db, _tmp) =
-        authed_with("s3cret", Duration::from_secs(3600), CookieSecure::Always)
-            .await
-            .unwrap();
-    for path in ["/api/login", "/api/logout"] {
-        let cookie = cookie_header(&always, path, &[]).await.unwrap();
-        assert!(cookie.contains("; Secure"), "always, {path}: {cookie}");
     }
 }
 
@@ -1551,6 +1560,9 @@ async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1592,6 +1604,9 @@ async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1638,6 +1653,9 @@ async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1677,6 +1695,9 @@ fn authed_on(db: &Db, token: &str) -> Router {
         status_dir: std::env::temp_dir(),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -1754,7 +1775,7 @@ async fn the_store_and_its_backups_hold_no_usable_session_id() -> anyhow::Result
     let app = authed_on(&db, "digest-token-0123456789abcdef0123456789ab");
     let cookie = login_cookie(&app, "digest-token-0123456789abcdef0123456789ab").await?;
     let id = cookie
-        .strip_prefix("smon_session=")
+        .strip_prefix("__Host-smon_session=")
         .ok_or_else(|| anyhow::anyhow!("cookie shape: {cookie}"))?;
     assert_eq!(read_with_cookie(&app, &cookie).await?, StatusCode::OK);
 
@@ -1816,6 +1837,9 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock,
         trusted_proxy: None,
         backup_dir: None,
@@ -1964,7 +1988,7 @@ async fn store_failures_answer_fixed_text_never_the_databases_own() -> anyhow::R
     let response = authed_app
         .oneshot(
             Request::post("/api/logout")
-                .header("cookie", "smon_session=whatever")
+                .header("cookie", "__Host-smon_session=whatever")
                 .body(Body::empty())?,
         )
         .await?;
@@ -1990,6 +2014,9 @@ fn uncapped(db: &Db) -> Router {
         status_dir: std::env::temp_dir(),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -2144,6 +2171,9 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,

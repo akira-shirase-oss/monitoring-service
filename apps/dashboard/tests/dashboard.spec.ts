@@ -479,15 +479,17 @@ test('sign-in: wrong token refused, right token earns the session, sign-out ends
 	});
 	// The session cookie is HttpOnly — document.cookie can never see it.
 	const cookies = await context.cookies();
-	const session = cookies.find((c) => c.name === 'smon_session');
-	expect(session, 'the login sets the session cookie').toBeTruthy();
+	const session = cookies.find((c) => c.name === '__Host-smon_session');
+	expect(session, 'the login sets the host-only session cookie').toBeTruthy();
 	expect(session?.httpOnly).toBe(true);
 	expect(session?.sameSite).toBe('Strict');
+	expect(session?.secure).toBe(true);
+	expect(session?.domain, 'a __Host- cookie carries no Domain').toBeUndefined();
 
 	// Sign out deletes the row server-side and expires the cookie — the card returns.
 	await page.getByTestId('account-menu').click();
 	await page.getByTestId('sign-out').click();
 	await expect(page).toHaveURL(/\/login/, { timeout: 10_000 });
 	const after = await context.cookies();
-	expect(after.find((c) => c.name === 'smon_session')?.value ?? '').toBe('');
+	expect(after.find((c) => c.name === '__Host-smon_session')?.value ?? '').toBe('');
 });

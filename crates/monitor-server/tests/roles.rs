@@ -47,6 +47,9 @@ async fn fixture() -> anyhow::Result<Fixture> {
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -89,7 +92,7 @@ async fn call(
         }
         Some(Cred::Cookie(cookie)) => {
             request = request
-                .header(header::COOKIE, format!("smon_session={cookie}"))
+                .header(header::COOKIE, format!("__Host-smon_session={cookie}"))
                 .header(header::HOST, "api.test")
                 .header(header::ORIGIN, "http://api.test");
         }
@@ -167,8 +170,8 @@ async fn sign_up(app: &axum::Router, email: &str) -> String {
         .to_str()
         .expect("cookie header is text")
         .to_owned();
-    raw.strip_prefix("smon_session=")
-        .expect("the smon_session cookie")
+    raw.strip_prefix("__Host-smon_session=")
+        .expect("the __Host-smon_session cookie")
         .split(';')
         .next()
         .expect("cookie id")
@@ -211,22 +214,58 @@ async fn seed_roster(
     let ws = workspace_of(db, "owner@a.example").await?;
     let _stranger = sign_up(app, "s@d.example").await;
     let stranger_ws = workspace_of(db, "s@d.example").await?;
-    for (email, role) in [
-        ("member@b.example", "member"),
-        ("viewer@c.example", "viewer"),
+    for (invitee, email, role) in [
+        (&member, "member@b.example", "member"),
+        (&viewer, "viewer@c.example", "viewer"),
     ] {
-        let (status, _, body) = call(
-            app,
-            "POST",
-            "/api/members",
-            Some(serde_json::json!({"email": email, "role": role})),
-            Some(Cred::Cookie(&owner)),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "{role}: {body}");
+        seat(app, &owner, invitee, email, role).await;
     }
     Ok((owner, member, viewer, ws, stranger_ws))
+}
+
+/// The S2-4 seat: the owner invites (a uniform 202 either way), the invitee finds the
+/// invitation addressed to them and accepts it — the seat exists only after consent.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: the invitation was just sent"
+)]
+async fn seat(app: &axum::Router, owner: &str, invitee: &str, email: &str, role: &str) {
+    let (status, _, body) = call(
+        app,
+        "POST",
+        "/api/members",
+        Some(serde_json::json!({"email": email, "role": role})),
+        Some(Cred::Cookie(owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{role}: {body}");
+    let (status, _, body) = call(
+        app,
+        "GET",
+        "/api/invitations",
+        None,
+        Some(Cred::Cookie(invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["invitations"]
+        .as_array()
+        .and_then(|all| all.last())
+        .and_then(|invite| invite["id"].as_str())
+        .expect("an invitation is pending")
+        .to_owned();
+    let (status, _, body) = call(
+        app,
+        "POST",
+        &format!("/api/invitations/{id}/accept"),
+        None,
+        Some(Cred::Cookie(invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "accept: {body}");
 }
 
 fn monitor_body(name: &str) -> serde_json::Value {
@@ -392,7 +431,7 @@ async fn the_workspace_picker_never_leaves_membership() -> anyhow::Result<()> {
 async fn the_last_owner_cannot_be_demoted_or_removed() -> anyhow::Result<()> {
     let (app, _state, db, _tmp) = fixture().await?;
     let owner = sign_up(&app, "owner@a.example").await;
-    let _other = sign_up(&app, "second@b.example").await;
+    let second = sign_up(&app, "second@b.example").await;
     let owner_id = account_of(&db, "owner@a.example").await?;
 
     for (method, uri, body) in [
@@ -419,17 +458,20 @@ async fn the_last_owner_cannot_be_demoted_or_removed() -> anyhow::Result<()> {
         assert_eq!(status, StatusCode::CONFLICT, "{method} {uri}: {body}");
     }
 
-    // Seat a second owner; now the first may stand down.
+    // Seat a second owner: an invitation can only ever carry member/viewer — a seat
+    // at owner is two consenting steps, the acceptance and then the promotion.
+    seat(&app, &owner, &second, "second@b.example", "member").await;
+    let second_id = account_of(&db, "second@b.example").await?;
     let (status, _, body) = call(
         &app,
-        "POST",
-        "/api/members",
-        Some(serde_json::json!({"email": "second@b.example", "role": "owner"})),
+        "PATCH",
+        &format!("/api/members/{second_id}"),
+        Some(serde_json::json!({"role": "owner"})),
         Some(Cred::Cookie(&owner)),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, _, body) = call(
         &app,
         "PATCH",

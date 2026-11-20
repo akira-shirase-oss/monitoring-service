@@ -46,6 +46,9 @@ async fn fixture() -> anyhow::Result<Fixture> {
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
@@ -83,7 +86,7 @@ async fn call(
         }
         Some(Cred::Cookie(cookie)) => {
             request = request
-                .header(header::COOKIE, format!("smon_session={cookie}"))
+                .header(header::COOKIE, format!("__Host-smon_session={cookie}"))
                 .header(header::HOST, "api.test")
                 .header(header::ORIGIN, "http://api.test");
         }
@@ -159,8 +162,8 @@ async fn sign_up(app: &axum::Router, email: &str) -> String {
         .to_str()
         .expect("cookie header is text")
         .to_owned();
-    raw.strip_prefix("smon_session=")
-        .expect("the smon_session cookie")
+    raw.strip_prefix("__Host-smon_session=")
+        .expect("the __Host-smon_session cookie")
         .split(';')
         .next()
         .expect("cookie id")
@@ -181,22 +184,58 @@ async fn roster(app: &axum::Router) -> anyhow::Result<(String, String, String)> 
     let owner = sign_up(app, "owner@a.example").await;
     let member = sign_up(app, "member@b.example").await;
     let viewer = sign_up(app, "viewer@c.example").await;
-    for (email, role) in [
-        ("member@b.example", "member"),
-        ("viewer@c.example", "viewer"),
+    for (invitee, email, role) in [
+        (&member, "member@b.example", "member"),
+        (&viewer, "viewer@c.example", "viewer"),
     ] {
-        let (status, _, body) = call(
-            app,
-            "POST",
-            "/api/members",
-            Some(serde_json::json!({"email": email, "role": role})),
-            Some(Cred::Cookie(&owner)),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "{role}: {body}");
+        seat(app, &owner, invitee, email, role).await;
     }
     Ok((owner, member, viewer))
+}
+
+/// The S2-4 seat: the owner invites (a uniform 202 either way), the invitee finds the
+/// invitation addressed to them and accepts it — the seat exists only after consent.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: the invitation was just sent"
+)]
+async fn seat(app: &axum::Router, owner: &str, invitee: &str, email: &str, role: &str) {
+    let (status, _, body) = call(
+        app,
+        "POST",
+        "/api/members",
+        Some(serde_json::json!({"email": email, "role": role})),
+        Some(Cred::Cookie(owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{role}: {body}");
+    let (status, _, body) = call(
+        app,
+        "GET",
+        "/api/invitations",
+        None,
+        Some(Cred::Cookie(invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["invitations"]
+        .as_array()
+        .and_then(|all| all.last())
+        .and_then(|invite| invite["id"].as_str())
+        .expect("an invitation is pending")
+        .to_owned();
+    let (status, _, body) = call(
+        app,
+        "POST",
+        &format!("/api/invitations/{id}/accept"),
+        None,
+        Some(Cred::Cookie(invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "accept: {body}");
 }
 
 fn put_webhook(url: &str) -> serde_json::Value {

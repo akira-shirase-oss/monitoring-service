@@ -1,4 +1,4 @@
-// Session auth: the dashboard trades a credential for an HttpOnly `smon_session`
+// Session auth: the dashboard trades a credential for an HttpOnly `__Host-smon_session`
 // cookie — email+password for accounts (S1b), the admin token for the operator.
 // Nothing is stored in the browser — no localStorage token to steal or forget; the
 // cookie rides same-origin requests on its own and the server decides when it dies
