@@ -5,6 +5,14 @@
 // Every iteration is one anonymous GET of /s/<slug>/status.json. The mix rotates by
 // iteration so it is the same on every run: 8/10 the live beat, 1/10 the born-expired
 // page, 1/10 an unknown slug's uniform 404 — the three honest answers the route gives.
+//
+// The route throttles per client address (BURST then a slow refill — the same bucket
+// every anonymous read pays). A real deployment sits behind Caddy + Cloudflare, so
+// visitors arrive with distinct addresses — the scenario models that with SM_CLIENTS
+// synthetic X-Forwarded-For values, which the harness's SMON_TRUSTED_PROXY=127.0.0.1
+// believes (exactly the deployment's proxy setup). The pool is larger than the
+// throttle's tracked table, so the eviction path is exercised too: a forgotten
+// address's next request rebuilds its bucket — the documented bound, under load.
 import http from 'k6/http';
 import { check } from 'k6';
 import exec from 'k6/execution';
@@ -14,6 +22,7 @@ const SLUG = __ENV.SM_SLUG;
 const STALE = __ENV.SM_STALE_SLUG;
 const REQUESTS = Number(__ENV.SM_REQUESTS || 1000000);
 const VUS = Number(__ENV.SM_VUS || 32);
+const CLIENTS = Number(__ENV.SM_CLIENTS || 16384);
 const NAMES = ['beat', 'beat', 'beat', 'beat', 'beat', 'beat', 'beat', 'beat', 'stale', 'missing'];
 
 export const options = {
@@ -37,7 +46,9 @@ export default function () {
 	const i = exec.scenario.iterationInTest;
 	const name = NAMES[i % NAMES.length];
 	const slug = name === 'beat' ? SLUG : name === 'stale' ? STALE : 'no-such-page';
+	const client = i % CLIENTS;
 	const res = http.get(`${BASE}/s/${slug}/status.json`, {
+		headers: { 'X-Forwarded-For': `10.${(client >> 7) & 127}.${client & 127}.9` },
 		responseCallback: http.expectedStatuses(EXPECTED[name]),
 		tags: { name },
 	});

@@ -1,0 +1,62 @@
+# Load evidence runs on hosted runners, not the laptop: the public status-page route's
+# full run is 1,000,000 anonymous GETs (the workspace load standard); a smoke mode sends
+# 100,000 to prove the harness. Manual only — the maintainer merges, then dispatches.
+# The run's summary lands in perf/results/ and uploads as an artifact, a miss included —
+# a failing run is evidence, never rerun to green. This workflow never pushes.
+name: load
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "which load scenario to run"
+        required: true
+        default: "public-status"
+        type: choice
+        options: [public-status]
+      mode:
+        description: "smoke (100k requests) or full (1,000,000)"
+        required: true
+        default: "full"
+        type: choice
+        options: [full, smoke]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a run halfway: a partial run is not evidence, and two runs at once
+  # would contaminate each other's numbers.
+  group: load-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  public-status:
+    if: inputs.scenario == 'public-status'
+    name: GET /s/<slug>/status.json
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: k6 (pinned, checksum-verified)
+        run: scripts/install-k6.sh "$RUNNER_TEMP/bin"
+      - name: Build the server under load (release)
+        run: cargo build --release -p monitor-server --locked
+      - name: The run
+        run: PATH="$RUNNER_TEMP/bin:$PATH" perf/k6/run-public-status.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: perf-results-public-status-${{ github.run_id }}
+          path: perf/results/public-status-*.json
+          if-no-files-found: warn
+          retention-days: 30
