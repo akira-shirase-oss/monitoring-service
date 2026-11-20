@@ -45,7 +45,11 @@ async fn fixture_with(lab: bool, workspace_slots: usize) -> anyhow::Result<Fixtu
         admin_token: Some(OPERATOR.into()),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: auth::PASSWORD_WORK_WAIT,
+        // Wait out the argon2 pool instead of ever seeing `busy` — the permits are
+        // process-global, so parallel tests' sign-ups queue behind each other and a
+        // fixed wait is a flake under load (the busy path is covered by the limits
+        // suite's flood test).
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
@@ -1255,17 +1259,44 @@ async fn receiver() -> (String, mpsc::Receiver<(HeaderMap, Vec<u8>)>) {
 async fn public_reads_spend_their_own_budget() -> anyhow::Result<()> {
     let (app, _state, _db, _tmp) = fixture(true).await?;
     let _owner = sign_up(&app, "owner@a.example").await;
-    for _ in 0..30 {
-        let (status, _, _) =
-            call(&app, "GET", "/s/no-such-page/status.json", None, None, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+    // Concurrent reads: the token is spent at admission, so all 31 admissions land
+    // inside one refill period however slow each request runs — the serial loop's
+    // 30-reads-then-check timing was a wall-clock flake.
+    let started = std::time::Instant::now();
+    let mut reads = tokio::task::JoinSet::new();
+    for _ in 0..31 {
+        let app = app.clone();
+        reads.spawn(async move {
+            let (status, headers, body) =
+                call(&app, "GET", "/s/no-such-page/status.json", None, None, None).await;
+            anyhow::Ok((status, headers, body))
+        });
     }
-    // The 31st read is refused — by the read budget, with a wait hint.
-    let (status, headers, body) =
-        call(&app, "GET", "/s/no-such-page/status.json", None, None, None).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert_eq!(body["error"]["code"], "too_many_requests", "{body}");
+    let (mut misses, mut refusal) = (0_u64, None);
+    while let Some(outcome) = reads.join_next().await {
+        let (status, headers, body) = outcome??;
+        match status {
+            StatusCode::NOT_FOUND => misses += 1,
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert_eq!(body["error"]["code"], "too_many_requests", "{body}");
+                refusal = Some(headers);
+            }
+            other => anyhow::bail!("read: unexpected {other}"),
+        }
+    }
+    let Some(headers) = refusal else {
+        panic!("the read budget never refused");
+    };
     assert!(headers.get(header::RETRY_AFTER).is_some());
+    // Thirty tokens; slack is only what elapsed time refilled (2/s reads).
+    let refilled = started
+        .elapsed()
+        .as_millis()
+        .div_ceil(monitor_server::throttle::READ_REFILL_EVERY.as_millis());
+    assert!(
+        u128::from(misses) <= 30 + refilled,
+        "{misses} reads admitted (burst 30 + {refilled} refilled)"
+    );
     // And the credential path's separate bucket is full: sign-in still runs its
     // password check and answers honestly — the read loop never spent it.
     let (status, _, body) = call(
@@ -1286,25 +1317,30 @@ async fn public_reads_spend_their_own_budget() -> anyhow::Result<()> {
 #[tokio::test]
 async fn credential_guessing_never_starves_public_reads() -> anyhow::Result<()> {
     let (app, _state, _db, _tmp) = fixture(true).await?;
-    // Burn the credential bucket until it refuses — argon verification takes long
-    // enough that tokens refill along the way, so the loop drives to the 429.
-    let mut refused = false;
-    for _ in 0..20 {
-        let (status, _, _) = call(
-            &app,
-            "POST",
-            "/api/login",
-            Some(serde_json::json!({"email": "owner@a.example", "password": "wrong"})),
-            None,
-            None,
-        )
-        .await;
-        refused |= status == StatusCode::TOO_MANY_REQUESTS;
-        if refused {
-            break;
-        }
+    // Burn the credential bucket concurrently: the token is spent at admission, so
+    // all eight admissions cluster inside one refill period however slow argon2 runs
+    // — the serial loop let refills keep pace with slow hashing (a flake, not a rule).
+    let mut guesses = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        guesses.spawn(async move {
+            let (status, _, _) = call(
+                &app,
+                "POST",
+                "/api/login",
+                Some(serde_json::json!({"email": "owner@a.example", "password": "wrong"})),
+                None,
+                None,
+            )
+            .await;
+            anyhow::Ok(status)
+        });
     }
-    assert!(refused, "the credential budget never refused a guess loop");
+    let mut refused = false;
+    while let Some(status) = guesses.join_next().await {
+        refused |= status?? == StatusCode::TOO_MANY_REQUESTS;
+    }
+    assert!(refused, "the credential budget never refused a guess burst");
     // The credential bucket is empty — the read budget is untouched.
     let (status, _, _) = call(&app, "GET", "/s/no-such-page/status.json", None, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

@@ -41,7 +41,7 @@ async fn fixture() -> anyhow::Result<Fixture> {
         admin_token: Some(OPERATOR.into()),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),

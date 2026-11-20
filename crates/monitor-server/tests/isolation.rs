@@ -215,7 +215,7 @@ async fn the_api_never_reaches_another_workspaces_monitor() -> anyhow::Result<()
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),

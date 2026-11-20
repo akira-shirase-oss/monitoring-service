@@ -31,7 +31,10 @@ async fn app() -> anyhow::Result<(axum::Router, Db, tempfile::TempDir)> {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::ZERO,
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        // Wait out the argon2 pool instead of ever seeing `busy`: the permits are
+        // process-global and parallel tests queue behind each other — the busy path
+        // is covered by `a_signin_flood_gets_busy_answers_and_the_api_stays_up` below.
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
@@ -168,6 +171,7 @@ async fn a_request_whose_body_never_finishes_is_408_at_the_deadline() -> anyhow:
 #[tokio::test]
 async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Result<()> {
     let (app, db, _tmp) = app().await?;
+    let started = std::time::Instant::now();
     let mut guesses = tokio::task::JoinSet::new();
     for n in 0..50 {
         let app = app.clone();
@@ -183,7 +187,7 @@ async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Res
             anyhow::Ok((response.status(), retry_after))
         });
     }
-    let (mut evaluated, mut refused) = (0, 0);
+    let (mut evaluated, mut refused) = (0_u64, 0_u64);
     while let Some(outcome) = guesses.join_next().await {
         let (status, retry_after) = outcome??;
         match status {
@@ -195,9 +199,15 @@ async fn parallel_wrong_logins_are_bounded_and_the_rest_get_429() -> anyhow::Res
             other => anyhow::bail!("unexpected {other}"),
         }
     }
+    // Five tokens in the burst; the only slack is what elapsed between the first
+    // admit and the last join refilled (0.5/s) — a fixed bound was a wall-clock flake.
+    let refilled = started
+        .elapsed()
+        .as_millis()
+        .div_ceil(monitor_server::throttle::REFILL_EVERY.as_millis());
     assert!(
-        (1..=5).contains(&evaluated),
-        "at most 5 guesses evaluated for one address, got {evaluated}"
+        (1..=5 + refilled).contains(&u128::from(evaluated)),
+        "at most 5 guesses (+{refilled} refilled) evaluated for one address, got {evaluated}"
     );
     assert_eq!(evaluated + refused, 50);
 
@@ -371,11 +381,12 @@ async fn wrong_bearer_tokens_are_throttled_per_address_too() -> anyhow::Result<(
             anyhow::Ok(app.oneshot(request).await?.status())
         }
     };
+    let started = std::time::Instant::now();
     let mut guesses = tokio::task::JoinSet::new();
     for _ in 0..200 {
         guesses.spawn(bearer_from(ATTACKER, "wrong"));
     }
-    let (mut evaluated, mut refused) = (0, 0);
+    let (mut evaluated, mut refused) = (0_u64, 0_u64);
     while let Some(status) = guesses.join_next().await {
         match status?? {
             StatusCode::UNAUTHORIZED => evaluated += 1,
@@ -383,7 +394,16 @@ async fn wrong_bearer_tokens_are_throttled_per_address_too() -> anyhow::Result<(
             other => anyhow::bail!("unexpected {other}"),
         }
     }
-    assert!(evaluated <= 5, "{evaluated} bearer guesses evaluated");
+    // Same elapsed-aware bound: burst five plus whatever real time refilled while
+    // the 200 guesses were being admitted.
+    let refilled = started
+        .elapsed()
+        .as_millis()
+        .div_ceil(monitor_server::throttle::REFILL_EVERY.as_millis());
+    assert!(
+        u128::from(evaluated) <= 5 + refilled,
+        "{evaluated} bearer guesses evaluated (burst 5 + {refilled} refilled)"
+    );
     assert_eq!(evaluated + refused, 200);
     assert_eq!(bearer_from(OWNER, TOKEN).await?, StatusCode::OK);
     Ok(())

@@ -23,7 +23,11 @@ const PASSWORD: &str = "correct horse battery staple";
 type Fixture = (axum::Router, Db, TempDir);
 
 async fn fixture() -> anyhow::Result<Fixture> {
-    fixture_with_wait(monitor_server::auth::PASSWORD_WORK_WAIT).await
+    // Tests wait out the argon2 pool instead of ever seeing `busy`: the permits are
+    // process-global, so parallel sign-ups/sign-ins queue behind each other and any
+    // fixed wait is a flake under load. The busy answer has its own coverage — the
+    // sign-in flood test below passes a one-millisecond wait.
+    fixture_with_wait(Duration::from_secs(600)).await
 }
 
 /// The production fixture, with the password-work queue deadline the caller picks —
@@ -386,43 +390,57 @@ async fn one_address_runs_out_of_guesses_and_another_still_signs_in() -> anyhow:
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // The flood address spends its burst on a wrong password — every answer is the
-    // one-envelope 401. Each guess costs a real argon2 verify plus the penalty sleep,
-    // so the bucket refills ~0.3 tokens a guess and drains ~0.7: the 429 lands within
-    // eight guesses on any machine.
+    // The flood address spends its burst on a wrong password. The token is spent at
+    // admission, *before* the argon2 compare — so the guesses go out together and all
+    // admissions cluster inside one refill period on any machine, however slow the
+    // hashing (the old serial loop let the 0.5/s refill keep pace: flake, not rule).
     let wrong = serde_json::json!({
         "email": "honest@tenant.example", "password": "not the password",
     });
-    let mut denial: Option<(axum::http::HeaderMap, serde_json::Value)> = None;
+    let started = std::time::Instant::now();
+    let mut guesses = tokio::task::JoinSet::new();
     for attempt_no in 1..=8 {
-        let (status, headers, body) = call_from(
-            &app,
-            Some(flood),
-            "POST",
-            "/api/login",
-            Some(wrong.clone()),
-            None,
-        )
-        .await;
-        if attempt_no <= 5 {
-            assert_eq!(
-                status,
-                StatusCode::UNAUTHORIZED,
-                "guess {attempt_no}: {body}"
-            );
-        }
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            denial = Some((headers, body));
-            break;
+        let (app, wrong) = (app.clone(), wrong.clone());
+        guesses.spawn(async move {
+            let (status, headers, body) =
+                call_from(&app, Some(flood), "POST", "/api/login", Some(wrong), None).await;
+            anyhow::Ok((attempt_no, status, headers, body))
+        });
+    }
+    let (mut evaluated, mut refused) = (0_u64, false);
+    while let Some(outcome) = guesses.join_next().await {
+        let (attempt_no, status, headers, body) = outcome??;
+        match status {
+            StatusCode::UNAUTHORIZED => {
+                evaluated += 1;
+                assert_eq!(body["error"]["message"], "invalid credentials", "{body}");
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert_eq!(body["error"]["code"], "too_many_requests", "{body}");
+                assert!(
+                    headers.get(header::RETRY_AFTER).is_some(),
+                    "a 429 must say when to retry"
+                );
+                refused = true;
+            }
+            // A timed-out request was still admitted — its token is spent either way.
+            StatusCode::REQUEST_TIMEOUT => evaluated += 1,
+            other => anyhow::bail!("guess {attempt_no}: unexpected {other}"),
         }
     }
-    let Some((headers, body)) = denial else {
-        panic!("the bucket still had a token after eight wrong guesses");
-    };
-    assert_eq!(body["error"]["code"], "too_many_requests");
     assert!(
-        headers.get(header::RETRY_AFTER).is_some(),
-        "a 429 must say when to retry"
+        refused,
+        "the bucket still had a token after eight wrong guesses"
+    );
+    // The burst is five tokens; the only slack is what real elapsed time refilled
+    // between the first admit and the last join (0.5/s — REFILL_EVERY is 2 s).
+    let refilled = started
+        .elapsed()
+        .as_millis()
+        .div_ceil(monitor_server::throttle::REFILL_EVERY.as_millis());
+    assert!(
+        u128::from(evaluated) <= 5 + refilled,
+        "{evaluated} guesses reached the password check (burst 5 + {refilled} refilled)"
     );
 
     // The other address's bucket is untouched: it still reaches the credential check
