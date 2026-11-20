@@ -137,6 +137,21 @@ pub fn required_slots<'a>(monitors: impl IntoIterator<Item = &'a Monitor>, tick:
         .sum()
 }
 
+/// Starts per tick one origin needs across `monitors` (unpaused only) — the same
+/// measure [`capacity`] rates per origin, so a write can ask whether *its* change
+/// is what pushed an origin over (S2 review).
+pub fn origin_required<'a>(
+    monitors: impl IntoIterator<Item = &'a Monitor>,
+    origin: &str,
+    tick: Duration,
+) -> f64 {
+    monitors
+        .into_iter()
+        .filter(|monitor| !monitor.paused && origin_key(&monitor.url) == origin)
+        .map(|monitor| tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON))
+        .sum()
+}
+
 /// A slot count as `f64` (slot counts are small; anything past `u32::MAX` saturates).
 pub(crate) fn slots_f64(slots: usize) -> f64 {
     f64::from(u32::try_from(slots).unwrap_or(u32::MAX))

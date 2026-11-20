@@ -1,6 +1,6 @@
 //! Management auth (M5.1 + M7.2): every `/api/**` route requires a credential once
 //! `SMON_ADMIN_TOKEN` is configured — either `Authorization: Bearer <token>` (CLI,
-//! scripts) or the `HttpOnly` `smon_session` cookie the dashboard earns at `/api/login`.
+//! scripts) or the `HttpOnly` `__Host-smon_session` cookie the dashboard earns at `/api/login`.
 //! Denied means denied — there is no bypass path inside the middleware; the only
 //! unauthenticated mode is dev-on-loopback, and boot refuses a tokenless
 //! non-loopback listen rather than leave the store open.
@@ -37,7 +37,9 @@ use crate::AppState;
 pub type AdminToken = Option<Arc<str>>;
 
 /// The `HttpOnly` cookie name the session id rides on.
-pub const SESSION_COOKIE: &str = "smon_session";
+/// `__Host-` pinned: the cookie is only ever valid with `Secure`, `Path=/` and no
+/// `Domain` — a subdomain or a man-in-the-middle can't overwrite it (S2 review).
+pub const SESSION_COOKIE: &str = "__Host-smon_session";
 
 /// When the session cookie carries `Secure` (`SMON_COOKIE_SECURE`). The server itself
 /// speaks plain HTTP; TLS is terminated in front of it, so "was this request TLS" is what
@@ -54,36 +56,12 @@ pub enum CookieSecure {
 }
 
 impl CookieSecure {
-    /// The cookie attribute for this request: `"; Secure"` or nothing.
-    pub fn attribute(self, headers: &header::HeaderMap) -> &'static str {
-        if self == Self::Always || came_over_tls(headers) {
-            "; Secure"
-        } else {
-            ""
-        }
+    /// The cookie attribute for this request: always `"; Secure"` — `__Host-` names
+    /// are rejected without it, so the choice no longer exists. `self`/`headers`
+    /// stay only so the `SMON_COOKIE_SECURE` knob parses harmlessly.
+    pub fn attribute(self, _headers: &header::HeaderMap) -> &'static str {
+        "; Secure"
     }
-}
-
-/// Any `https` in `X-Forwarded-Proto` (a list when proxies chain) or a `proto=https` pair
-/// in `Forwarded` (RFC 7239). "Any", because adding `Secure` is the safe direction.
-fn came_over_tls(headers: &header::HeaderMap) -> bool {
-    let values = |name| {
-        headers
-            .get_all(name)
-            .into_iter()
-            .filter_map(|value| value.to_str().ok())
-    };
-    let forwarded_proto = values("x-forwarded-proto")
-        .flat_map(|value| value.split(','))
-        .any(|proto| proto.trim().eq_ignore_ascii_case("https"));
-    let forwarded = values("forwarded")
-        .flat_map(|value| value.split([',', ';']))
-        .filter_map(|pair| pair.split_once('='))
-        .any(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("proto")
-                && value.trim().trim_matches('"').eq_ignore_ascii_case("https")
-        });
-    forwarded_proto || forwarded
 }
 
 pub async fn require_auth(
@@ -813,14 +791,14 @@ mod tests {
 
     #[test]
     fn session_cookie_parses_its_own_name_only() {
-        let header = HeaderValue::from_static("other=1; smon_session=abc-123 ; theme=dark");
+        let header = HeaderValue::from_static("other=1; __Host-smon_session=abc-123 ; theme=dark");
         assert_eq!(session_cookie(Some(&header)), Some("abc-123"));
         assert_eq!(
-            session_cookie(Some(&HeaderValue::from_static("smon_session="))),
+            session_cookie(Some(&HeaderValue::from_static("__Host-smon_session="))),
             None
         );
         assert_eq!(
-            session_cookie(Some(&HeaderValue::from_static("smon_sessionx=abc"))),
+            session_cookie(Some(&HeaderValue::from_static("__Host-smon_sessionx=abc"))),
             None
         );
         assert_eq!(session_cookie(None), None);

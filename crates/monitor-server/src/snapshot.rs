@@ -270,7 +270,9 @@ pub async fn write_beat(
     let mut live = std::collections::HashSet::with_capacity(pages.len());
     let since = OffsetDateTime::now_utc() - PAGE_STATS_WINDOW;
     for page in &pages {
-        live.insert(page.slug.clone());
+        // Files are named by workspace, not slug: a released or renamed slug resolves
+        // to this workspace's file, never a previous owner's bytes (S2 review).
+        live.insert(page.workspace.0.to_string());
         let scoped = db.workspace(page.workspace);
         let open = scoped.open_incidents().await?;
         let mut coverage = HashMap::with_capacity(page.monitors.len());
@@ -284,17 +286,17 @@ pub async fn write_beat(
         let json = build_page(page, statuses, &open, &coverage, config.ttl, observing);
         write_snapshot(
             &config.dir.join("s"),
-            &format!("{}.json", page.slug),
+            &format!("{}.json", page.workspace.0),
             &serde_json::to_vec_pretty(&json)?,
         )?;
     }
     if let Ok(entries) = std::fs::read_dir(config.dir.join("s")) {
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(slug) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
                 continue;
             };
-            if !live.contains(slug) {
+            if !live.contains(id) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

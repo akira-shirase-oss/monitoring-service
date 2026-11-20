@@ -148,9 +148,16 @@ pub struct AppState {
     /// flusher lands them in one store write — never a write per request.
     pub token_use: auth::TokenUse,
     /// `SMON_STATUS_DIR`: where the public snapshots live — `status.json` plus each
-    /// enabled workspace page at `s/<slug>.json` (S2, D-021). The public route reads
-    /// the files; the snapshot writer's heartbeat is their freshness.
+    /// enabled workspace page at `s/<workspace>.json` (S2, D-021). The public route
+    /// reads the files; the snapshot writer's heartbeat is their freshness. Files
+    /// are named by workspace, not slug: a released slug can then never serve the
+    /// previous owner's page (S2 review).
     pub status_dir: std::path::PathBuf,
+    /// Enabled-slug → workspace cache for the public route: anonymous hits resolve
+    /// the slug and read the file without touching the store (two SQL per hit on a
+    /// 4-connection read pool would otherwise be the bottleneck). `put_status_page`
+    /// is the only writer of the mapping it caches, so invalidation lives there.
+    pub status_slugs: StatusSlugs,
     /// Per-workspace "send test alert" cooldowns (S2): the test is a real network
     /// send, so one per `TEST_SEND_EVERY` bounds what a member can aim at their
     /// receiver. Bounded like `token_use`: workspaces are bounded, and the map
@@ -160,6 +167,12 @@ pub struct AppState {
     /// (window start, writes spent)` — a config write can't amplify into a
     /// write loop against the store. Bounded and forgotten like `test_sends`.
     pub status_writes: WritePace,
+    /// Per-workspace schedule-write budgets (S2 review): bounds a tenant's
+    /// create/edit loop now that DNS waits happen before the schedule lock.
+    pub monitor_writes: WritePace,
+    /// Per-workspace invitation budgets (S2-4): a roster write can't amplify into
+    /// an invitation loop, and the uniform 202 can't be used to enumerate fast.
+    pub invite_writes: WritePace,
     /// S3: the in-flight probe share one workspace's schedule may claim — a
     /// create or edit whose own requirement would pass it is refused at write
     /// time (`capacity`), so one tenant's schedule can't crowd the engine.
@@ -179,8 +192,45 @@ pub type WritePace = std::sync::Arc<
     >,
 >;
 
+/// The public route's enabled-slug → workspace resolution (`AppState::status_slugs`).
+/// Only enabled pages are ever stored; a workspace's one page means one entry.
+pub type StatusSlugs = std::sync::Arc<
+    std::sync::RwLock<std::collections::HashMap<String, monitor_domain::WorkspaceId>>,
+>;
+
 /// Monitors one status page may publish — the allowlist's bound (S2 hardening).
 pub const PAGE_MAX_MONITORS: usize = 64;
+/// Spend one unit of `workspace`'s write budget: `Err(wait)` when the rolling
+/// window is spent — the caller turns it into `ApiError::TooMany`. Validation
+/// refusals never reach this; a store refusal spends — that is what the budget
+/// is for.
+fn spend_write_budget(
+    pace: &WritePace,
+    workspace: monitor_domain::WorkspaceId,
+    budget: u32,
+    window: Duration,
+    map_cap: usize,
+) -> Result<(), Duration> {
+    let now = tokio::time::Instant::now();
+    let mut writes = pace
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if writes.len() >= map_cap {
+        let cutoff = now - window;
+        writes.retain(|_, (opened, _)| *opened > cutoff);
+    }
+    let (opened, spent) = writes.entry(workspace).or_insert((now, 0));
+    if now.duration_since(*opened) >= window {
+        *opened = now;
+        *spent = 0;
+    }
+    if *spent >= budget {
+        return Err(window.saturating_sub(now.duration_since(*opened)));
+    }
+    *spent += 1;
+    Ok(())
+}
+
 /// Status-page writes per workspace per rolling window: a few saves are free,
 /// a write loop is not (S2 hardening).
 pub const STATUS_WRITE_BUDGET: u32 = 6;
@@ -188,6 +238,22 @@ pub const STATUS_WRITE_BUDGET: u32 = 6;
 pub const STATUS_WRITE_WINDOW: Duration = Duration::from_secs(60);
 /// Write-budget map bound: past it, quiet entries are forgotten before counting.
 const STATUS_WRITE_CAP: usize = 4096;
+
+/// Schedule writes per workspace per rolling window (S2 review): create/edit DNS
+/// resolution happens before the schedule lock now, so the budget — not the lock —
+/// is what bounds a tenant's write loop.
+pub const MONITOR_WRITE_BUDGET: u32 = 12;
+/// The rolling window `MONITOR_WRITE_BUDGET` spends within.
+pub const MONITOR_WRITE_WINDOW: Duration = Duration::from_secs(60);
+/// `monitor_writes` workspaces tracked at once; spent windows are pruned past it.
+const MONITOR_WRITE_CAP: usize = 4096;
+
+/// Member invitations per workspace per rolling window (S2 review, S2-4).
+pub const INVITE_WRITE_BUDGET: u32 = 6;
+/// The rolling window `INVITE_WRITE_BUDGET` spends within.
+pub const INVITE_WRITE_WINDOW: Duration = Duration::from_secs(60);
+/// `invite_writes` workspaces tracked at once.
+const INVITE_WRITE_CAP: usize = 4096;
 
 /// One test alert per workspace this often (S2). A second call inside the window is
 /// 429 `too_many_requests` with `Retry-After`.
@@ -340,10 +406,16 @@ fn routes(state: AppState) -> Router {
         // Roster and workspace API tokens (S1c): reads any member, writes owner-only —
         // `member_for`/`owner_for` decide by the request's role, not by route table.
         .route("/members", get(list_members).post(add_member))
+        .route("/members/invitations", get(list_workspace_invitations))
         .route(
             "/members/{id}",
             patch(set_member_role).delete(remove_member),
         )
+        // Invitations addressed to the caller's account (S2-4): the seat is the
+        // invitee's to take. Account work — tokens and the operator get 403.
+        .route("/invitations", get(list_invitations))
+        .route("/invitations/{id}/accept", post(accept_invitation))
+        .route("/invitations/{id}/decline", post(decline_invitation))
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{id}", delete(revoke_token))
         // The workspace itself (S2): rename, the memberships the switcher lists, and
@@ -402,7 +474,8 @@ async fn check_capacity(
     principal: &auth::Principal,
     change: impl FnOnce(&mut Vec<Monitor>),
 ) -> Result<(), ApiError> {
-    let mut monitors = load_registry(&state.db).await?;
+    let before = load_registry(&state.db).await?;
+    let mut monitors = before.clone();
     change(&mut monitors);
     // Per-origin capacity counts resolved addresses (origin.rs): resolve the names not
     // known yet — the one being written above all — within a bound the request can afford.
@@ -412,41 +485,67 @@ async fn check_capacity(
     )
     .await;
     let config = schedule::Config::default();
-    match schedule::capacity(&monitors, &config) {
-        None => Ok(()),
-        Some(schedule::Overload::Global { required }) => Err(ApiError::Capacity(format!(
-            "this schedule would need {required:.0} probes in flight; the monitor runs at most {} \
-             at once. Lengthen intervals or shorten timeouts",
-            schedule::MAX_GLOBAL_SLOTS
-        ))),
-        Some(schedule::Overload::Origin { origin, per_tick }) => {
-            // The origin name would tell a tenant about another tenant's targets —
-            // operators get it, accounts get the shape of the limit instead (D-020).
-            let detail = match principal {
-                auth::Principal::Operator { .. } => {
-                    format!("{origin} would need {per_tick:.1} probe starts a second")
+    if let Some(overload) = schedule::capacity(&monitors, &config) {
+        // Refuse only when *this* change adds load to an overloaded budget (S2
+        // review): an origin another tenant already pushed over must not block an
+        // unrelated write, and a pause — which only ever frees — is never refused.
+        let adds_load = match &overload {
+            schedule::Overload::Global { .. } => {
+                schedule::required_slots(monitors.iter(), config.tick)
+                    > schedule::required_slots(before.iter(), config.tick)
+            }
+            schedule::Overload::Origin { origin, .. } => {
+                schedule::origin_required(monitors.iter(), origin, config.tick)
+                    > schedule::origin_required(before.iter(), origin, config.tick)
+            }
+        };
+        if adds_load {
+            return Err(match overload {
+                schedule::Overload::Global { required } => ApiError::Capacity(format!(
+                    "this schedule would need {required:.0} probes in flight; the monitor runs at most {} \
+                     at once. Lengthen intervals or shorten timeouts",
+                    schedule::MAX_GLOBAL_SLOTS
+                )),
+                schedule::Overload::Origin { origin, per_tick } => {
+                    // The origin name would tell a tenant about another tenant's
+                    // targets — operators get it, accounts get the shape of the
+                    // limit instead (D-020).
+                    let detail = match principal {
+                        auth::Principal::Operator { .. } => {
+                            format!("{origin} would need {per_tick:.1} probe starts a second")
+                        }
+                        auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
+                            "one origin would exceed its probe rate".to_owned()
+                        }
+                    };
+                    ApiError::Capacity(format!(
+                        "{detail}; one origin gets at most {}. Lengthen the intervals of its monitors",
+                        config.per_origin_slots
+                    ))
                 }
-                auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
-                    "one origin would exceed its probe rate".to_owned()
-                }
-            };
-            Err(ApiError::Capacity(format!(
-                "{detail}; one origin gets at most {}. Lengthen the intervals of its monitors",
-                config.per_origin_slots
-            )))
+            });
         }
-    }?;
+    }
     // S3: a workspace's *own* share of the probe budget — named here, at the
     // write, instead of one tenant's schedule quietly crowding the engine's
     // global slots later. Paused monitors cost nothing (`required_slots` skips
-    // them), so pausing frees the share.
+    // them), so pausing frees the share — and a schedule already past the cap is
+    // refused only when this write makes it worse (S2 review).
     let own = schedule::required_slots(
         monitors
             .iter()
             .filter(|monitor| monitor.workspace == principal.workspace()),
         config.tick,
     );
-    if own > schedule::slots_f64(state.workspace_slots) {
+    if own > schedule::slots_f64(state.workspace_slots)
+        && own
+            > schedule::required_slots(
+                before
+                    .iter()
+                    .filter(|monitor| monitor.workspace == principal.workspace()),
+                config.tick,
+            )
+    {
         return Err(ApiError::Capacity(format!(
             "this workspace's schedule would need {own:.1} probes in flight; a workspace gets \
              at most {}. Pause monitors, lengthen intervals or shorten timeouts",
@@ -822,8 +921,11 @@ pub struct MemberBody {
     pub role: Option<Role>,
 }
 
-/// Seat an existing account in this workspace at `role` — owner work (S1c). The email
-/// is normalized exactly like signup's; an unknown one is a 404, never a silent seat.
+/// Invite `email` to this workspace at `role` — owner work (S2-4). The seat is
+/// earned by the invitee's acceptance, never seated by the inviter's say-so: the
+/// answer is a uniform 202 whether the address has an account, is already a member,
+/// or belongs to no one — nothing about the roster or the directory leaks through
+/// the response. The workspace's write budget bounds the asking.
 async fn add_member(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<auth::Principal>,
@@ -833,24 +935,116 @@ async fn add_member(
     let (Some(email), Some(role)) = (body.email, body.role) else {
         return Err(ApiError::Invalid("email and role are required".into()));
     };
-    let account = state
-        .db
-        .account_by_email(&email.trim().to_lowercase())
-        .await?
-        .ok_or_else(|| ApiError::Invalid("no account with that email".into()))?;
-    let id = Uuid::parse_str(&account.id).map_err(|_| ApiError::Corrupt)?;
-    view.add_member(AccountId(id), role, (state.clock)())
+    let email = email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(ApiError::Invalid("email must be an email address".into()));
+    }
+    spend_write_budget(
+        &state.invite_writes,
+        principal.workspace(),
+        INVITE_WRITE_BUDGET,
+        INVITE_WRITE_WINDOW,
+        INVITE_WRITE_CAP,
+    )
+    .map_err(ApiError::TooMany)?;
+    view.invite_member(&email, role, &principal_label(&principal))
         .await
         .map_err(|e| match e {
-            QueryError::Invalid(msg) => ApiError::Conflict(msg),
+            QueryError::Invalid(msg) => ApiError::Invalid(msg),
             other => ApiError::Db(other),
         })?;
     Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "member": { "account": id, "email": account.email, "role": role.as_str() }
-        })),
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "invited": true })),
     ))
+}
+
+/// Who an invitation names as its inviter — an account id, a token id, or the
+/// operator; never an email or secret.
+fn principal_label(principal: &auth::Principal) -> String {
+    match principal {
+        auth::Principal::Operator { .. } => "operator".to_owned(),
+        auth::Principal::Account { account, .. } => format!("account:{}", account.0),
+        auth::Principal::Token { token, .. } => format!("token:{}", token.0),
+    }
+}
+
+/// The workspace's pending invitations — owner visibility, so the roster view shows
+/// who has been asked but not yet seated (S2-4).
+async fn list_workspace_invitations(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    let invitations = view
+        .list_invitations(time::OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(serde_json::json!({
+        "invitations": invitations.iter().map(|i| serde_json::json!({
+            "id": i.id, "email": i.email, "role": i.role, "created_at": i.created_at,
+        })).collect::<Vec<_>>()
+    })))
+}
+
+/// The account principal behind this request — invitations belong to accounts,
+/// never to tokens or the operator (S2-4).
+fn account_for(principal: &auth::Principal) -> Result<AccountId, ApiError> {
+    match principal {
+        auth::Principal::Account { account, .. } => Ok(*account),
+        _ => Err(ApiError::Forbidden(
+            "invitations belong to accounts, not tokens or the operator".into(),
+        )),
+    }
+}
+
+/// Every invitation addressed to this account's email (S2-4): the workspace's name
+/// and the role it offers — the match is on the account's stored email.
+async fn list_invitations(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+) -> Result<impl IntoResponse, ApiError> {
+    let account = account_for(&principal)?;
+    let invitations = state
+        .db
+        .invitations_for_account(account, time::OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(serde_json::json!({
+        "invitations": invitations.iter().map(|i| serde_json::json!({
+            "id": i.id, "workspace": i.workspace_name, "role": i.role,
+            "created_at": i.created_at,
+        })).collect::<Vec<_>>()
+    })))
+}
+
+/// Accept an invitation: it must be addressed to this account's email, and the seat
+/// it grants is the invitation's stored role — never anything the request asked for.
+/// Unknown and someone-else's read the same 404 (S2-4).
+async fn accept_invitation(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let account = account_for(&principal)?;
+    let role = state
+        .db
+        .accept_invitation(&id, account, (state.clock)())
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(serde_json::json!({ "member": { "role": role } })))
+}
+
+/// Decline an invitation — same addressing rule as accept, the row is simply gone.
+/// Unknown and someone-else's read the same 404 (S2-4).
+async fn decline_invitation(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let account = account_for(&principal)?;
+    if !state.db.decline_invitation(&id, account).await? {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1215,7 +1409,9 @@ async fn put_status_page(
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Json(body): Json<StatusPageBody>,
 ) -> Result<Response, ApiError> {
-    let view = member_for(&state, &principal)?;
+    // Owner-only: the status page is the workspace's public face — what it names and
+    // publishes is the same tier of decision as roster and webhook secrets.
+    let view = owner_for(&state, &principal)?;
     if let Some(slug) = body.slug.as_deref()
         && !valid_slug(slug)
     {
@@ -1250,36 +1446,14 @@ async fn put_status_page(
     // weren't writes. The budget is spent before the store call, so a store
     // refusal costs it too — that is what the budget is for.
     {
-        let now = tokio::time::Instant::now();
-        let mut writes = state
-            .status_writes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if writes.len() >= STATUS_WRITE_CAP {
-            let cutoff = now - STATUS_WRITE_WINDOW;
-            writes.retain(|_, (opened, _)| *opened > cutoff);
-        }
-        let (opened, spent) = writes.entry(principal.workspace()).or_insert((now, 0));
-        if now.duration_since(*opened) >= STATUS_WRITE_WINDOW {
-            *opened = now;
-            *spent = 0;
-        }
-        if *spent >= STATUS_WRITE_BUDGET {
-            let wait = STATUS_WRITE_WINDOW.saturating_sub(now.duration_since(*opened));
-            return Ok((
-                StatusCode::TOO_MANY_REQUESTS,
-                [(
-                    axum::http::header::RETRY_AFTER,
-                    throttle::retry_after_secs(wait).to_string(),
-                )],
-                Json(serde_json::json!({
-                    "error": { "code": "too_many_requests",
-                               "message": "status-page writes are bounded; retry shortly" }
-                })),
-            )
-                .into_response());
-        }
-        *spent += 1;
+        spend_write_budget(
+            &state.status_writes,
+            principal.workspace(),
+            STATUS_WRITE_BUDGET,
+            STATUS_WRITE_WINDOW,
+            STATUS_WRITE_CAP,
+        )
+        .map_err(ApiError::TooMany)?;
     }
     view.set_status_page(
         body.slug.as_deref(),
@@ -1293,6 +1467,24 @@ async fn put_status_page(
         other => ApiError::Db(other),
     })?;
     let page = viewer_for(&state, &principal).status_page().await?;
+    // Keep the public route's slug map honest with what just committed: this
+    // workspace's one page means dropping every key that resolves to it, then
+    // caching the current slug when the page is enabled. A disabled page is gone
+    // from the map and from disk at once — never served until the writer's next
+    // beat notices.
+    {
+        let ws = principal.workspace();
+        let mut slugs = state
+            .status_slugs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slugs.retain(|_, workspace| *workspace != ws);
+        if page.title.is_some() {
+            slugs.insert(page.slug.clone(), ws);
+        } else {
+            let _ = std::fs::remove_file(state.status_dir.join("s").join(format!("{}.json", ws.0)));
+        }
+    }
     Ok(Json(serde_json::json!({
         "status_page": {
             "slug": page.slug,
@@ -1376,9 +1568,9 @@ async fn public_status(
         tracing::error!("invariant: routes() installs the credential guard");
         return ApiError::Corrupt.into_response();
     };
-    // Anonymous reads spend a token and are never refunded — there is no credential
-    // whose correctness earns it back.
-    if let Err(wait) = guard.throttle.admit(guard.client(&extensions, &headers)) {
+    // Anonymous reads spend from their own budget, never the credential one — a
+    // read loop can't lock out a sign-in, a guessing flood can't starve readers.
+    if let Err(wait) = guard.reads.admit(guard.client(&extensions, &headers)) {
         return throttle::too_many(wait);
     }
     // Every non-beat answer is `no-store`: a shared cache must not keep a 404
@@ -1402,17 +1594,46 @@ async fn public_status(
             serde_json::json!({"error": {"code": "not_found", "message": "no status page here"}}),
         );
     }
-    match state.db.status_page_by_slug(&slug).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return unavailable(
-                StatusCode::NOT_FOUND,
-                serde_json::json!({"error": {"code": "not_found", "message": "no status page here"}}),
-            );
+    // Slug → workspace: the in-memory map first (anonymous hits shouldn't pay SQL
+    // on the small read pool); a miss asks the store once and remembers. `None`
+    // covers unknown, disabled and malformed alike — the public answer is uniform.
+    let workspace = {
+        let cached = state
+            .status_slugs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&slug)
+            .copied();
+        match cached {
+            Some(workspace) => Some(workspace),
+            None => match state.db.status_page_by_slug(&slug).await {
+                Ok(Some(page)) => {
+                    state
+                        .status_slugs
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(slug.clone(), page.workspace);
+                    Some(page.workspace)
+                }
+                Ok(None) => None,
+                Err(error) => return ApiError::Db(error).into_response(),
+            },
         }
-        Err(error) => return ApiError::Db(error).into_response(),
-    }
-    if let Ok(bytes) = std::fs::read(state.status_dir.join("s").join(format!("{slug}.json"))) {
+    };
+    let Some(workspace) = workspace else {
+        return unavailable(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": {"code": "not_found", "message": "no status page here"}}),
+        );
+    };
+    // The file is named by workspace: a slug a previous owner released resolves to
+    // the new owner's file — never stale content under a recycled name.
+    if let Ok(bytes) = std::fs::read(
+        state
+            .status_dir
+            .join("s")
+            .join(format!("{}.json", workspace.0)),
+    ) {
         return (
             StatusCode::OK,
             [
@@ -1495,31 +1716,16 @@ fn check_signup_fields(body: &SignupBody) -> Result<String, &'static str> {
     Ok(email)
 }
 
-/// The workspace and account a valid signup mints. The slug derives from the email's
-/// local part plus account-id entropy, so two signups can't collide on it.
+/// The workspace and account a valid signup mints. The public slug is random — an
+/// email-derived name would tell anyone who can guess an address which page is
+/// theirs (S2 review) — and the workspace's name starts neutral, never the email.
 fn new_account(email: &str, password_hash: String) -> monitor_db::NewAccount {
-    let local = email.split('@').next().unwrap_or("ws");
-    let slug_base: String = local
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .take(20)
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned();
     let id = AccountId::new();
     monitor_db::NewAccount {
         id,
         workspace: monitor_domain::WorkspaceId::new(),
-        workspace_slug: format!(
-            "{}-{}",
-            if slug_base.is_empty() {
-                "ws"
-            } else {
-                &slug_base
-            },
-            &id.0.simple().to_string()[..6]
-        ),
-        workspace_name: email.to_owned(),
+        workspace_slug: format!("ws-{}", &Uuid::now_v7().simple().to_string()[20..]),
+        workspace_name: "Personal workspace".to_owned(),
         email: email.to_owned(),
         password_hash,
     }
@@ -1810,14 +2016,31 @@ async fn create_monitor(
         )));
     }
     let monitor = new.into_monitor_for(principal.workspace());
+    // Everything that can wait or refuse happens BEFORE the schedule lock (S2
+    // review): the write budget, the cheap count pre-check, and the candidate's
+    // DNS resolution. A tenant refused at the cap — or looping a black-hole name —
+    // must never hold the lock everyone's writes queue behind.
+    spend_write_budget(
+        &state.monitor_writes,
+        principal.workspace(),
+        MONITOR_WRITE_BUDGET,
+        MONITOR_WRITE_WINDOW,
+        MONITOR_WRITE_CAP,
+    )
+    .map_err(ApiError::TooMany)?;
+    // The plan caps the workspace's own count first; the server's `SMON_MAX_MONITORS`
+    // ceiling still bounds every tier (S3). `insert_monitor_within` re-checks this
+    // atomically inside its transaction — the pre-check only keeps the refusal cheap.
+    let cap = limits.max_monitors.min(state.max_monitors);
+    if view.monitor_count().await? >= cap {
+        return Err(ApiError::LimitReached(cap));
+    }
+    origin::refresh(std::iter::once(monitor.url.clone()), Duration::from_secs(3)).await;
     let _schedule = lock.0.lock().await;
     check_capacity(&state, &principal, |monitors| {
         monitors.push(monitor.clone());
     })
     .await?;
-    // The plan caps the workspace's own count first; the server's `SMON_MAX_MONITORS`
-    // ceiling still bounds every tier (S3).
-    let cap = limits.max_monitors.min(state.max_monitors);
     if !view.insert_monitor_within(&monitor, cap).await? {
         return Err(ApiError::LimitReached(cap));
     }
@@ -1894,6 +2117,17 @@ async fn patch_monitor(
             )));
         }
     }
+    // Same ordering as create (S2 review): the write budget and a changed name's
+    // DNS resolution happen before the schedule lock, never under it.
+    spend_write_budget(
+        &state.monitor_writes,
+        principal.workspace(),
+        MONITOR_WRITE_BUDGET,
+        MONITOR_WRITE_WINDOW,
+        MONITOR_WRITE_CAP,
+    )
+    .map_err(ApiError::TooMany)?;
+    origin::refresh(std::iter::once(merged.url.clone()), Duration::from_secs(3)).await;
     let _schedule = lock.0.lock().await;
     check_capacity(&state, &principal, |monitors| {
         for stored in monitors.iter_mut().filter(|stored| stored.id == merged.id) {
@@ -2374,6 +2608,10 @@ pub enum ApiError {
     /// D-019: `SMON_BACKUP_DIR` unset — the endpoint is off, like `auth_disabled` on login.
     #[error("backups are not configured on this server (SMON_BACKUP_DIR unset)")]
     BackupDisabled,
+    /// A per-workspace write budget is spent (S2 review): the wait until one unit
+    /// returns is the `Retry-After`.
+    #[error("too many writes from this workspace; retry shortly")]
+    TooMany(Duration),
     #[error("stored data violates the contract")]
     Corrupt,
     /// The store failed. Clients get fixed text; the detail (SQLite and sqlx messages:
@@ -2396,6 +2634,7 @@ impl ApiError {
             Self::Capacity(_) => "capacity_exceeded",
             Self::RefusedTarget => "refused_target",
             Self::BackupDisabled => "backup_disabled",
+            Self::TooMany(_) => "too_many_requests",
             Self::Corrupt => "corrupt_store",
             Self::Db(_) => "internal",
         }
@@ -2413,6 +2652,7 @@ impl ApiError {
             Self::Conflict(_) | Self::PlanLimit(_) | Self::LimitReached(_) | Self::Capacity(_) => {
                 StatusCode::CONFLICT
             }
+            Self::TooMany(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Corrupt | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -2420,6 +2660,19 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        if let Self::TooMany(wait) = self {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    throttle::retry_after_secs(wait).to_string(),
+                )],
+                Json(serde_json::json!({
+                    "error": { "code": self.code(), "message": self.to_string() }
+                })),
+            )
+                .into_response();
+        }
         let status = self.status();
         if status.is_server_error() {
             let detail = std::error::Error::source(&self).map(ToString::to_string);

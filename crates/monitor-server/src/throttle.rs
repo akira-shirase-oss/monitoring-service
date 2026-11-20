@@ -30,6 +30,12 @@ use tokio::time::Instant;
 pub const BURST: f64 = 5.0;
 /// One guess comes back this often.
 pub const REFILL_EVERY: Duration = Duration::from_secs(2);
+/// Anonymous reads an address may make back to back — a page reload storm, not a
+/// credential guess, so the budget is far above the guessing one.
+pub const READ_BURST: f64 = 30.0;
+/// One anonymous read comes back this often (2/s sustained — a viewer refreshing an
+/// incident page never notices; a flood is still bounded).
+pub const READ_REFILL_EVERY: Duration = Duration::from_millis(500);
 /// Addresses tracked at once (about 40 bytes each).
 pub const MAX_TRACKED: usize = 4096;
 
@@ -91,10 +97,10 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn refilled(self, now: Instant) -> f64 {
+    fn refilled(self, now: Instant, burst: f64, refill_every: Duration) -> f64 {
         let earned =
-            now.saturating_duration_since(self.at).as_secs_f64() / REFILL_EVERY.as_secs_f64();
-        (self.tokens + earned).min(BURST)
+            now.saturating_duration_since(self.at).as_secs_f64() / refill_every.as_secs_f64();
+        (self.tokens + earned).min(burst)
     }
 }
 
@@ -103,9 +109,12 @@ impl Bucket {
 pub struct Throttle {
     buckets: Arc<Mutex<HashMap<ClientKey, Bucket>>>,
     capacity: usize,
+    burst: f64,
+    refill_every: Duration,
 }
 
 impl Default for Throttle {
+    /// The credential-guessing budget.
     fn default() -> Self {
         Self::with_capacity(MAX_TRACKED)
     }
@@ -125,7 +134,9 @@ impl Attempt {
         let mut buckets = self.throttle.lock();
         if let Some(bucket) = buckets.get_mut(&self.key) {
             *bucket = Bucket {
-                tokens: (bucket.refilled(now) + 1.0).min(BURST),
+                tokens: (bucket.refilled(now, self.throttle.burst, self.throttle.refill_every)
+                    + 1.0)
+                    .min(self.throttle.burst),
                 at: now,
             };
         }
@@ -137,6 +148,20 @@ impl Throttle {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),
             capacity: capacity.max(1),
+            burst: BURST,
+            refill_every: REFILL_EVERY,
+        }
+    }
+
+    /// The anonymous-read budget: separate buckets from credential guessing, so a loop
+    /// against the public status pages can't lock out a sign-in, and a sign-in attack
+    /// can't starve readers mid-incident (S2 review).
+    pub fn reads() -> Self {
+        Self {
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+            capacity: MAX_TRACKED,
+            burst: READ_BURST,
+            refill_every: READ_REFILL_EVERY,
         }
     }
 
@@ -150,16 +175,16 @@ impl Throttle {
         let now = Instant::now();
         let mut buckets = self.lock();
         if !buckets.contains_key(&key) && buckets.len() >= self.capacity {
-            make_room(&mut buckets, now);
+            make_room(&mut buckets, now, self.burst, self.refill_every);
         }
         let bucket = buckets.entry(key).or_insert(Bucket {
-            tokens: BURST,
+            tokens: self.burst,
             at: now,
         });
-        let tokens = bucket.refilled(now);
+        let tokens = bucket.refilled(now, self.burst, self.refill_every);
         if tokens < 1.0 {
             *bucket = Bucket { tokens, at: now };
-            let wait = (1.0 - tokens) * REFILL_EVERY.as_secs_f64();
+            let wait = (1.0 - tokens) * self.refill_every.as_secs_f64();
             return Err(Duration::from_secs_f64(wait));
         }
         *bucket = Bucket {
@@ -180,14 +205,17 @@ impl Throttle {
 }
 
 /// Forget refilled buckets; if none, forget the fullest one.
-fn make_room(buckets: &mut HashMap<ClientKey, Bucket>, now: Instant) {
-    buckets.retain(|_, bucket| bucket.refilled(now) < BURST);
+fn make_room(buckets: &mut HashMap<ClientKey, Bucket>, now: Instant, burst: f64, refill: Duration) {
+    buckets.retain(|_, bucket| bucket.refilled(now, burst, refill) < burst);
     if buckets.is_empty() {
         return;
     }
     let fullest = buckets
         .iter()
-        .max_by(|a, b| a.1.refilled(now).total_cmp(&b.1.refilled(now)))
+        .max_by(|a, b| {
+            a.1.refilled(now, burst, refill)
+                .total_cmp(&b.1.refilled(now, burst, refill))
+        })
         .map(|(key, _)| *key);
     if let Some(key) = fullest {
         buckets.remove(&key);
@@ -205,11 +233,16 @@ pub fn retry_after_secs(wait: Duration) -> u64 {
 /// token never waits for it.
 pub const PENALTY_SLOTS: usize = 16;
 
-/// What `routes()` hands every request (an extension): the buckets, the penalty ceiling,
-/// and which peer may speak for clients through `X-Forwarded-For`.
+/// What `routes()` hands every request (an extension): the credential-guessing
+/// buckets, the separate anonymous-read buckets, the penalty ceiling, and which
+/// peer may speak for clients through `X-Forwarded-For`.
 #[derive(Debug, Clone)]
 pub struct Guard {
     pub throttle: Throttle,
+    /// Anonymous public reads (`/s/{slug}/status.json`): their own buckets, so a read
+    /// loop can't spend the credential budget and a guessing flood can't starve
+    /// readers (S2 review). Never refunded — there is no credential to earn it back.
+    pub reads: Throttle,
     pub penalties: Arc<tokio::sync::Semaphore>,
     pub trusted_proxy: Option<IpAddr>,
 }
@@ -218,6 +251,7 @@ impl Guard {
     pub fn new(trusted_proxy: Option<IpAddr>) -> Self {
         Self {
             throttle: Throttle::default(),
+            reads: Throttle::reads(),
             penalties: Arc::new(tokio::sync::Semaphore::new(PENALTY_SLOTS)),
             trusted_proxy,
         }
