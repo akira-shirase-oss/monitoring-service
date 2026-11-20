@@ -517,12 +517,23 @@ async fn check_capacity(
             schedule::MAX_GLOBAL_SLOTS
         )));
     }
-    // Every origin the proposed schedule overloads is judged, not just the worst
-    // `capacity` would report — a change pushing a *second* origin over its bound
-    // must not pass because another origin is already saturated (S2 review).
+    // The per-origin bound is a per-workspace share keyed by (address, host)
+    // (S2 re-review): another tenant's load on a shared host is theirs, never a
+    // reason to refuse this write. Every origin this workspace's proposed share
+    // overloads is judged, not just the worst — a change pushing a *second*
+    // origin over must not pass because another is already saturated.
     let origin_limit = schedule::slots_f64(config.per_origin_slots);
-    let before_origins = schedule::per_origin_loads(before.iter(), config.tick);
-    let worsened = schedule::per_origin_loads(monitors.iter(), config.tick)
+    let workspace = principal.workspace();
+    let own_loads = |monitors: &[Monitor]| {
+        schedule::per_origin_loads(
+            monitors
+                .iter()
+                .filter(|monitor| monitor.workspace == workspace),
+            config.tick,
+        )
+    };
+    let before_origins = own_loads(&before);
+    let worsened = own_loads(&monitors)
         .into_iter()
         .filter(|(origin, per_tick)| {
             *per_tick > origin_limit
@@ -541,7 +552,8 @@ async fn check_capacity(
             }
         };
         return Err(ApiError::Capacity(format!(
-            "{detail}; one origin gets at most {}. Lengthen the intervals of its monitors",
+            "{detail}; one workspace gets at most {} probe starts a second against \
+             one origin. Lengthen the intervals of its monitors",
             config.per_origin_slots
         )));
     }

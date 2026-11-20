@@ -1488,6 +1488,60 @@ async fn capacity_refuses_only_the_added_load() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// S2 re-review (finding raised to S2): the per-origin bound is a per-workspace
+/// share keyed by (IP, Host). Shared hosting puts every tenant's site behind one
+/// address — one workspace saturating that origin must not refuse another
+/// workspace's first monitor on the same target.
+#[tokio::test]
+async fn a_workspace_gets_its_own_share_of_a_shared_origin() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let _hog = sign_up(&app, "hog@a.example").await;
+    let other = sign_up(&app, "other@b.example").await;
+    let (hog_ws, other_ws) = (
+        workspace_of(&db, "hog@a.example").await?,
+        workspace_of(&db, "other@b.example").await?,
+    );
+    for id in [&hog_ws, &other_ws] {
+        db.set_workspace_plan(
+            WorkspaceId(uuid::Uuid::parse_str(id)?),
+            monitor_domain::Plan::Operator,
+        )
+        .await?;
+    }
+    // The hog's own share is already over the bound: 31 × 15 s probes on one
+    // origin ≈ 2.07 starts/tick — a saturation the next workspace must not pay for.
+    let hog_id = WorkspaceId(uuid::Uuid::parse_str(&hog_ws)?);
+    for i in 0..31 {
+        let monitor = monitor_domain::NewMonitor::with_schedule(
+            format!("h{i}"),
+            url::Url::parse("https://shared.example/")?,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+        )?
+        .into_monitor_for(hog_id);
+        db.workspace(hog_id).insert_monitor(&monitor).await?;
+    }
+    // Under an origin-wide budget this write worsens an overloaded origin and is
+    // refused; under a per-workspace share the other tenant's share is untouched.
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "mine", "url": "https://shared.example/", "interval_s": 15,
+        })),
+        Some(Cred::Cookie(&other)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a shared origin's load is each workspace's own business: {body}"
+    );
+    Ok(())
+}
+
 /// N2: inside the schedule lock the capacity check resolves nothing — foreign
 /// workspaces' monitor names answer from the origin cache or their own spelling.
 /// A registry full of black-hole names must never hold every writer's lock while

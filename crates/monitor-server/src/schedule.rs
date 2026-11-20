@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use monitor_db::{Observation, WriterHandle};
-use monitor_domain::{Monitor, MonitorId, SlotObservation};
+use monitor_domain::{Monitor, MonitorId, SlotObservation, WorkspaceId};
 
 use crate::probe::ProbeClient;
 use crate::vitals::Vitals;
@@ -32,7 +32,10 @@ pub struct Config {
     /// Global in-flight probe bound's floor; the coordinator raises it to what the
     /// schedule needs, up to [`MAX_GLOBAL_SLOTS`] (D-018).
     pub global_slots: usize,
-    /// In-flight probes per `host:port`.
+    /// In-flight probes per (origin, workspace) share — an origin is an
+    /// `addr:port|host` pair (origin.rs), and each workspace holds its own bound
+    /// on it (S2 re-review): one tenant's load on a shared host never eats
+    /// another tenant's allowance.
     pub per_origin_slots: usize,
     /// Capacity of the probe-results channel; full means workers park, slots go `missed`.
     pub results_bound: usize,
@@ -115,11 +118,11 @@ impl Runtime {
 
 /// The most probes one coordinator keeps in flight (D-018): outbound sockets, well inside
 /// the unit's 4096 file descriptors beside `SMON_MAX_CONNECTIONS` inbound ones. A
-/// schedule that would need more is refused when it is written ([`capacity`]).
+/// schedule that would need more is refused when it is written (`check_capacity`).
 pub const MAX_GLOBAL_SLOTS: usize = 512;
 
 /// S3: the share of the probe budget one workspace's own schedule may need —
-/// a quarter of the global ceiling. Writes past it are refused (`capacity`), so
+/// a quarter of the global ceiling. Writes past it are refused (`check_capacity`), so
 /// a tenant's schedule can't silently crowd the engine's slots (D-020 tenancy).
 pub const MAX_WORKSPACE_SLOTS: usize = MAX_GLOBAL_SLOTS / 4;
 
@@ -134,21 +137,6 @@ pub fn required_slots<'a>(monitors: impl IntoIterator<Item = &'a Monitor>, tick:
             let interval = monitor.interval.as_secs_f64().max(f64::EPSILON);
             (tick.as_secs_f64() + monitor.timeout.min(monitor.interval).as_secs_f64()) / interval
         })
-        .sum()
-}
-
-/// Starts per tick one origin needs across `monitors` (unpaused only) — the same
-/// measure [`capacity`] rates per origin, so a write can ask whether *its* change
-/// is what pushed an origin over (S2 review).
-pub fn origin_required<'a>(
-    monitors: impl IntoIterator<Item = &'a Monitor>,
-    origin: &str,
-    tick: Duration,
-) -> f64 {
-    monitors
-        .into_iter()
-        .filter(|monitor| !monitor.paused && origin_key(&monitor.url) == origin)
-        .map(|monitor| tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON))
         .sum()
 }
 
@@ -176,20 +164,10 @@ fn global_budget(monitors: &[Monitor], config: &Config) -> usize {
     needed.clamp(config.global_slots.min(MAX_GLOBAL_SLOTS), MAX_GLOBAL_SLOTS)
 }
 
-/// What a schedule can't be served by, if anything — checked when monitors are written,
-/// so an impossible schedule is a named refusal instead of slots silently missed (D-018).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Overload {
-    /// More probe slots than [`MAX_GLOBAL_SLOTS`] at these intervals and timeouts.
-    Global { required: f64 },
-    /// More starts per tick on one origin than its per-origin bound allows, even if every
-    /// probe were instant.
-    Origin { origin: String, per_tick: f64 },
-}
-
-/// Starts per tick on each origin in the schedule (paused monitors excluded) — the
-/// map [`capacity`] reduces to its worst entry, kept whole so a write check can ask
-/// about every origin the change touches, not just the single worst.
+/// Starts per tick on each origin across the given monitors (paused excluded). The
+/// per-origin bound is a per-workspace share (S2 re-review), so the write check calls
+/// this on one workspace's monitors; the bound's keys are `addr:port|host` pairs, so
+/// sites sharing one hosting address are already distinct entries.
 pub fn per_origin_loads<'a>(
     monitors: impl Iterator<Item = &'a Monitor>,
     tick: Duration,
@@ -200,20 +178,6 @@ pub fn per_origin_loads<'a>(
             tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
     }
     per_origin
-}
-
-/// Check a whole schedule (the stored monitors with a proposed change applied).
-pub fn capacity(monitors: &[Monitor], config: &Config) -> Option<Overload> {
-    let required = required_slots(monitors, config.tick);
-    if required > slots_f64(MAX_GLOBAL_SLOTS) {
-        return Some(Overload::Global { required });
-    }
-    let origin_limit = slots_f64(config.per_origin_slots);
-    per_origin_loads(monitors.iter(), config.tick)
-        .into_iter()
-        .filter(|(_, per_tick)| *per_tick > origin_limit)
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(origin, per_tick)| Overload::Origin { origin, per_tick })
 }
 
 /// The global semaphore, resized to the schedule's budget whenever the registry changes.
@@ -321,7 +285,7 @@ async fn run(
     // Background name lookups for the per-origin keys; aborted when the loop ends.
     let mut lookups = tokio::task::JoinSet::new();
     let mut ticks_since_refresh = 0_u32;
-    let mut origins: HashMap<String, Arc<Semaphore>> = HashMap::new();
+    let mut origins: HashMap<(String, WorkspaceId), Arc<Semaphore>> = HashMap::new();
     let mut runtimes: HashMap<MonitorId, Runtime> = HashMap::new();
     let tracker = TaskTracker::new();
     let mut ticker = tokio::time::interval(config.tick);
@@ -395,7 +359,7 @@ async fn run(
 /// so no mutable borrow crosses an `.await`.
 fn plan_due(
     runtimes: &mut HashMap<MonitorId, Runtime>,
-    origins: &mut HashMap<String, Arc<Semaphore>>,
+    origins: &mut HashMap<(String, WorkspaceId), Arc<Semaphore>>,
     global: &Arc<Semaphore>,
     config: &Config,
 ) -> Plan {
@@ -428,7 +392,10 @@ fn plan_due(
             debug!(monitor = %entry.monitor.id.0, "global probe slots exhausted");
             continue;
         };
-        let key = origin_key(&entry.monitor.url);
+        // The bound is a per-workspace share (S2 re-review): the semaphore's key is
+        // the (addr|host) origin *and* the workspace, so a shared host's load is
+        // each tenant's own business.
+        let key = (origin_key(&entry.monitor.url), entry.monitor.workspace);
         let origin = origins
             .entry(key)
             .or_insert_with(|| Arc::new(Semaphore::new(config.per_origin_slots)))
@@ -528,7 +495,7 @@ impl Plan {
 /// mismatch makes the writer drop it.
 fn reconcile(
     runtimes: &mut HashMap<MonitorId, Runtime>,
-    origins: &mut HashMap<String, Arc<Semaphore>>,
+    origins: &mut HashMap<(String, WorkspaceId), Arc<Semaphore>>,
     monitors: &[Monitor],
     config: &Config,
     clock: &SlotClock,
@@ -564,8 +531,8 @@ fn reconcile(
     }
 }
 
-/// The per-origin bound's key: the resolved address and port (origin.rs), so aliases of
-/// one server share it.
+/// The per-origin bound's key: the resolved address and the requested host
+/// (`addr:port|host`, origin.rs) — sites sharing one hosting address stay distinct.
 fn origin_key(url: &Url) -> String {
     crate::origin::key(url)
 }
@@ -573,14 +540,14 @@ fn origin_key(url: &Url) -> String {
 /// Drop the per-origin semaphores no runtime keys to any more (after a registry change, or
 /// after a refresh re-keyed a name).
 fn prune_origins(
-    origins: &mut HashMap<String, Arc<Semaphore>>,
+    origins: &mut HashMap<(String, WorkspaceId), Arc<Semaphore>>,
     runtimes: &HashMap<MonitorId, Runtime>,
 ) {
-    let in_use: std::collections::HashSet<String> = runtimes
+    let in_use: std::collections::HashSet<(String, WorkspaceId)> = runtimes
         .values()
-        .map(|entry| origin_key(&entry.monitor.url))
+        .map(|entry| (origin_key(&entry.monitor.url), entry.monitor.workspace))
         .collect();
-    origins.retain(|origin, _| in_use.contains(origin));
+    origins.retain(|key, _| in_use.contains(key));
 }
 
 /// How often the coordinator re-resolves its monitors' names (ticks).
@@ -937,11 +904,11 @@ mod tests {
         );
     }
 
-    /// Hostname aliases of one address are one origin: `localhost` and `127.0.0.1` on the
-    /// same port share the per-origin bound once the name is resolved, so spelling a host
-    /// two ways can't double what one server receives.
+    /// S2 re-review: origins are (address, host) pairs. A name and the address it
+    /// resolves to are different origins — on shared hosting the host is the site,
+    /// and one address is many tenants' worth of vhosts.
     #[tokio::test(start_paused = true)]
-    async fn aliases_of_one_address_share_the_per_origin_bound() {
+    async fn a_name_and_the_address_it_resolves_to_are_different_origins() {
         let config = Config {
             per_origin_slots: 1,
             ..Config::default()
@@ -961,8 +928,61 @@ mod tests {
         let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
         assert_eq!(
             plan.dispatches.len(),
+            2,
+            "(127.0.0.1:9, localhost) and (127.0.0.1:9, 127.0.0.1) are different origins"
+        );
+    }
+
+    /// The bound itself is a per-workspace share: two workspaces on the same origin
+    /// each get their own slot — a shared host's load is never a commons one
+    /// tenant's schedule can exhaust for the others (S2 re-review).
+    #[tokio::test(start_paused = true)]
+    async fn each_workspace_gets_its_own_share_of_an_origin() {
+        let config = Config {
+            per_origin_slots: 1,
+            ..Config::default()
+        };
+        let mut monitors = fleet(2, 1, Duration::from_secs(15), Duration::from_secs(3));
+        let other = WorkspaceId(uuid::Uuid::now_v7());
+        monitors[1].workspace = other;
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        let clock = SlotClock::start();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
+        for entry in runtimes.values_mut() {
+            entry.next_slot = Instant::now(); // both due on this tick
+        }
+        let global = Arc::new(Semaphore::new(16));
+        let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
+        assert_eq!(
+            plan.dispatches.len(),
+            2,
+            "two workspaces on one origin share no slot budget"
+        );
+    }
+
+    /// Within a workspace the share still binds: two same-origin monitors of one
+    /// tenant compete for that workspace's per-origin slots.
+    #[tokio::test(start_paused = true)]
+    async fn the_share_binds_within_a_workspace() {
+        let config = Config {
+            per_origin_slots: 1,
+            ..Config::default()
+        };
+        let monitors = fleet(2, 1, Duration::from_secs(15), Duration::from_secs(3));
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        let clock = SlotClock::start();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
+        for entry in runtimes.values_mut() {
+            entry.next_slot = Instant::now(); // both due on this tick
+        }
+        let global = Arc::new(Semaphore::new(16));
+        let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
+        assert_eq!(
+            plan.dispatches.len(),
             1,
-            "two spellings of one address got two per-origin slots"
+            "one workspace's two monitors on an origin got two per-origin slots"
         );
     }
 }
