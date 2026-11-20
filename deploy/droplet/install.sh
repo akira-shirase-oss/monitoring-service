@@ -73,7 +73,11 @@ if ! need caddy; then
     || { echo "error: pinned caddy repo key exported empty" >&2;
          rm -rf "$gtmp" "$caddy_key"; exit 2; }
   rm -rf "$gtmp" "$caddy_key"
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  # The sources line is written inline (S3 review): fetching the .list means
+  # trusting whatever signed-by/trusted=yes it arrives carrying — that would
+  # undo the fingerprint pin above.
+  printf '%s\n' \
+    'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
     >/etc/apt/sources.list.d/caddy-stable.list
   apt-get update
   apt-get install -y caddy

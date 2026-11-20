@@ -46,13 +46,18 @@ fn the_unit_hardening_check_passes() {
     harness("check-unit-hardening.sh");
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a missing deploy file is a test failure, not input"
+)]
+fn read(name: &str) -> String {
+    let path = format!("{DROPLET}/{name}");
+    assert!(Path::new(&path).exists(), "missing {path}");
+    std::fs::read_to_string(&path).expect("just proven to exist")
+}
+
 #[test]
 fn the_deploy_scripts_carry_their_promised_properties() {
-    let read = |name: &str| {
-        let path = format!("{DROPLET}/{name}");
-        assert!(Path::new(&path).exists(), "missing {path}");
-        std::fs::read_to_string(&path).unwrap()
-    };
     let install = read("install.sh");
     assert!(
         install.contains("umask 077"),
@@ -116,9 +121,17 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         "--export \"$want\"", // …and ONLY the pinned key is exported to apt
         "sha256sum",          // the CA pin covers every byte of the file, not just the first cert
         "caddy version",      // >= 2.7 floor: {client_ip}/trusted-proxies need it
+        // S3: the sources line is written inline with signed-by — a fetched list
+        // could arrive carrying `trusted=yes` and undo the fingerprint pin.
+        "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg]",
     ] {
         assert!(install.contains(pin), "install.sh is missing '{pin}'");
     }
+    assert!(
+        !install.contains("debian.deb.txt"),
+        "the apt sources list must not be downloaded — its signed-by/trusted=yes \
+         content would undo the key pin"
+    );
     assert!(
         !install.contains("apt-get install -y caddy ||"),
         "the pinned repo must be registered BEFORE caddy is installed — Ubuntu's older \
@@ -129,7 +142,10 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         "the env file is sourced unexported — `set -a` would leak the admin token to \
          every child of the installer"
     );
+}
 
+#[test]
+fn the_edge_and_unit_files_carry_their_promised_properties() {
     // N1: the edge forwards the visitor's address, and only Cloudflare gets to say
     // what it is — the default client_ip_headers reads left-most X-Forwarded-For,
     // which a client writes itself (a fresh throttle key per request).
