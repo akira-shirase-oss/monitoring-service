@@ -93,6 +93,71 @@ fn the_env_template_has_no_inline_comments_and_its_examples_parse() {
 
 const PLIST: &str = include_str!("../../../deploy/com.shirase.smon.plist");
 const RUNBOOK: &str = include_str!("../../../deploy/RUNBOOK.md");
+const BACKUP_UNIT: &str = include_str!("../../../deploy/droplet/smon-backup.service");
+const INSTALL_SH: &str = include_str!("../../../deploy/droplet/install.sh");
+
+/// `ps` shows argv to every local user, so no command line may ever carry a secret —
+/// secrets travel by files (`EnvironmentFile`, `LoadCredential`, sourced env) or by the
+/// environment itself. Asserted over every shipped unit's `ExecStart`, the launchd
+/// `ProgramArguments`, and `install.sh`'s flag contract (its flags take file paths only).
+#[test]
+fn no_secret_is_ever_passed_on_a_command_line() {
+    let forbidden = |what: &str, line: &str| {
+        let l = line.to_lowercase();
+        for word in ["token", "secret", "key", "password", "credential"] {
+            assert!(
+                !l.contains(word),
+                "{what} names {word} on a command line: {line}"
+            );
+        }
+    };
+    for (name, unit) in [
+        ("monitor-server.service", UNIT),
+        ("smon-backup.service", BACKUP_UNIT),
+    ] {
+        for line in unit.lines().map(str::trim) {
+            if let Some(cmd) = line.strip_prefix("ExecStart=") {
+                forbidden(name, cmd);
+            }
+            // LoadCredential= is the sanctioned channel: the file path is argv-safe,
+            // its contents reach the process as $CREDENTIALS_DIRECTORY/<name>.
+        }
+    }
+    // The launchd argv is a fixed wrapper that sources /opt/smon/env — assert it stays
+    // exactly that: any added literal would be a secret in `ps`.
+    let program_args = PLIST
+        .split("<key>ProgramArguments</key>")
+        .nth(1)
+        .and_then(|rest| rest.split("</array>").next())
+        .expect("the plist must carry ProgramArguments");
+    let argv: Vec<&str> = program_args
+        .split("<string>")
+        .skip(1)
+        .filter_map(|s| s.split("</string>").next())
+        .collect();
+    assert_eq!(
+        argv,
+        [
+            "/bin/sh",
+            "-c",
+            "set -a; . /opt/smon/env; set +a; exec /opt/smon/current/bin/monitor-server"
+        ],
+        "the launchd argv changed — review what it now exposes"
+    );
+    // install.sh's non-interactive flags are all file paths; a literal credential flag
+    // (--r2-access-key was removed for exactly this reason) must not come back.
+    for flag in INSTALL_SH
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("--"))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(|l| l.trim_end_matches([')', ';']))
+    {
+        assert!(
+            !flag.contains("endpoint") && !flag.contains("access-key") && !flag.contains("token"),
+            "install.sh flag `--{flag}` invites a credential as an argv value"
+        );
+    }
+}
 
 /// launchd sends SIGTERM, then SIGKILL after `ExitTimeOut` (its default is shorter than
 /// the server's 12 s HTTP + 15 s engine drain), so `launchctl kickstart -k` could cut the

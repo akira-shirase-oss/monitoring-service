@@ -9,33 +9,38 @@
 # Prompts only for secrets that can't be generated (the origin certificate pair, the R2
 # secret), with umask 077 and no echo. Everything else is generated or fetched. ~15 min.
 #
-# Non-interactive installs (CI, replays) pass the same secrets as file paths/flags —
-# never through a prompt: --origin-cert F --origin-key F each replaces its `cat` prompt,
-# and --r2-secret F --r2-endpoint U --r2-access-key I together replace the R2 prompts
-# (a partial set is an error — prompting for half a credential is worse than either mode).
+# Non-interactive installs (CI, replays) pass the same secrets as file paths — never
+# through a prompt and never as argv values (ps shows argv to every local user):
+# --origin-cert F --origin-key F each replaces its `cat` prompt, and --r2-secret F
+# --r2-env F together replace the R2 prompts (the env file carries SMON_R2_ENDPOINT
+# and SMON_R2_ACCESS_KEY; a partial set is an error — prompting for half a credential
+# is worse than either mode).
 set -euo pipefail
 umask 077
 PREFIX=/opt/smon
 RELEASE_DIR=""
 ORIGIN_CERT=""; ORIGIN_KEY=""
-R2_SECRET=""; R2_ENDPOINT=""; R2_ACCESS_KEY=""
+R2_SECRET=""; R2_ENV=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --release-dir)    RELEASE_DIR="$2"; shift 2 ;;
     --origin-cert)    ORIGIN_CERT="$2"; shift 2 ;;
     --origin-key)     ORIGIN_KEY="$2"; shift 2 ;;
     --r2-secret)      R2_SECRET="$2"; shift 2 ;;
-    --r2-endpoint)    R2_ENDPOINT="$2"; shift 2 ;;
-    --r2-access-key)  R2_ACCESS_KEY="$2"; shift 2 ;;
+    --r2-env)         R2_ENV="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
-for f in "$ORIGIN_CERT" "$ORIGIN_KEY" "$R2_SECRET"; do
+for f in "$ORIGIN_CERT" "$ORIGIN_KEY" "$R2_SECRET" "$R2_ENV"; do
   [[ -z "$f" || -f "$f" ]] || { echo "error: $f does not exist" >&2; exit 2; }
 done
-r2_given=$(( ${#R2_SECRET} + ${#R2_ENDPOINT} + ${#R2_ACCESS_KEY} ))
-if [[ $r2_given -gt 0 && ( -z "$R2_SECRET" || -z "$R2_ENDPOINT" || -z "$R2_ACCESS_KEY" ) ]]; then
-  echo "error: --r2-secret, --r2-endpoint and --r2-access-key go together" >&2; exit 2
+if [[ -n "$R2_SECRET" || -n "$R2_ENV" ]] && [[ -z "$R2_SECRET" || -z "$R2_ENV" ]]; then
+  echo "error: --r2-secret and --r2-env go together" >&2; exit 2
+fi
+if [[ -n "$R2_ENV" ]]; then
+  for key in SMON_R2_ENDPOINT SMON_R2_ACCESS_KEY; do
+    grep -q "^$key=" "$R2_ENV" || { echo "error: $R2_ENV lacks $key" >&2; exit 2; }
+  done
 fi
 [[ $EUID -eq 0 ]] || { echo "error: run as root" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
@@ -132,8 +137,7 @@ fi
 if [[ ! -s "$PREFIX/credentials/s3_secret_key" ]]; then
   if [[ -n "$R2_SECRET" ]]; then
     install -m 0400 "$R2_SECRET" "$PREFIX/credentials/s3_secret_key"
-    printf 'SMON_R2_ENDPOINT=%s\nSMON_R2_ACCESS_KEY=%s\n' "$R2_ENDPOINT" "$R2_ACCESS_KEY" >"$PREFIX/credentials/r2.env"
-    chmod 0644 "$PREFIX/credentials/r2.env"
+    install -m 0644 "$R2_ENV" "$PREFIX/credentials/r2.env"
   else
     printf 'Paste the R2 secret access key (no echo): '
     read -rs key || { echo >&2 "aborted: re-run install.sh when you have the key"; exit 2; }

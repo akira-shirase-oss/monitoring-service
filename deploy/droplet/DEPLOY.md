@@ -99,11 +99,13 @@ exists" is evidence, not a wait for the first timer tick), and finishes with `sm
 Secrets are prompted for with echo off; nothing secret lands anywhere but the root-only
 files CREATE.md names.
 
-Non-interactive installs (CI, replays) pass the same secrets without a prompt:
+Non-interactive installs (CI, replays) pass the same secrets without a prompt and never
+as argv values — `ps` shows argv to every local user, so each flag takes a file path:
 `--origin-cert FILE --origin-key FILE` install the origin pair, and `--r2-secret FILE
---r2-endpoint URL --r2-access-key ID` together seed the R2 credentials — a partial set is
-refused. The deploy-check workflow runs exactly this on a hosted VM (rclone stubbed to a
-filesystem remote — the pipeline is real, the account is not), twice, for idempotence.
+--r2-env FILE` together seed the R2 credentials (the env file carries
+`SMON_R2_ENDPOINT`/`SMON_R2_ACCESS_KEY`). A partial set is refused. The deploy-check
+workflow runs exactly this on a hosted VM (rclone stubbed to a filesystem remote — the
+pipeline is real, the account is not), twice, for idempotence.
 
 What it deliberately does **not** do: overwrite an existing `env`, re-initialise a store,
 or weaken the file modes.
