@@ -38,7 +38,7 @@ jobs:
         run: cargo build --release -p monitor-server -p monitor-cli --locked
       - name: Stage a release dir, test secrets and the rclone stub
         run: |
-          work="$RUNNER_WORK/install-check"
+          work="$RUNNER_TEMP/install-check"
           mkdir -p "$work/release/bin" "$work/secrets"
           cp target/release/monitor-server target/release/monitor "$work/release/bin/"
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
@@ -66,7 +66,7 @@ jobs:
           sudo install -d /opt/smon-rclone-remote
       - name: Run install.sh (non-interactive, as root)
         run: |
-          work="$RUNNER_WORK/install-check"
+          work="$RUNNER_TEMP/install-check"
           sudo env "PATH=$PATH" "SMOKE_LOCAL=1" deploy/droplet/install.sh \
             --release-dir "$work/release" \
             --origin-cert "$work/secrets/origin.pem" --origin-key "$work/secrets/origin.key" \
@@ -74,7 +74,7 @@ jobs:
             2>&1 | tee "$work/install.log"
       - name: Re-run install.sh — the promised property is idempotence
         run: |
-          work="$RUNNER_WORK/install-check"
+          work="$RUNNER_TEMP/install-check"
           sudo env "PATH=$PATH" "SMOKE_LOCAL=1" deploy/droplet/install.sh \
             --release-dir "$work/release" 2>&1 | tee "$work/install-rerun.log"
       - name: The install is live and the unit is what was checked in
@@ -87,7 +87,7 @@ jobs:
       - name: Keep the evidence
         run: |
           mkdir -p deploy-check-artifacts
-          cp "$RUNNER_WORK/install-check"/*.log deploy-check-artifacts/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/install-check"/*.log deploy-check-artifacts/ 2>/dev/null || true
           systemd-analyze security monitor-server.service > deploy-check-artifacts/security.txt 2>&1 || true
           sudo journalctl -u monitor-server --no-pager -n 80 > deploy-check-artifacts/monitor-server.journal 2>/dev/null || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

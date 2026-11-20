@@ -162,6 +162,32 @@ fn the_deploy_scripts_carry_their_promised_properties() {
 }
 
 #[test]
+fn the_install_job_uses_a_runner_path_and_runs_install_twice() {
+    // CI 44754877109: the job staged under `$RUNNER_WORK`, which GitHub never sets —
+    // the empty expansion made `work` "/install-check" and the runner user could not
+    // mkdir at the filesystem root. The job never passed once. Pin the real variable
+    // (RUNNER_TEMP) and the promised shape: install runs, then runs again.
+    let workflow = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/deploy-check.yml"
+    ))
+    .unwrap();
+    assert!(
+        !workflow.contains("RUNNER_WORK"),
+        "RUNNER_WORK is not a GitHub variable — it expands to '/'"
+    );
+    assert!(
+        workflow.contains("$RUNNER_TEMP"),
+        "the scratch dir must live under the runner's temp"
+    );
+    assert_eq!(
+        workflow.matches("deploy/droplet/install.sh").count(),
+        2,
+        "the job must run install.sh, then re-run it for idempotence"
+    );
+}
+
+#[test]
 fn the_server_reports_its_schema_version() {
     // The guard's other half: the binary must report the newest migration it knows.
     // (The value itself — today's migrations — is proven by the stub harness running a
