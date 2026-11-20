@@ -725,7 +725,7 @@ impl Db {
         sqlx::query_as::<_, PendingInvitation>(
             "SELECT i.id, i.workspace_id, w.name AS workspace_name, i.role, i.created_at
                FROM workspace_invitations i
-               JOIN accounts a ON lower(a.email) = lower(i.email)
+               JOIN accounts a ON a.email = i.email
                JOIN workspaces w ON w.id = i.workspace_id
               WHERE a.id = ? AND i.expires_at > ? ORDER BY i.created_at",
         )
@@ -750,7 +750,7 @@ impl Db {
         let mut tx = self.pool.begin().await?;
         let invitation = sqlx::query_as::<_, (String, String)>(
             "SELECT i.workspace_id, i.role FROM workspace_invitations i
-               JOIN accounts a ON lower(a.email) = lower(i.email)
+               JOIN accounts a ON a.email = i.email
               WHERE i.id = ? AND a.id = ? AND i.expires_at > ?",
         )
         .bind(id)
@@ -789,7 +789,7 @@ impl Db {
         let gone = sqlx::query(
             "DELETE FROM workspace_invitations
               WHERE id = ?
-                AND lower(email) IN (SELECT lower(email) FROM accounts WHERE id = ?)",
+                AND email IN (SELECT email FROM accounts WHERE id = ?)",
         )
         .bind(id)
         .bind(account.0.to_string())
@@ -1438,6 +1438,26 @@ impl Db {
                SELECT id FROM sessions WHERE expires_at <= ? LIMIT ?)",
         )
         .bind(OffsetDateTime::now_utc())
+        .bind(i64::from(limit.max(1)))
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    /// Delete up to `limit` invitations past `now` — same retention-tick
+    /// housekeeping as [`sweep_expired_sessions`], same bound (D-012): expired rows
+    /// are honest-expired on read already, this just keeps the table small. The
+    /// caller passes `now` so a test can sweep a future instant.
+    pub async fn sweep_expired_invitations(
+        &self,
+        now: OffsetDateTime,
+        limit: u32,
+    ) -> Result<u64, QueryError> {
+        let done = sqlx::query(
+            "DELETE FROM workspace_invitations WHERE id IN (
+               SELECT id FROM workspace_invitations WHERE expires_at <= ? LIMIT ?)",
+        )
+        .bind(now)
         .bind(i64::from(limit.max(1)))
         .execute(&self.pool)
         .await?;
@@ -2654,6 +2674,21 @@ impl MemberDb<'_> {
                 )
                 .execute(&mut *tx)
                 .await?;
+                // The held set stays bounded per workspace (S3 review): a rename
+                // loop would otherwise grow a tombstone per call. The newest 64
+                // stay — a name older than that has been recycled so many times
+                // the association is gone anyway.
+                sqlx::query(
+                    "DELETE FROM status_held_slugs
+                      WHERE workspace_id = ? AND slug NOT IN (
+                        SELECT slug FROM status_held_slugs
+                         WHERE workspace_id = ?
+                         ORDER BY released_at DESC, slug DESC LIMIT 64)",
+                )
+                .bind(ws.workspace.0.to_string())
+                .bind(ws.workspace.0.to_string())
+                .execute(&mut *tx)
+                .await?;
             }
             sqlx::query("UPDATE workspaces SET slug = ? WHERE id = ?")
                 .bind(slug)
@@ -2797,6 +2832,20 @@ impl OwnerDb<'_> {
         .fetch_all(&self.view.view.view.db.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Withdraw a pending invitation — the owner's undo for a mistyped address or a
+    /// changed mind before the invitee ever sees it. `Ok(false)` = no such pending
+    /// invitation in this workspace.
+    pub async fn revoke_invitation(&self, id: &str) -> Result<bool, QueryError> {
+        let gone =
+            sqlx::query("DELETE FROM workspace_invitations WHERE id = ? AND workspace_id = ?")
+                .bind(id)
+                .bind(self.view.view.view.workspace.0.to_string())
+                .execute(&self.view.view.view.db.pool)
+                .await?
+                .rows_affected();
+        Ok(gone > 0)
     }
 
     /// Change `account`'s role. The last-owner rule is enforced inside the

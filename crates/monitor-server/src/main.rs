@@ -344,6 +344,7 @@ fn app_state(
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
         status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         monitor_writes: std::sync::Arc::default(),
         invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
@@ -586,6 +587,30 @@ fn spawn_retention(
             }
             if swept > 0 {
                 tracing::debug!(sessions = swept, "swept expired sessions");
+            }
+            // Expired invitations are the same housekeeping: reads already treat
+            // them as absent (`expires_at > now`), the sweep keeps the table from
+            // accumulating them forever (S3 review). Bounded per call, same rule.
+            let mut swept = 0;
+            loop {
+                match db
+                    .sweep_expired_invitations(time::OffsetDateTime::now_utc(), SESSION_SWEEP_BATCH)
+                    .await
+                {
+                    Ok(n) => {
+                        swept += n;
+                        if n < u64::from(SESSION_SWEEP_BATCH) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "invitation sweep failed");
+                        break;
+                    }
+                }
+            }
+            if swept > 0 {
+                tracing::debug!(invitations = swept, "swept expired invitations");
             }
         }
     })

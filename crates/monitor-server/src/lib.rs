@@ -155,9 +155,14 @@ pub struct AppState {
     pub status_dir: std::path::PathBuf,
     /// Enabled-slug → workspace cache for the public route: anonymous hits resolve
     /// the slug and read the file without touching the store (two SQL per hit on a
-    /// 4-connection read pool would otherwise be the bottleneck). `put_status_page`
+    /// 4-connection read pool would otherwise be the bottleneck — and uncached
+    /// misses would be just as bad under a random-slug flood). `put_status_page`
     /// is the only writer of the mapping it caches, so invalidation lives there.
     pub status_slugs: StatusSlugs,
+    /// Bumped on every status-page write; cached slug entries carry it and a
+    /// stale version re-resolves — the commit/insert race leaves no stale entry.
+    /// `Arc` so every cloned `AppState` shares the one counter.
+    pub status_slug_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Per-workspace "send test alert" cooldowns (S2): the test is a real network
     /// send, so one per `TEST_SEND_EVERY` bounds what a member can aim at their
     /// receiver. Bounded like `token_use`: workspaces are bounded, and the map
@@ -192,11 +197,26 @@ pub type WritePace = std::sync::Arc<
     >,
 >;
 
-/// The public route's enabled-slug → workspace resolution (`AppState::status_slugs`).
-/// Only enabled pages are ever stored; a workspace's one page means one entry.
-pub type StatusSlugs = std::sync::Arc<
-    std::sync::RwLock<std::collections::HashMap<String, monitor_domain::WorkspaceId>>,
->;
+/// The public route's slug → workspace resolution (`AppState::status_slugs`), one
+/// entry per asked-for slug — `None` is a cached miss (unknown/disabled), so a
+/// random-slug flood costs the in-memory map, not the small read pool (S2 review).
+/// `version` is [`AppState::status_slug_version`] at insert time; a stale-version
+/// entry is a miss, which closes the race where a reader's lookup ran before a
+/// PUT committed but its insert landed after the PUT's invalidation.
+#[derive(Debug, Clone, Copy)]
+pub struct SlugEntry {
+    pub workspace: Option<monitor_domain::WorkspaceId>,
+    pub version: u64,
+}
+
+/// The slug map itself: bounded like every other per-key cache (the cap clears it
+/// whole — entries are re-resolved on the next ask).
+pub type StatusSlugs =
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, SlugEntry>>>;
+
+/// The slug map's bound — a flood of distinct public-slug guesses can't grow it
+/// without limit.
+pub const STATUS_SLUG_CAP: usize = 4096;
 
 /// Monitors one status page may publish — the allowlist's bound (S2 hardening).
 pub const PAGE_MAX_MONITORS: usize = 64;
@@ -407,6 +427,7 @@ fn routes(state: AppState) -> Router {
         // `member_for`/`owner_for` decide by the request's role, not by route table.
         .route("/members", get(list_members).post(add_member))
         .route("/members/invitations", get(list_workspace_invitations))
+        .route("/members/invitations/{id}", delete(revoke_invitation))
         .route(
             "/members/{id}",
             patch(set_member_role).delete(remove_member),
@@ -738,7 +759,7 @@ async fn login_operator(
             axum::http::header::SET_COOKIE,
             format!(
                 "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
-                auth::SESSION_COOKIE,
+                state.cookie_secure.name(),
                 state.session_ttl.as_secs(),
                 state.cookie_secure.attribute(headers),
             ),
@@ -829,7 +850,7 @@ async fn login_account(
             axum::http::header::SET_COOKIE,
             format!(
                 "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
-                auth::SESSION_COOKIE,
+                state.cookie_secure.name(),
                 state.session_ttl.as_secs(),
                 state.cookie_secure.attribute(headers),
             ),
@@ -923,7 +944,10 @@ pub struct MemberBody {
 /// earned by the invitee's acceptance, never seated by the inviter's say-so: the
 /// answer is a uniform 202 whether the address has an account, is already a member,
 /// or belongs to no one — nothing about the roster or the directory leaks through
-/// the response. The workspace's write budget bounds the asking.
+/// the response. The workspace's write budget bounds the asking. Known residual
+/// (re-review): an invitation to an address with no account yet can be claimed by
+/// whoever registers that address inside the 72 h expiry — the expiry bounds the
+/// window, and the owner can withdraw a mistyped ask (`revoke_invitation`).
 async fn add_member(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<auth::Principal>,
@@ -1040,6 +1064,21 @@ async fn decline_invitation(
 ) -> Result<StatusCode, ApiError> {
     let account = account_for(&principal)?;
     if !state.db.decline_invitation(&id, account).await? {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Withdraw one of this workspace's pending invitations — the owner's undo for a
+/// mistyped address or a changed mind before the invitee ever saw it (S3 review).
+/// A member can read the roster but only an owner can unsend an ask.
+async fn revoke_invitation(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<auth::Principal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let view = owner_for(&state, &principal)?;
+    if !view.revoke_invitation(&id).await? {
         return Err(ApiError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1465,20 +1504,31 @@ async fn put_status_page(
         other => ApiError::Db(other),
     })?;
     let page = viewer_for(&state, &principal).status_page().await?;
-    // Keep the public route's slug map honest with what just committed: this
-    // workspace's one page means dropping every key that resolves to it, then
+    // Keep the public route's slug map honest with what just committed: the
+    // version bump alone retires every entry a reader may have raced in, then
+    // this workspace's one page means dropping every key that resolves to it and
     // caching the current slug when the page is enabled. A disabled page is gone
     // from the map and from disk at once — never served until the writer's next
     // beat notices.
     {
         let ws = principal.workspace();
+        let version = state
+            .status_slug_version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
         let mut slugs = state
             .status_slugs
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        slugs.retain(|_, workspace| *workspace != ws);
+        slugs.retain(|_, entry| entry.workspace != Some(ws));
         if page.title.is_some() {
-            slugs.insert(page.slug.clone(), ws);
+            slugs.insert(
+                page.slug.clone(),
+                SlugEntry {
+                    workspace: Some(ws),
+                    version,
+                },
+            );
         } else {
             let _ = std::fs::remove_file(state.status_dir.join("s").join(format!("{}.json", ws.0)));
         }
@@ -1593,8 +1643,13 @@ async fn public_status(
         );
     }
     // Slug → workspace: the in-memory map first (anonymous hits shouldn't pay SQL
-    // on the small read pool); a miss asks the store once and remembers. `None`
-    // covers unknown, disabled and malformed alike — the public answer is uniform.
+    // on the small read pool). The version is read *before* the store lookup — an
+    // entry inserted under a version a PUT has since bumped is a miss, so the
+    // commit/insert race can't leave the map serving a name the writer released.
+    // A cached `None` answers unknown/disabled without a query at all.
+    let version = state
+        .status_slug_version
+        .load(std::sync::atomic::Ordering::Acquire);
     let workspace = {
         let cached = state
             .status_slugs
@@ -1603,17 +1658,20 @@ async fn public_status(
             .get(&slug)
             .copied();
         match cached {
-            Some(workspace) => Some(workspace),
-            None => match state.db.status_page_by_slug(&slug).await {
-                Ok(Some(page)) => {
-                    state
+            Some(entry) if entry.version == version => entry.workspace,
+            _ => match state.db.status_page_by_slug(&slug).await {
+                Ok(page) => {
+                    let workspace = page.map(|page| page.workspace);
+                    let mut slugs = state
                         .status_slugs
                         .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(slug.clone(), page.workspace);
-                    Some(page.workspace)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slugs.len() >= STATUS_SLUG_CAP {
+                        slugs.clear();
+                    }
+                    slugs.insert(slug.clone(), SlugEntry { workspace, version });
+                    workspace
                 }
-                Ok(None) => None,
                 Err(error) => return ApiError::Db(error).into_response(),
             },
         }
@@ -1842,7 +1900,10 @@ async fn signup(
 /// session answers the same way, so a browser can always reset its own state.
 async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
     // Tokenless dev mode never issues sessions, so there is no row to delete.
-    if let Some(id) = auth::session_cookie(headers.get(axum::http::header::COOKIE)) {
+    if let Some(id) = auth::session_cookie(
+        headers.get(axum::http::header::COOKIE),
+        state.cookie_secure.name(),
+    ) {
         if let Some(admin) = &state.admin_token
             && let Err(error) = state.db.delete_session(&auth::session_key(admin, id)).await
         {
@@ -1864,7 +1925,7 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
             axum::http::header::SET_COOKIE,
             format!(
                 "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
-                auth::SESSION_COOKIE,
+                state.cookie_secure.name(),
                 state.cookie_secure.attribute(&headers),
             ),
         )],

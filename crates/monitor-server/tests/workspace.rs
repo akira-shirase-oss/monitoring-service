@@ -51,6 +51,7 @@ async fn fixture_with(lab: bool, workspace_slots: usize) -> anyhow::Result<Fixtu
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
         status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         monitor_writes: std::sync::Arc::default(),
         invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
@@ -729,6 +730,12 @@ async fn public_status_page_serves_the_beat_or_unavailable() -> anyhow::Result<(
         ttl: Duration::from_secs(90),
     };
     monitor_server::snapshot::write_beat(&db, &state.statuses, &config, true).await?;
+    // The beat lands keyed by workspace id, never the public slug — a released
+    // name can then never serve the previous owner's file (S3 review).
+    assert!(
+        state.status_dir.join(format!("s/{ws}.json")).exists(),
+        "the beat is written as s/<workspace-id>.json"
+    );
 
     // The writer's file is the fresh answer — the beat verbatim.
     let (status, _, body) = call(&app, "GET", "/s/acme-status/status.json", None, None, None).await;
@@ -1445,7 +1452,6 @@ async fn capacity_refuses_only_the_added_load() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 /// N2: inside the schedule lock the capacity check resolves nothing — foreign
 /// workspaces' monitor names answer from the origin cache or their own spelling.
 /// A registry full of black-hole names must never hold every writer's lock while
@@ -1884,5 +1890,120 @@ async fn signup_mints_a_random_slug_and_neutral_name() -> anyhow::Result<()> {
         !slug.contains("alice") && !workspace["name"].as_str().is_some_and(|n| n.contains('@')),
         "nothing of the email leaks into the public face: {body}"
     );
+    Ok(())
+}
+
+/// S3: an owner can withdraw a pending invitation — the invitee's pending answer
+/// is gone the moment it is revoked, and a stranger's DELETE on another
+/// workspace's invitation is scoped out the same as unknown.
+#[tokio::test]
+async fn an_owner_can_revoke_a_pending_invitation() -> anyhow::Result<()> {
+    let (app, _state, _db, _tmp) = fixture(false).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let invitee = sign_up(&app, "member@b.example").await;
+    let other = sign_up(&app, "other@c.example").await;
+    invite(&app, &owner, "member@b.example", "member").await;
+
+    // The owner's roster view names the pending row.
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/api/members/invitations",
+        None,
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    let id = body["invitations"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a pending invitation: {body}"))
+        .to_owned();
+    let route = format!("/api/members/invitations/{id}");
+
+    // A different workspace's owner can't touch it — the delete is workspace-scoped.
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &route,
+        None,
+        Some(Cred::Cookie(&other)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The owner withdraws it: 204, and the invitee's pending list is empty.
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &route,
+        None,
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, _, body) = call(
+        &app,
+        "GET",
+        "/api/invitations",
+        None,
+        Some(Cred::Cookie(&invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        body["invitations"].as_array().map(Vec::len),
+        Some(0),
+        "{body}"
+    );
+    // Accepting it now is the same uniform 404 as a stranger's was.
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        &format!("/api/invitations/{id}/accept"),
+        Some(serde_json::json!({})),
+        Some(Cred::Cookie(&invitee)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // And the ask is really gone — a second revoke is 404 too.
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &route,
+        None,
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// S2-1 residual: an unknown slug is a cached miss, not a per-hit query — a
+/// random-slug flood costs the in-memory map, never the small read pool.
+#[tokio::test]
+async fn an_unknown_slug_is_a_cached_miss() -> anyhow::Result<()> {
+    let (app, state, _db, _tmp) = fixture(false).await?;
+    let (status, _, _) = call(&app, "GET", "/s/ws-neverhere/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The miss was cached as a `None` workspace — the repeat ask answers from the
+    // map without the store lookup at all.
+    {
+        let entry = state
+            .status_slugs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("ws-neverhere")
+            .copied();
+        assert!(
+            matches!(entry, Some(e) if e.workspace.is_none()),
+            "the unknown slug must cache as a miss: {entry:?}"
+        );
+    }
+    let (status, _, _) = call(&app, "GET", "/s/ws-neverhere/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     Ok(())
 }

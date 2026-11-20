@@ -41,7 +41,7 @@ run; what exists is what the commits show. Highlights:
   backups behind `POST /api/backup`; versioned releases + rollback by repoint.
 - **Auth:** `SMON_ADMIN_TOKEN` (at least 32 bytes, no spaces or `#` — e.g.
   `openssl rand -hex 32`; a weaker value refuses to boot) → `Bearer` for CLI/scripts, or the HttpOnly
-  `smon_session` cookie the dashboard earns at `POST /api/login` (store-side
+  `__Host-smon_session` cookie the dashboard earns at `POST /api/login` (store-side
   expiry, `SMON_SESSION_TTL_S`; `Origin` must match `Host`, mandatory on
   cookie-authed writes). Sessions are stored as token-bound digests and end when
   the token rotates or after `SMON_SESSION_IDLE_S` unused (D-016). Every `/api` route and method is proven to

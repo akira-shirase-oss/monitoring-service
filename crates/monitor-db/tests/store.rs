@@ -2401,3 +2401,80 @@ fn plan_retention_never_exceeds_the_operator_ceiling() {
     let operator = RetentionPolicy::for_plan(monitor_domain::Plan::Operator, &configured);
     assert_eq!(operator, configured);
 }
+
+/// S3: expired invitations are honest-expired on read already — the sweep's job is
+/// keeping the table small, in bounded batches like every other retention delete
+/// (D-012). A live invitation survives the pass.
+#[tokio::test]
+async fn expired_invitations_are_swept_and_live_ones_kept() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let owner = db.owner(WorkspaceId::DEFAULT);
+    owner
+        .invite_member("a@x.example", Role::Member, "test")
+        .await?;
+    owner
+        .invite_member("b@x.example", Role::Viewer, "test")
+        .await?;
+    let now = OffsetDateTime::now_utc();
+    assert_eq!(owner.list_invitations(now).await?.len(), 2);
+    // Nothing is old yet.
+    assert_eq!(db.sweep_expired_invitations(now, 500).await?, 0);
+    // Past the 72 h TTL both rows are gone — and a one-row batch still converges.
+    let future = now + time::Duration::hours(73);
+    assert_eq!(db.sweep_expired_invitations(future, 1).await?, 1);
+    assert_eq!(db.sweep_expired_invitations(future, 500).await?, 1);
+    assert_eq!(db.sweep_expired_invitations(future, 500).await?, 0);
+    assert_eq!(owner.list_invitations(future).await?.len(), 0);
+    Ok(())
+}
+
+/// S3: a released slug stays held against other tenants — but only the newest 64
+/// per workspace, so a rename loop can't grow the tombstone table without limit.
+/// The proof is cross-tenant: once `ws`'s oldest tombstone falls out of the
+/// window, another workspace may take the name again.
+#[tokio::test]
+async fn released_slugs_are_held_but_capped_per_workspace() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let owner = db.owner(WorkspaceId::DEFAULT);
+    owner
+        .set_status_page(Some("ws-first"), Some("Page"), &[])
+        .await?;
+    // 70 renames: the newest tombstones cap at 64, so the earliest names come free.
+    for i in 0..70 {
+        owner
+            .set_status_page(Some(&format!("s{i}")), Some("Page"), &[])
+            .await?;
+    }
+    // A second workspace to ask the question with (the held check is cross-tenant).
+    let now = OffsetDateTime::now_utc();
+    let invite = db
+        .create_invite("digest", now, now + time::Duration::hours(1))
+        .await?;
+    let account = db
+        .signup(
+            &invite.id,
+            &monitor_db::NewAccount {
+                id: monitor_domain::AccountId(uuid::Uuid::now_v7()),
+                workspace: WorkspaceId(uuid::Uuid::now_v7()),
+                workspace_slug: "ws-other".to_owned(),
+                workspace_name: "Other".to_owned(),
+                email: "other@x.example".to_owned(),
+                password_hash: "x".to_owned(),
+            },
+            now,
+        )
+        .await?;
+    let other = db.owner(WorkspaceId(uuid::Uuid::parse_str(&account.workspace_id)?));
+    // The oldest tombstone fell out of the 64-name window → free to take.
+    other
+        .set_status_page(Some("ws-first"), Some("Theirs"), &[])
+        .await?;
+    // The most recently released name is still held → conflict.
+    let held = other
+        .set_status_page(Some("s68"), Some("Theirs"), &[])
+        .await;
+    assert!(matches!(held, Err(QueryError::Conflict(_))), "{held:?}");
+    Ok(())
+}

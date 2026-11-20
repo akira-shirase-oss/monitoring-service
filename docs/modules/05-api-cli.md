@@ -55,16 +55,18 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
 - **Auth (M5.1 + M7.2, live):** every `/api/**` route requires a credential —
   `Authorization: Bearer $SMON_ADMIN_TOKEN` (sha256-digest compare) for CLI/scripts,
-  or the HttpOnly `smon_session` cookie for the dashboard. `/livez`, `/readyz` and
+  or the HttpOnly `__Host-smon_session` cookie for the dashboard. `/livez`, `/readyz` and
   static files stay open. Token unset = dev mode on loopback only; a tokenless
   public bind refuses to boot. Denied means denied — no unauthenticated path once
   enabled.
 - **Session login (M7.2):** `POST /api/login {token}` exchanges the admin token for a
-  `sessions` row (migration 0007) + `Set-Cookie: smon_session=<id>; HttpOnly;
-  SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>[; Secure]` —
-  `Secure` whenever the TLS proxy reports the request as https (`X-Forwarded-Proto`,
-  `Forwarded: proto=`), or always with `SMON_COOKIE_SECURE=always`; logout's expiring
-  cookie carries the same flag (`the_session_cookie_is_secure_whenever_the_request_came_over_tls`). Store-side
+  `sessions` row (migration 0007) + `Set-Cookie: __Host-smon_session=<id>; HttpOnly;
+  SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>; Secure` —
+  the `__Host-` pin means `Secure` is unconditional (browsers reject the name without
+  it). `SMON_COOKIE_SECURE=off` is the plain-HTTP development escape: it emits the
+  plain `smon_session` name with no `Secure`, the only way a self-hosted
+  `http://<host>:<port>` install can sign in. Logout's expiring cookie carries the
+  same shape. Store-side
   `expires_at` is the authority — the cookie's Max-Age is a browser hint. The token
   itself never lands in browser storage; it can be rotated without stranding copies.
   `POST /api/logout` deletes the row and expires the cookie — idempotent. A wrong

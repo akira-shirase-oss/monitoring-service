@@ -51,6 +51,7 @@ async fn fixture_with_wait(password_work_wait: Duration) -> anyhow::Result<Fixtu
         test_sends: std::sync::Arc::default(),
         status_writes: std::sync::Arc::default(),
         status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         monitor_writes: std::sync::Arc::default(),
         invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),

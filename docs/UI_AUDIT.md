@@ -12,7 +12,7 @@ explicit, reasoned exclusion. Re-run when either side adds a route or command
 | `GET /livez` | — | system probe; `ping` in the CLI. Not an operator action — deliberate exclusion |
 | `GET /readyz` | header banners (unreachable / monitoring unavailable / degraded) | readiness is *shown*, never hidden behind a green board |
 | `GET /version` | — | upgrade/rollback check; deliberate exclusion (operator CLI/log) |
-| `POST /api/login` | sign-in gate | earns the `smon_session` cookie |
+| `POST /api/login` | sign-in gate | earns the `__Host-smon_session` cookie |
 | `POST /api/logout` | sign-out button | deletes the session row + expires the cookie |
 | `GET /api/monitors` | monitors list | name, url, interval, status badge |
 | `POST /api/monitors` | "Add monitor" form | name, url, interval, timeout, thresholds |

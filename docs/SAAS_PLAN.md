@@ -20,7 +20,7 @@ Decisions already made (2026-11-13, by the maintainer):
 
 ## Where Service Monitor is today
 
-- One operator: `SMON_ADMIN_TOKEN` bearer for CLI/scripts, or the `smon_session` cookie from `POST /api/login`.
+- One operator: `SMON_ADMIN_TOKEN` bearer for CLI/scripts, or the `__Host-smon_session` cookie from `POST /api/login`.
   There are no user accounts or workspaces.
 - API: `/monitors`, `/monitors/{id}/checks`, `/monitors/{id}/stats`, `/incidents`, `/maintenance/{id}`, `/backup`,
   `/livez`, `/readyz`, `/version`.

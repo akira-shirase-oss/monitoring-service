@@ -418,9 +418,13 @@ impl Config {
         let cookie_secure = match env.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
             None | Some("auto") => crate::auth::CookieSecure::Auto,
             Some("always") => crate::auth::CookieSecure::Always,
+            // `off` is the plain-HTTP development escape — the emitted cookie drops
+            // `Secure` and the `__Host-` name, so a self-hosted install on
+            // http://<host>:<port> can still sign in. Production is HTTPS-only.
+            Some("off") => crate::auth::CookieSecure::Off,
             Some(other) => {
                 env.problems.push(format!(
-                    "SMON_COOKIE_SECURE={other:?}: expected `auto` or `always`"
+                    "SMON_COOKIE_SECURE={other:?}: expected `auto`, `always` or `off`"
                 ));
                 crate::auth::CookieSecure::Auto
             }

@@ -53,14 +53,32 @@ pub enum CookieSecure {
     Auto,
     /// On every cookie — for a proxy that does not forward the scheme.
     Always,
+    /// Plain-HTTP development only (`SMON_COOKIE_SECURE=off`): no `Secure`, and the
+    /// plain `smon_session` name — browsers reject a `__Host-` cookie without
+    /// `Secure`, so the escape changes the name rather than emit a dead cookie.
+    /// Anything but loopback self-hosting should leave this alone: production is
+    /// HTTPS-only.
+    Off,
 }
 
 impl CookieSecure {
-    /// The cookie attribute for this request: always `"; Secure"` — `__Host-` names
-    /// are rejected without it, so the choice no longer exists. `self`/`headers`
-    /// stay only so the `SMON_COOKIE_SECURE` knob parses harmlessly.
+    /// The cookie's name — the `__Host-` pin in every secure mode, the plain
+    /// fallback only where the dev escape is configured.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto | Self::Always => SESSION_COOKIE,
+            Self::Off => "smon_session",
+        }
+    }
+
+    /// The cookie attribute: `"; Secure"` in every secure mode — `__Host-` names
+    /// are rejected without it, so there the choice no longer exists. Only the
+    /// explicit `off` escape drops it, and it drops the `__Host-` name with it.
     pub fn attribute(self, _headers: &header::HeaderMap) -> &'static str {
-        "; Secure"
+        match self {
+            Self::Off => "",
+            Self::Auto | Self::Always => "; Secure",
+        }
     }
 }
 
@@ -405,7 +423,7 @@ async fn session_principal(
     state: &AppState,
     cookie: Option<&header::HeaderValue>,
 ) -> Result<Option<Session>, Box<Response>> {
-    let Some(session) = session_cookie(cookie) else {
+    let Some(session) = session_cookie(cookie, state.cookie_secure.name()) else {
         return Ok(None);
     };
     if let Some(token) = &state.admin_token {
@@ -507,12 +525,14 @@ fn is_mutation(method: &Method) -> bool {
     )
 }
 
-/// The session id from the Cookie header — name-prefix match, value must be non-empty.
-/// `pub` so `logout` parses the cookie through the same code the middleware trusts.
-pub fn session_cookie(cookie: Option<&header::HeaderValue>) -> Option<&str> {
+/// The session id from the Cookie header — name-prefix match on the configured
+/// cookie name (`CookieSecure::name()`, so the dev escape parses what it emits),
+/// value must be non-empty. `pub` so `logout` parses the cookie through the same
+/// code the middleware trusts.
+pub fn session_cookie<'a>(cookie: Option<&'a header::HeaderValue>, name: &str) -> Option<&'a str> {
     cookie?.to_str().ok()?.split(';').find_map(|pair| {
         let pair = pair.trim();
-        let value = pair.strip_prefix(SESSION_COOKIE)?.strip_prefix('=')?;
+        let value = pair.strip_prefix(name)?.strip_prefix('=')?;
         (!value.is_empty()).then_some(value)
     })
 }
@@ -790,18 +810,34 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_parses_its_own_name_only() {
+    fn session_cookie_parses_its_configured_name_only() {
+        let name = CookieSecure::Auto.name();
         let header = HeaderValue::from_static("other=1; __Host-smon_session=abc-123 ; theme=dark");
-        assert_eq!(session_cookie(Some(&header)), Some("abc-123"));
+        assert_eq!(session_cookie(Some(&header), name), Some("abc-123"));
         assert_eq!(
-            session_cookie(Some(&HeaderValue::from_static("__Host-smon_session="))),
+            session_cookie(
+                Some(&HeaderValue::from_static("__Host-smon_session=")),
+                name
+            ),
             None
         );
         assert_eq!(
-            session_cookie(Some(&HeaderValue::from_static("__Host-smon_sessionx=abc"))),
+            session_cookie(
+                Some(&HeaderValue::from_static("__Host-smon_sessionx=abc")),
+                name
+            ),
             None
         );
-        assert_eq!(session_cookie(None), None);
+        assert_eq!(session_cookie(None, name), None);
+        // The dev escape emits and parses the plain name — and a `__Host-` cookie
+        // presented under it is not the session.
+        let off = CookieSecure::Off.name();
+        assert_eq!(off, "smon_session");
+        assert_eq!(
+            session_cookie(Some(&HeaderValue::from_static("smon_session=abc-123")), off),
+            Some("abc-123")
+        );
+        assert_eq!(session_cookie(Some(&header), off), None);
     }
 
     /// Known answer (computed independently with Python's hashlib): a sha2 upgrade that
