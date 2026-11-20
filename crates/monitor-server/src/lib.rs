@@ -1428,8 +1428,9 @@ pub struct StatusPageBody {
 /// The public slug's charset — what `new_account` mints and the file name the writer
 /// uses (`s/<slug>.json`); anything else is refused rather than sanitized. `default`
 /// is a real slug (the seeded workspace's) — a tenant asking for it answers the same
-/// "already taken" conflict as any other owned slug.
-fn valid_slug(slug: &str) -> bool {
+/// "already taken" conflict as any other owned slug. `pub` so the fuzz harness hits
+/// the same gate the routes do.
+pub fn valid_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug.len() <= 64
         && slug

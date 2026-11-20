@@ -74,3 +74,19 @@ jobs:
         run: scripts/check-advisories.sh
       - name: npm advisories for what the dashboard ships
         run: npm audit --omit=dev --audit-level=moderate
+
+  fuzz-smoke:
+    name: fuzz smoke (cargo-fuzz, seeded, bounded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Nightly for libFuzzer's sanitizer coverage
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Every outside-input decoder, 20 s seeded each
+        run: scripts/check-fuzz.sh

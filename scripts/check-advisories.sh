@@ -31,6 +31,12 @@ done < <(grep -E '^[[:space:]]*\{[[:space:]]*id[[:space:]]*=' deny.toml || true)
 # shellcheck disable=SC2086 # "cargo deny" is two words on purpose
 if $deny --version >/dev/null 2>&1; then
     $deny --locked check advisories bans licenses sources
+    # The fuzz package is a detached workspace — its own lockfile, its own check
+    # (model: labs/minibtc's fuzz advisories step).
+    if [ -f fuzz/Cargo.lock ]; then
+        $deny --manifest-path fuzz/Cargo.toml --locked --config deny.toml \
+            check advisories sources
+    fi
 elif [ -n "${CI:-}" ]; then
     echo "cargo-deny is required in CI: cargo install cargo-deny --locked" >&2
     exit 1

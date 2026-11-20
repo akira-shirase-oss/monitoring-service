@@ -6,6 +6,8 @@
 
 # Rust
 /target/
+# The detached fuzz package's own target dir
+fuzz/target/
 
 # Node / SvelteKit
 node_modules/
@@ -32,3 +34,6 @@ apps/dashboard/playwright-report/
 # cargo-mutants working dirs (transient — evidence lands in perf/results/)
 mutants.out*/
 perf/tmp/
+
+# Fuzz crash reproducers — evidence, reviewed and committed deliberately, never silently.
+fuzz/artifacts/
