@@ -54,24 +54,39 @@ if ! { need jq && need curl && need age && need rclone && need sqlite3; }; then
   apt-get install -y ufw jq curl ca-certificates unattended-upgrades age rclone sqlite3
 fi
 if ! need caddy; then
-  apt-get install -y caddy || {
-    # The repo key is pinned by fingerprint (S2 review): a substituted key would
-    # otherwise sign packages apt trusts. Fingerprint from the published key itself —
-    # armor whitespace can't hide a different key.
-    caddy_key=$(mktemp)
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$caddy_key"
-    got=$(gpg --batch --show-keys --with-fingerprint "$caddy_key" 2>/dev/null \
-      | awk '/^pub/{getline; gsub(/ /, ""); print; exit}')
-    want=65760C51EDEA2017CEA2CA15155B6D79CA56EA34
-    [[ "$got" == "$want" ]] \
-      || { echo "error: caddy repo key fingerprint $got, expected $want" >&2; rm -f "$caddy_key"; exit 2; }
-    gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg "$caddy_key"
-    rm -f "$caddy_key"
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' >/etc/apt/sources.list.d/caddy-stable.list
-    apt-get update
-    apt-get install -y caddy
-  }
+  # The repo is registered BEFORE caddy is installed — Ubuntu's own package installs
+  # fine and would silently win otherwise, and it is too old for {client_ip} and
+  # trusted proxies (needs >= 2.7; checked again below).
+  # The repo key is pinned by fingerprint (S2 review): import the fetched key file
+  # into a throwaway keyring and export ONLY the pinned key — dearmoring the whole
+  # file would trust every other key bundled in it.
+  caddy_key=$(mktemp)
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$caddy_key"
+  want=65760C51EDEA2017CEA2CA15155B6D79CA56EA34
+  gtmp=$(mktemp -d); chmod 0700 "$gtmp"
+  gpg --batch --homedir "$gtmp" --import "$caddy_key" >/dev/null 2>&1
+  gpg --batch --homedir "$gtmp" --export "$want" \
+    >/usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+    || { echo "error: caddy repo key $want not present in fetched key file" >&2;
+         rm -rf "$gtmp" "$caddy_key"; exit 2; }
+  [[ -s /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]] \
+    || { echo "error: pinned caddy repo key exported empty" >&2;
+         rm -rf "$gtmp" "$caddy_key"; exit 2; }
+  rm -rf "$gtmp" "$caddy_key"
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    >/etc/apt/sources.list.d/caddy-stable.list
+  apt-get update
+  apt-get install -y caddy
 fi
+# {client_ip} and the trusted-proxies parser need Caddy >= 2.7 — a distro package that
+# already satisfied `need caddy` could be older, and an older Caddy answers every
+# request with an empty client_ip header (every visitor then shares one throttle key).
+caddy_ver=$(caddy version 2>/dev/null | sed -n 's/^v\([0-9]*\.[0-9]*\).*/\1/p')
+case "$caddy_ver" in
+  ''|1.*|2.[0-6])
+    echo "error: caddy ${caddy_ver:-unknown} < 2.7 — the trusted-proxy/Caddyfile config needs it" >&2
+    exit 2 ;;
+esac
 
 step "user and directories"
 id -u smon >/dev/null 2>&1 || useradd --system --home-dir "$PREFIX" --no-create-home --shell /usr/sbin/nologin smon

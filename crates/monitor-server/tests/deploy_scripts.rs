@@ -108,20 +108,31 @@ fn the_deploy_scripts_carry_their_promised_properties() {
     for pin in [
         "65760C51EDEA2017CEA2CA15155B6D79CA56EA34", // caddy repo key, by fingerprint
         "9A1AC2B4BE15F9F27EEE20A734CBA4E9898F61001B3BD7C84B69B56A3E25A2B9", // CF origin-pull CA, DER sha256
-        "--show-keys --with-fingerprint", // key checked before dearmor
-        "openssl x509",                   // CA checked before install
+        "--homedir",          // repo key verified inside a throwaway keyring…
+        "--export \"$want\"", // …and ONLY the pinned key is exported to apt
+        "openssl x509",       // CA checked before install
+        "caddy version",      // >= 2.7 floor: {client_ip}/trusted-proxies need it
     ] {
         assert!(install.contains(pin), "install.sh is missing '{pin}'");
     }
-
-    // S2-1: the edge forwards the visitor's address — without it every Cloudflare
-    // edge IP would share one anonymous-read bucket.
-    let caddyfile = read("Caddyfile");
     assert!(
-        caddyfile.contains("header_up X-Forwarded-For {client_ip}")
-            && caddyfile.contains("trusted_proxies"),
-        "the Caddyfile must forward {{client_ip}} through the trusted CF proxies"
+        !install.contains("apt-get install -y caddy ||"),
+        "the pinned repo must be registered BEFORE caddy is installed — Ubuntu's older \
+         package would otherwise win and silently lack trusted-proxies support"
     );
+
+    // N1: the edge forwards the visitor's address, and only Cloudflare gets to say
+    // what it is — the default client_ip_headers reads left-most X-Forwarded-For,
+    // which a client writes itself (a fresh throttle key per request).
+    let caddyfile = read("Caddyfile");
+    for pin in [
+        "header_up X-Forwarded-For {client_ip}",
+        "trusted_proxies",
+        "client_ip_headers CF-Connecting-IP",
+        "trusted_proxies_strict",
+    ] {
+        assert!(caddyfile.contains(pin), "Caddyfile is missing '{pin}'");
+    }
 
     // The unit check's systemd-analyze half must run against a staged --root:
     // bare `verify` judges the host's filesystem — on a CI runner without an

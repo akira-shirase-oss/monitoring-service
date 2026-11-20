@@ -9,6 +9,14 @@
 		# Cloudflare's ranges, so Caddy passes the visitor's address on in X-Forwarded-For
 		# (cloudflare-ips.sh writes this file).
 		import /etc/caddy/cloudflare-trusted.caddy
+		# The visitor's address comes only from CF-Connecting-IP — the default
+		# client_ip_headers reads the left-most X-Forwarded-For, which a client can
+		# write anything into (Cloudflare then appends to it), letting one caller mint
+		# a fresh throttle key per request. trusted_proxies_strict drops requests
+		# whose immediate peer is not a listed proxy — nothing reaches the app
+		# claiming a visitor address except Cloudflare itself.
+		client_ip_headers CF-Connecting-IP
+		trusted_proxies_strict
 	}
 }
 
