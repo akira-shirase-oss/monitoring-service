@@ -2478,3 +2478,104 @@ async fn released_slugs_are_held_but_capped_per_workspace() -> anyhow::Result<()
     assert!(matches!(held, Err(QueryError::Conflict(_))), "{held:?}");
     Ok(())
 }
+
+/// S3 re-review: 0018's slug backfill must hold every name it replaces. Released
+/// unheld, a fresh install's seeded `default` — and any turned-off page's chosen
+/// slug — becomes claimable by another tenant while readers still associate the
+/// name with its previous owner (0016's whole point). Fresh migrate proves the
+/// seed row keeps its name held; the real migration file is then replayed
+/// against fixture rows standing in for a pre-0018 store.
+#[tokio::test]
+async fn the_slug_backfill_holds_every_name_it_replaces() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("store.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let raw = sqlx::SqlitePool::connect(&url).await?;
+
+    // A fresh DB: the seeded `default` is renamed, but the name stays held by the
+    // seeded workspace — another tenant can never claim /s/default.
+    let held_default: Option<String> =
+        sqlx::query_scalar("SELECT workspace_id FROM status_held_slugs WHERE slug = 'default'")
+            .fetch_optional(&raw)
+            .await?;
+    assert_eq!(
+        held_default.as_deref(),
+        Some("00000000-0000-0000-0000-000000000001"),
+        "`default` was renamed without holding it — any tenant can now claim it"
+    );
+
+    // Fixture rows standing in for a pre-0018 store: an unpublished email-derived
+    // slug (renamed, held), a published page (untouched, unheld), an already
+    // random slug (untouched), and an outsider that will try to take the name.
+    let (old, published, untouched, outsider) = (
+        uuid::Uuid::now_v7().to_string(),
+        uuid::Uuid::now_v7().to_string(),
+        uuid::Uuid::now_v7().to_string(),
+        uuid::Uuid::now_v7().to_string(),
+    );
+    for (id, slug, title) in [
+        (old.as_str(), "alice.example.com", None),
+        (published.as_str(), "bob.example.com", Some("Live")),
+        (untouched.as_str(), "ws-already-random", None),
+        (outsider.as_str(), "ws-outsider", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO workspaces (id, slug, name, created_at, status_title)
+             VALUES (?, ?, 'ws', '2026-01-01T00:00:00.000Z', ?)",
+        )
+        .bind(id)
+        .bind(slug)
+        .bind(title)
+        .execute(&raw)
+        .await?;
+    }
+    sqlx::raw_sql(include_str!("../migrations/0018_review_followups.sql"))
+        .execute(&raw)
+        .await?;
+
+    let new_slug: String = sqlx::query_scalar("SELECT slug FROM workspaces WHERE id = ?")
+        .bind(&old)
+        .fetch_one(&raw)
+        .await?;
+    assert!(new_slug.starts_with("ws-"), "renamed: {new_slug}");
+    let held_old: Option<String> = sqlx::query_scalar(
+        "SELECT workspace_id FROM status_held_slugs WHERE slug = 'alice.example.com'",
+    )
+    .fetch_optional(&raw)
+    .await?;
+    assert_eq!(
+        held_old.as_deref(),
+        Some(old.as_str()),
+        "a turned-off page's name must stay held by its owner"
+    );
+    let bob_slug: String = sqlx::query_scalar("SELECT slug FROM workspaces WHERE id = ?")
+        .bind(&published)
+        .fetch_one(&raw)
+        .await?;
+    assert_eq!(
+        bob_slug, "bob.example.com",
+        "a published page keeps its URL"
+    );
+    let held_bob: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM status_held_slugs WHERE slug = 'bob.example.com'")
+            .fetch_one(&raw)
+            .await?;
+    assert_eq!(held_bob, 0, "a name still in use is not tombstoned");
+
+    // The contract end to end: the outsider's claim is a conflict, and the
+    // original owner may re-take its own release.
+    let outsider_view = db.owner(WorkspaceId(uuid::Uuid::parse_str(&outsider)?));
+    let claimed = outsider_view
+        .set_status_page(Some("alice.example.com"), Some("Theirs"), &[])
+        .await;
+    assert!(
+        matches!(claimed, Err(QueryError::Conflict(_))),
+        "another tenant took the released name: {claimed:?}"
+    );
+    db.owner(WorkspaceId(uuid::Uuid::parse_str(&old)?))
+        .set_status_page(Some("alice.example.com"), Some("Mine"), &[])
+        .await?;
+    raw.close().await;
+    Ok(())
+}
