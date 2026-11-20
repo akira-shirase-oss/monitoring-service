@@ -22,7 +22,11 @@ no ids, no URLs. The route is unauthenticated with the same per-address throttle
 `{"error":{"code":"not_found"}}` 404 — a disabled page is indistinguishable from one
 that never existed. An enabled page with no file yet answers 200 born-expired
 (`monitoring: "unavailable"`, empty services) — "nothing written" can never read as
-healthy. `GET /s/{slug}` itself is the dashboard's static fallback; the editor is
+healthy. Caching (S2 hardening): the served beat carries `Cache-Control: public,
+max-age=30` — cacheable only until the next beat lands, its own `expires_at` the
+real freshness claim; every other answer (born-expired, 404) is `no-store` so a
+shared cache can never keep "unavailable" or "missing" past the truth. `GET
+/s/{slug}` itself is the dashboard's static fallback; the editor is
 `PUT /api/workspace/status-page` (member work, module 05).
 
 ## Purpose

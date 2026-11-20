@@ -166,11 +166,13 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         token_use: std::sync::Arc::default(),
         status_dir: dir.join("status"),
         test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     };

@@ -22,6 +22,10 @@ const OPERATOR: &str = "test-operator-token";
 type Fixture = (axum::Router, monitor_server::AppState, Db, TempDir);
 
 async fn fixture(lab: bool) -> anyhow::Result<Fixture> {
+    fixture_with(lab, usize::MAX).await
+}
+
+async fn fixture_with(lab: bool, workspace_slots: usize) -> anyhow::Result<Fixture> {
     let tmp = tempfile::tempdir()?;
     let db = Db::connect(
         &format!("sqlite:{}", tmp.path().join("api.db").display()),
@@ -45,11 +49,13 @@ async fn fixture(lab: bool) -> anyhow::Result<Fixture> {
         token_use: std::sync::Arc::default(),
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots,
         allow_local_targets: lab,
         version: "test",
     };
@@ -685,8 +691,8 @@ async fn public_status_page_serves_the_beat_or_unavailable() -> anyhow::Result<(
     };
     monitor_server::snapshot::write_beat(&db, &state.statuses, &config, true).await?;
 
-    let (status, headers, body) =
-        call(&app, "GET", "/s/acme-status/status.json", None, None, None).await;
+    // The writer's file is the fresh answer — the beat verbatim.
+    let (status, _, body) = call(&app, "GET", "/s/acme-status/status.json", None, None, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["title"], "Acme status");
     assert_eq!(body["monitoring"], "available", "{body}");
@@ -702,7 +708,6 @@ async fn public_status_page_serves_the_beat_or_unavailable() -> anyhow::Result<(
         services[0].get("id").is_none(),
         "no ids leave: {services:?}"
     );
-    let _ = headers;
 
     // An unknown slug and a workspace with no page answer identically.
     for slug in ["no-such-page", "default"] {
@@ -737,6 +742,229 @@ async fn public_status_page_serves_the_beat_or_unavailable() -> anyhow::Result<(
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
     let _ = ws;
+    Ok(())
+}
+
+/// The public route's cache contract (S2 hardening): the served beat is cacheable
+/// only until the next beat lands (`public, max-age=30` — its own `expires_at`
+/// stays the freshness claim), and every other answer is `no-store` — a shared
+/// cache must never keep "unavailable" or "missing" past the truth.
+#[tokio::test]
+async fn public_status_cache_headers() -> anyhow::Result<()> {
+    let (app, state, db, _tmp) = fixture(true).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let mon = monitor(&app, &owner, "api").await;
+    let (status, _, body) = call(
+        &app,
+        "PUT",
+        "/api/workspace/status-page",
+        Some(serde_json::json!({
+            "slug": "acme-status", "title": "Acme", "monitor_ids": [mon],
+        })),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let cache_of = |headers: &HeaderMap| {
+        headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    // Enabled but never written — born-expired, never cached.
+    let (status, headers, _) =
+        call(&app, "GET", "/s/acme-status/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_of(&headers).as_deref(), Some("no-store"));
+
+    // The writer's file — cacheable for one beat interval.
+    let config = monitor_server::snapshot::Config {
+        dir: state.status_dir.clone(),
+        interval: Duration::from_secs(30),
+        ttl: Duration::from_secs(90),
+    };
+    monitor_server::snapshot::write_beat(&db, &state.statuses, &config, true).await?;
+    let (status, headers, _) =
+        call(&app, "GET", "/s/acme-status/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_of(&headers).as_deref(), Some("public, max-age=30"));
+
+    // Unknown and malformed slugs — the 404s are never cached either.
+    for slug in ["no-such-page", "UPPER"] {
+        let (status, headers, _) = call(
+            &app,
+            "GET",
+            &format!("/s/{slug}/status.json"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{slug}");
+        assert_eq!(cache_of(&headers).as_deref(), Some("no-store"), "{slug}");
+    }
+    Ok(())
+}
+
+/// The status-page write's bounds (S2 hardening): `monitor_ids` past the page's
+/// bound is a 422 *before* store work — and the refusal names the bound; a title
+/// too long or carrying a control character is a 422; duplicate ids collapse to
+/// their first occurrence instead of tripping the `status_monitors` primary key
+/// into a 500; and writes past the workspace's per-window budget answer 429 with
+/// `Retry-After` — a config write can't amplify.
+#[tokio::test]
+async fn status_page_input_bounds_and_write_pacing() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let (owner, _member, _viewer) = roster(&app).await?;
+    let ws = workspace_of(&db, "owner@a.example").await?;
+    let mon = monitor(&app, &owner, "api").await;
+
+    // The bound check runs before ids are even parsed — the message names the cap.
+    let too_many: Vec<String> = (0..65).map(|_| uuid::Uuid::now_v7().to_string()).collect();
+    let (status, _, body) = call(
+        &app,
+        "PUT",
+        "/api/workspace/status-page",
+        Some(serde_json::json!({"title": "x", "monitor_ids": too_many})),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_request", "{body}");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("64"), "{message}");
+
+    for title in ["x".repeat(121), "with\u{7}bell".to_owned()] {
+        let (status, _, body) = call(
+            &app,
+            "PUT",
+            "/api/workspace/status-page",
+            Some(serde_json::json!({"title": title, "monitor_ids": []})),
+            Some(Cred::Cookie(&owner)),
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{title}: {body}");
+    }
+
+    // A duplicate id is a no-op on the echo — one row, not a constraint error.
+    let (status, _, body) = call(
+        &app,
+        "PUT",
+        "/api/workspace/status-page",
+        Some(serde_json::json!({
+            "slug": "acme-status", "title": "Acme",
+            "monitor_ids": [mon.clone(), mon.clone()],
+        })),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["status_page"]["monitor_ids"],
+        serde_json::json!([mon.clone()]),
+        "{body}"
+    );
+
+    // The per-workspace write budget: six writes a rolling window, then 429.
+    // The refusals above never counted — they weren't writes.
+    for n in 0..5 {
+        let (status, _, body) = call(
+            &app,
+            "PUT",
+            "/api/workspace/status-page",
+            Some(serde_json::json!({"title": format!("Acme {n}"), "monitor_ids": [mon.clone()]})),
+            Some(Cred::Cookie(&owner)),
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "write {n}: {body}");
+    }
+    let (status, headers, body) = call(
+        &app,
+        "PUT",
+        "/api/workspace/status-page",
+        Some(serde_json::json!({"title": "one too many", "monitor_ids": [mon.clone()]})),
+        Some(Cred::Cookie(&owner)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "too_many_requests", "{body}");
+    assert!(headers.get(header::RETRY_AFTER).is_some());
+    Ok(())
+}
+
+/// S3's per-workspace probe share: a workspace's own schedule can't claim more
+/// than `workspace_slots` in-flight probes — the create is a named 409 `capacity`
+/// refusal, not a slot quietly missed later. Pausing frees the share (it counts
+/// unpaused monitors only) and another tenant's creates are unmoved.
+#[tokio::test]
+async fn a_workspace_cannot_claim_the_whole_probe_budget() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture_with(false, 4).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let neighbour = sign_up(&app, "neighbour@b.example").await;
+
+    // interval = timeout = 15 s: each monitor needs (tick + 15)/15 ≈ 1.07 slots.
+    // Three fit under a 4-slot share; the fourth makes the workspace need 4.27.
+    let create = |cookie: &str, name: &str| {
+        let app = app.clone();
+        let cookie = cookie.to_owned();
+        let name = name.to_owned();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/api/monitors",
+                Some(serde_json::json!({
+                    "name": name, "url": "https://example.com/health",
+                    "interval_s": 15, "timeout_s": 15,
+                })),
+                Some(Cred::Cookie(&cookie)),
+                None,
+            )
+            .await
+        }
+    };
+    for n in 0..3 {
+        let (status, _, body) = create(&owner, &format!("m{n}")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, _, body) = create(&owner, "one too loud").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded", "{body}");
+
+    // Pausing frees the share — the refused create succeeds once a monitor sleeps.
+    let ws = workspace_of(&db, "owner@a.example").await?;
+    let first = db
+        .workspace(WorkspaceId(uuid::Uuid::parse_str(&ws)?))
+        .list_monitors()
+        .await?
+        .into_iter()
+        .next()
+        .expect("a monitor");
+    let (status, _, body) = call(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{}", first.id),
+        Some(serde_json::json!({"paused": true})),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = create(&owner, "within budget now").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Another tenant's share is its own: the neighbour creates while the owner is at it.
+    for n in 0..3 {
+        let (status, _, body) = create(&neighbour, &format!("n{n}")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
     Ok(())
 }
 

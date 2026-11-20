@@ -118,6 +118,11 @@ impl Runtime {
 /// schedule that would need more is refused when it is written ([`capacity`]).
 pub const MAX_GLOBAL_SLOTS: usize = 512;
 
+/// S3: the share of the probe budget one workspace's own schedule may need —
+/// a quarter of the global ceiling. Writes past it are refused (`capacity`), so
+/// a tenant's schedule can't silently crowd the engine's slots (D-020 tenancy).
+pub const MAX_WORKSPACE_SLOTS: usize = MAX_GLOBAL_SLOTS / 4;
+
 /// Probe slots a schedule needs (D-018). Each tick starts `Σ tick/interval` probes, and
 /// each holds its slot until it ends — at worst its whole timeout — so the bound is
 /// `Σ (tick + timeout) / interval` over the unpaused monitors.
@@ -133,7 +138,7 @@ pub fn required_slots<'a>(monitors: impl IntoIterator<Item = &'a Monitor>, tick:
 }
 
 /// A slot count as `f64` (slot counts are small; anything past `u32::MAX` saturates).
-fn slots_f64(slots: usize) -> f64 {
+pub(crate) fn slots_f64(slots: usize) -> f64 {
     f64::from(u32::try_from(slots).unwrap_or(u32::MAX))
 }
 

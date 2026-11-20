@@ -30,7 +30,16 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   a token's one workspace, the operator's inventory); `GET|PUT
   /api/workspace/status-page` (`{slug, title, monitor_ids}` — `title` empty/null is
   the page's off switch, the monitor set is workspace-scoped, a taken slug is 409).
-  The public read is outside `/api`: `GET /s/{slug}/status.json` (module 07).
+  Status-page bounds (S2 hardening): ≤ 64 `monitor_ids` (duplicates collapse to
+  their first occurrence — never a PK error), title ≤ 120 visible chars, and a
+  per-workspace write budget of 6 per rolling 60 s — past it, 429 + `Retry-After`;
+  validation refusals don't spend. The public read is outside `/api`:
+  `GET /s/{slug}/status.json` (module 07).
+- **Per-workspace probe share (S3):** a monitor create/edit is also refused
+  `capacity_exceeded` (409) when the workspace's *own* unpaused schedule would need
+  more than `MAX_WORKSPACE_SLOTS` (= `MAX_GLOBAL_SLOTS` / 4 = 128) probes in
+  flight — one tenant's schedule can't silently crowd the engine; pausing frees
+  the share. The per-workspace monitor-count cap remains `SMON_MAX_MONITORS`.
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
 - **Auth (M5.1 + M7.2, live):** every `/api/**` route requires a credential —

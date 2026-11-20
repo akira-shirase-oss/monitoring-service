@@ -156,6 +156,14 @@ pub struct AppState {
     /// receiver. Bounded like `token_use`: workspaces are bounded, and the map
     /// forgets spent cooldowns past a cap.
     pub test_sends: TestSends,
+    /// Per-workspace status-page write budgets (S2 hardening): `workspace →
+    /// (window start, writes spent)` — a config write can't amplify into a
+    /// write loop against the store. Bounded and forgotten like `test_sends`.
+    pub status_writes: WritePace,
+    /// S3: the in-flight probe share one workspace's schedule may claim — a
+    /// create or edit whose own requirement would pass it is refused at write
+    /// time (`capacity`), so one tenant's schedule can't crowd the engine.
+    pub workspace_slots: usize,
     pub version: &'static str,
 }
 
@@ -163,6 +171,23 @@ pub struct AppState {
 pub type TestSends = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<monitor_domain::WorkspaceId, tokio::time::Instant>>,
 >;
+
+/// Status-page write budgets — `workspace → (window opened, writes spent)`.
+pub type WritePace = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<monitor_domain::WorkspaceId, (tokio::time::Instant, u32)>,
+    >,
+>;
+
+/// Monitors one status page may publish — the allowlist's bound (S2 hardening).
+pub const PAGE_MAX_MONITORS: usize = 64;
+/// Status-page writes per workspace per rolling window: a few saves are free,
+/// a write loop is not (S2 hardening).
+pub const STATUS_WRITE_BUDGET: u32 = 6;
+/// The rolling window `STATUS_WRITE_BUDGET` spends within.
+pub const STATUS_WRITE_WINDOW: Duration = Duration::from_secs(60);
+/// Write-budget map bound: past it, quiet entries are forgotten before counting.
+const STATUS_WRITE_CAP: usize = 4096;
 
 /// One test alert per workspace this often (S2). A second call inside the window is
 /// 429 `too_many_requests` with `Retry-After`.
@@ -409,7 +434,25 @@ async fn check_capacity(
                 config.per_origin_slots
             )))
         }
+    }?;
+    // S3: a workspace's *own* share of the probe budget — named here, at the
+    // write, instead of one tenant's schedule quietly crowding the engine's
+    // global slots later. Paused monitors cost nothing (`required_slots` skips
+    // them), so pausing frees the share.
+    let own = schedule::required_slots(
+        monitors
+            .iter()
+            .filter(|monitor| monitor.workspace == principal.workspace()),
+        config.tick,
+    );
+    if own > schedule::slots_f64(state.workspace_slots) {
+        return Err(ApiError::Capacity(format!(
+            "this workspace's schedule would need {own:.1} probes in flight; a workspace gets \
+             at most {}. Pause monitors, lengthen intervals or shorten timeouts",
+            state.workspace_slots
+        )));
     }
+    Ok(())
 }
 
 /// The service stack, as one `ServiceBuilder` — its *first* layer is the outermost
@@ -1132,7 +1175,7 @@ async fn put_status_page(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Json(body): Json<StatusPageBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let view = member_for(&state, &principal)?;
     if let Some(slug) = body.slug.as_deref()
         && !valid_slug(slug)
@@ -1148,10 +1191,56 @@ async fn put_status_page(
             "a status page title is at most 120 visible characters".into(),
         ));
     }
-    let mut monitors = Vec::with_capacity(body.monitor_ids.len().min(64));
+    if body.monitor_ids.len() > PAGE_MAX_MONITORS {
+        return Err(ApiError::Invalid(format!(
+            "a status page publishes at most {PAGE_MAX_MONITORS} monitors"
+        )));
+    }
+    // One row per monitor: the first occurrence wins, so a repeated id is a
+    // no-op rather than a `status_monitors` primary-key violation.
+    let mut monitors = Vec::with_capacity(body.monitor_ids.len());
     for id in &body.monitor_ids {
         let uuid = Uuid::parse_str(id).map_err(|_| ApiError::BadId)?;
-        monitors.push(MonitorId(uuid));
+        let id = MonitorId(uuid);
+        if !monitors.contains(&id) {
+            monitors.push(id);
+        }
+    }
+    // The workspace's write budget — a few saves in a row are free, a write
+    // loop against the store is not. Validation refusals never spend: they
+    // weren't writes. The budget is spent before the store call, so a store
+    // refusal costs it too — that is what the budget is for.
+    {
+        let now = tokio::time::Instant::now();
+        let mut writes = state
+            .status_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if writes.len() >= STATUS_WRITE_CAP {
+            let cutoff = now - STATUS_WRITE_WINDOW;
+            writes.retain(|_, (opened, _)| *opened > cutoff);
+        }
+        let (opened, spent) = writes.entry(principal.workspace()).or_insert((now, 0));
+        if now.duration_since(*opened) >= STATUS_WRITE_WINDOW {
+            *opened = now;
+            *spent = 0;
+        }
+        if *spent >= STATUS_WRITE_BUDGET {
+            let wait = STATUS_WRITE_WINDOW.saturating_sub(now.duration_since(*opened));
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    throttle::retry_after_secs(wait).to_string(),
+                )],
+                Json(serde_json::json!({
+                    "error": { "code": "too_many_requests",
+                               "message": "status-page writes are bounded; retry shortly" }
+                })),
+            )
+                .into_response());
+        }
+        *spent += 1;
     }
     view.set_status_page(
         body.slug.as_deref(),
@@ -1171,7 +1260,8 @@ async fn put_status_page(
             "title": page.title,
             "monitor_ids": page.monitors.iter().map(|m| &m.monitor_id).collect::<Vec<_>>(),
         }
-    })))
+    }))
+    .into_response())
 }
 
 /// "Send test alert" (S2): one real send through the D-017 gate — the same
@@ -1252,10 +1342,17 @@ async fn public_status(
     if let Err(wait) = guard.throttle.admit(guard.client(&extensions, &headers)) {
         return throttle::too_many(wait);
     }
+    // Every non-beat answer is `no-store`: a shared cache must not keep a 404
+    // past the page's enablement, nor an "unavailable" past the outage. The
+    // beat file alone is cacheable — and only until the next beat lands; the
+    // payload's own `expires_at` stays the freshness claim a reader trusts.
     let unavailable = |code: StatusCode, body: serde_json::Value| {
         (
             code,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
             body.to_string(),
         )
             .into_response()
@@ -1279,7 +1376,10 @@ async fn public_status(
     if let Ok(bytes) = std::fs::read(state.status_dir.join("s").join(format!("{slug}.json"))) {
         return (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=30"),
+            ],
             bytes,
         )
             .into_response();

@@ -49,11 +49,13 @@ async fn fixture_with_wait(password_work_wait: Duration) -> anyhow::Result<Fixtu
         token_use: std::sync::Arc::default(),
         status_dir: tmp.path().join("status"),
         test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });

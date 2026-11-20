@@ -342,11 +342,13 @@ fn app_state(
         token_use: std::sync::Arc::default(),
         status_dir: config.status_dir.clone().into(),
         test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
         backup_dir: config.backup_dir.clone(),
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
+        workspace_slots: monitor_server::schedule::MAX_WORKSPACE_SLOTS,
         allow_local_targets: config.lab,
         version: env!("CARGO_PKG_VERSION"),
     }
