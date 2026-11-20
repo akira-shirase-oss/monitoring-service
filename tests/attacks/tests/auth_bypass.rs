@@ -70,6 +70,17 @@ async fn every_authed_write_denies_without_a_credential() -> anyhow::Result<()> 
             "{method} {path} answered without a credential"
         );
     }
+    // Stored-state re-read: a status alone could hide a write that landed before
+    // the denial — the store must still be empty under a real credential.
+    for (path, key) in [("/api/monitors", "monitors"), ("/api/tokens", "tokens")] {
+        let list = authed(&instance, reqwest::Method::GET, path).send().await?;
+        let body: serde_json::Value = list.json().await?;
+        assert_eq!(
+            body[key].as_array().map(Vec::len),
+            Some(0),
+            "an unauthed write left rows in {path}: {body}"
+        );
+    }
     Ok(())
 }
 

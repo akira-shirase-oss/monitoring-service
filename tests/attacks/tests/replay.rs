@@ -89,6 +89,19 @@ async fn a_logged_out_session_cookie_replays_to_401() -> anyhow::Result<()> {
             "a logged-out cookie replayed against {path}"
         );
     }
+    // A dead cookie must be dead for writes too — replay it against a mutation.
+    let write = http
+        .patch(format!("{}/api/workspace", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
+        .json(&json!({"name": "replayed"}))
+        .send()
+        .await?;
+    assert_eq!(
+        write.status(),
+        StatusCode::UNAUTHORIZED,
+        "a logged-out cookie replayed against a write"
+    );
     Ok(())
 }
 
@@ -146,6 +159,18 @@ async fn a_used_invite_code_does_not_replay() -> anyhow::Result<()> {
         "a used invite replayed answered {}",
         replay.status()
     );
+    // Stored-state re-read: the refusal must mean no account — the replayed
+    // signup's credentials must not open a session.
+    let login = http
+        .post(format!("{}/api/login", instance.base))
+        .json(&json!({"email": "second@tenant.example", "password": "a password that is long enough"}))
+        .send()
+        .await?;
+    assert_eq!(
+        login.status(),
+        StatusCode::UNAUTHORIZED,
+        "the replayed signup left a working account behind"
+    );
     Ok(())
 }
 
@@ -183,25 +208,45 @@ async fn a_stale_generation_patch_is_a_conflict() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("view carried no generation: {view}"))?;
 
     // Write 1 at generation g succeeds; replaying the SAME generation after it
-    // must conflict — the stale write can't shadow the newer one.
-    let patch = |g: serde_json::Value| {
+    // must conflict — the stale write can't shadow the newer one. The replay
+    // carries a different name so a silent overwrite would be visible.
+    let patch = |g: serde_json::Value, name: &str| {
         http.patch(format!("{}/api/monitors/{id}", instance.base))
             .header("cookie", &cookie)
             .header("origin", &instance.base)
-            .json(&json!({"name": "renamed", "generation": g}))
+            .json(&json!({"name": name, "generation": g}))
     };
-    let first = patch(serde_json::json!(generation)).send().await?;
+    let first = patch(serde_json::json!(generation), "first-write")
+        .send()
+        .await?;
     assert!(
         first.status().is_success(),
         "the live generation patches fine: {}",
         first.status()
     );
-    let replayed = patch(serde_json::json!(generation)).send().await?;
+    let replayed = patch(serde_json::json!(generation), "shadow-write")
+        .send()
+        .await?;
     assert_eq!(
         replayed.status(),
         StatusCode::CONFLICT,
         "the same generation twice must conflict, got {}",
         replayed.status()
+    );
+    // Stored-state re-read: the conflict must be a refusal, not an applied write —
+    // the store still shows the first write's name.
+    let view: serde_json::Value = http
+        .get(format!("{}/api/monitors/{id}", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        view["name"].as_str(),
+        Some("first-write"),
+        "the stale write reached the store: {view}"
     );
     Ok(())
 }
@@ -262,6 +307,25 @@ async fn a_revoked_workspace_token_stops_working() -> anyhow::Result<()> {
         replayed.status(),
         StatusCode::UNAUTHORIZED,
         "a revoked token must not replay"
+    );
+    // Stored-state re-read: revocation is a stamped row kept as history, not a
+    // delete — the token still lists, now carrying its revoked_at.
+    let list = http
+        .get(format!("{}/api/tokens", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
+        .send()
+        .await?;
+    let body: serde_json::Value = list.json().await?;
+    let stamped = body["tokens"].as_array().and_then(|ts| {
+        ts.iter()
+            .find(|t| t["id"].as_str() == Some(id.as_str()))
+            .map(|t| !t["revoked_at"].is_null())
+    });
+    assert_eq!(
+        stamped,
+        Some(true),
+        "the revoked stamp must be on the row that survives as history: {body}"
     );
     Ok(())
 }

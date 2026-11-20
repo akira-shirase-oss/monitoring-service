@@ -142,7 +142,9 @@ async fn a_foreign_workspace_header_unlocks_nothing() -> anyhow::Result<()> {
             .header("cookie", &b_cookie)
             .header("origin", &instance.base)
             .header("x-smon-workspace", &a_ws)
-            .json(&json!({}))
+            // A hostile body on every request — denials happen before the body is
+            // trusted, so GETs ignore it and writes must never apply it.
+            .json(&json!({"name": "pwned-by-b", "url": "http://169.254.169.254/"}))
             .send()
             .await?;
         let status = response.status();
@@ -151,6 +153,22 @@ async fn a_foreign_workspace_header_unlocks_nothing() -> anyhow::Result<()> {
             "{method} {path} under a foreign workspace answered {status}"
         );
     }
+
+    // Stored-state re-read: denied or not, A's row must be exactly what A wrote —
+    // a foreign PATCH or DELETE that slipped through leaves this changed or gone.
+    let after = http
+        .get(format!("{}/api/monitors/{a_monitor}", instance.base))
+        .header("cookie", &a_cookie)
+        .header("origin", &instance.base)
+        .send()
+        .await?;
+    assert_eq!(after.status(), StatusCode::OK, "A's monitor is still there");
+    let body: serde_json::Value = after.json().await?;
+    assert_eq!(
+        body["name"].as_str(),
+        Some("alice-mon"),
+        "a foreign write reached A's monitor: {body}"
+    );
 
     // Without the header B scopes to its own workspace — A's monitor is a plain
     // 404, the same answer a never-created id gets.

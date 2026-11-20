@@ -150,5 +150,19 @@ async fn a_cross_site_origin_cannot_spend_a_cookie() -> anyhow::Result<()> {
         StatusCode::FORBIDDEN,
         "a cross-site Origin on a cookie write must be refused"
     );
+    // Stored-state re-read: the refused write must not have landed — the
+    // workspace name stays what the tenant's own signup chose, not the attacker's.
+    let workspaces = http
+        .get(format!("{}/api/workspaces", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
+        .send()
+        .await?;
+    let body: serde_json::Value = workspaces.json().await?;
+    assert_ne!(
+        body["workspaces"][0]["name"].as_str(),
+        Some("renamed-by-an-attacker"),
+        "the cross-site write reached the store: {body}"
+    );
     Ok(())
 }

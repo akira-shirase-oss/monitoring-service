@@ -6,6 +6,7 @@ mod common;
 
 use common::{client, spawn};
 use reqwest::StatusCode;
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A body past the cap is refused before it is parsed — the 413 lands without a
@@ -35,6 +36,18 @@ async fn an_oversized_body_is_413() -> anyhow::Result<()> {
             "unexpected client error: {e}"
         ),
     }
+    // The refusal must not have cost a slot or killed the listener: a normal
+    // request right after still gets the server's own answer.
+    let alive = http
+        .post(format!("{}/api/login", instance.base))
+        .json(&json!({"token": "wrong"}))
+        .send()
+        .await?;
+    assert_eq!(
+        alive.status(),
+        StatusCode::UNAUTHORIZED,
+        "after the oversized body the server stopped answering normally"
+    );
     Ok(())
 }
 
@@ -61,12 +74,26 @@ async fn a_body_that_never_finishes_is_408() -> anyhow::Result<()> {
         "a never-ending body must be 408, got {}",
         response.status()
     );
+    // The timed-out request must release its slot — the next normal request is
+    // answered by the server, not stalled on the abandoned body's budget.
+    let after = http
+        .post(format!("{}/api/login", instance.base))
+        .json(&json!({"token": "wrong"}))
+        .send()
+        .await?;
+    assert_eq!(
+        after.status(),
+        StatusCode::UNAUTHORIZED,
+        "after the stalled body the server stopped answering normally"
+    );
     Ok(())
 }
 
-/// Headers dripped a byte at a time: the server's header-read timeout cuts the
-/// connection — our read ends (response or close) inside 18 s, far inside the
-/// 800 ms/byte drip rate that would otherwise keep the header alive past it.
+/// Headers dripped a byte at a time, forever: the header never completes, so only
+/// the server's header-read deadline can end the connection — our read ends
+/// (response or close) inside 18 s. A finite drip that finishes inside the
+/// deadline would test nothing: any refusal it got back would be an answered
+/// request, not a cut.
 #[tokio::test]
 async fn drip_fed_headers_are_cut() -> anyhow::Result<()> {
     let instance = spawn().await?;
@@ -80,13 +107,16 @@ async fn drip_fed_headers_are_cut() -> anyhow::Result<()> {
     writer
         .write_all(b"POST /api/login HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n")
         .await?;
-    // One byte every 800 ms: the full header block would take >10 s to arrive.
+    // A byte every 700 ms and never the terminating blank line: the header is
+    // still in progress at every deadline the server could pick.
     let drip = tokio::spawn(async move {
-        for byte in b"X-Drip: 1\r\n\r\n" {
-            if writer.write_all(&[*byte]).await.is_err() {
-                return;
+        loop {
+            for byte in b"X-Drip: 1\r\n" {
+                if writer.write_all(&[*byte]).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         }
     });
 
@@ -115,6 +145,12 @@ async fn drip_fed_headers_are_cut() -> anyhow::Result<()> {
             );
         }
     }
+    // The cut connection freed its read slot — the listener still answers.
+    let alive = client()?
+        .get(format!("{}/livez", instance.base))
+        .send()
+        .await?;
+    assert!(alive.status().is_success(), "the drip starved the listener");
     Ok(())
 }
 
@@ -141,5 +177,15 @@ async fn an_oversized_header_is_refused() -> anyhow::Result<()> {
     }
     // A client-side send failure means the parser cut the connection — also a
     // refusal, and never a processed request.
+    // The parser is still serving: a normal request gets the server's own 401.
+    let alive = http
+        .get(format!("{}/api/monitors", instance.base))
+        .send()
+        .await?;
+    assert_eq!(
+        alive.status(),
+        StatusCode::UNAUTHORIZED,
+        "after the giant header the parser stopped serving requests"
+    );
     Ok(())
 }

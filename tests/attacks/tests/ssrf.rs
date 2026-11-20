@@ -98,6 +98,20 @@ async fn local_targets_are_refused_at_save_in_every_spelling() -> anyhow::Result
             "target {url} answered {status} — it must be refused at save"
         );
     }
+    // Stored-state re-read: nineteen refusals must mean nineteen non-creates —
+    // the workspace's monitor list is still empty.
+    let list = http
+        .get(format!("{}/api/monitors", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
+        .send()
+        .await?;
+    let body: serde_json::Value = list.json().await?;
+    assert_eq!(
+        body["monitors"].as_array().map(Vec::len),
+        Some(0),
+        "a refused target was saved anyway: {body}"
+    );
     Ok(())
 }
 
@@ -155,5 +169,18 @@ async fn the_webhook_target_gate_refuses_local_addresses() -> anyhow::Result<()>
             response.status()
         );
     }
+    // Stored-state re-read: no refused URL may be sitting in the workspace's
+    // webhook slot waiting for the next delivery attempt.
+    let read = http
+        .get(format!("{}/api/workspace/webhook", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
+        .send()
+        .await?;
+    let body: serde_json::Value = read.json().await?;
+    assert!(
+        body["webhook"].is_null(),
+        "a refused webhook target was stored: {body}"
+    );
     Ok(())
 }
