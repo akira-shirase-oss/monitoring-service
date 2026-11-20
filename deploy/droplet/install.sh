@@ -8,16 +8,35 @@
 #
 # Prompts only for secrets that can't be generated (the origin certificate pair, the R2
 # secret), with umask 077 and no echo. Everything else is generated or fetched. ~15 min.
+#
+# Non-interactive installs (CI, replays) pass the same secrets as file paths/flags —
+# never through a prompt: --origin-cert F --origin-key F each replaces its `cat` prompt,
+# and --r2-secret F --r2-endpoint U --r2-access-key I together replace the R2 prompts
+# (a partial set is an error — prompting for half a credential is worse than either mode).
 set -euo pipefail
 umask 077
 PREFIX=/opt/smon
 RELEASE_DIR=""
+ORIGIN_CERT=""; ORIGIN_KEY=""
+R2_SECRET=""; R2_ENDPOINT=""; R2_ACCESS_KEY=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --release-dir) RELEASE_DIR="$2"; shift 2 ;;
+    --release-dir)    RELEASE_DIR="$2"; shift 2 ;;
+    --origin-cert)    ORIGIN_CERT="$2"; shift 2 ;;
+    --origin-key)     ORIGIN_KEY="$2"; shift 2 ;;
+    --r2-secret)      R2_SECRET="$2"; shift 2 ;;
+    --r2-endpoint)    R2_ENDPOINT="$2"; shift 2 ;;
+    --r2-access-key)  R2_ACCESS_KEY="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+for f in "$ORIGIN_CERT" "$ORIGIN_KEY" "$R2_SECRET"; do
+  [[ -z "$f" || -f "$f" ]] || { echo "error: $f does not exist" >&2; exit 2; }
+done
+r2_given=$(( ${#R2_SECRET} + ${#R2_ENDPOINT} + ${#R2_ACCESS_KEY} ))
+if [[ $r2_given -gt 0 && ( -z "$R2_SECRET" || -z "$R2_ENDPOINT" || -z "$R2_ACCESS_KEY" ) ]]; then
+  echo "error: --r2-secret, --r2-endpoint and --r2-access-key go together" >&2; exit 2
+fi
 [[ $EUID -eq 0 ]] || { echo "error: run as root" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -85,6 +104,8 @@ systemctl daemon-reload
 systemctl enable --now monitor-server smon-backup.timer
 
 step "Caddy: origin certificate, AOP CA, Cloudflare ranges"
+if [[ -n "$ORIGIN_CERT" ]]; then install -o root -g caddy -m 0640 "$ORIGIN_CERT" /etc/caddy/origin.pem; fi
+if [[ -n "$ORIGIN_KEY" ]]; then install -o root -g caddy -m 0640 "$ORIGIN_KEY" /etc/caddy/origin.key; fi
 if [[ ! -s /etc/caddy/origin.pem || ! -s /etc/caddy/origin.key ]]; then
   echo "Paste the Cloudflare ORIGIN CERTIFICATE (CREATE.md 7), then Ctrl-D:"
   cat >/etc/caddy/origin.pem
@@ -109,18 +130,34 @@ if [[ ! -s "$PREFIX/backup-age-identity" ]]; then
   echo ">> copy the AGE-SECRET-KEY-… line out of $PREFIX/backup-age-identity NOW (it unlocks every R2 backup), then continue"
 fi
 if [[ ! -s "$PREFIX/credentials/s3_secret_key" ]]; then
-  printf 'Paste the R2 secret access key (no echo): '
-  read -rs key || { echo >&2 "aborted: re-run install.sh when you have the key"; exit 2; }
-  printf '\n'
-  printf '%s' "$key" >"$PREFIX/credentials/s3_secret_key"; unset key
-  chmod 0400 "$PREFIX/credentials/s3_secret_key"
-  printf 'R2 endpoint (https://<account-id>.r2.cloudflarestorage.com): '
-  read -r endpoint
-  printf 'R2 access key id: '
-  read -r access_key
-  printf 'SMON_R2_ENDPOINT=%s\nSMON_R2_ACCESS_KEY=%s\n' "$endpoint" "$access_key" >"$PREFIX/credentials/r2.env"
-  chmod 0644 "$PREFIX/credentials/r2.env"; unset endpoint access_key
+  if [[ -n "$R2_SECRET" ]]; then
+    install -m 0400 "$R2_SECRET" "$PREFIX/credentials/s3_secret_key"
+    printf 'SMON_R2_ENDPOINT=%s\nSMON_R2_ACCESS_KEY=%s\n' "$R2_ENDPOINT" "$R2_ACCESS_KEY" >"$PREFIX/credentials/r2.env"
+    chmod 0644 "$PREFIX/credentials/r2.env"
+  else
+    printf 'Paste the R2 secret access key (no echo): '
+    read -rs key || { echo >&2 "aborted: re-run install.sh when you have the key"; exit 2; }
+    printf '\n'
+    printf '%s' "$key" >"$PREFIX/credentials/s3_secret_key"; unset key
+    chmod 0400 "$PREFIX/credentials/s3_secret_key"
+    printf 'R2 endpoint (https://<account-id>.r2.cloudflarestorage.com): '
+    read -r endpoint
+    printf 'R2 access key id: '
+    read -r access_key
+    printf 'SMON_R2_ENDPOINT=%s\nSMON_R2_ACCESS_KEY=%s\n' "$endpoint" "$access_key" >"$PREFIX/credentials/r2.env"
+    chmod 0644 "$PREFIX/credentials/r2.env"; unset endpoint access_key
+  fi
 fi
+
+step "first off-box backup"
+# The exit gate wants a backup less than a day old — take one now, through the real path
+# (the server's own /api/backup → age → rclone), while the credentials are fresh. If the
+# credentials are wrong the failure lands here, loudly, not at the next timer tick.
+for _ in $(seq 1 30); do
+  curl -fsS --max-time 2 "http://${SMON_LISTEN:-127.0.0.1:58400}/livez" >/dev/null 2>&1 && break
+  sleep 1
+done
+SMON_LOCAL_URL="http://${SMON_LISTEN:-127.0.0.1:58400}" smon-backup run
 
 step "smoke"
 "$here/smoke.sh"

@@ -94,8 +94,16 @@ never re-initialised), installs and enables the units (server + `smon-backup.tim
 installs Caddy + the Caddyfile, prompts for the origin certificate pair only if missing,
 fetches Cloudflare's origin-pull CA (AOP), applies `cloudflare-ips.sh` (Caddy trusted
 proxies + ufw 443-from-Cloudflare), generates the age identity if missing, prompts for the
-R2 secret, and finishes with `smoke.sh`. Secrets are prompted for with echo off; nothing
-secret lands anywhere but the root-only files CREATE.md names.
+R2 secret, takes the first off-box backup (`smon-backup run` — the exit gate's "a backup
+exists" is evidence, not a wait for the first timer tick), and finishes with `smoke.sh`.
+Secrets are prompted for with echo off; nothing secret lands anywhere but the root-only
+files CREATE.md names.
+
+Non-interactive installs (CI, replays) pass the same secrets without a prompt:
+`--origin-cert FILE --origin-key FILE` install the origin pair, and `--r2-secret FILE
+--r2-endpoint URL --r2-access-key ID` together seed the R2 credentials — a partial set is
+refused. The deploy-check workflow runs exactly this on a hosted VM (rclone stubbed to a
+filesystem remote — the pipeline is real, the account is not), twice, for idempotence.
 
 What it deliberately does **not** do: overwrite an existing `env`, re-initialise a store,
 or weaken the file modes.

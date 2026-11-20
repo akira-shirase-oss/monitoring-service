@@ -41,6 +41,12 @@ fn the_schema_guard_passes_its_stub_harness() {
 }
 
 #[test]
+fn the_unit_hardening_check_passes() {
+    // The static half runs anywhere (it is what deploy-check's VM job runs in full).
+    harness("check-unit-hardening.sh");
+}
+
+#[test]
 fn the_deploy_scripts_carry_their_promised_properties() {
     let read = |name: &str| {
         let path = format!("{DROPLET}/{name}");
