@@ -79,12 +79,17 @@ latest() {
 
 run() {
   [[ -s "$recipient_file" ]] || { echo "error: no age recipient in $recipient_file (DEPLOY.md step 9)" >&2; exit 1; }
-  local token name
+  local token name hdr
   token=$(setting SMON_ADMIN_TOKEN "$env_file")
   [[ -n "$token" ]] || { echo "error: no SMON_ADMIN_TOKEN in $env_file" >&2; exit 1; }
+  # The token travels in a root-only header file — argv is visible to every local
+  # user via `ps` (S2 review). The file is removed even if curl fails.
+  hdr=$(mktemp); trap 'rm -f "$hdr"' RETURN
+  printf 'authorization: Bearer %s\n' "$token" >"$hdr"
   name=$(curl -fsS --max-time 30 -X POST "$local_url/api/backup" \
-    -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{}' \
+    -H "@$hdr" -H 'content-type: application/json' -d '{}' \
     | jq -r '.name // empty')
+  rm -f "$hdr"; trap - RETURN
   [[ -n "$name" && -s "$backup_dir/$name" ]] \
     || { echo "error: the server did not produce a snapshot in $backup_dir" >&2; exit 1; }
 

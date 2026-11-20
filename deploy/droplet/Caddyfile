@@ -27,5 +27,11 @@ monitor.example.com:443 {
 	reverse_proxy 127.0.0.1:58400 {
 		lb_try_duration 15s
 		lb_try_interval 250ms
+		# X-Forwarded-For must carry the visitor, not the Cloudflare edge that talked to
+		# us: with the trusted_proxies block above, {client_ip} resolves through CF's
+		# ranges to the real client. Without this, Caddy appends its own peer (a CF
+		# edge IP) right-most — the monitor would throttle a whole CF location as one
+		# address.
+		header_up X-Forwarded-For {client_ip}
 	}
 }

@@ -55,7 +55,18 @@ if ! { need jq && need curl && need age && need rclone && need sqlite3; }; then
 fi
 if ! need caddy; then
   apt-get install -y caddy || {
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    # The repo key is pinned by fingerprint (S2 review): a substituted key would
+    # otherwise sign packages apt trusts. Fingerprint from the published key itself —
+    # armor whitespace can't hide a different key.
+    caddy_key=$(mktemp)
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$caddy_key"
+    got=$(gpg --batch --show-keys --with-fingerprint "$caddy_key" 2>/dev/null \
+      | awk '/^pub/{getline; gsub(/ /, ""); print; exit}')
+    want=65760C51EDEA2017CEA2CA15155B6D79CA56EA34
+    [[ "$got" == "$want" ]] \
+      || { echo "error: caddy repo key fingerprint $got, expected $want" >&2; rm -f "$caddy_key"; exit 2; }
+    gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg "$caddy_key"
+    rm -f "$caddy_key"
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' >/etc/apt/sources.list.d/caddy-stable.list
     apt-get update
     apt-get install -y caddy
@@ -92,13 +103,17 @@ fi
 "$PREFIX/current/bin/monitor-server" --version
 
 step "the store (created only once — D-015)"
-set -a; . "$PREFIX/env"; set +a
-dbpath=${SMON_DATABASE_URL#sqlite:}
-if sudo -u smon test -f "$dbpath"; then
-  echo "store exists at $dbpath — not re-initialising"
-else
-  sudo -u smon SMON_DATABASE_URL="$SMON_DATABASE_URL" "$PREFIX/current/bin/monitor-server" --init
-fi
+# The env file holds the admin token — scope its export to this subshell so no later
+# child of this script (systemctl, curl, the smoke run) inherits it (S2 review).
+(
+  set -a; . "$PREFIX/env"; set +a
+  dbpath=${SMON_DATABASE_URL#sqlite:}
+  if sudo -u smon test -f "$dbpath"; then
+    echo "store exists at $dbpath — not re-initialising"
+  else
+    sudo -u smon SMON_DATABASE_URL="$SMON_DATABASE_URL" "$PREFIX/current/bin/monitor-server" --init
+  fi
+)
 
 step "systemd"
 install -m 0644 "$here/../monitor-server.service" /etc/systemd/system/monitor-server.service
@@ -120,8 +135,18 @@ if [[ ! -s /etc/caddy/origin.pem || ! -s /etc/caddy/origin.key ]]; then
   chmod 0640 /etc/caddy/origin.pem /etc/caddy/origin.key
 fi
 if [[ ! -s /etc/caddy/cloudflare-origin-pull-ca.pem ]]; then
-  curl -fsSo /etc/caddy/cloudflare-origin-pull-ca.pem \
+  # Pinned by DER sha256 fingerprint (S2 review): this CA decides whose client
+  # certificate passes Authenticated Origin Pulls — a substituted CA would open
+  # the origin to anyone holding a cert from it.
+  aop_ca=$(mktemp)
+  curl -fsSo "$aop_ca" \
     https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem
+  got=$(openssl x509 -in "$aop_ca" -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2)
+  want=9A1AC2B4BE15F9F27EEE20A734CBA4E9898F61001B3BD7C84B69B56A3E25A2B9
+  [[ "$got" == "$want" ]] \
+    || { echo "error: CF origin-pull CA fingerprint $got, expected $want" >&2; rm -f "$aop_ca"; exit 2; }
+  install -m 0644 "$aop_ca" /etc/caddy/cloudflare-origin-pull-ca.pem
+  rm -f "$aop_ca"
 fi
 install -m 0644 "$here/Caddyfile" /etc/caddy/Caddyfile
 "$here/cloudflare-ips.sh"
