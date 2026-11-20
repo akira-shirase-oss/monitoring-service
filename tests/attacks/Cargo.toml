@@ -1,0 +1,27 @@
+# The pentest regression suite (workspace rule, 2026-11-20): real attack requests
+# against a *running* monitor-server — the binary on a loopback port, a temp store,
+# the strict profile — each test asserting the refusal, never just the happy path.
+# Model: labs/minibtc/tests/attacks (a workspace member whose tests are the suite).
+[package]
+name = "monitor-attacks"
+description = "Service Monitor pentest regression suite: real attacks against a running instance."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+anyhow.workspace = true
+bytes = "1"
+tokio-stream = "0.1"
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile = "3.27.0"
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1294,6 +1294,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "monitor-attacks"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "monitor-cli"
 version = "0.1.0-alpha.0"
 dependencies = [
