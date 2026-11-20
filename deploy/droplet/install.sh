@@ -118,17 +118,17 @@ fi
 "$PREFIX/current/bin/monitor-server" --version
 
 step "the store (created only once — D-015)"
-# The env file holds the admin token — scope its export to this subshell so no later
-# child of this script (systemctl, curl, the smoke run) inherits it (S2 review).
-(
-  set -a; . "$PREFIX/env"; set +a
-  dbpath=${SMON_DATABASE_URL#sqlite:}
-  if sudo -u smon test -f "$dbpath"; then
-    echo "store exists at $dbpath — not re-initialising"
-  else
-    sudo -u smon SMON_DATABASE_URL="$SMON_DATABASE_URL" "$PREFIX/current/bin/monitor-server" --init
-  fi
-)
+# The env file's values feed this script's own references — SMON_DATABASE_URL for
+# --init, SMON_LISTEN for the livez/smoke probes below. Sourced without exporting:
+# they stay shell variables, so no child (systemctl, curl, the smoke run) inherits
+# the admin token (S2 review; the earlier subshell hid SMON_LISTEN from the probes).
+. "$PREFIX/env"
+dbpath=${SMON_DATABASE_URL#sqlite:}
+if sudo -u smon test -f "$dbpath"; then
+  echo "store exists at $dbpath — not re-initialising"
+else
+  sudo -u smon SMON_DATABASE_URL="$SMON_DATABASE_URL" "$PREFIX/current/bin/monitor-server" --init
+fi
 
 step "systemd"
 install -m 0644 "$here/../monitor-server.service" /etc/systemd/system/monitor-server.service
@@ -150,16 +150,17 @@ if [[ ! -s /etc/caddy/origin.pem || ! -s /etc/caddy/origin.key ]]; then
   chmod 0640 /etc/caddy/origin.pem /etc/caddy/origin.key
 fi
 if [[ ! -s /etc/caddy/cloudflare-origin-pull-ca.pem ]]; then
-  # Pinned by DER sha256 fingerprint (S2 review): this CA decides whose client
-  # certificate passes Authenticated Origin Pulls — a substituted CA would open
-  # the origin to anyone holding a cert from it.
+  # Pinned by whole-file sha256 (S2 review): this CA decides whose client
+  # certificate passes Authenticated Origin Pulls. Hashing only the first
+  # certificate would let a substituted file append its own CA after it — Caddy
+  # trusts every certificate in the file, so the pin covers every byte.
   aop_ca=$(mktemp)
   curl -fsSo "$aop_ca" \
     https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem
-  got=$(openssl x509 -in "$aop_ca" -noout -fingerprint -sha256 | tr -d ':' | cut -d= -f2)
-  want=9A1AC2B4BE15F9F27EEE20A734CBA4E9898F61001B3BD7C84B69B56A3E25A2B9
+  got=$(sha256sum "$aop_ca" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
+  want=FA7511982D758634477A48DC6375F8FC8D5FED9FDB43235BC3923887FDEA0597
   [[ "$got" == "$want" ]] \
-    || { echo "error: CF origin-pull CA fingerprint $got, expected $want" >&2; rm -f "$aop_ca"; exit 2; }
+    || { echo "error: CF origin-pull CA sha256 $got, expected $want" >&2; rm -f "$aop_ca"; exit 2; }
   install -m 0644 "$aop_ca" /etc/caddy/cloudflare-origin-pull-ca.pem
   rm -f "$aop_ca"
 fi

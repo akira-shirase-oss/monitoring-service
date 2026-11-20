@@ -112,7 +112,11 @@ or weaken the file modes.
 
 `SMON_TRUSTED_PROXY=127.0.0.1` (in the template) is right here: Caddy is the only proxy smon
 sees, and Caddy attributes the visitor over Cloudflare's trusted ranges.
-`SMON_COOKIE_SECURE=always` because every dashboard request arrives over TLS.
+`SMON_COOKIE_SECURE=always` because every dashboard request arrives over TLS. A
+self-hosted install that serves the dashboard over plain `http://` needs
+`SMON_COOKIE_SECURE=off` — it emits the plain `smon_session` cookie without `Secure`
+(the `__Host-` name is rejected by browsers without it), and it is a development
+escape only: production sign-in is HTTPS-only.
 
 ## 4. Sign in once
 

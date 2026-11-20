@@ -83,17 +83,19 @@ run() {
   token=$(setting SMON_ADMIN_TOKEN "$env_file")
   [[ -n "$token" ]] || { echo "error: no SMON_ADMIN_TOKEN in $env_file" >&2; exit 1; }
   # The token travels in a root-only header file — argv is visible to every local
-  # user via `ps` (S2 review). The file is removed even if curl fails.
-  hdr=$(mktemp); trap 'rm -f "$hdr"' RETURN
+  # user via `ps` (S2 review). The path is baked into an EXIT trap: a RETURN trap
+  # does not run when `set -e` aborts inside the function, which would strand the
+  # token file on a curl failure.
+  hdr=$(mktemp); trap "rm -f '$hdr'" EXIT
   printf 'authorization: Bearer %s\n' "$token" >"$hdr"
   name=$(curl -fsS --max-time 30 -X POST "$local_url/api/backup" \
     -H "@$hdr" -H 'content-type: application/json' -d '{}' \
     | jq -r '.name // empty')
-  rm -f "$hdr"; trap - RETURN
+  rm -f "$hdr"; trap - EXIT
   [[ -n "$name" && -s "$backup_dir/$name" ]] \
     || { echo "error: the server did not produce a snapshot in $backup_dir" >&2; exit 1; }
 
-  work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+  work=$(mktemp -d); trap "rm -rf '$work'" EXIT
   age --encrypt --recipients-file "$recipient_file" -o "$work/$name.age" "$backup_dir/$name"
   [[ -s "$work/$name.age" ]] || { echo "error: the encrypted snapshot is empty" >&2; exit 1; }
   r2 copyto "$work/$name.age" "r2:$bucket/snapshots/$name.age"

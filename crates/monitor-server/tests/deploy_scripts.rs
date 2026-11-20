@@ -105,12 +105,16 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         backup.contains("mktemp") && backup.contains("trap"),
         "the header file is temporary and cleaned up"
     );
+    assert!(
+        backup.contains("\" EXIT") && !backup.contains("' RETURN"),
+        "the token-file trap must fire on a set -e exit — a RETURN trap does not"
+    );
     for pin in [
         "65760C51EDEA2017CEA2CA15155B6D79CA56EA34", // caddy repo key, by fingerprint
-        "9A1AC2B4BE15F9F27EEE20A734CBA4E9898F61001B3BD7C84B69B56A3E25A2B9", // CF origin-pull CA, DER sha256
+        "FA7511982D758634477A48DC6375F8FC8D5FED9FDB43235BC3923887FDEA0597", // CF origin-pull CA file, sha256
         "--homedir",          // repo key verified inside a throwaway keyring…
         "--export \"$want\"", // …and ONLY the pinned key is exported to apt
-        "openssl x509",       // CA checked before install
+        "sha256sum",          // the CA pin covers every byte of the file, not just the first cert
         "caddy version",      // >= 2.7 floor: {client_ip}/trusted-proxies need it
     ] {
         assert!(install.contains(pin), "install.sh is missing '{pin}'");
@@ -119,6 +123,11 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         !install.contains("apt-get install -y caddy ||"),
         "the pinned repo must be registered BEFORE caddy is installed — Ubuntu's older \
          package would otherwise win and silently lack trusted-proxies support"
+    );
+    assert!(
+        !install.contains("set -a"),
+        "the env file is sourced unexported — `set -a` would leak the admin token to \
+         every child of the installer"
     );
 
     // N1: the edge forwards the visitor's address, and only Cloudflare gets to say
