@@ -77,8 +77,24 @@ want Service EnvironmentFile /opt/smon/env
 
 echo "systemd-analyze — the real checker, when this host has systemd"
 if command -v systemd-analyze >/dev/null 2>&1; then
-  if out=$(systemd-analyze verify "$unit_file" 2>&1); then
-    [[ -z "$out" ]] && ok "systemd-analyze verify: clean" || { echo "$out" | sed 's/^/  info  /'; ok "systemd-analyze verify: no errors (notes above)"; }
+  # verify resolves ExecStart/EnvironmentFile against the live filesystem — on a
+  # runner that never installed, our paths don't exist and the check would fail
+  # on the host's state, not the unit's. Stage a root where the unit's paths are
+  # real so verify judges only this unit's lines, identically on any host.
+  fake=$(mktemp -d)
+  mkdir -p "$fake/opt/smon/current/bin" "$fake/opt/smon/data" "$fake/opt/smon/status" \
+           "$fake/etc/systemd/system" "$fake/etc"
+  printf '#!/bin/sh\nexit 0\n' >"$fake/opt/smon/current/bin/monitor-server"
+  chmod +x "$fake/opt/smon/current/bin/monitor-server"
+  : >"$fake/opt/smon/env"
+  printf 'smon:x:900:900:smon monitor:/nonexistent:/usr/sbin/nologin\n' >"$fake/etc/passwd"
+  printf 'smon:x:900:\n' >"$fake/etc/group"
+  cp "$unit_file" "$fake/etc/systemd/system/monitor-server.service"
+  out=$(systemd-analyze verify --root="$fake" monitor-server.service 2>&1); rc=$?
+  rm -rf "$fake"
+  if [[ $rc -eq 0 ]]; then
+    [[ -z "$out" ]] && ok "systemd-analyze verify: clean" \
+      || { printf '%s\n' "$out" | sed 's/^/  info  /'; ok "systemd-analyze verify: no errors on our unit (notes above)"; }
   else
     bad "systemd-analyze verify: $out"
   fi

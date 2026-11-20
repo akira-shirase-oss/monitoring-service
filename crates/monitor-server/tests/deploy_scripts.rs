@@ -122,6 +122,23 @@ fn the_deploy_scripts_carry_their_promised_properties() {
             && caddyfile.contains("trusted_proxies"),
         "the Caddyfile must forward {{client_ip}} through the trusted CF proxies"
     );
+
+    // The unit check's systemd-analyze half must run against a staged --root:
+    // bare `verify` judges the host's filesystem — on a CI runner without an
+    // install, /opt/smon paths are absent and the check fails on host state
+    // (and the host's own units leak into the verdict).
+    let hardening = read("check-unit-hardening.sh");
+    for pin in ["--root", "mktemp -d", "chmod +x"] {
+        assert!(
+            hardening.contains(pin),
+            "check-unit-hardening.sh must stage a root for verify — missing '{pin}'"
+        );
+    }
+    assert!(
+        !hardening.contains("systemd-analyze verify \"$unit_file\"")
+            && !hardening.contains("systemd-analyze verify \"$unit\""),
+        "bare verify judges the host's filesystem, not the unit"
+    );
 }
 
 #[test]
