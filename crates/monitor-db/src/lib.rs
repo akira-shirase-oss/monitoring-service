@@ -14,7 +14,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use monitor_domain::{
-    AccountId, ApiTokenId, CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, Role,
+    AccountId, ApiTokenId, CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, Plan, Role,
     SlotObservation, Thresholds, WorkspaceId,
 };
 
@@ -161,6 +161,19 @@ impl Default for RetentionPolicy {
 }
 
 impl RetentionPolicy {
+    /// The policy one workspace's plan resolves to (S3, D-022): a plan that fixes its
+    /// own horizons uses them; one that defers (`operator`) keeps the configured policy.
+    /// Plans can only ever shed evidence earlier than the server, never keep it longer —
+    /// the free tier's constants are all below the defaults.
+    pub fn for_plan(plan: Plan, configured: &Self) -> Self {
+        plan.limits().retention.map_or(*configured, |plan| Self {
+            checks: plan.checks,
+            aggregates: plan.aggregates,
+            incidents: plan.incidents,
+            delivered_outbox: plan.delivered_outbox,
+        })
+    }
+
     /// The expiry instants for a pass run at `now`. A horizon too large to subtract
     /// saturates to "keep everything".
     pub fn cutoffs(&self, now: OffsetDateTime) -> RetentionCutoffs {
@@ -543,7 +556,7 @@ impl Db {
         workspace: WorkspaceId,
     ) -> Result<Option<WorkspaceRow>, QueryError> {
         sqlx::query_as::<_, WorkspaceRow>(
-            "SELECT id, slug, name, created_at FROM workspaces WHERE id = ?",
+            "SELECT id, slug, name, plan, created_at FROM workspaces WHERE id = ?",
         )
         .bind(workspace.0.to_string())
         .fetch_optional(&self.pool)
@@ -554,11 +567,26 @@ impl Db {
     /// Every workspace, oldest first — an inventory for the (single-tenant-today) console.
     pub async fn list_workspaces(&self) -> Result<Vec<WorkspaceRow>, QueryError> {
         sqlx::query_as::<_, WorkspaceRow>(
-            "SELECT id, slug, name, created_at FROM workspaces ORDER BY created_at",
+            "SELECT id, slug, name, plan, created_at FROM workspaces ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Move a workspace to another plan (S3, D-022) — operator work only; `false`
+    /// means the id doesn't exist. The new tier gates the workspace's next write.
+    pub async fn set_workspace_plan(
+        &self,
+        workspace: WorkspaceId,
+        plan: Plan,
+    ) -> Result<bool, QueryError> {
+        let done = sqlx::query("UPDATE workspaces SET plan = ? WHERE id = ?")
+            .bind(plan.as_str())
+            .bind(workspace.0.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() == 1)
     }
 
     /// Persist an invite: the row keeps the code's digest, never the code — the plaintext
@@ -831,7 +859,7 @@ impl Db {
     /// isn't in.
     pub async fn memberships(&self, account: AccountId) -> Result<Vec<MembershipRow>, QueryError> {
         sqlx::query_as::<_, MembershipRow>(
-            "SELECT w.id, w.slug, w.name, m.role
+            "SELECT w.id, w.slug, w.name, w.plan, m.role
                FROM members m JOIN workspaces w ON w.id = m.workspace_id
               WHERE m.account_id = ? ORDER BY w.name, w.created_at",
         )
@@ -970,6 +998,17 @@ impl WorkspaceDb<'_> {
     /// rows, an outbox insert keyed by monitor).
     pub fn id(&self) -> WorkspaceId {
         self.workspace
+    }
+
+    /// This workspace's plan (S3, D-022) — the tier whose limits gate its writes. An
+    /// unreadable stored value is corruption, never quietly the free tier.
+    pub async fn plan(&self) -> Result<Plan, QueryError> {
+        let stored: String = sqlx::query_scalar("SELECT plan FROM workspaces WHERE id = ?")
+            .bind(self.workspace.0.to_string())
+            .fetch_one(&self.db.pool)
+            .await?;
+        Plan::parse(&stored)
+            .ok_or_else(|| QueryError::Corrupt(format!("unreadable plan {stored:?}")))
     }
 
     pub async fn insert_monitor(&self, monitor: &Monitor) -> Result<(), QueryError> {
@@ -1299,13 +1338,19 @@ impl Db {
         Ok(())
     }
 
-    /// Delete every session past its expiry — the retention tick's housekeeping so
-    /// forgotten rows can't accumulate forever.
-    pub async fn sweep_expired_sessions(&self) -> Result<u64, QueryError> {
-        let done = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
-            .bind(OffsetDateTime::now_utc())
-            .execute(&self.pool)
-            .await?;
+    /// Delete up to `limit` sessions past their expiry — the retention tick's
+    /// housekeeping, bounded per call like every other retention delete (D-012) so a
+    /// forgotten backlog can't hold the store. The caller repeats until the count
+    /// comes back short; `0`/`1` bounds still delete exactly the expired.
+    pub async fn sweep_expired_sessions(&self, limit: u32) -> Result<u64, QueryError> {
+        let done = sqlx::query(
+            "DELETE FROM sessions WHERE id IN (
+               SELECT id FROM sessions WHERE expires_at <= ? LIMIT ?)",
+        )
+        .bind(OffsetDateTime::now_utc())
+        .bind(i64::from(limit.max(1)))
+        .execute(&self.pool)
+        .await?;
         Ok(done.rows_affected())
     }
 }
@@ -1502,17 +1547,23 @@ impl Db {
     /// behind it) for seconds: the caller repeats until `RetainReport::exhausted(batch)`,
     /// one writer command per batch, and observations interleave between them.
     ///
+    /// **Per-workspace horizons (S3, D-022).** `workspaces` maps each workspace to the
+    /// cutoffs its plan resolves to; every delete joins it, so a `free` workspace's
+    /// evidence expires on the free plan's shorter clocks while an operator workspace's
+    /// same-age rows are kept. A workspace absent from the map keeps everything —
+    /// missing a tenant is "keep", never "delete".
+    ///
     /// Open incidents and undelivered rows of kept incidents are never touched. Called
     /// only by the single writer.
     pub async fn retain(
         &self,
-        cutoffs: &RetentionCutoffs,
+        workspaces: &[(WorkspaceId, RetentionCutoffs)],
         batch: u32,
     ) -> Result<RetainReport, QueryError> {
         let batch = i64::from(batch.max(1));
         let mut conn = self.pool.acquire().await?;
         let Some(cap) = self.max_db_bytes else {
-            return retain_batch(&mut conn, cutoffs, batch).await;
+            return retain_batch(&mut conn, workspaces, batch).await;
         };
         // Lift the ceiling on this one connection for this one transaction, then put it
         // back whatever happened: SQLite clamps the restored ceiling up to the file's size,
@@ -1532,7 +1583,7 @@ impl Db {
         )))
         .execute(&mut *conn)
         .await?;
-        let result = retain_batch(&mut conn, cutoffs, batch).await;
+        let result = retain_batch(&mut conn, workspaces, batch).await;
         if let Err(error) = apply_max_bytes(&mut conn, cap).await {
             tracing::error!(%error, "could not restore the size ceiling; closing the connection");
             let _ = conn.close().await;
@@ -1782,42 +1833,66 @@ fn reserve_ceiling(cap_pages: i64, page_count: i64) -> i64 {
 }
 
 /// One bounded retention batch, in one transaction on `conn` (see `Db::retain`).
+/// `workspaces` lands in `temp.plan_cutoffs` first — every expiry join below keys a
+/// row's `workspace_id` to the horizons its workspace's plan resolved to.
 async fn retain_batch(
     conn: &mut sqlx::SqliteConnection,
-    cutoffs: &RetentionCutoffs,
+    workspaces: &[(WorkspaceId, RetentionCutoffs)],
     batch: i64,
 ) -> Result<RetainReport, QueryError> {
     use sqlx::Connection as _;
     let mut tx = conn.begin().await?;
+    sqlx::query("DROP TABLE IF EXISTS temp.plan_cutoffs")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "CREATE TEMP TABLE plan_cutoffs (
+            workspace_id TEXT PRIMARY KEY,
+            checks TEXT NOT NULL, aggregates TEXT NOT NULL,
+            incidents TEXT NOT NULL, outbox TEXT NOT NULL)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    for (workspace, cutoffs) in workspaces {
+        sqlx::query("INSERT INTO temp.plan_cutoffs VALUES (?, ?, ?, ?, ?)")
+            .bind(workspace.0.to_string())
+            .bind(cutoffs.checks)
+            .bind(cutoffs.aggregates)
+            .bind(cutoffs.incidents)
+            .bind(cutoffs.delivered_outbox)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("DROP TABLE IF EXISTS temp.expiring")
         .execute(&mut *tx)
         .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TEMP TABLE expiring AS
-         SELECT id, monitor_id, workspace_id, date(slot_at) AS day, outcome FROM checks
-         WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
-         ORDER BY id LIMIT ?2"
+         SELECT checks.id, checks.monitor_id, checks.workspace_id, date(slot_at) AS day, outcome
+         FROM checks JOIN temp.plan_cutoffs pc ON pc.workspace_id = checks.workspace_id
+         WHERE slot_at < pc.checks AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
+         ORDER BY checks.id LIMIT ?1"
     )))
-    .bind(cutoffs.checks)
     .bind(batch)
     .execute(&mut *tx)
     .await?;
     let deleted = sqlx::query("DELETE FROM checks WHERE id IN (SELECT id FROM temp.expiring)")
         .execute(&mut *tx)
         .await?;
-    let aggregate_day = cutoffs.aggregates.date().to_string();
-    let pruned = prune_expired(&mut tx, cutoffs, &aggregate_day, batch).await?;
-    // Space is free now; write the aggregates of what was deleted.
+    let pruned = prune_expired(&mut tx, batch).await?;
+    // Space is free now; write the aggregates of what was deleted — days younger than
+    // that workspace's own aggregate horizon.
     let aggregated = sqlx::query(
         "INSERT INTO check_stats_daily
             (monitor_id, workspace_id, day, pass, http_fail, transport, timeout, missed)
-         SELECT monitor_id, workspace_id, day,
+         SELECT monitor_id, temp.expiring.workspace_id, day,
                 SUM(outcome = 'pass'), SUM(outcome = 'http_fail'),
                 SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
                 SUM(outcome = 'missed')
          FROM temp.expiring
-         WHERE day >= ?1
-         GROUP BY monitor_id, workspace_id, day
+         JOIN temp.plan_cutoffs pc ON pc.workspace_id = temp.expiring.workspace_id
+         WHERE day >= date(pc.aggregates)
+         GROUP BY monitor_id, temp.expiring.workspace_id, day
          ON CONFLICT (monitor_id, day) DO UPDATE SET
             pass = check_stats_daily.pass + excluded.pass,
             http_fail = check_stats_daily.http_fail + excluded.http_fail,
@@ -1825,7 +1900,6 @@ async fn retain_batch(
             timeout = check_stats_daily.timeout + excluded.timeout,
             missed = check_stats_daily.missed + excluded.missed",
     )
-    .bind(&aggregate_day)
     .execute(&mut *tx)
     .await?;
     sqlx::query("DROP TABLE temp.expiring")
@@ -1844,15 +1918,14 @@ async fn retain_batch(
 /// Returns a report with only those counts set.
 async fn prune_expired(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    cutoffs: &RetentionCutoffs,
-    aggregate_day: &str,
     batch: i64,
 ) -> Result<RetainReport, QueryError> {
     let old_days = sqlx::query(
         "DELETE FROM check_stats_daily WHERE rowid IN (
-           SELECT rowid FROM check_stats_daily WHERE day < ?1 LIMIT ?2)",
+           SELECT d.rowid FROM check_stats_daily d
+           JOIN temp.plan_cutoffs pc ON pc.workspace_id = d.workspace_id
+           WHERE d.day < date(pc.aggregates) LIMIT ?1)",
     )
-    .bind(aggregate_day)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
@@ -1862,10 +1935,11 @@ async fn prune_expired(
         .await?;
     sqlx::query(
         "CREATE TEMP TABLE expired_incidents AS
-         SELECT id FROM incidents WHERE state = 'resolved' AND resolved_at < ?1
-         ORDER BY id LIMIT ?2",
+         SELECT i.id FROM incidents i
+         JOIN temp.plan_cutoffs pc ON pc.workspace_id = i.workspace_id
+         WHERE i.state = 'resolved' AND i.resolved_at < pc.incidents
+         ORDER BY i.id LIMIT ?1",
     )
-    .bind(cutoffs.incidents)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
@@ -1883,18 +1957,19 @@ async fn prune_expired(
         .await?;
     let windows = sqlx::query(
         "DELETE FROM maintenance_windows WHERE id IN (
-           SELECT id FROM maintenance_windows WHERE ends_at < ?1 LIMIT ?2)",
+           SELECT w.id FROM maintenance_windows w
+           JOIN temp.plan_cutoffs pc ON pc.workspace_id = w.workspace_id
+           WHERE w.ends_at < pc.incidents LIMIT ?1)",
     )
-    .bind(cutoffs.incidents)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
     let delivered = sqlx::query(
         "DELETE FROM notify_outbox WHERE id IN (
-           SELECT id FROM notify_outbox
-           WHERE delivered_at IS NOT NULL AND delivered_at < ?1 LIMIT ?2)",
+           SELECT o.id FROM notify_outbox o
+           JOIN temp.plan_cutoffs pc ON pc.workspace_id = o.workspace_id
+           WHERE o.delivered_at IS NOT NULL AND o.delivered_at < pc.outbox LIMIT ?1)",
     )
-    .bind(cutoffs.delivered_outbox)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
@@ -2030,6 +2105,8 @@ pub struct WorkspaceRow {
     pub id: String,
     pub slug: String,
     pub name: String,
+    /// The stored plan tier (S3, D-022) — `Plan::parse` reads it.
+    pub plan: String,
     pub created_at: OffsetDateTime,
 }
 
@@ -2081,12 +2158,13 @@ pub struct MemberRow {
 }
 
 /// One membership row of `GET /api/workspaces` — the workspace the account sits in
-/// and its role there (S2).
+/// and its role there (S2). `plan` is the workspace's tier (S3).
 #[derive(Debug, FromRow)]
 pub struct MembershipRow {
     pub id: String,
     pub slug: String,
     pub name: String,
+    pub plan: String,
     pub role: String,
 }
 
@@ -2196,6 +2274,11 @@ impl ViewerDb<'_> {
     /// The bound workspace.
     pub fn id(&self) -> WorkspaceId {
         self.view.id()
+    }
+
+    /// This workspace's plan tier (S3, D-022).
+    pub async fn plan(&self) -> Result<Plan, QueryError> {
+        self.view.plan().await
     }
 
     pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
@@ -2399,7 +2482,7 @@ impl MemberDb<'_> {
     pub async fn rename_workspace(&self, name: &str) -> Result<WorkspaceRow, QueryError> {
         sqlx::query_as::<_, WorkspaceRow>(
             "UPDATE workspaces SET name = ? WHERE id = ?
-             RETURNING id, slug, name, created_at",
+             RETURNING id, slug, name, plan, created_at",
         )
         .bind(name)
         .bind(self.view.view.workspace.0.to_string())

@@ -141,6 +141,99 @@ impl Default for WorkspaceId {
     }
 }
 
+/// The workspace's plan tier (S3, D-022). Payments are bypassed for the beta, so a
+/// plan is just the set of limits the server enforces — monitors, interval floor,
+/// evidence horizons — read from the `workspaces.plan` column on every write that
+/// could cross one. `free` is what signup mints; `operator` is the maintainer's own
+/// tier, which defers to the server's configured ceilings instead of adding its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    Free,
+    Operator,
+}
+
+/// The limits one plan carries (S3). Every number is a provisional bound, not a
+/// measurement — the droplet's real capacity is unmeasured, and these tighten it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanLimits {
+    /// Monitors the workspace may register (paused ones count — they keep history).
+    /// `u64::MAX` defers to the server's `SMON_MAX_MONITORS` ceiling.
+    pub max_monitors: u64,
+    /// The tightest probe interval the plan allows. Stricter than `MIN_INTERVAL` only
+    /// on `free` — a tenant can't hammer a third-party site through us.
+    pub min_interval: Duration,
+    /// Evidence horizons the plan fixes outright, or `None` to follow the server's
+    /// configured `RetentionPolicy` (`SMON_RETENTION_*` — the operator tier's answer).
+    pub retention: Option<PlanRetention>,
+}
+
+/// The evidence horizons a plan fixes (S3) — the same four kinds a
+/// `RetentionPolicy` covers, so the retention task can translate one into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanRetention {
+    pub checks: Duration,
+    pub aggregates: Duration,
+    pub incidents: Duration,
+    pub delivered_outbox: Duration,
+}
+
+/// The free plan's monitor cap (provisional — sized to the friends beta, not the
+/// droplet's measured capacity).
+pub const FREE_MAX_MONITORS: u64 = 10;
+
+/// The free plan's interval floor — the "e.g. 60 s" the plan document's gap table names.
+pub const FREE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The free plan's evidence horizons (provisional): raw checks two days, daily
+/// aggregates and resolved incidents a quarter, delivered outbox a week. Always
+/// shorter than the configured defaults — a free workspace can't out-keep the
+/// operator's policy, it can only shed evidence earlier.
+pub const FREE_RETENTION: PlanRetention = PlanRetention {
+    checks: Duration::from_hours(48),
+    aggregates: Duration::from_hours(24 * 90),
+    incidents: Duration::from_hours(24 * 90),
+    delivered_outbox: Duration::from_hours(24 * 7),
+};
+
+impl Plan {
+    /// The stored value in `workspaces.plan` (the migration's CHECK constraint is
+    /// exactly this set).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Operator => "operator",
+        }
+    }
+
+    /// Parse a stored or submitted plan name; anything else is not a plan.
+    #[must_use]
+    pub fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "free" => Some(Self::Free),
+            "operator" => Some(Self::Operator),
+            _ => None,
+        }
+    }
+
+    /// This plan's limits — the server's own ceilings still apply on top.
+    #[must_use]
+    pub fn limits(self) -> PlanLimits {
+        match self {
+            Self::Free => PlanLimits {
+                max_monitors: FREE_MAX_MONITORS,
+                min_interval: FREE_MIN_INTERVAL,
+                retention: Some(FREE_RETENTION),
+            },
+            Self::Operator => PlanLimits {
+                max_monitors: u64::MAX,
+                min_interval: MIN_INTERVAL,
+                retention: None,
+            },
+        }
+    }
+}
+
 /// The smallest interval the contract allows; the lab profile runs at 60 seconds.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(15);
 /// The default probe interval from the guide's probe contract.

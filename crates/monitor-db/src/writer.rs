@@ -88,9 +88,10 @@ enum Command {
         reply: oneshot::Sender<Result<(), QueryError>>,
     },
     /// A retention pass: aggregate + delete expired checks in one transaction. Goes
-    /// through the writer like everything else — the store has one owner.
+    /// through the writer like everything else — the store has one owner. Each
+    /// workspace expires on its own plan's cutoffs (S3, D-022).
     Retain {
-        cutoffs: RetentionCutoffs,
+        workspaces: Arc<[(WorkspaceId, RetentionCutoffs)]>,
         batch: u32,
         reply: oneshot::Sender<Result<RetainReport, QueryError>>,
     },
@@ -147,9 +148,13 @@ impl WriterHandle {
 
     /// Run one retention pass (D-012, `Db::retain`): expired checks roll into daily
     /// aggregates; old aggregates, resolved incidents, ended windows and delivered outbox
-    /// rows are pruned — one transaction. Open incidents are never touched.
-    pub async fn retain(&self, cutoffs: RetentionCutoffs) -> Result<RetainReport, WriterError> {
-        self.retain_in_batches(cutoffs, RETAIN_BATCH).await
+    /// rows are pruned — one transaction. `workspaces` maps each workspace to the
+    /// cutoffs its plan resolves to (S3, D-022); open incidents are never touched.
+    pub async fn retain(
+        &self,
+        workspaces: &[(WorkspaceId, RetentionCutoffs)],
+    ) -> Result<RetainReport, WriterError> {
+        self.retain_in_batches(workspaces, RETAIN_BATCH).await
     }
 
     /// A full retention pass as a series of bounded writer commands — `batch` rows of each
@@ -158,15 +163,16 @@ impl WriterHandle {
     /// waiting out the whole pass. Returns the folded report.
     pub async fn retain_in_batches(
         &self,
-        cutoffs: RetentionCutoffs,
+        workspaces: &[(WorkspaceId, RetentionCutoffs)],
         batch: u32,
     ) -> Result<RetainReport, WriterError> {
+        let workspaces: Arc<[(WorkspaceId, RetentionCutoffs)]> = workspaces.into();
         let mut total = RetainReport::default();
         loop {
             let (reply, rx) = oneshot::channel();
             self.tx
                 .send(Command::Retain {
-                    cutoffs,
+                    workspaces: workspaces.clone(),
                     batch,
                     reply,
                 })
@@ -248,13 +254,13 @@ async fn run(
                 }
             }
             Command::Retain {
-                cutoffs,
+                workspaces,
                 batch,
                 reply,
             } => {
                 // Retention is a supporting duty too: a failed pass degrades the monitor
                 // (the retention task reports it), it does not make it unavailable.
-                let outcome = db.retain(&cutoffs, batch).await;
+                let outcome = db.retain(&workspaces, batch).await;
                 if reply.send(outcome).is_err() {
                     debug!("retain reply channel closed; pass still committed");
                 }

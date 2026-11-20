@@ -471,7 +471,10 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
     writer.record(pass(&monitor)).await?;
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await?;
     assert_eq!(report.rows_deleted, 4, "monitor A's four expired rows");
     assert_eq!(report.days_written, 1, "one monitor-day aggregated");
@@ -1203,7 +1206,7 @@ async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
         .await?;
     // `dead` was already deleted by the lazy guard above — the sweep takes what's left.
     assert_eq!(
-        db.sweep_expired_sessions().await?,
+        db.sweep_expired_sessions(100).await?,
         1,
         "the untouched expired row swept"
     );
@@ -1296,7 +1299,10 @@ async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow
     writer.record(fail(&monitor)).await?;
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await?;
     assert_eq!(
         report.rows_deleted, 9,
@@ -1408,7 +1414,10 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
     .await?;
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(now))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(now),
+        )])
         .await?;
     assert_eq!(report.incidents_deleted, 1);
     assert_eq!(
@@ -1502,7 +1511,10 @@ async fn retention_frees_space_in_a_store_filled_to_its_cap() -> anyhow::Result<
     assert!(write_health.load(std::sync::atomic::Ordering::Relaxed) > 0);
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await
         .expect("retention must run at the cap");
     assert_eq!(report.rows_deleted, stored, "every expired row is freed");
@@ -1534,7 +1546,10 @@ async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
     }
     let now = OffsetDateTime::now_utc();
     let first = writer
-        .retain(RetentionPolicy::default().cutoffs(now))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(now),
+        )])
         .await?;
     assert_eq!((first.rows_deleted, first.aggregates_deleted), (4, 0));
     assert_eq!(
@@ -1549,7 +1564,9 @@ async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
         aggregates: std::time::Duration::from_hours(24 * 10),
         ..RetentionPolicy::default()
     };
-    let second = writer.retain(short.cutoffs(now)).await?;
+    let second = writer
+        .retain(&[(WorkspaceId::DEFAULT, short.cutoffs(now))])
+        .await?;
     assert!(second.aggregates_deleted >= 1, "{second:?}");
     assert_eq!(
         db.workspace(WorkspaceId::DEFAULT)
@@ -1582,7 +1599,10 @@ async fn only_failed_observation_commits_count_as_write_failures() -> anyhow::Re
 
     assert!(
         writer
-            .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+            .retain(&[(
+                WorkspaceId::DEFAULT,
+                RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc())
+            )])
             .await
             .is_err()
     );
@@ -1614,7 +1634,9 @@ async fn retention_runs_in_bounded_batches_and_converges() -> anyhow::Result<()>
             .await?;
     }
     let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
-    let report = writer.retain_in_batches(cutoffs, 10).await?;
+    let report = writer
+        .retain_in_batches(&[(WorkspaceId::DEFAULT, cutoffs)], 10)
+        .await?;
     assert_eq!(report.rows_deleted, 25);
     assert_eq!(
         db.workspace(WorkspaceId::DEFAULT)
@@ -1654,7 +1676,11 @@ async fn an_observation_lands_while_a_large_retention_pass_is_still_running() ->
     let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
     let retention = {
         let writer = writer.clone();
-        tokio::spawn(async move { writer.retain_in_batches(cutoffs, 10).await })
+        tokio::spawn(async move {
+            writer
+                .retain_in_batches(&[(WorkspaceId::DEFAULT, cutoffs)], 10)
+                .await
+        })
     };
     tokio::task::yield_now().await;
     writer.record(pass(&monitor)).await?;
@@ -1746,7 +1772,10 @@ async fn retention_at_the_cap_has_room_for_summaries_of_a_thin_expired_slice() -
         false,
     );
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await
         .expect("retention must have room for the summaries at the cap");
     assert_eq!(report.rows_deleted, 150);
@@ -2247,6 +2276,101 @@ async fn api_tokens_digest_and_touch() -> anyhow::Result<()> {
         db.api_token_by_digest("d-ci")
             .await?
             .is_some_and(|row| row.revoked_at == Some(later))
+    );
+    Ok(())
+}
+
+/// S3 (D-022): a retention pass reads each workspace's own horizon. A `free`
+/// workspace's evidence expires on the free plan's shorter clocks while an
+/// `operator` workspace's same-age rows are still kept — one pass, one batch
+/// bound, different truths per tier.
+#[tokio::test]
+async fn retention_ages_each_workspace_on_its_own_plan() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    // The seeded default workspace is the operator's own (migration 0015); a
+    // workspace a signup mints is `free`.
+    let seeded = db
+        .workspace_row(WorkspaceId::DEFAULT)
+        .await?
+        .expect("seeded default");
+    assert_eq!(seeded.plan, "operator");
+    let free = db.create_workspace("free-co", "Free Co").await?;
+    assert_eq!(
+        db.workspace_row(free).await?.expect("free workspace").plan,
+        "free"
+    );
+    let free_monitor =
+        NewMonitor::new("free", url::Url::parse("https://free.example/")?)?.into_monitor_for(free);
+    db.workspace(free).insert_monitor(&free_monitor).await?;
+
+    // Checks 3 days old: past the free plan's 2-day horizon, inside the
+    // configured 7-day one.
+    let age = OffsetDateTime::now_utc() - time::Duration::days(3);
+    for m in [&monitor, &free_monitor] {
+        let mut observation = probe(m, CheckOutcome::Pass);
+        observation.slot_at = age;
+        writer.record(observation).await?;
+    }
+
+    let configured = RetentionPolicy::default();
+    let now = OffsetDateTime::now_utc();
+    let cutoffs: Vec<(WorkspaceId, _)> = db
+        .list_workspaces()
+        .await?
+        .into_iter()
+        .map(|row| {
+            let workspace = WorkspaceId(uuid::Uuid::parse_str(&row.id)?);
+            let plan = monitor_domain::Plan::parse(&row.plan)
+                .ok_or_else(|| anyhow::anyhow!("unreadable plan"))?;
+            Ok((
+                workspace,
+                RetentionPolicy::for_plan(plan, &configured).cutoffs(now),
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let report = writer.retain(&cutoffs).await?;
+    assert_eq!(
+        report.rows_deleted, 1,
+        "only the free workspace's row expired"
+    );
+    assert!(
+        db.workspace(free)
+            .list_checks(free_monitor.id, 10)
+            .await?
+            .is_empty(),
+        "free evidence expired on the free horizon"
+    );
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 10)
+            .await?
+            .len(),
+        1,
+        "operator evidence keeps the configured horizon"
+    );
+    Ok(())
+}
+
+/// The session sweep deletes in bounded batches like every other retention
+/// delete (D-012): at most `limit` rows per call, converging by repeating —
+/// so housekeeping never holds the store long.
+#[tokio::test]
+async fn the_session_sweep_deletes_in_bounded_batches() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let past = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+    for n in 0..3 {
+        db.create_session(&format!("dead-{n}"), past).await?;
+    }
+    db.create_session("live", OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .await?;
+
+    assert_eq!(db.sweep_expired_sessions(2).await?, 2, "one bounded batch");
+    assert_eq!(db.sweep_expired_sessions(2).await?, 1, "the remainder");
+    assert_eq!(db.sweep_expired_sessions(2).await?, 0, "converged");
+    assert!(
+        db.session_valid("live", IDLE).await?,
+        "the live session was never swept"
     );
     Ok(())
 }
