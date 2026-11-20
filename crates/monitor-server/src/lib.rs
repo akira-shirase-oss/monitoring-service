@@ -477,54 +477,52 @@ async fn check_capacity(
     let before = load_registry(&state.db).await?;
     let mut monitors = before.clone();
     change(&mut monitors);
-    // Per-origin capacity counts resolved addresses (origin.rs): resolve the names not
-    // known yet — the one being written above all — within a bound the request can afford.
-    origin::refresh(
-        monitors.iter().map(|monitor| monitor.url.clone()),
-        Duration::from_secs(3),
-    )
-    .await;
+    // No name is resolved inside this lock (S2 review): the caller resolves the
+    // proposed URL above it, so foreign workspaces' monitors answer here from the
+    // origin cache — or their own spelling, a stable capacity key either way. A
+    // black-hole hostname in another tenant's registry must never hold every
+    // writer's lock for 2–3 s.
     let config = schedule::Config::default();
-    if let Some(overload) = schedule::capacity(&monitors, &config) {
-        // Refuse only when *this* change adds load to an overloaded budget (S2
-        // review): an origin another tenant already pushed over must not block an
-        // unrelated write, and a pause — which only ever frees — is never refused.
-        let adds_load = match &overload {
-            schedule::Overload::Global { .. } => {
-                schedule::required_slots(monitors.iter(), config.tick)
-                    > schedule::required_slots(before.iter(), config.tick)
+    // Refuse only when *this* change adds load to an overloaded budget (S2
+    // review): an origin another tenant already pushed over must not block an
+    // unrelated write, and a pause — which only ever frees — is never refused.
+    let required_after = schedule::required_slots(monitors.iter(), config.tick);
+    if required_after > schedule::slots_f64(schedule::MAX_GLOBAL_SLOTS)
+        && required_after > schedule::required_slots(before.iter(), config.tick)
+    {
+        return Err(ApiError::Capacity(format!(
+            "this schedule would need {required_after:.0} probes in flight; the monitor runs at most {} \
+             at once. Lengthen intervals or shorten timeouts",
+            schedule::MAX_GLOBAL_SLOTS
+        )));
+    }
+    // Every origin the proposed schedule overloads is judged, not just the worst
+    // `capacity` would report — a change pushing a *second* origin over its bound
+    // must not pass because another origin is already saturated (S2 review).
+    let origin_limit = schedule::slots_f64(config.per_origin_slots);
+    let before_origins = schedule::per_origin_loads(before.iter(), config.tick);
+    let worsened = schedule::per_origin_loads(monitors.iter(), config.tick)
+        .into_iter()
+        .filter(|(origin, per_tick)| {
+            *per_tick > origin_limit
+                && *per_tick > before_origins.get(origin).copied().unwrap_or(0.0)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((origin, per_tick)) = worsened {
+        // The origin name would tell a tenant about another tenant's targets —
+        // operators get it, accounts get the shape of the limit instead (D-020).
+        let detail = match principal {
+            auth::Principal::Operator { .. } => {
+                format!("{origin} would need {per_tick:.1} probe starts a second")
             }
-            schedule::Overload::Origin { origin, .. } => {
-                schedule::origin_required(monitors.iter(), origin, config.tick)
-                    > schedule::origin_required(before.iter(), origin, config.tick)
+            auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
+                "one origin would exceed its probe rate".to_owned()
             }
         };
-        if adds_load {
-            return Err(match overload {
-                schedule::Overload::Global { required } => ApiError::Capacity(format!(
-                    "this schedule would need {required:.0} probes in flight; the monitor runs at most {} \
-                     at once. Lengthen intervals or shorten timeouts",
-                    schedule::MAX_GLOBAL_SLOTS
-                )),
-                schedule::Overload::Origin { origin, per_tick } => {
-                    // The origin name would tell a tenant about another tenant's
-                    // targets — operators get it, accounts get the shape of the
-                    // limit instead (D-020).
-                    let detail = match principal {
-                        auth::Principal::Operator { .. } => {
-                            format!("{origin} would need {per_tick:.1} probe starts a second")
-                        }
-                        auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
-                            "one origin would exceed its probe rate".to_owned()
-                        }
-                    };
-                    ApiError::Capacity(format!(
-                        "{detail}; one origin gets at most {}. Lengthen the intervals of its monitors",
-                        config.per_origin_slots
-                    ))
-                }
-            });
-        }
+        return Err(ApiError::Capacity(format!(
+            "{detail}; one origin gets at most {}. Lengthen the intervals of its monitors",
+            config.per_origin_slots
+        )));
     }
     // S3: a workspace's *own* share of the probe budget — named here, at the
     // write, instead of one tenant's schedule quietly crowding the engine's

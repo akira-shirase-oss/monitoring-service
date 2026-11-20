@@ -1445,6 +1445,144 @@ async fn capacity_refuses_only_the_added_load() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// N2: inside the schedule lock the capacity check resolves nothing — foreign
+/// workspaces' monitor names answer from the origin cache or their own spelling.
+/// A registry full of black-hole names must never hold every writer's lock while
+/// DNS runs on the inside (the caller resolves only the proposed URL, above the
+/// lock). `origin::name_is_stale` is the observable: a name the in-lock path had
+/// looked up would come back cached, not stale.
+#[tokio::test]
+async fn foreign_monitor_names_are_never_resolved_inside_the_lock() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let _owner = sign_up(&app, "owner@a.example").await;
+    let writer = sign_up(&app, "writer@b.example").await;
+    let (ws, writer_ws) = (
+        workspace_of(&db, "owner@a.example").await?,
+        workspace_of(&db, "writer@b.example").await?,
+    );
+    for id in [&ws, &writer_ws] {
+        db.set_workspace_plan(
+            WorkspaceId(uuid::Uuid::parse_str(id)?),
+            monitor_domain::Plan::Operator,
+        )
+        .await?;
+    }
+    // A registry stuffed with names never looked up — a paused one too, since a
+    // refresh inside the lock used to walk even paused monitors. Unique names:
+    // nothing another test resolves can touch these cache entries.
+    let ws_id = WorkspaceId(uuid::Uuid::parse_str(&ws)?);
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let mut foreign_urls = Vec::new();
+    for i in 0..20 {
+        let foreign = url::Url::parse(&format!("https://n{i}-{nonce}.never.invalid/"))?;
+        let mut monitor = monitor_domain::NewMonitor::with_schedule(
+            format!("n{i}"),
+            foreign.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )?
+        .into_monitor_for(ws_id);
+        monitor.paused = i == 0;
+        db.workspace(ws_id).insert_monitor(&monitor).await?;
+        foreign_urls.push(foreign);
+    }
+    assert!(
+        foreign_urls
+            .iter()
+            .all(monitor_server::origin::name_is_stale),
+        "seeded names must start uncached, or the test observes nothing"
+    );
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "fine", "url": "https://example.com/fine", "interval_s": 60,
+        })),
+        Some(Cred::Cookie(&writer)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        foreign_urls
+            .iter()
+            .all(monitor_server::origin::name_is_stale),
+        "a foreign name was resolved inside the schedule lock — every stale entry \
+         the write left behind is a lookup it ran while holding every writer"
+    );
+    Ok(())
+}
+
+/// S2-3 residual: `capacity` reports only the worst overloaded origin — so under
+/// the old single-overload check a write that pushed a *second* origin over
+/// passed, because the change added nothing to the reported (worst) one. Every
+/// origin the proposed schedule overloads is judged now.
+#[tokio::test]
+async fn capacity_judges_every_origin_the_change_touches() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture(false).await?;
+    let _owner = sign_up(&app, "owner@a.example").await;
+    let writer = sign_up(&app, "writer@b.example").await;
+    let (ws, writer_ws) = (
+        workspace_of(&db, "owner@a.example").await?,
+        workspace_of(&db, "writer@b.example").await?,
+    );
+    for id in [&ws, &writer_ws] {
+        db.set_workspace_plan(
+            WorkspaceId(uuid::Uuid::parse_str(id)?),
+            monitor_domain::Plan::Operator,
+        )
+        .await?;
+    }
+    let ws_id = WorkspaceId(uuid::Uuid::parse_str(&ws)?);
+    let writer_id = WorkspaceId(uuid::Uuid::parse_str(&writer_ws)?);
+    // Origin A strictly worse than anything else: 32 × 15 s probes ≈ 2.13
+    // starts/tick — `capacity` reports it alone.
+    for i in 0..32 {
+        let monitor = monitor_domain::NewMonitor::with_schedule(
+            format!("a{i}"),
+            url::Url::parse("https://first.example/")?,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+        )?
+        .into_monitor_for(ws_id);
+        db.workspace(ws_id).insert_monitor(&monitor).await?;
+    }
+    // Origin B just under the bound in the writer's own workspace: 30 × 15 s
+    // probes = 2.0 starts/tick. The write that takes it to 31 is refused — even
+    // though origin A, the only one `capacity` reports, stays untouched.
+    for i in 0..30 {
+        let monitor = monitor_domain::NewMonitor::with_schedule(
+            format!("b{i}"),
+            url::Url::parse("https://second.example/")?,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+        )?
+        .into_monitor_for(writer_id);
+        db.workspace(writer_id).insert_monitor(&monitor).await?;
+    }
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/api/monitors",
+        Some(serde_json::json!({
+            "name": "b30", "url": "https://second.example/more", "interval_s": 15,
+        })),
+        Some(Cred::Cookie(&writer)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the write pushing a second origin over must be refused: {body}"
+    );
+    assert_eq!(body["error"]["code"], "capacity_exceeded", "{body}");
+    assert!(!body.to_string().contains("second.example"), "{body}");
+    Ok(())
+}
+
 /// POST /api/members — every ask answers the same 202 envelope, whatever the
 /// address turns out to be (S2-4).
 async fn invite(app: &axum::Router, owner: &str, email: &str, role: &str) {

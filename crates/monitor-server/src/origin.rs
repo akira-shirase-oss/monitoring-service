@@ -91,6 +91,13 @@ pub fn key(url: &Url) -> String {
         .unwrap_or_else(|| spelling(url))
 }
 
+/// `stale`, test-visible: proves the in-lock capacity check resolves nothing — a
+/// name an in-lock `refresh` would have looked up comes back cached, not stale.
+#[doc(hidden)]
+pub fn name_is_stale(url: &Url) -> bool {
+    stale(url)
+}
+
 /// Whether `url`'s name needs a (fresh) lookup.
 fn stale(url: &Url) -> bool {
     if literal_key(url).is_some() {

@@ -187,19 +187,29 @@ pub enum Overload {
     Origin { origin: String, per_tick: f64 },
 }
 
+/// Starts per tick on each origin in the schedule (paused monitors excluded) — the
+/// map [`capacity`] reduces to its worst entry, kept whole so a write check can ask
+/// about every origin the change touches, not just the single worst.
+pub fn per_origin_loads<'a>(
+    monitors: impl Iterator<Item = &'a Monitor>,
+    tick: Duration,
+) -> HashMap<String, f64> {
+    let mut per_origin: HashMap<String, f64> = HashMap::new();
+    for monitor in monitors.filter(|monitor| !monitor.paused) {
+        *per_origin.entry(origin_key(&monitor.url)).or_default() +=
+            tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
+    }
+    per_origin
+}
+
 /// Check a whole schedule (the stored monitors with a proposed change applied).
 pub fn capacity(monitors: &[Monitor], config: &Config) -> Option<Overload> {
     let required = required_slots(monitors, config.tick);
     if required > slots_f64(MAX_GLOBAL_SLOTS) {
         return Some(Overload::Global { required });
     }
-    let mut per_origin: HashMap<String, f64> = HashMap::new();
-    for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
-        *per_origin.entry(origin_key(&monitor.url)).or_default() +=
-            config.tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
-    }
     let origin_limit = slots_f64(config.per_origin_slots);
-    per_origin
+    per_origin_loads(monitors.iter(), config.tick)
         .into_iter()
         .filter(|(_, per_tick)| *per_tick > origin_limit)
         .max_by(|a, b| a.1.total_cmp(&b.1))
