@@ -1080,10 +1080,12 @@ mod tests {
         )
         .expect("probe client");
         let (results, mut results_rx) = mpsc::channel::<Observation>(8);
-        let tracker = TaskTracker::new();
-        let other = WorkspaceId::new();
-        let permit =
-            || Arc::new(Semaphore::new(4)).try_acquire_owned().expect("slot");
+        let (tracker, other) = (TaskTracker::new(), WorkspaceId::new());
+        let permit = || {
+            Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot")
+        };
         let dispatch = |name: &str, workspace: WorkspaceId| Dispatch {
             monitor_id: MonitorId(uuid::Uuid::now_v7()),
             workspace,
