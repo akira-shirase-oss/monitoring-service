@@ -59,7 +59,7 @@ const MARKER = 'SMON-ALIVE';
 // lifted to `operator` so the run isn't plan-bound.
 const WORKSPACES = Number(arg('workspaces', 1));
 const TIMEOUT_S = Number(arg('timeout-s', 3));
-const ADMIN_TOKEN = 'loadrun-admin';
+const ADMIN_TOKEN = 'loadrun-admin-token-0123456789abcdef-0123456789abcdef';
 const TMP = process.env.SMON_TMP ?? '/tmp';
 const DB = `${TMP}/smon-load-${process.pid}.db`;
 const LOG = `${TMP}/smon-load-${process.pid}.log`;
