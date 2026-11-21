@@ -232,17 +232,25 @@ read-only:
 ```sh
 dbpath=$(sed -n 's/^SMON_DATABASE_URL=sqlite://p' /opt/smon/env | tail -n 1)
 sqlite3 "file:$dbpath?mode=ro" \
-  "SELECT version, description, success, length(checksum) FROM _sqlx_migrations
+  "SELECT version, description, success, hex(checksum) FROM _sqlx_migrations
    ORDER BY version DESC LIMIT 5;"
 ```
 
-Any row whose version has no file under the candidate's
-`crates/monitor-db/migrations/` — or whose checksum doesn't match
-`shasum -a 384` of that file (sqlx records the SHA-384 of the migration's SQL) —
-means the database diverged from the release line: repair `_sqlx_migrations`
-before deploying, don't boot through it. In particular, version 18 should not
-exist on a main-lineage database at all (the file was introduced and restored
-on a branch, never released); a version-18 row is the tell.
+`upgrade.sh` runs this same inspection automatically before the switch.
+`hex(checksum)` is what `shasum -a 384` prints, so an applied row can be
+compared directly to the candidate's file (sqlx records the SHA-384 of the
+migration's SQL). Any row whose version has no file under the candidate's
+`crates/monitor-db/migrations/` — or whose hex checksum doesn't match that
+file's `shasum -a 384` — means the database diverged from the release line:
+repair `_sqlx_migrations` before deploying, don't boot through it.
+
+Version 18 is the historical edge: it was introduced and restored on a
+branch before this release line carried it, so a database that last ran a
+**pre-merge** build may hold a version-18 row written by a different 0018's
+bytes. Once this release line has deployed, a version-18 row is ordinary —
+do not "repair" a database merely for containing it. The tell is only a
+version-18 row whose checksum differs from the candidate's
+`0018_*.sql` file — divergence, not presence.
 
 ## Rollback
 

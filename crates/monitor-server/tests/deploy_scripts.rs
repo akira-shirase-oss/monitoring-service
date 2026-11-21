@@ -80,6 +80,13 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         "tail -n +4",        // keeps the newest 3 releases
         "systemctl restart monitor-server",
         "rolling back", // automatic rollback on a failed upgrade
+        // N-4 re-review: the read-only _sqlx_migrations inspection is scripted
+        // in the upgrade itself — not a manual step an operator can skip — and
+        // it compares applied checksums to file SHA-384s, so it reads
+        // hex(checksum), never length().
+        "_sqlx_migrations",
+        "hex(checksum)",
+        "mode=ro",
     ] {
         assert!(upgrade.contains(pin), "upgrade.sh is missing '{pin}'");
     }
@@ -155,6 +162,29 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         !install.contains("set -a"),
         "the env file is sourced unexported — `set -a` would leak the admin token to \
          every child of the installer"
+    );
+}
+
+#[test]
+fn the_migration_inspection_is_hex_and_version_18_is_scoped() {
+    // N-4 re-review: the DEPLOY.md instruction must be runnable as written —
+    // hex(checksum) is what `shasum -a 384` produces; length(checksum) is not.
+    // And the version-18 tell is scoped to a database that last ran a
+    // pre-merge build — on the first deploy of this release line version 18
+    // is ordinary, so the doc must not send an operator to "repair" a
+    // healthy database.
+    let deploy = read("DEPLOY.md");
+    assert!(
+        deploy.contains("hex(checksum)"),
+        "the migration inspection must select hex(checksum) for the shasum comparison"
+    );
+    assert!(
+        !deploy.contains("length(checksum)"),
+        "length(checksum) can never be compared to shasum -a 384"
+    );
+    assert!(
+        deploy.contains("pre-merge"),
+        "the version-18 tell must be scoped to a pre-merge database"
     );
 }
 

@@ -64,6 +64,37 @@ dbpath=$(sed -n 's/^SMON_DATABASE_URL=sqlite://p' "$PREFIX/env" | tail -n 1)
 dbpath=${dbpath:-$PREFIX/data/monitor.db}
 "$guard" "$dbpath" "$dest/bin/monitor-server"
 
+# --- applied-migration checksum inspection (read-only, before the switch) --
+# A database that ever ran a branch/experiment build may hold _sqlx_migrations
+# rows whose bytes differ from this release's files — sqlx would refuse to
+# boot AFTER the switch. Compare what was applied (hex(checksum), the same
+# SHA-384 shasum prints) against the candidate's migration files while the
+# previous release still serves. Read-only; never repairs — divergence is a
+# human call, not an upgrade-time edit.
+if command -v sqlite3 >/dev/null 2>&1 && [[ -f "$dbpath" ]]; then
+  mig_dir="$dest/migrations"
+  [[ -d "$mig_dir" ]] || mig_dir="$(dirname "$dest")/../source/crates/monitor-db/migrations"
+  diverged=0
+  while IFS='|' read -r v hexsum; do
+    [[ -z "$v" ]] && continue
+    file=$(find "$mig_dir" -maxdepth 1 -name "$(printf '%04d' "$v")_*.sql" -print -quit 2>/dev/null)
+    if [[ -z "$file" ]]; then
+      echo "upgrade: WARNING _sqlx_migrations v$v has no migration file in this release" >&2
+      diverged=1
+      continue
+    fi
+    filesum=$(shasum -a 384 "$file" | cut -d' ' -f1 | tr 'A-F' 'a-f')
+    if [[ "${hexsum,,}" != "$filesum" ]]; then
+      echo "upgrade: WARNING _sqlx_migrations v$v checksum diverges from $(basename "$file")" >&2
+      diverged=1
+    fi
+  done < <(sqlite3 "file:$dbpath?mode=ro" \
+    "SELECT version, hex(checksum) FROM _sqlx_migrations WHERE success ORDER BY version;" 2>/dev/null)
+  if (( diverged )); then
+    echo "upgrade: applied-migration divergence — inspect _sqlx_migrations before proceeding (DEPLOY.md)" >&2
+  fi
+fi
+
 # --- atomic switch + restart + prove -------------------------------------
 switch() { ln -sfn "$1" "$PREFIX/current.new" && mv -T "$PREFIX/current.new" "$PREFIX/current"; }
 wait_ready() {
