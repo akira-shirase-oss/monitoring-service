@@ -433,19 +433,30 @@ maintainer confirms it is gone. Consequences:
 
 Every probe start pays one resolved IP's token bucket — 8/s shared across all
 workspaces (the ceiling the write-time `addr:port` bound assumes), under a 2/s
-per-workspace share so the heaviest spender stops at its own rate and can never
-starve a neighbour whose monitors happen to sit on the same CDN address. The
-charge lives inside the SSRF validating resolver on the addresses actually
-offered to the dialer (the first paying candidate per family — a candidate that
-would only ever sit behind it in the dial list doesn't pay), and beside it for
-the paths that never touch DNS: an IP-literal URL pays its own literal, and the
-redirect closure pays each hop's literal host before following it, refusing the
-hop as `address_budget`. IPv4-mapped IPv6 spellings normalize to the IPv4 key —
-`::ffff:8.8.8.8` and `8.8.8.8` share one bucket. The bucket map is bounded
-(8192 entries); when it fills it evicts only buckets that have fully refilled,
-and when none qualify it refuses the *new* address as a counted miss — it never
-clears, so a spent bucket stays spent under churn. A refusal commits `missed` +
-`address_budget`: a coverage gap that reports `unknown` but is neutral on the
-monitor's failure/recovery streaks — the evidence the outage needs can't be
-erased by the monitor's own bound, and a starved tenant's alert can't be
-silenced by another tenant's load.
+per-workspace share so the heaviest spender stops at its own rate. While the
+ceiling has room the static share is the whole rule; once it is spent the
+ceiling becomes **max-min fair**: a workspace still below its fair split of it
+(8 ÷ the workspaces at that address) keeps starting, and the spender already
+holding its split is who refuses — four busy tenants behind one CDN address
+can't turn a fifth's monitor `unknown` forever. The honest cost: under
+contention the effective ceiling is the burst plus at most one in-flight
+start per waiting workspace — the ceiling refills, the overshoot is bounded.
+The charge lives inside the SSRF validating resolver on the ONE candidate
+offered to the dialer — the first paying address in answer order; a fallback
+family or a sprayed answer's tail is never dialed and never pays — and beside
+it for the paths that never touch DNS: an IP-literal URL pays its own literal,
+and the redirect closure pays each hop's literal host before following it,
+refusing the hop as `address_budget`. IPv4-mapped IPv6 spellings normalize to
+the IPv4 key — `::ffff:8.8.8.8` and `8.8.8.8` share one bucket. The bucket map
+is bounded (8192 entries); when it fills it evicts only buckets that have
+fully refilled, and when none qualify it refuses the *new* address as a
+counted miss — it never clears, so a spent bucket stays spent under churn. A
+refusal commits `missed` + `address_budget`: a coverage gap that reports
+`unknown` but is neutral on the monitor's failure/recovery streaks — in memory
+AND in the SQL (`first_fail_at` never sees it as a boundary, the rebuild tail
+windows past it), so the outage evidence a restart replays matches what the
+live machine held. The webhook/test-alert channel is deliberately NOT on this
+budget: sends are member- or incident-initiated, outbox- and retry-bounded —
+a different bound for a different channel, and charging them here would let a
+busy webhook URL starve unrelated probes at the same address (explicit gap,
+N-6).
