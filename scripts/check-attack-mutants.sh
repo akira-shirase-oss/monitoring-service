@@ -72,11 +72,19 @@ for file in tests/attacks/tests/*.rs; do
             echo "NO MUTANT: $stem::$tname has no ${stem}__${tname}.patch" >&2
             fails=$((fails + 1))
         fi
+        # F re-review: a kill must land on the test's OWN protection check —
+        # the .expect file pins the panic location(s) the decisive assertion
+        # produces (file:line, one per line). A panic at a setup .expect or a
+        # helper is not in it, so a server crash can never pass as a kill.
+        if [[ ! -s "tests/attacks/mutants/${stem}__${tname}.expect" ]]; then
+            echo "NO EXPECT: $stem::$tname has no ${stem}__${tname}.expect" >&2
+            fails=$((fails + 1))
+        fi
     done < <(awk '
         /^[[:space:]]*#\[(tokio::)?test/ {
             # The fn line may follow attributes/blanks and may be indented or
             # non-async — print it, let sed pull the name.
-            while ((getline line) > 0 && line ~ /^[[:space:]]*(#|$)/) continue
+            while ((getline line) > 0 && line ~ /^[[:space:]]*(#|$|\/\/)/) continue
             print line
         }' "$file" | sed -n 's/.*fn[[:space:]]\{1,\}\([a-z0-9_]*\).*/\1/p')
 done
@@ -142,14 +150,16 @@ for patch in "${mutants[@]}"; do
             fails=$((fails + 1))
         elif grep -q "^test ${test} \.\.\. FAILED" "$log"; then
             # The named test failed — but on WHAT? A mutant that breaks the
-            # test's own setup still prints its FAILED line (N-6 re-review):
-            # the kill is only real when the panic lands in the test file's
-            # own assertions, not in a fixture, helper, or elsewhere.
-            if grep -q "panicked at .*tests/attacks/tests/${stem}\.rs" "$log"; then
+            # test's own setup still prints its FAILED line: the kill is only
+            # real when the panic lands on the file:line the .expect sidecar
+            # pins — the protection's own assertion — never a fixture's
+            # .expect, a helper, or a crash elsewhere (F re-review).
+            if grep -q "panicked at .*tests/attacks/tests/${stem}\.rs" "$log" \
+                && grep -F -q -f "tests/attacks/mutants/${name}.expect" "$log"; then
                 echo "killed: $name"
                 killed=$((killed + 1))
             else
-                echo "INCONCLUSIVE: $name failed $test away from its own assertions — not a kill:" >&2
+                echo "INCONCLUSIVE: $name failed $test off its pinned assertion — not a kill:" >&2
                 grep "panicked at" "$log" | head -3 >&2
                 fails=$((fails + 1))
             fi
