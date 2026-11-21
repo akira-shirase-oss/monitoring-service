@@ -150,6 +150,21 @@ async fn only_health_and_public_surfaces_answer_unauthed() -> anyhow::Result<()>
         StatusCode::NOT_FOUND,
         "an unknown slug is 404, never a credential prompt"
     );
+    // The other half of the name: the authed surfaces refuse without a
+    // credential. The layer that gates them is the protection this test
+    // measures, so the refusal is the specific 401 — not any failure.
+    for path in ["/api/monitors", "/api/incidents", "/api/workspaces"] {
+        let status = http
+            .get(format!("{}{}", instance.base, path))
+            .send()
+            .await?
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must refuse unauthed, got {status}"
+        );
+    }
     Ok(())
 }
 
