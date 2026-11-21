@@ -20,10 +20,12 @@ it to the writer — without ever letting a slow target stall the schedule.
 - **Phase (D-018):** each monitor's slots sit at a fixed phase within its interval, from its id, so monitors created together never fall due on one tick.
 - **Concurrency bounds:** global probe semaphore sized to the schedule, `Σ (tick + timeout)/interval`, 20 to 512 (D-018; a schedule past it, or past 2 starts a tick on one origin — `(resolved addr:port, host)` per workspace, or on the resolved `addr:port` summed across hosts — is refused at write time with 409 `capacity_exceeded`), per-origin semaphore 2 (keyed by
   `(origin, workspace)`), one in-flight probe per monitor, and a cross-tenant starts budget
-  per IP: 8/s shared across all workspaces under a 2/s per-workspace share, max-min fair
-  once the ceiling is spent (a workspace below its split of it still starts; the spender
-  at its split is who refuses — D-024), with every admit paying a global token so the
-  ceiling binds paced tenants too. It is charged inside the SSRF resolver on the ONE
+  per IP: 8/s shared across all workspaces under a 2/s per-workspace share, then a
+  bounded FIFO per address once the ceiling is spent — every pending start holds its
+  place in arrival order and each global token goes to the head (D-024: round-robin, so
+  a newcomer can never be starved by incumbents; a claim spends its token only when
+  served, and leaves the queue when served, when its share cannot pay, or when it stops
+  asking). It is charged inside the SSRF resolver on the ONE
   candidate offered to the dialer — the first paying address in answer order, so a fallback
   family or a sprayed answer's tail is never dialed and never pays (the trade-off: no
   multi-address fallback — a dual-stack target whose first answer is a dead family records
@@ -32,7 +34,8 @@ it to the writer — without ever letting a slow target stall the schedule.
   touched DNS. A refusal commits `missed` + `address_budget`: a *neutral* coverage gap that
   shows `unknown` but never resets an outage's streaks — in memory and in the SQL
   (`first_fail_at`, rebuild tail), so a starved tenant's alert can't be laundered away by a
-  neighbour's load. Bounds are `try_acquire` — contention means `missed`, not a queue.
+  neighbour's load. Bounds are `try_acquire` — contention means `missed`, never a parked
+  request; the FIFO only orders whose *next* slot is served, nothing waits async.
   Webhook/test-alert sends are outbox-bounded, not on this budget (D-024).
 - **Classification:** `Pass` = acceptable status (2xx in v1; assertions later);
   `HttpFail{status}` = any other status incl. exhausted redirects; `Transport` = connect/DNS/

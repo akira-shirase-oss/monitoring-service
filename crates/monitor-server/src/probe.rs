@@ -113,9 +113,7 @@ pub struct AddressBudget {
     burst: f64,
     /// Sustained refill — tokens per second.
     rate: f64,
-    /// The window "active" is measured over for the fair split: a workspace
-    /// with an admitted start inside the last `per` counts toward it.
-    per: Duration,
+
     /// The per-workspace sub-bucket's burst and refill at one address — the
     /// same share the write-time per-address cap sells a workspace.
     share_burst: f64,
@@ -123,11 +121,17 @@ pub struct AddressBudget {
     buckets: std::sync::Mutex<HashMap<IpAddr, IpBucket>>,
 }
 
-/// One address's buckets: the global ceiling plus each workspace's share of it.
+/// One address's buckets: the global ceiling, each workspace's share of it,
+/// and the FIFO of workspaces whose pending start is waiting on the ceiling.
 #[derive(Debug)]
 struct IpBucket {
     global: Bucket,
     shares: HashMap<WorkspaceId, Bucket>,
+    /// Waiting workspaces in arrival order — the next global token goes to
+    /// the front (G1 re-review: round-robin, no split arithmetic).
+    waiters: std::collections::VecDeque<WorkspaceId>,
+    /// Each queued workspace's last ask — membership lookup and staleness.
+    queued: HashMap<WorkspaceId, tokio::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -140,6 +144,15 @@ struct Bucket {
 
 /// Addresses remembered at once — a wildcard-DNS spray must not grow it unbounded.
 const MAX_BUCKETS: usize = 8192;
+
+/// Workspaces queued on one address at once — bounded like everything else;
+/// a fuller queue refuses, it never grows memory with the spray.
+const MAX_WAITERS: usize = 128;
+
+/// A pending claim outlives its workspace's last ask by this long — slots
+/// re-ask every monitor interval, so a workspace silent this long left the
+/// queue; only the head is stale-checked, which bounds a dead claim's stall.
+const WAITER_IDLE: Duration = Duration::from_secs(300);
 
 fn refill(bucket: &mut Bucket, burst: f64, rate: f64, now: tokio::time::Instant) {
     bucket.tokens = (bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate).min(burst);
@@ -159,7 +172,6 @@ impl AddressBudget {
         Self {
             burst: f64::from(burst),
             rate: f64::from(burst) / per.as_secs_f64().max(f64::EPSILON),
-            per,
             share_burst: f64::from(share_burst),
             share_rate: f64::from(share_burst) / share_per.as_secs_f64().max(f64::EPSILON),
             buckets: std::sync::Mutex::new(HashMap::new()),
@@ -203,56 +215,74 @@ impl AddressBudget {
                 last_admit: None,
             },
             shares: HashMap::new(),
+            waiters: std::collections::VecDeque::new(),
+            queued: HashMap::new(),
         });
         refill(&mut bucket.global, self.burst, self.rate, now);
         if let Some(workspace) = workspace {
-            // A re-review: every admit pays a GLOBAL token, debt capped at the
-            // count of workspaces active at this address — the ceiling binds
-            // paced tenants, not just burst ones (fairness admits used to pay
-            // nothing, so the real cap was share × workspaces). Active = an
-            // admitted start within the last `per` window; idle shares drop
-            // out of the split rather than counting forever.
-            let active_now = |shares: &HashMap<WorkspaceId, Bucket>| {
-                shares
-                    .values()
-                    .filter(|s| {
-                        s.last_admit
-                            .is_some_and(|t| now.duration_since(t) < self.per)
-                    })
-                    .count()
+            let share_can_pay = {
+                let share = bucket.shares.entry(workspace).or_insert(Bucket {
+                    tokens: self.share_burst,
+                    at: now,
+                    last_admit: None,
+                });
+                refill(share, self.share_burst, self.share_rate, now);
+                share.tokens >= 1.0
             };
-            let mut active = active_now(&bucket.shares);
-            if !bucket.shares.get(&workspace).is_some_and(|s| {
-                s.last_admit
-                    .is_some_and(|t| now.duration_since(t) < self.per)
-            }) {
-                active += 1; // this workspace counts toward the split it asks for
+            // G1 re-review: not a fair split — a FIFO. A workspace whose start
+            // waits on the ceiling holds its place in arrival order and every
+            // global token goes to the head; the per-workspace share still
+            // caps. Dead claims leave the queue: only the head is checked —
+            // stale beyond WAITER_IDLE it is dropped, and a head that cannot
+            // pay a share token yields to whoever can.
+            while let Some(&front) = bucket.waiters.front() {
+                let stale = bucket
+                    .queued
+                    .get(&front)
+                    .is_some_and(|asked| now.duration_since(*asked) > WAITER_IDLE);
+                let broke = bucket.shares.get_mut(&front).is_some_and(|front_share| {
+                    refill(front_share, self.share_burst, self.share_rate, now);
+                    front_share.tokens < 1.0
+                });
+                if !stale && !broke {
+                    break;
+                }
+                bucket.waiters.pop_front();
+                bucket.queued.remove(&front);
             }
-            let active = f64::from(u32::try_from(active).unwrap_or(u32::MAX));
-            let share = bucket.shares.entry(workspace).or_insert(Bucket {
-                tokens: self.share_burst,
-                at: now,
-                last_admit: None,
-            });
-            refill(share, self.share_burst, self.share_rate, now);
-            // The workspace's cap at this address is the smaller of its own
-            // share and its fair split of the ceiling (N-1/A re-review: a
-            // below-split tenant still starts — nobody goes dark — and a take
-            // that would carry it past the split is the one that refuses).
-            let fair_split = (self.burst / active).min(self.share_burst);
-            if self.share_burst - share.tokens + 1.0 > fair_split {
-                return false;
+            if let Some(asked) = bucket.queued.get_mut(&workspace) {
+                *asked = now;
+                if bucket.waiters.front() == Some(&workspace)
+                    && share_can_pay
+                    && bucket.global.tokens >= 1.0
+                {
+                    bucket.global.tokens -= 1.0;
+                    if let Some(share) = bucket.shares.get_mut(&workspace) {
+                        share.tokens -= 1.0;
+                        share.last_admit = Some(now);
+                    }
+                    bucket.waiters.pop_front();
+                    bucket.queued.remove(&workspace);
+                    return true; // its turn arrived — the claim leaves the queue
+                }
+                return false; // head waiting on the ceiling, or still in line
             }
-            // Debt room: the ceiling may be overspent by one start per active
-            // workspace — the price of letting a below-split tenant in while
-            // the ceiling is exhausted — and no further.
-            if bucket.global.tokens <= -active {
-                return false;
+            if !share_can_pay {
+                return false; // the workspace's own share of the address is spent
             }
-            bucket.global.tokens -= 1.0;
-            share.tokens -= 1.0;
-            share.last_admit = Some(now);
-            return true;
+            if bucket.waiters.is_empty() && bucket.global.tokens >= 1.0 {
+                bucket.global.tokens -= 1.0;
+                if let Some(share) = bucket.shares.get_mut(&workspace) {
+                    share.tokens -= 1.0;
+                    share.last_admit = Some(now);
+                }
+                return true; // uncontended — never queued, holds no queue state
+            }
+            if bucket.waiters.len() < MAX_WAITERS {
+                bucket.waiters.push_back(workspace);
+                bucket.queued.insert(workspace, now);
+            }
+            return false; // pending — its turn comes in arrival order
         }
         if bucket.global.tokens >= 1.0 {
             bucket.global.tokens -= 1.0;
@@ -1358,45 +1388,69 @@ mod tests {
         );
     }
 
-    /// N-1 re-review: the global ceiling is max-min FAIR, not first-come. When
-    /// the ceiling is spent, a workspace below the fair split — ceiling /
-    /// workspaces at the address — still starts: four tenants inside their
-    /// shares can fill the ceiling without a fifth's monitor going dark.
-    /// Only a spender already at (or above) the split refuses.
-    #[tokio::test]
-    async fn the_spent_ceiling_admits_a_workspace_below_the_fair_split() {
+    /// G1 re-review: not a fair split — a FIFO. Every global token goes to the
+    /// next waiting workspace in arrival order, so nobody goes dark: once the
+    /// ceiling is spent, a pending start keeps its place and the next refill
+    /// serves whoever queued first — first-come no longer starves newcomers.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_ceiling_serves_the_waiters_in_order() {
         let budget =
-            AddressBudget::with_share(4, Duration::from_secs(3600), 2, Duration::from_secs(3600));
+            AddressBudget::with_share(4, Duration::from_secs(4), 2, Duration::from_secs(3600));
         let ip: IpAddr = "9.9.9.9".parse().expect("ip");
-        let (a, b, c) = (WorkspaceId::new(), WorkspaceId::new(), WorkspaceId::new());
+        let (a, b, c, d) = (
+            WorkspaceId::new(),
+            WorkspaceId::new(),
+            WorkspaceId::new(),
+            WorkspaceId::new(),
+        );
         assert!(budget.take(ip, Some(a)));
         assert!(budget.take(ip, Some(a)));
         assert!(budget.take(ip, Some(b)));
         assert!(budget.take(ip, Some(b)));
-        // The ceiling is spent 2+2 — first-come would refuse c on every slot,
-        // unknown forever, no alert. Max-min: c has spent nothing of its fair
-        // split (4/3) → it starts; a and b already hold theirs.
-        assert!(
-            budget.take(ip, Some(c)),
-            "a workspace below the fair split still starts"
-        );
-        assert!(
-            !budget.take(ip, Some(a)),
-            "a spender at its split is the one that refuses, not the newcomer"
-        );
-        // And the ceiling is not decorative: c's fair split is 4/3 — its first
-        // take pays it, and the second would carry it past the split.
+        // The ceiling is spent 2+2 — first-come refused c on every slot,
+        // unknown forever, no alert. Round-robin: each refusal registers a
+        // pending start; c and d hold their places in arrival order.
         assert!(
             !budget.take(ip, Some(c)),
-            "the fair split is a cap, not a floor of two: 4/3 admits exactly one start"
+            "no global token left — c's start is pending"
         );
+        assert!(
+            !budget.take(ip, Some(d)),
+            "d queues behind c in arrival order"
+        );
+        // One refill token per second: it goes to the head — c — not to d,
+        // and not to the spenders who emptied the bucket.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            !budget.take(ip, Some(d)),
+            "still c's turn — the head is served first"
+        );
+        assert!(
+            budget.take(ip, Some(c)),
+            "the first refill serves the head of the queue"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            budget.take(ip, Some(d)),
+            "the next token serves the next in order"
+        );
+        // And the spenders do not jump the queue: even a fresh workspace waits
+        // behind whatever is pending once the ceiling is gone.
+        let e = WorkspaceId::new();
+        let f = WorkspaceId::new();
+        assert!(
+            !budget.take(ip, Some(e)),
+            "the queue is empty but the ceiling is spent — e's start is pending"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!budget.take(ip, Some(f)), "f waits behind e");
+        assert!(budget.take(ip, Some(e)), "e's claim was first");
     }
 
-    /// A re-review: every admit must take a global token — the ceiling has to
-    /// bind PACED tenants, not only burst ones. Seven workspaces each doing two
-    /// starts against an 8-start ceiling must not get all fourteen: once
-    /// everyone is active each workspace's fair split is one start, so the
-    /// second round is refused wholesale.
+    /// A re-review: every admit takes a global token — the ceiling binds PACED
+    /// tenants, not only burst ones. Seven workspaces each doing two starts
+    /// against an 8-start ceiling get exactly the ceiling: four take it, three
+    /// register pending starts that stay pending without a refill.
     #[tokio::test]
     async fn paced_workspaces_cannot_exceed_the_global_ceiling() {
         let budget =
@@ -1410,8 +1464,70 @@ mod tests {
             }
         }
         assert_eq!(
-            admitted, 7,
-            "each of seven workspaces keeps its fair start — and the ceiling binds the paced second round"
+            admitted, 8,
+            "the ceiling admits its tokens and queues the rest — never more"
+        );
+    }
+
+    /// G1 re-review proof, under paused time: admits never exceed the token
+    /// stream — `burst + rate·t` over any window — and every waiting workspace
+    /// reaches the head within ceil(waiters/burst) seconds while it keeps
+    /// asking. Twenty workspaces at 8/s: nobody waits past three seconds.
+    #[tokio::test(start_paused = true)]
+    async fn the_ceiling_bound_holds_and_every_waiter_is_served_in_turn() {
+        let budget =
+            AddressBudget::with_share(8, Duration::from_secs(1), 8, Duration::from_secs(1));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let workspaces: Vec<WorkspaceId> = (0..20).map(|_| WorkspaceId::new()).collect();
+        let mut first_admit: Vec<Option<u64>> = vec![None; 20];
+        let mut admitted = 0usize;
+        for second in 0u64..4 {
+            for (i, workspace) in workspaces.iter().enumerate() {
+                if budget.take(ip, Some(*workspace)) {
+                    admitted += 1;
+                    if first_admit[i].is_none() {
+                        first_admit[i] = Some(second);
+                    }
+                }
+            }
+            assert!(
+                admitted <= 8 + usize::try_from(second + 1).expect("small") * 8,
+                "the ceiling is a token stream: admits ({admitted}) must not exceed 8+8t"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        for (i, first) in first_admit.iter().enumerate() {
+            assert_eq!(
+                *first,
+                Some(u64::try_from(i / 8).expect("small")),
+                "workspace {i} waits only its position in line: {}",
+                first
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "never".to_owned())
+            );
+        }
+    }
+
+    /// G1 re-review: eight greedy neighbours cannot starve a ninth tenant —
+    /// round-robin serves the victim one start in every cycle of nine.
+    #[tokio::test(start_paused = true)]
+    async fn a_victim_keeps_its_turn_behind_greedy_neighbours() {
+        let budget =
+            AddressBudget::with_share(8, Duration::from_secs(1), 8, Duration::from_secs(1));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let attackers: Vec<WorkspaceId> = (0..8).map(|_| WorkspaceId::new()).collect();
+        let victim = WorkspaceId::new();
+        let mut victim_admits = 0usize;
+        for _ in 0..60 {
+            for attacker in &attackers {
+                budget.take(ip, Some(*attacker));
+            }
+            victim_admits += usize::from(budget.take(ip, Some(victim)));
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert!(
+            victim_admits >= 25,
+            "queued first each cycle, the victim turns roughly every other second — got {victim_admits}"
         );
     }
 

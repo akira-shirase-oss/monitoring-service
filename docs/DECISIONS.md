@@ -435,15 +435,20 @@ Every probe start pays one resolved IP's token bucket — 8/s shared across all
 workspaces (the ceiling the write-time `addr:port` bound assumes), under a 2/s
 per-workspace share so the heaviest spender stops at its own rate. While the
 ceiling has room the static share is the whole rule; once it is spent the
-ceiling becomes **max-min fair**: a workspace still below its fair split of it
-(8 ÷ the workspaces at that address) keeps starting, and the spender already
-holding its split is who refuses — four busy tenants behind one CDN address
-can't turn a fifth's monitor `unknown` forever. Every admit pays a global
-token even when the ceiling is spent (debt capped at the active-workspace
-count at that address, "active" = an admitted start inside the last ceiling
-window), so the ceiling binds paced tenants at its refill rate, not only
-burst ones; the honest cost is a bounded overshoot of at most one start per
-active workspace. The charge lives inside the SSRF validating resolver on the
+ceiling becomes a **round-robin queue**, not arithmetic: every workspace
+whose start waits on the ceiling holds its place in a bounded FIFO per
+address (128 waiters), and each global token goes to the head in arrival
+order — first-come can never starve a newcomer, because every waiting
+workspace reaches the head within ⌈waiters ÷ ceiling⌉ seconds while it keeps
+asking (the fifth re-review killed the max-min-split arithmetic: under it a
+hard cap of 8 active workspaces made every newcomer's split < 1 start, so
+twenty paced tenants starved twelve of themselves and eight greedy tenants
+starved their ninth). A claim costs nothing while it waits — no tokens are
+spent — and it leaves the queue when its turn arrives, when its own share
+cannot pay, or when it stops asking for five minutes (a >5-minute-interval
+workspace under contention that long can lose its place; it re-queues, never
+silences). Total admits stay a pure token stream — burst + rate·t over any
+window — because a queued claim pays its global token only when served. The charge lives inside the SSRF validating resolver on the
 ONE candidate offered to the dialer — the first paying address in answer
 order; a fallback family or a sprayed answer's tail is never dialed and never
 pays. The honest trade-off of offering one: hyper collects the offered
