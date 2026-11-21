@@ -370,39 +370,62 @@ async fn a_literal_regex_is_not_an_engine() -> anyhow::Result<()> {
 }
 
 /// Expectations are workspace-owned monitor data — never the public snapshot.
-/// The default workspace's monitor lands on the global page; its `expect_*` and
-/// `method` fields must not.
+/// A published monitor lands on its workspace's own `/s/{slug}` page; its
+/// `expect_*` and `method` fields must not.
 #[tokio::test]
 async fn expectations_stay_out_of_the_public_snapshot() -> anyhow::Result<()> {
     let instance = spawn_lab().await?;
     let http = client()?;
-    authed(&instance, reqwest::Method::POST, "/api/monitors")
+    let cookie = account(&instance, "page@tenant.example").await?;
+    let response = http
+        .post(format!("{}/api/monitors", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
         .json(&json!({
-            "name": "secret-expect", "url": "http://93.184.216.34/",
+            "name": "secret-check", "url": "http://93.184.216.34/",
             "interval_s": 60, "method": "GET",
             "expect_statuses": ["200-299", "418"], "expect_body": "LEAKME"
         }))
         .send()
         .await?;
-    // Poll the snapshot until the monitor's page has a service entry — then its
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let id = response.json::<Value>().await?["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    // Publish the monitor on this workspace's own status page — a member's
+    // monitor never lands on the operator's global `/status.json` (D-021).
+    let page = http
+        .put(format!("{}/api/workspace/status-page", instance.base))
+        .header("cookie", &cookie)
+        .header("origin", &instance.base)
+        .json(&json!({"slug": "assert-check", "title": "assertions", "monitor_ids": [id]}))
+        .send()
+        .await?;
+    assert_eq!(page.status(), StatusCode::OK, "status-page publish");
+    // Poll the page snapshot until the monitor's service entry lands — then the
     // serialized body must hold none of the expectation fields or the marker.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let body = http
-            .get(format!("{}/status.json", instance.base))
+            .get(format!("{}/s/assert-check/status.json", instance.base))
             .send()
             .await?
             .text()
             .await?;
-        if body.contains("\"services\":[]") || body.is_empty() {
+        let populated = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["services"].as_array().map(|a| !a.is_empty()))
+            .unwrap_or(false);
+        if !populated {
             if std::time::Instant::now() > deadline {
-                anyhow::bail!("status.json never populated: {body}");
+                anyhow::bail!("status page never populated: {body}");
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             continue;
         }
         assert!(
-            !body.contains("expect"),
+            !body.contains("\"expect"),
             "expectation fields leaked into status.json: {body}"
         );
         assert!(

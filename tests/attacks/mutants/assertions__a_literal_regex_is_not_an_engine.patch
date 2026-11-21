@@ -1,5 +1,5 @@
 diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
-index f10e12a..59ed679 100644
+index 5b1bfb9..28485f8 100644
 --- a/crates/monitor-server/src/probe.rs
 +++ b/crates/monitor-server/src/probe.rs
 @@ -847,7 +847,11 @@ impl ProbeClient {
@@ -10,7 +10,7 @@ index f10e12a..59ed679 100644
 +                        !buf.windows(marker.len()).any(|w| {
 +                            w.iter()
 +                                .zip(marker.iter())
-+                                .all(|(a, b)| *b == b'.' || a == b)
++                                .all(|(a, b)| *b == b'.' || *b == b'*' || a == b)
 +                        })
                      }
                      // Marker expected but no body was ever buffered — treat as a
