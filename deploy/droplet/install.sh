@@ -53,32 +53,35 @@ if ! { need jq && need curl && need age && need rclone && need sqlite3; }; then
   apt-get update
   apt-get install -y ufw jq curl ca-certificates unattended-upgrades age rclone sqlite3
 fi
+# The pinned caddy repo is written UNCONDITIONALLY (N5 review): a box where
+# caddy is already installed still needs it — its next `apt-get upgrade`
+# otherwise pulls from whatever unverifiable source it already had.
+# The repo key is pinned by fingerprint (S2 review): import the fetched key file
+# into a throwaway keyring and export ONLY the pinned key — dearmoring the whole
+# file would trust every other key bundled in it.
+caddy_key=$(mktemp)
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$caddy_key"
+want=65760C51EDEA2017CEA2CA15155B6D79CA56EA34
+gtmp=$(mktemp -d); chmod 0700 "$gtmp"
+gpg --batch --homedir "$gtmp" --import "$caddy_key" >/dev/null 2>&1
+gpg --batch --homedir "$gtmp" --export "$want" \
+  >/usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+  || { echo "error: caddy repo key $want not present in fetched key file" >&2;
+       rm -rf "$gtmp" "$caddy_key"; exit 2; }
+[[ -s /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]] \
+  || { echo "error: pinned caddy repo key exported empty" >&2;
+       rm -rf "$gtmp" "$caddy_key"; exit 2; }
+rm -rf "$gtmp" "$caddy_key"
+# The sources line is written inline (S3 review): fetching the .list means
+# trusting whatever signed-by/trusted=yes it arrives carrying — that would
+# undo the fingerprint pin above.
+printf '%s\n' \
+  'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
+  >/etc/apt/sources.list.d/caddy-stable.list
 if ! need caddy; then
   # The repo is registered BEFORE caddy is installed — Ubuntu's own package installs
   # fine and would silently win otherwise, and it is too old for {client_ip} and
   # trusted proxies (needs >= 2.7; checked again below).
-  # The repo key is pinned by fingerprint (S2 review): import the fetched key file
-  # into a throwaway keyring and export ONLY the pinned key — dearmoring the whole
-  # file would trust every other key bundled in it.
-  caddy_key=$(mktemp)
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$caddy_key"
-  want=65760C51EDEA2017CEA2CA15155B6D79CA56EA34
-  gtmp=$(mktemp -d); chmod 0700 "$gtmp"
-  gpg --batch --homedir "$gtmp" --import "$caddy_key" >/dev/null 2>&1
-  gpg --batch --homedir "$gtmp" --export "$want" \
-    >/usr/share/keyrings/caddy-stable-archive-keyring.gpg \
-    || { echo "error: caddy repo key $want not present in fetched key file" >&2;
-         rm -rf "$gtmp" "$caddy_key"; exit 2; }
-  [[ -s /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]] \
-    || { echo "error: pinned caddy repo key exported empty" >&2;
-         rm -rf "$gtmp" "$caddy_key"; exit 2; }
-  rm -rf "$gtmp" "$caddy_key"
-  # The sources line is written inline (S3 review): fetching the .list means
-  # trusting whatever signed-by/trusted=yes it arrives carrying — that would
-  # undo the fingerprint pin above.
-  printf '%s\n' \
-    'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
-    >/etc/apt/sources.list.d/caddy-stable.list
   apt-get update
   apt-get install -y caddy
 fi

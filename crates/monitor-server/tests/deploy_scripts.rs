@@ -137,6 +137,20 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         "the pinned repo must be registered BEFORE caddy is installed — Ubuntu's older \
          package would otherwise win and silently lack trusted-proxies support"
     );
+    // N5: the sources line (and its key pin) is written *unconditionally* — a box
+    // where caddy is already installed still needs the pinned repo, or its next
+    // `apt-get upgrade` pulls from whatever unverifiable source it already had.
+    let sources_line = install
+        .find("deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg]")
+        .expect("the inline sources line");
+    let conditional = install
+        .find("if ! need caddy")
+        .expect("the conditional install");
+    assert!(
+        sources_line < conditional,
+        "the pinned sources line must be written BEFORE the `need caddy` check — \
+         an already-installed caddy still needs the pinned repo"
+    );
     assert!(
         !install.contains("set -a"),
         "the env file is sourced unexported — `set -a` would leak the admin token to \
