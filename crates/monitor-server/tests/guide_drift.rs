@@ -151,6 +151,7 @@ fn the_guide_has_no_stale_words() {
         "body",
         "request",
         "rejected_local",
+        "assert_body",
         "cert_expired",
         "cert_not_yet_valid",
         "cert_name_mismatch",

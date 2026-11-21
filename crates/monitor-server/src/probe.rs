@@ -1940,14 +1940,25 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n";
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Answer only once the request head is consumed — a
+                    // response written while the client still sends is an
+                    // UnexpectedMessage error, not a dribbling body.
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 512];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 16777216\r\n\r\n";
                     if sock.write_all(head).await.is_err() {
                         return;
                     }
                     loop {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        if sock.write_all(b"1\r\nM\r\n").await.is_err() {
+                        if sock.write_all(b"M").await.is_err() {
                             return;
                         }
                     }
