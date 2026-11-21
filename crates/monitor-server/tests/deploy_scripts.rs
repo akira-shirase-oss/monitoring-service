@@ -87,6 +87,45 @@ fn the_migration_inspector_fails_closed() {
 }
 
 #[test]
+fn the_guards_run_on_staging_before_anything_moves() {
+    // G2: a release name is unique — a repeated --release-dir name computes
+    // the same destination, which the script must refuse while everything is
+    // still a staging dir; and the schema guard + migration inspector run on
+    // the STAGED binary, so a bad release is refused before anything under
+    // releases/ (let alone `current`) is touched.
+    let upgrade = read("upgrade.sh");
+    let refuse = upgrade
+        .find("\"$dest\" == \"$previous\"")
+        .expect("upgrade.sh must refuse a destination that already exists");
+    let publish = upgrade
+        .find("mv -T \"$staging\" \"$dest\"")
+        .expect("the staging dir becomes the release only after the guards");
+    // The -x sanity check also mentions the staged binary — what matters is
+    // that at least two references (guard + inspector) sit INSIDE the window
+    // between the duplicate-name refusal and the publish move.
+    let on_staging_inside: usize = upgrade
+        .match_indices("$staging/bin/monitor-server")
+        .map(|(pos, _)| pos)
+        .filter(|pos| refuse < *pos && *pos < publish)
+        .count();
+    assert!(
+        on_staging_inside >= 2,
+        "the schema guard and the inspector must run on $staging/bin/monitor-server \
+         AFTER refusing a duplicate name and BEFORE the staging dir is published"
+    );
+    // The staging name itself is unique per run — a repeated run must not
+    // collide with its own leftover.
+    assert!(
+        upgrade.contains(".staging-$VERSION-"),
+        "staging dirs carry a unique suffix, not the shared .staging-$VERSION"
+    );
+    assert!(
+        upgrade.contains("already exists"),
+        "the refusal must say why — a silent exit teaches nothing"
+    );
+}
+
+#[test]
 fn the_deploy_scripts_carry_their_promised_properties() {
     let install = read("install.sh");
     assert!(

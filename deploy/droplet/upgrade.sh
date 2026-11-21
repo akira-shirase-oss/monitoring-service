@@ -28,23 +28,25 @@ done
 guard=/usr/local/bin/smon-schema-guard
 [[ -x "$guard" ]] || guard="$(dirname "$0")/schema-guard.sh"
 
-# --- stage -------------------------------------------------------------
+# --- stage (unique name — a repeated run must never collide, G2) ---------
 staging=""
+cleanup_staging() { [[ -n "$staging" && -d "$staging" ]] && rm -rf "$staging"; return 0; }
+trap cleanup_staging EXIT
 if [[ -n "$RELEASE_DIR" ]]; then
   VERSION=${VERSION:-$(basename "$RELEASE_DIR")}
-  staging="$PREFIX/releases/.staging-$VERSION"
-  rm -rf "$staging"; mkdir -p "$staging"
+  staging="$PREFIX/releases/.staging-$VERSION-$$"
+  mkdir -p "$staging"
   cp -R "$RELEASE_DIR/bin" "$staging/"
   [[ -d "$RELEASE_DIR/dashboard" ]] && cp -R "$RELEASE_DIR/dashboard" "$staging/"
 elif [[ -n "$VERSION" && -n "$URL" && -n "$SHA" ]]; then
-  staging="$PREFIX/releases/.staging-$VERSION"
-  rm -rf "$staging"; mkdir -p "$staging"
+  staging="$PREFIX/releases/.staging-$VERSION-$$"
+  mkdir -p "$staging"
   pkg="$staging/package"; dl=$(mktemp)
   curl -fsSL --max-time 300 "$URL" -o "$dl"
   echo "$SHA  $dl" | sha256sum -c - >/dev/null
   mkdir -p "$pkg" && tar -xzf "$dl" -C "$pkg" && rm -f "$dl"
   inner=$(find "$pkg" -name monitor-server -type f | head -1)
-  [[ -n "$inner" ]] || { echo "error: no monitor-server in the package" >&2; rm -rf "$staging"; exit 1; }
+  [[ -n "$inner" ]] || { echo "error: no monitor-server in the package" >&2; exit 1; }
   root=$(dirname "$(dirname "$inner")")        # <root>/bin/monitor-server
   cp -R "$root/bin" "$staging/"
   [[ -d "$root/dashboard" ]] && cp -R "$root/dashboard" "$staging/"
@@ -52,19 +54,23 @@ elif [[ -n "$VERSION" && -n "$URL" && -n "$SHA" ]]; then
 else
   echo "usage: upgrade.sh --release-dir <dir> | --version <v> --url <tarball> --sha256 <hex>" >&2; exit 2
 fi
-[[ -x "$staging/bin/monitor-server" ]] || { echo "error: staged release has no monitor-server" >&2; rm -rf "$staging"; exit 1; }
+[[ -x "$staging/bin/monitor-server" ]] || { echo "error: staged release has no monitor-server" >&2; exit 1; }
 
 previous=$(readlink -f "$PREFIX/current" || true)
 dest="$PREFIX/releases/$VERSION"
-rm -rf "$dest" && mv -T "$staging" "$dest"
-echo "upgrade: staged $dest (binary: $("$dest/bin/monitor-server" --version))"
+# A release name is unique (G2): a repeated --release-dir name computes the
+# same destination — it must refuse while everything is still staging, never
+# overwrite the live release, and never swap out a checked-in release dir.
+if [[ "$dest" == "$previous" || -e "$dest" ]]; then
+  echo "error: $dest already exists — release names are unique (live release: $(basename "${previous:-none}"))" >&2
+  exit 1
+fi
 
-# --- schema guard BEFORE the switch -------------------------------------
+# --- guards run on the STAGING dir before anything under releases/ moves ---
 dbpath=$(sed -n 's/^SMON_DATABASE_URL=sqlite://p' "$PREFIX/env" | tail -n 1)
 dbpath=${dbpath:-$PREFIX/data/monitor.db}
-"$guard" "$dbpath" "$dest/bin/monitor-server"
+"$guard" "$dbpath" "$staging/bin/monitor-server"
 
-# --- applied-migration checksum inspection (read-only, before the switch) --
 # A database that ever ran a branch/experiment build may hold _sqlx_migrations
 # rows whose bytes differ from this release's migrations — sqlx would refuse to
 # boot AFTER the switch. The candidate binary carries its own compiled-in
@@ -73,7 +79,11 @@ dbpath=${dbpath:-$PREFIX/data/monitor.db}
 # answer aborts the upgrade; the check never repairs — that is a human call.
 inspector=/usr/local/bin/smon-inspect-migrations
 [[ -x "$inspector" ]] || inspector="$(dirname "$0")/inspect-migrations.sh"
-"$inspector" "$dbpath" "$dest/bin/monitor-server"
+"$inspector" "$dbpath" "$staging/bin/monitor-server"
+
+# Both guards passed — only now does the validated staging dir become a release.
+mv -T "$staging" "$dest"
+echo "upgrade: staged $dest (binary: $("$dest/bin/monitor-server" --version))"
 
 # --- atomic switch + restart + prove -------------------------------------
 switch() { ln -sfn "$1" "$PREFIX/current.new" && mv -T "$PREFIX/current.new" "$PREFIX/current"; }

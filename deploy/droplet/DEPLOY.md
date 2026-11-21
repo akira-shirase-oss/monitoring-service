@@ -217,11 +217,19 @@ $CHECKOUT/deploy/droplet/upgrade.sh --release-dir /opt/release-candidate
 $CHECKOUT/deploy/droplet/upgrade.sh --version <v> --url <tarball> --sha256 <hex>
 ```
 
-Stages the release, verifies the download's SHA-256, runs `schema-guard.sh` **before**
-anything switches, repoints `current` with an atomic rename, restarts, polls readiness,
+Stages under a unique name, verifies the download's SHA-256, runs `schema-guard.sh`
+and the migration inspector **on the staged copy before anything under `releases/`
+moves**, repoints `current` with an atomic rename, restarts, polls readiness,
 runs the local smoke — and **rolls back automatically** on any post-switch failure. Keeps
 the newest 3 release dirs. Serving gap < 5 s (Caddy holds requests); check slots inside the
 restart are committed `missed` on boot — that's the monitor accounting for its own gap.
+
+**Release names are unique.** The release's name comes from `--release-dir`'s basename
+(or `--version`), and an upgrade refuses while still staging if that name already exists
+under `/opt/smon/releases/` — a repeated `--release-dir /opt/release-candidate` computes
+the same destination, and overwriting the live release before the guards ran is exactly
+the failure the rule exists for. Give every candidate its own directory
+(`/opt/release-candidate-<build>` or `--version`) and re-runs are safe by construction.
 
 **Migration checksum before switching (read-only).** If the database ever ran a
 branch/experiment build — anything other than a main-line release — a migration

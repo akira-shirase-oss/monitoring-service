@@ -98,18 +98,43 @@ jobs:
           # BEFORE the atomic switch and leave `current` exactly where it was.
           v=$(sudo sqlite3 -batch -readonly "$db" "SELECT min(version) FROM _sqlx_migrations;")
           sudo sqlite3 "$db" "UPDATE _sqlx_migrations SET checksum = randomblob(48) WHERE version = $v;"
-          if sudo deploy/droplet/upgrade.sh --release-dir "$work/release2"; then
+          pid_before=$(systemctl show monitor-server -p MainPID --value)
+          if sudo deploy/droplet/upgrade.sh --release-dir "$work/release2" > "$work/refused.log" 2>&1; then
             echo "upgrade.sh switched releases on a divergent _sqlx_migrations" >&2
             exit 1
           fi
+          # G4: the refusal must come from the migration inspector itself —
+          # the same exit code a later boot-refusal would give proves nothing —
+          # and the running process must be the one that was there before.
+          grep -q "diverges" "$work/refused.log" || {
+            echo "the refusal did not come from the migration inspector" >&2
+            cat "$work/refused.log"; exit 1; }
+          [[ "$(systemctl show monitor-server -p MainPID --value)" == "$pid_before" ]] || {
+            echo "the service restarted on a refused upgrade" >&2; exit 1; }
           [[ "$(readlink -f /opt/smon/current)" == "$before" ]] || {
             echo "upgrade.sh moved \`current\` despite refusing" >&2; exit 1; }
           # Restore and prove the clean path completes the switch + restart.
-          want=$(sudo /opt/smon/releases/release2/bin/monitor-server --migration-manifest \
+          want=$("$work/release2/bin/monitor-server" --migration-manifest \
             | awk -F'|' -v v="$v" '$1 == v { print $2; exit }')
           sudo sqlite3 "$db" "UPDATE _sqlx_migrations SET checksum = x'$want' WHERE version = $v;"
           sudo deploy/droplet/upgrade.sh --release-dir "$work/release2"
           [[ "$(readlink -f /opt/smon/current)" != "$before" ]]
+          curl -fsS --max-time 10 http://127.0.0.1:58400/livez
+          # G2: the same --release-dir name again computes the same destination,
+          # which is now the live release — it must refuse before touching
+          # releases/, never swap the live dir out from under the service.
+          pid_before=$(systemctl show monitor-server -p MainPID --value)
+          if sudo deploy/droplet/upgrade.sh --release-dir "$work/release2" > "$work/refused2.log" 2>&1; then
+            echo "upgrade.sh re-ran a release name that is already live" >&2
+            exit 1
+          fi
+          grep -q "already exists" "$work/refused2.log" || {
+            echo "the repeated-name refusal did not come from the unique-name guard" >&2
+            cat "$work/refused2.log"; exit 1; }
+          [[ "$(systemctl show monitor-server -p MainPID --value)" == "$pid_before" ]] || {
+            echo "the service restarted on a repeated-name refusal" >&2; exit 1; }
+          [[ "$(readlink -f /opt/smon/current)" == "$(readlink -f /opt/smon/releases/release2)" ]] || {
+            echo "the repeated-name refusal moved \`current\`" >&2; exit 1; }
           curl -fsS --max-time 10 http://127.0.0.1:58400/livez
       - name: Keep the evidence
         run: |
