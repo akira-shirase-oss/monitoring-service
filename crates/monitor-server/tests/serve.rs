@@ -310,6 +310,79 @@ async fn a_slow_header_and_an_idle_keep_alive_are_closed_and_the_cap_holds() -> 
     Ok(())
 }
 
+/// The header-read deadline doubles as the keep-alive idle bound (hyper's one
+/// knob): at it the server closes the connection WITHOUT a response. That is the
+/// close contract every upstream must be sized under — the deploy edge keeps its
+/// upstream keepalive below this bound for exactly this reason. What must hold:
+/// the close lands as a clean FIN before any bytes of a reusing request, never
+/// as a reset mid-request — a truncated answer would be the worst outcome, and a
+/// client reading the FIN knows to reconnect.
+#[tokio::test]
+async fn an_idle_keep_alive_closes_cleanly_before_any_reuse_bytes() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let limits = Limits {
+        header_read_timeout: Duration::from_millis(400),
+        ..Limits::default()
+    };
+    let (addr, _stop) = serving(limits).await?;
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+    stream
+        .write_all(b"GET /livez HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await?;
+    // The first request is answered whole — headers and body, nothing truncated.
+    let mut first = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !String::from_utf8_lossy(&first).contains("alive") {
+            let mut buf = [0_u8; 512];
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => first.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await?;
+    let first = String::from_utf8_lossy(&first);
+    assert!(
+        first.starts_with("HTTP/1.1 200") && first.contains("alive"),
+        "{first}"
+    );
+
+    // Idle past the bound: the next thing the peer can observe is a clean EOF —
+    // the server's FIN arriving before any bytes of a reuse request.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let mut buf = [0_u8; 512];
+    match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        other => panic!("the idle close must be a clean EOF, not {other:?}"),
+    }
+
+    // The reuse race this bounds: bytes written after the FIN are never served —
+    // the connection answers nothing or errors, never a truncated response.
+    let _ = stream
+        .write_all(b"GET /livez HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await;
+    match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
+        Ok(Ok(0) | Err(_)) | Err(_) => {}
+        Ok(Ok(n)) => panic!(
+            "a reuse past the bound must never get response bytes: {:?}",
+            &buf[..n]
+        ),
+    }
+
+    // And the listener itself is unaffected — a fresh connection is served whole.
+    let (received, _) = closed_within(
+        addr,
+        b"GET /livez HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(2),
+    )
+    .await?;
+    assert!(
+        received.starts_with("HTTP/1.1 200") && received.contains("alive"),
+        "{received}"
+    );
+    Ok(())
+}
+
 /// W1: a response write had no deadline. Clients that pipeline requests and never read
 /// kept their connections — and every slot under the cap — for as long as they liked, so
 /// nobody else was served. A write that makes no progress for `write_stall` now closes the

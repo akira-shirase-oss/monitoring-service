@@ -2,6 +2,29 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-023 — Any client keep-alive lives strictly below the server's header-read bound
+
+`Limits::header_read_timeout` (10 s) is hyper's one knob and bounds two waits: the
+time a request's headers may take AND the idle wait between requests on a
+kept-alive connection. At the deadline hyper closes the connection with no
+response — a clean FIN, but silent. A client or proxy whose own idle timeout is
+longer will reuse a connection the server is about to close: Go/k6 reads
+`readLoopPeekFailLocked` (`status 0`), and Caddy answers a non-idempotent request
+with a 502 — a transport failure indistinguishable from a real outage, counted by
+the load gate and served to a real caller.
+
+The rule: the peer side expires first. Every upstream that holds connections to
+smon keeps its idle bound strictly below 10 s, or never reuses at all — the server
+bound stays a property of `Limits`, not of any client. In the deploy edge the
+`transport http { keepalive 5s }` block expires Caddy's idle upstreams at half the
+bound (the default 2 m would race every time). k6 cannot express an idle-timeout
+below it (grafana/k6#3466 is still open), so the load scenarios set
+`noConnectionReuse: true` — a fresh connection per request, which never races and
+exercises the accept path anyway. `tests/serve.rs` pins the server's side of the
+contract: idled past the bound, the connection ends in a clean close before any
+bytes of a reuse — never a reset mid-request — and a fresh connection is served
+whole.
+
 ## D-022 — Plan tiers live on the workspace row; limits enforce at write time
 
 `workspaces.plan` is the closed set `free`/`operator` (migration 0015). Signup mints

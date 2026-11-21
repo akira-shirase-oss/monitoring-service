@@ -29,6 +29,12 @@ export const options = {
 	scenarios: {
 		reads: { executor: 'shared-iterations', vus: VUS, iterations: REQUESTS, maxDuration: '60m' },
 	},
+	// smon's header-read deadline doubles as its keep-alive idle bound and closes the
+	// connection silently at it; k6 has no idle-connection timeout under it
+	// (grafana/k6#3466), so a reused connection could race the close and read status 0
+	// — a transport failure the gate would count. A fresh connection per request
+	// never races, and exercises the accept path too.
+	noConnectionReuse: true,
 	discardResponseBodies: true,
 	summaryTrendStats: ['min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max', 'avg'],
 	// The gate: every request answered its honest status — 200s for the beats, the

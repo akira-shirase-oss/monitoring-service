@@ -173,6 +173,50 @@ fn the_edge_and_unit_files_carry_their_promised_properties() {
         assert!(caddyfile.contains(pin), "Caddyfile is missing '{pin}'");
     }
 
+    // hyper's header-read deadline doubles as the keep-alive idle bound, and on it
+    // the server closes the connection without a response. An upstream keepalive
+    // longer than the bound reuses a connection the server is closing — the reuse
+    // races the close and a non-idempotent request comes back a 502. The proxy's
+    // transport must expire its idle upstreams strictly below the server's bound.
+    let proxy = caddyfile
+        .find("reverse_proxy")
+        .expect("Caddyfile must proxy to the server");
+    let transport = caddyfile[proxy..]
+        .find("transport http")
+        .expect("reverse_proxy must set an http transport with a bounded keepalive");
+    let transport_end = caddyfile[proxy + transport..]
+        .find('}')
+        .expect("the transport block must close");
+    let block = &caddyfile[proxy + transport..proxy + transport + transport_end];
+    let keepalive = block
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("keepalive "))
+        .expect("the http transport must set `keepalive` below the server's bound")
+        .trim()
+        .trim_end_matches(';');
+    let (num, unit) = keepalive.split_at(
+        keepalive
+            .find(|c: char| c.is_ascii_alphabetic())
+            .unwrap_or(keepalive.len()),
+    );
+    let seconds = num.trim().parse::<f64>().expect("a keepalive duration")
+        * match unit.trim() {
+            "ms" => 0.001,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            other => panic!("unhandled keepalive unit {other:?}"),
+        };
+    assert!(
+        seconds
+            < monitor_server::serve::Limits::default()
+                .header_read_timeout
+                .as_secs_f64(),
+        "the upstream keepalive ({seconds}s) must sit below the server's idle bound \
+         — a reused connection would race the close"
+    );
+
     // The unit check's systemd-analyze half must run against a staged --root:
     // bare `verify` judges the host's filesystem — on a CI runner without an
     // install, /opt/smon paths are absent and the check fails on host state

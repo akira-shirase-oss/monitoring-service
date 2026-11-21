@@ -8,7 +8,9 @@
 //! anonymous client reaches before any request exists:
 //! - **header-read timeout** ([`Limits::header_read_timeout`]): a request whose header has
 //!   not arrived in full by then is closed. hyper arms the same deadline while a keep-alive
-//!   connection waits for its next request, so it is the **idle timeout** too;
+//!   connection waits for its next request, so it is the **idle timeout** too — and the
+//!   close sends no response, which is why any client/proxy keep-alive must sit below it
+//!   (D-023): a reuse that races the close is answered with nothing;
 //! - **connection cap** ([`Limits::max_connections`], `SMON_MAX_CONNECTIONS`): a permit is
 //!   taken *before* `accept`, so past the cap new connections wait in the kernel's backlog
 //!   instead of taking file descriptors from probes, SQLite and the snapshot;
@@ -41,7 +43,9 @@ pub enum Stopped {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// A request's header must arrive in full within this; an idle keep-alive connection is
-    /// closed after it too.
+    /// closed after it too (hyper's one knob serves both reads). The close lands without a
+    /// response, so every upstream that keeps connections — the deploy edge, a load client —
+    /// must expire its idle side BELOW this bound or its reuse races the close (D-023).
     pub header_read_timeout: Duration,
     /// Connections served at once. Keep it well below the process's file-descriptor limit
     /// (the unit's `LimitNOFILE=4096`): probes, SQLite and the snapshot need theirs.
