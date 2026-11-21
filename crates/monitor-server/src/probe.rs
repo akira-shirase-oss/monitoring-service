@@ -869,7 +869,10 @@ impl ProbeClient {
                 (None, _) => false,
             };
         let (outcome, detail) = if expect.accepts(u16_status) && missed {
-            (CheckOutcome::HttpFail { status: u16_status }, Some("assert_body"))
+            (
+                CheckOutcome::HttpFail { status: u16_status },
+                Some("assert_body"),
+            )
         } else if expect.accepts(u16_status) {
             (CheckOutcome::Pass, None)
         } else {

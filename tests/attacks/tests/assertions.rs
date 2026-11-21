@@ -9,7 +9,7 @@ mod common;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use common::{authed, client, spawn, spawn_lab};
+use common::{client, spawn, spawn_lab};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,7 +70,7 @@ async fn account(instance: &common::Instance, email: &str) -> anyhow::Result<Str
         .to_owned();
     let lift = http
         .patch(format!("{}/api/workspaces/{id}/plan", instance.base))
-        .bearer_auth(&instance.token)
+        .bearer_auth(instance.token)
         .json(&json!({"plan": "operator"}))
         .send()
         .await?;
@@ -95,7 +95,10 @@ async fn read_head(sock: &mut tokio::net::TcpStream) -> String {
 
 /// Serve `body` with a 200 and a content-length forever — one task per
 /// connection, so a probe chain gets an answer on every hop it owns.
-#[expect(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "attack fixture: a listener that cannot bind is a failed test"
+)]
 fn serve_body(body: &'static [u8]) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture bind");
     let addr = listener.local_addr().expect("fixture addr");
@@ -120,7 +123,10 @@ fn serve_body(body: &'static [u8]) -> SocketAddr {
 /// The `HEAD` redirect probe: `/go` 303s to `/land`; `/land` answers 200 only to
 /// `HEAD` — any other method gets 501. A `HEAD` rewritten to `GET` lands as a
 /// failure, which is exactly what the honest answer must NOT be.
-#[expect(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "attack fixture: a listener that cannot bind is a failed test"
+)]
 fn serve_redirect(methods: Arc<Mutex<Vec<String>>>) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture bind");
     let addr = listener.local_addr().expect("fixture addr");
@@ -152,7 +158,10 @@ fn serve_redirect(methods: Arc<Mutex<Vec<String>>>) -> SocketAddr {
 }
 
 /// A body that never finishes: headers then one chunked byte a beat, forever.
-#[expect(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "attack fixture: a listener that cannot bind is a failed test"
+)]
 fn serve_dribble() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture bind");
     let addr = listener.local_addr().expect("fixture addr");
