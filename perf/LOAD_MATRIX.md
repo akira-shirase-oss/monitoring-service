@@ -93,3 +93,10 @@ maintainer decision, not a harness change.
 Caveats: runs are development observations on this machine — never public capacity claims.
 `sysctl`/`ps` are denied in the run environment, so `loadavg_*`/`rss_kb` fields are null.
 The 24 h soak + ≥1M-check run remain droplet work, not local.
+
+Probe-client note: the probe `reqwest::Client` builds with
+`pool_max_idle_per_host(0)` — deliberate (a probe is a fresh visitor; reuse
+would hide a target's accept/first-byte cost), so every probe pays a full
+connect (and TLS handshake where `https`) inside its 5 s deadline. Probe
+latency in any baseline therefore includes the handshake; per-request latency
+targets for the API itself are unaffected.

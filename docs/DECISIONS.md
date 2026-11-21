@@ -428,3 +428,24 @@ maintainer confirms it is gone. Consequences:
   claimed — say "rebuilt contract" instead.
 - If the old repository resurfaces, archive it under `references/` unchanged and port its
   fixtures before touching internals.
+
+## D-024 — The per-address probe budget is a global ceiling with a per-workspace share
+
+Every probe start pays one resolved IP's token bucket — 8/s shared across all
+workspaces (the ceiling the write-time `addr:port` bound assumes), under a 2/s
+per-workspace share so the heaviest spender stops at its own rate and can never
+starve a neighbour whose monitors happen to sit on the same CDN address. The
+charge lives inside the SSRF validating resolver on the addresses actually
+offered to the dialer (the first paying candidate per family — a candidate that
+would only ever sit behind it in the dial list doesn't pay), and beside it for
+the paths that never touch DNS: an IP-literal URL pays its own literal, and the
+redirect closure pays each hop's literal host before following it, refusing the
+hop as `address_budget`. IPv4-mapped IPv6 spellings normalize to the IPv4 key —
+`::ffff:8.8.8.8` and `8.8.8.8` share one bucket. The bucket map is bounded
+(8192 entries); when it fills it evicts only buckets that have fully refilled,
+and when none qualify it refuses the *new* address as a counted miss — it never
+clears, so a spent bucket stays spent under churn. A refusal commits `missed` +
+`address_budget`: a coverage gap that reports `unknown` but is neutral on the
+monitor's failure/recovery streaks — the evidence the outage needs can't be
+erased by the monitor's own bound, and a starved tenant's alert can't be
+silenced by another tenant's load.

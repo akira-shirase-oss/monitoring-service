@@ -70,6 +70,7 @@ fn every_slot_outcome_is_in_the_guide() {
     // is whatever commit actually writes.
     for slot in [
         SlotObservation::Missed,
+        SlotObservation::Budgeted,
         SlotObservation::Probe(CheckOutcome::Pass),
         SlotObservation::Probe(CheckOutcome::HttpFail { status: 500 }),
         SlotObservation::Probe(CheckOutcome::Transport),

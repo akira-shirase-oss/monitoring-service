@@ -531,6 +531,13 @@ impl CheckOutcome {
 pub enum SlotObservation {
     Probe(CheckOutcome),
     Missed,
+    /// The slot never ran because the monitor's own bound refused the start —
+    /// the shared per-address probe budget was spent (B re-review). A coverage
+    /// gap like `Missed` — no evidence either way, the display goes back to
+    /// `unknown` — but **neutral on the streaks**: a shared address starved by
+    /// a neighbour must not launder a real outage's failure streak into
+    /// silence. It commits as `missed` + `address_budget` like any refusal.
+    Budgeted,
 }
 
 /// The displayed status of a monitor (D-005, provisional).
@@ -565,8 +572,10 @@ pub type Statuses = std::collections::HashMap<MonitorId, Status>;
 /// The per-monitor incident state machine: streaks plus whether an incident is open.
 ///
 /// Recovery passes count only while an incident is open — passes before it mean nothing — and a
-/// missed slot clears *both* streaks: a gap in coverage is not evidence in either direction.
-/// What a missed slot does **not** clear is the open incident itself.
+/// missed slot clears *both* streaks: a gap in coverage is not evidence in either direction —
+/// except a `Budgeted` one, which clears neither streak: our own bound's refusal must not
+/// launder a real outage's count away. What a missed slot does **not** clear is the open
+/// incident itself.
 #[derive(Debug, Clone, Default)]
 pub struct Health {
     consecutive_failures: u8,
@@ -636,6 +645,14 @@ impl Health {
                 // incident is open. The incident itself is untouched — only new evidence closes it.
                 self.consecutive_failures = 0;
                 self.recovery_passes = 0;
+                self.fresh = false;
+                Effect::Unchanged
+            }
+            SlotObservation::Budgeted => {
+                // Same coverage gap — still no evidence, display `unknown` —
+                // but OUR bound's refusal is neutral on the streaks: it is not
+                // the target's doing and must not launder a real outage's
+                // failure count away (B re-review).
                 self.fresh = false;
                 Effect::Unchanged
             }
@@ -803,6 +820,26 @@ mod tests {
             Effect::Unchanged
         );
         assert!(!health.incident_open());
+    }
+
+    /// B re-review: our own bound's refusal is a coverage gap — `unknown`, no
+    /// evidence — but never a streak reset: a starved monitor's real failures
+    /// still add up across the gap.
+    #[test]
+    fn a_budget_refusal_gap_is_neutral_on_the_streak() {
+        let mut health = Health::new();
+        for _ in 0..2 {
+            health.rec(SlotObservation::Probe(CheckOutcome::HttpFail {
+                status: 500,
+            }));
+        }
+        health.rec(SlotObservation::Budgeted);
+        // The third failure still opens — the gap laundered nothing away.
+        assert_eq!(
+            health.rec(SlotObservation::Probe(CheckOutcome::Transport)),
+            Effect::IncidentOpened
+        );
+        assert!(health.incident_open());
     }
 
     #[test]

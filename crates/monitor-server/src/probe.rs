@@ -12,7 +12,7 @@ use reqwest::redirect;
 use tokio::time::Instant;
 use url::{Host, Url};
 
-use monitor_domain::CheckOutcome;
+use monitor_domain::{CheckOutcome, WorkspaceId};
 
 /// Redirects followed per hop, each revalidated — a hop limit, never a free pass.
 const MAX_REDIRECT_HOPS: usize = 5;
@@ -72,19 +72,59 @@ impl std::fmt::Display for AddressBusy {
 
 impl std::error::Error for AddressBusy {}
 
+// The workspace whose schedule is paying for the in-flight probe, carried as a
+// task-local so the charge can reach the places that know the address but not
+// the tenant — the resolver (called deep inside reqwest's connect) and the
+// redirect closure. Unattributed calls still pay the global per-address bound.
+tokio::task_local! {
+    pub(crate) static PROBE_WORKSPACE: WorkspaceId;
+}
+
+/// Whose schedule is paying, when the call site can't pass it: `None` outside a
+/// probe dispatch (webhook sends, bare resolves) — those pay only the global
+/// per-address bound.
+fn workspace() -> Option<WorkspaceId> {
+    PROBE_WORKSPACE.try_with(|w| *w).ok()
+}
+
+/// The address a URL literal means — the bucket key, normalised like
+/// `origin.rs`'s `address_key` so `::ffff:V` spends `V`'s share, not a twin.
+fn literal_ip(url: &Url) -> Option<IpAddr> {
+    match url.host()? {
+        Host::Ipv4(v4) => Some(IpAddr::V4(v4)),
+        Host::Ipv6(v6) => Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4)),
+        Host::Domain(_) => None,
+    }
+}
+
 /// Token bucket per resolved address — the cross-tenant bound on probe starts
 /// at one IP (N1 re-review). The per-workspace (origin, host) share keeps
 /// fairness between sites, but it cannot bound what many names or many tenants
 /// aim at one address: this cap rides the address the validating resolver
 /// actually hands to the dialer — every tenant, every redirect hop. Ports are
 /// invisible to DNS, so the bucket's key is the address alone.
+///
+/// Under the global ceiling each workspace has its own share at the address
+/// (B re-review): the heaviest spender stops at its own 2 starts a second
+/// while a neighbour's share — and the global room left — is untouched.
 #[derive(Debug)]
 pub struct AddressBudget {
     /// Burst size — the most starts one address may pay at once.
     burst: f64,
     /// Sustained refill — tokens per second.
     rate: f64,
-    buckets: std::sync::Mutex<HashMap<IpAddr, Bucket>>,
+    /// The per-workspace sub-bucket's burst and refill at one address — the
+    /// same share the write-time per-address cap sells a workspace.
+    share_burst: f64,
+    share_rate: f64,
+    buckets: std::sync::Mutex<HashMap<IpAddr, IpBucket>>,
+}
+
+/// One address's buckets: the global ceiling plus each workspace's share of it.
+#[derive(Debug)]
+struct IpBucket {
+    global: Bucket,
+    shares: HashMap<WorkspaceId, Bucket>,
 }
 
 #[derive(Debug)]
@@ -96,53 +136,104 @@ struct Bucket {
 /// Addresses remembered at once — a wildcard-DNS spray must not grow it unbounded.
 const MAX_BUCKETS: usize = 8192;
 
+fn refill(bucket: &mut Bucket, burst: f64, rate: f64, now: tokio::time::Instant) {
+    bucket.tokens = (bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate).min(burst);
+    bucket.at = now;
+}
+
 impl AddressBudget {
-    /// `burst` paid starts at once, refilling to `burst` over `per`.
+    /// `burst` paid starts at once, refilling to `burst` over `per`; the
+    /// per-workspace share equals the global bound (unattributed behaviour).
     pub fn new(burst: u32, per: Duration) -> Self {
+        Self::with_share(burst, per, burst, per)
+    }
+
+    /// A global `burst`/`per` ceiling per address, and under it each
+    /// workspace's own `share_burst`/`share_per` share at that address.
+    pub fn with_share(burst: u32, per: Duration, share_burst: u32, share_per: Duration) -> Self {
         Self {
             burst: f64::from(burst),
             rate: f64::from(burst) / per.as_secs_f64().max(f64::EPSILON),
+            share_burst: f64::from(share_burst),
+            share_rate: f64::from(share_burst) / share_per.as_secs_f64().max(f64::EPSILON),
             buckets: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Charge one probe start at `ip`: false while its window is spent. `Instant`
-    /// is tokio's clock — under paused time the refill is a test-clock fact.
-    pub fn take(&self, ip: IpAddr) -> bool {
+    /// Charge one probe start at `ip` on behalf of `workspace`: false while
+    /// either bound — the address's global ceiling, or the workspace's own
+    /// share at it — is spent. `Instant` is tokio's clock: under paused time
+    /// the refill is a test-clock fact.
+    pub fn take(&self, ip: IpAddr, workspace: Option<WorkspaceId>) -> bool {
+        // E re-review: the mapped spelling is the same address (`address_key`).
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 @ IpAddr::V4(_) => v4,
+        };
         let now = tokio::time::Instant::now();
         let mut buckets = self
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !buckets.contains_key(&ip) && buckets.len() >= MAX_BUCKETS {
-            buckets.retain(|_, b| now.duration_since(b.at) < Duration::from_secs(3600));
+            // Fail closed (C re-review): evict only buckets that are whole
+            // again — the global token recovered AND every workspace share in
+            // it recovered — so a still-spent bucket (a victim's, or a
+            // spender's share) is never laundered back to full by churn.
+            buckets.retain(|_, b| {
+                !(now.duration_since(b.global.at).as_secs_f64() * self.rate >= self.burst
+                    && b.shares.values().all(|s| {
+                        now.duration_since(s.at).as_secs_f64() * self.share_rate >= self.share_burst
+                    }))
+            });
             if buckets.len() >= MAX_BUCKETS {
-                buckets.clear();
+                return false;
             }
         }
-        let bucket = buckets.entry(ip).or_insert(Bucket {
-            tokens: self.burst,
-            at: now,
+        let bucket = buckets.entry(ip).or_insert_with(|| IpBucket {
+            global: Bucket {
+                tokens: self.burst,
+                at: now,
+            },
+            shares: HashMap::new(),
         });
-        bucket.tokens = (bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * self.rate)
-            .min(self.burst);
-        bucket.at = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
+        refill(&mut bucket.global, self.burst, self.rate, now);
+        if let Some(workspace) = workspace {
+            let share = bucket.shares.entry(workspace).or_insert(Bucket {
+                tokens: self.share_burst,
+                at: now,
+            });
+            refill(share, self.share_burst, self.share_rate, now);
+            if bucket.global.tokens >= 1.0 && share.tokens >= 1.0 {
+                bucket.global.tokens -= 1.0;
+                share.tokens -= 1.0;
+                return true;
+            }
+            return false;
         }
+        if bucket.global.tokens >= 1.0 {
+            bucket.global.tokens -= 1.0;
+            return true;
+        }
+        false
     }
 }
 
-/// The budget every probe shares (N1 re-review): the write-time cap already
-/// gives one workspace 2 starts a second on an address; 8 starts a second
-/// across ALL tenants leaves headroom for a few workspaces sharing an IP
-/// legitimately while keeping a wildcard-DNS spray an order under the engine's
-/// 512-slot ceiling.
-static PER_ADDRESS: std::sync::LazyLock<Arc<AddressBudget>> =
-    std::sync::LazyLock::new(|| Arc::new(AddressBudget::new(8, Duration::from_secs(1))));
+/// The budget every probe this client makes shares (N1/B re-review): the
+/// global per-address ceiling is 8 starts a second across ALL tenants and each
+/// workspace's share of one address is the same 2 starts a second the
+/// write-time per-address cap sells it — a spray can never take more than its
+/// share, and the ceiling keeps a wildcard-DNS spray an order under the
+/// engine's 512-slot bound. A fresh budget per client: the bound is a
+/// property of the dialer, not of process state (and tests stay isolated).
+fn probe_budget() -> Arc<AddressBudget> {
+    Arc::new(AddressBudget::with_share(
+        8,
+        Duration::from_secs(1),
+        2,
+        Duration::from_secs(1),
+    ))
+}
 
 /// Test-only DNS answers, keyed by name — see `PolicyResolver::for_test`.
 #[cfg(test)]
@@ -186,10 +277,10 @@ impl PolicyResolver {
 
     /// The resolver the probe client dials through: the strict gate plus the
     /// shared per-address starts budget (N1 re-review).
-    fn for_probes(allow_local_targets: bool) -> Self {
+    fn for_probes(allow_local_targets: bool, budget: Arc<AddressBudget>) -> Self {
         Self {
             allow_local_targets,
-            budget: Some(PER_ADDRESS.clone()),
+            budget: Some(budget),
             #[cfg(test)]
             overrides: None,
         }
@@ -248,15 +339,31 @@ impl Resolve for PolicyResolver {
                 None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
             };
             validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
-            // The per-address bound pays where the truth is (N1 re-review): every
-            // candidate in the answer pays for the start it may take — happy
-            // eyeballs may dial several, and a redirect hop re-enters here on the
-            // address it lands on. A name whose whole answer is spent gets no dial.
-            let paid: Vec<SocketAddr> = addrs
-                .into_iter()
-                .filter(|addr| budget.as_ref().is_none_or(|b| b.take(addr.ip())))
-                .collect();
-            if paid.is_empty() {
+            let Some(budget) = &budget else {
+                return Ok(Box::new(addrs.into_iter()) as Addrs);
+            };
+            // The bound pays only what the dialer can take (B re-review): the
+            // first paying candidate per address family — offering the rest
+            // would charge addresses that are never dialed, so a sprayed
+            // answer could tax two hundred buckets for one connect. A
+            // redirect hop re-enters here on the address it lands on, and a
+            // name whose whole answer is spent gets no dial.
+            let mut v4 = None;
+            let mut v6 = None;
+            let mut any_refused = false;
+            for addr in addrs {
+                let slot = if addr.is_ipv4() { &mut v4 } else { &mut v6 };
+                if slot.is_some() {
+                    continue;
+                }
+                if budget.take(addr.ip(), workspace()) {
+                    *slot = Some(addr);
+                } else {
+                    any_refused = true;
+                }
+            }
+            let paid: Vec<SocketAddr> = [v4, v6].into_iter().flatten().collect();
+            if paid.is_empty() && any_refused {
                 return Err(Box::new(AddressBusy) as Box<dyn std::error::Error + Send + Sync>);
             }
             Ok(Box::new(paid.into_iter()) as Addrs)
@@ -429,13 +536,17 @@ pub struct ProbeResult {
 pub struct ProbeClient {
     client: reqwest::Client,
     policy: ProbePolicy,
+    /// The shared per-address starts budget this client's probes pay — `None`
+    /// only where a resolver was built without one (the webhook deliverer, the
+    /// pin fixture).
+    budget: Option<Arc<AddressBudget>>,
     /// Response bodies are read at most this far — evidence is the status, not the page.
     max_body: usize,
 }
 
 impl ProbeClient {
     pub fn new(policy: ProbePolicy, max_body: usize) -> Result<Self, reqwest::Error> {
-        let resolver = PolicyResolver::for_probes(policy.allow_local_targets);
+        let resolver = PolicyResolver::for_probes(policy.allow_local_targets, probe_budget());
         Self::build(policy, max_body, &[], resolver)
     }
 
@@ -487,6 +598,8 @@ impl ProbeClient {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let redirect_policy = policy.clone();
+        let budget = resolver.budget.clone();
+        let hop_budget = budget.clone();
         // No proxy, ever: a proxied request is resolved by the proxy, so the DNS-layer
         // guard below would never see the name (HTTP_PROXY would turn
         // `http://metadata.internal…` into whatever the proxy answers). Probes go direct.
@@ -497,7 +610,8 @@ impl ProbeClient {
         let client = builder
             // No connection reuse between probes (N1 re-review): a pooled dial
             // never reaches the resolver, so it would never pay the address's
-            // starts budget. Every probe resolves — and pays — its target.
+            // starts budget. Every probe resolves — and pays — its target, and
+            // literal targets pay where the literal is still visible (below).
             .pool_max_idle_per_host(0)
             .tls_backend_preconfigured(tls)
             .redirect(redirect::Policy::custom(move |attempt| {
@@ -506,6 +620,18 @@ impl ProbeClient {
                 } else if redirect_policy.check(attempt.url()).is_err() {
                     // A hop the policy refuses is evidence, not a path: keep the 3xx.
                     attempt.stop()
+                } else if let (Some(budget), Some(ip)) =
+                    (hop_budget.as_deref(), literal_ip(attempt.url()))
+                {
+                    // A literal hop never reaches the resolver — hyper parses
+                    // the socket itself — so it pays its start here, where the
+                    // address is still visible (A re-review). The refusal rides
+                    // the same AddressBusy the resolver's does.
+                    if budget.take(ip, workspace()) {
+                        attempt.follow()
+                    } else {
+                        attempt.error(AddressBusy)
+                    }
                 } else {
                     attempt.follow()
                 }
@@ -516,6 +642,7 @@ impl ProbeClient {
         Ok(Self {
             client,
             policy,
+            budget,
             max_body,
         })
     }
@@ -526,6 +653,15 @@ impl ProbeClient {
         let attempt = async {
             if let Err(rejected) = self.policy.check(url) {
                 return Attempt::Rejected(rejected);
+            }
+            // An IP literal never reaches the resolver — hyper parses the
+            // socket itself (A re-review) — so its start pays where the address
+            // is still known: here, once per probe. A named target pays inside
+            // `resolve` instead, on the addresses actually dialed.
+            if let (Some(budget), Some(ip)) = (self.budget.as_deref(), literal_ip(url))
+                && !budget.take(ip, workspace())
+            {
+                return Attempt::Budgeted;
             }
             match self.client.get(url.clone()).send().await {
                 Err(error) => Attempt::Failed(error),
@@ -569,6 +705,15 @@ impl ProbeClient {
                 latency: start.elapsed(),
                 detail: Some(rejected_detail(rejected)),
                 limited: false,
+            },
+            // A literal's own bound refused the start — the same counted
+            // coverage gap the resolver's refusal commits.
+            Ok(Attempt::Budgeted) => ProbeResult {
+                outcome: CheckOutcome::Transport,
+                http_status: None,
+                latency: start.elapsed(),
+                detail: Some("address_budget"),
+                limited: true,
             },
             // Our own bound's refusal is not evidence about the target: the
             // resolver's per-address budget spent means the slot is a `missed`,
@@ -616,6 +761,9 @@ impl ProbeClient {
 
 enum Attempt {
     Rejected(Rejected),
+    /// The literal's own per-address bound refused the start (A re-review) —
+    /// a reqwest error cannot be built by hand, so this carries the refusal.
+    Budgeted,
     Failed(reqwest::Error),
     Answered(reqwest::StatusCode),
 }
@@ -953,7 +1101,7 @@ mod tests {
         );
         let budget = Arc::new(AddressBudget::new(1, Duration::from_secs(3600)));
         // 8.8.8.8 is already spent by an earlier resolution.
-        assert!(budget.take("8.8.8.8".parse().expect("ip")));
+        assert!(budget.take("8.8.8.8".parse().expect("ip"), None));
         let resolver = PolicyResolver::for_test_budgeted(false, map, budget);
         let addrs = resolver
             .resolve(Name::from_str("two.test").expect("name"))
@@ -973,10 +1121,279 @@ mod tests {
     async fn the_address_budget_refills_at_its_rate() {
         let budget = AddressBudget::new(2, Duration::from_secs(60));
         let ip = "8.8.8.8".parse().expect("ip");
-        assert!(budget.take(ip));
-        assert!(budget.take(ip));
-        assert!(!budget.take(ip), "the burst is spent");
+        assert!(budget.take(ip, None));
+        assert!(budget.take(ip, None));
+        assert!(!budget.take(ip, None), "the burst is spent");
         tokio::time::advance(Duration::from_secs(61)).await;
-        assert!(budget.take(ip), "a window later the bucket refilled");
+        assert!(budget.take(ip, None), "a window later the bucket refilled");
+    }
+
+    /// A loopback fixture that counts the requests it answers — the honest
+    /// evidence a dial actually happened — and returns its `host:port`
+    /// authority for URL building.
+    async fn counting_fixture<F, R>(handler: F) -> SocketAddr
+    where
+        F: Fn() -> R + Clone + Send + Sync + 'static,
+        R: axum::response::IntoResponse + Send + 'static,
+    {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let handler = handler.clone();
+                async move { handler() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        addr
+    }
+
+    /// A re-review: an IP literal never reaches the resolver — hyper parses the
+    /// socket address itself — so the start must be paid where the address is
+    /// still known, at the probe. Under a one-start budget the first literal
+    /// probe dials (the fixture counts it); the second is a counted budget
+    /// refusal, and the fixture never sees it.
+    #[tokio::test]
+    async fn literal_targets_pay_the_budget() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let fixture = counting_fixture(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "ok"
+        })
+        .await;
+        let url: Url = format!("http://{fixture}/").parse().expect("url");
+        let client = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides(),
+            Arc::new(AddressBudget::new(1, Duration::from_secs(3600))),
+        )
+        .expect("client");
+        let first = client.probe(&url, Duration::from_secs(3)).await;
+        assert!(
+            matches!(first.outcome, CheckOutcome::Pass),
+            "the paid start dials: {first:?}"
+        );
+        let second = client.probe(&url, Duration::from_secs(3)).await;
+        assert!(
+            second.limited,
+            "the literal's spent budget refuses the start: {second:?}"
+        );
+        assert_eq!(
+            second.detail,
+            Some("address_budget"),
+            "the miss names its cause"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly the paid probe reached the fixture"
+        );
+    }
+
+    /// A re-review: a redirect to a literal target pays the address it lands on
+    /// too — the hop never reaches the resolver either, so the redirect closure
+    /// is where its start is charged. The destination fixture counts hits; the
+    /// spent hop must refuse *before* the dial.
+    #[tokio::test]
+    async fn literal_redirect_hops_pay_the_budget() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let landing = counting_fixture(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "ok"
+        })
+        .await;
+        let redirector = counting_fixture(move || {
+            axum::response::Redirect::temporary(&format!("http://{landing}/"))
+        })
+        .await;
+        let url: Url = format!("http://{redirector}/").parse().expect("url");
+        let client = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides(),
+            // One start on the shared address: the redirector's literal spends
+            // it, the hop's literal finds it spent.
+            Arc::new(AddressBudget::new(1, Duration::from_secs(3600))),
+        )
+        .expect("client");
+        let result = client.probe(&url, Duration::from_secs(3)).await;
+        assert!(
+            result.limited,
+            "the literal hop's spent budget refuses the follow: {result:?}"
+        );
+        assert_eq!(
+            result.detail,
+            Some("address_budget"),
+            "the hop's refusal names the budget"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused hop never dialed the landing fixture"
+        );
+    }
+
+    /// C re-review: the bounded map fails closed — a spent bucket must stay
+    /// spent no matter how many other addresses churn through it, and a new
+    /// address waits rather than evicting a still-spent one.
+    #[tokio::test]
+    async fn a_spent_bucket_stays_spent_under_map_churn() {
+        let budget = AddressBudget::new(1, Duration::from_secs(3600));
+        let victim: IpAddr = "8.8.8.8".parse().expect("ip");
+        assert!(budget.take(victim, None));
+        assert!(!budget.take(victim, None), "spent stays spent");
+        for i in 0..MAX_BUCKETS {
+            let [_, b1, b2, b3] = u32::try_from(i).expect("index").to_be_bytes();
+            let ip = IpAddr::V4(Ipv4Addr::new(9, b1, b2, b3));
+            budget.take(ip, None);
+        }
+        assert!(
+            !budget.take(victim, None),
+            "churn must not refill a spent bucket"
+        );
+        let fresh: IpAddr = "7.7.7.7".parse().expect("ip");
+        assert!(
+            !budget.take(fresh, None),
+            "a map full of spent buckets refuses the new address — never a clear"
+        );
+    }
+
+    /// E re-review: `::ffff:V` is the same address as `V` — the mapped spelling
+    /// spends the same bucket the plain one does (the `origin.rs` `address_key`
+    /// normalisation, applied at the charge).
+    #[tokio::test]
+    async fn an_ipv4_mapped_spelling_shares_the_v4_bucket() {
+        let budget = AddressBudget::new(1, Duration::from_secs(3600));
+        let v4: IpAddr = "8.8.8.8".parse().expect("ip");
+        let mapped: IpAddr = "::ffff:8.8.8.8".parse().expect("ip");
+        assert!(budget.take(mapped, None));
+        assert!(
+            !budget.take(v4, None),
+            "the mapped spelling spends the same bucket"
+        );
+    }
+
+    /// B re-review: the global ceiling is shared, but a workspace only ever
+    /// spends its own share of it — the heaviest spender stops at its share
+    /// while a neighbour's share at the same address is untouched.
+    #[tokio::test]
+    async fn the_heaviest_spender_stops_at_its_workspace_share() {
+        let budget =
+            AddressBudget::with_share(4, Duration::from_secs(3600), 2, Duration::from_secs(3600));
+        let victim: IpAddr = "8.8.8.8".parse().expect("ip");
+        let a = WorkspaceId::new();
+        let b = WorkspaceId::new();
+        assert!(budget.take(victim, Some(a)));
+        assert!(budget.take(victim, Some(a)));
+        assert!(
+            !budget.take(victim, Some(a)),
+            "a's own share at the address is spent — the global room stays"
+        );
+        assert!(
+            budget.take(victim, Some(b)),
+            "b's share is untouched: one tenant cannot spend another's"
+        );
+        // And the global ceiling still binds everyone together: four shares of
+        // two are all the room there is.
+        assert!(budget.take(victim, Some(b)));
+        assert!(
+            !budget.take(victim, Some(b)),
+            "the global ceiling binds after the shares do"
+        );
+    }
+
+    /// B re-review: only the address the dialer can take pays — the first
+    /// paying candidate per family. A name spraying two hundred answers taxes
+    /// exactly one bucket for the connect it produces.
+    #[tokio::test]
+    async fn the_resolver_charges_only_the_dialed_candidates() {
+        let map = overrides();
+        let many: Vec<SocketAddr> = (0..200)
+            .map(|i| {
+                format!("8.8.{}.{}:0", i / 256, i % 256)
+                    .parse()
+                    .expect("addr")
+            })
+            .collect();
+        map.lock()
+            .expect("map")
+            .insert("spray.test".to_owned(), many.clone());
+        let budget = Arc::new(AddressBudget::new(1, Duration::from_secs(3600)));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget.clone());
+        let yielded = resolver
+            .resolve(Name::from_str("spray.test").expect("name"))
+            .await
+            .expect("the first paying candidate pays")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            yielded,
+            vec![many[0]],
+            "only the first paying address per family is offered to the dialer"
+        );
+        assert!(
+            !budget.take(many[0].ip(), None),
+            "the dialed candidate was charged"
+        );
+        assert!(
+            budget.take(many[50].ip(), None),
+            "an undialed candidate was never charged"
+        );
+    }
+
+    /// B re-review: the workspace attribution reaches the resolver through the
+    /// probe task-local — the same address resolves against a different
+    /// workspace's share when the schedule changes hands.
+    #[tokio::test]
+    async fn the_resolver_charges_the_attributed_workspace() {
+        let map = overrides();
+        map.lock().expect("map").insert(
+            "victim.test".to_owned(),
+            vec!["8.8.8.8:0".parse().expect("addr")],
+        );
+        let budget = Arc::new(AddressBudget::with_share(
+            4,
+            Duration::from_secs(3600),
+            2,
+            Duration::from_secs(3600),
+        ));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget);
+        let a = WorkspaceId::new();
+        let b = WorkspaceId::new();
+        let name = || Name::from_str("victim.test").expect("name");
+        for _ in 0..2 {
+            assert!(
+                PROBE_WORKSPACE
+                    .scope(a, resolver.resolve(name()))
+                    .await
+                    .is_ok(),
+                "a's own share pays"
+            );
+        }
+        assert!(
+            PROBE_WORKSPACE
+                .scope(a, resolver.resolve(name()))
+                .await
+                .is_err(),
+            "a's third start meets its own spent share"
+        );
+        assert!(
+            PROBE_WORKSPACE
+                .scope(b, resolver.resolve(name()))
+                .await
+                .is_ok(),
+            "b's share at the same address is untouched"
+        );
     }
 }

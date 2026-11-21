@@ -20,8 +20,14 @@ it to the writer — without ever letting a slow target stall the schedule.
 - **Phase (D-018):** each monitor's slots sit at a fixed phase within its interval, from its id, so monitors created together never fall due on one tick.
 - **Concurrency bounds:** global probe semaphore sized to the schedule, `Σ (tick + timeout)/interval`, 20 to 512 (D-018; a schedule past it, or past 2 starts a tick on one origin — `(resolved addr:port, host)` per workspace, or on the resolved `addr:port` summed across hosts — is refused at write time with 409 `capacity_exceeded`), per-origin semaphore 2 (keyed by
   `(origin, workspace)`), one in-flight probe per monitor, and a cross-tenant starts budget
-  on every resolved IP inside the SSRF resolver itself — redirect hops pay the address they
-  land on. Bounds are `try_acquire` — contention means `missed`, not a queue.
+  per IP: 8/s shared across all workspaces under a 2/s per-workspace share, charged
+  inside the SSRF resolver on the addresses actually offered to the dialer (the first
+  paying candidate per family — candidates that would only ever be a fallback don't
+  pay), on IP-literal URLs and on every redirect hop's literal host — a literal never
+  skips the charge because it never touched DNS. A refusal commits `missed` +
+  `address_budget`: a *neutral* coverage gap that shows `unknown` but never resets an
+  outage's streaks, so a starved tenant's alert can't be laundered away by a neighbour's
+  load. Bounds are `try_acquire` — contention means `missed`, not a queue.
 - **Classification:** `Pass` = acceptable status (2xx in v1; assertions later);
   `HttpFail{status}` = any other status incl. exhausted redirects; `Transport` = connect/DNS/
   TLS/body failure; `Timeout` = deadline exceeded. Never infer. `Transport` carries a stable

@@ -488,7 +488,15 @@ impl Plan {
             let results = results.clone();
             tracker.spawn(async move {
                 // The permits ride inside `dispatch` and release when the task ends.
-                let result = probes.probe(&dispatch.url, dispatch.deadline).await;
+                // The workspace attribution rides a task-local so the address
+                // charge — wherever it happens — spends the right tenant's
+                // share of the address, never a neighbour's (B re-review).
+                let result = crate::probe::PROBE_WORKSPACE
+                    .scope(
+                        dispatch.workspace,
+                        probes.probe(&dispatch.url, dispatch.deadline),
+                    )
+                    .await;
                 // A probe the SSRF guard refused at probe time (a name resolving to a local
                 // address, a redirect to one) is a *target failure*: every real visitor of
                 // that target is broken too. It commits as `transport` + `rejected_local`
@@ -499,10 +507,11 @@ impl Plan {
                     generation: dispatch.generation,
                     slot_at: dispatch.slot_at,
                     // A start OUR bound refused is a coverage gap, never target
-                    // evidence: the resolver's per-address budget spent commits
-                    // `missed` with its reason, not a failure row (N1 re-review).
+                    // evidence — and it is *neutral* on the monitor's streaks:
+                    // a starved slot must not launder a real outage's failure
+                    // count away. The commit is `missed` + `address_budget`.
                     slot: if result.limited {
-                        SlotObservation::Missed
+                        SlotObservation::Budgeted
                     } else {
                         SlotObservation::Probe(result.outcome)
                     },
@@ -990,13 +999,33 @@ mod tests {
         );
     }
 
+    /// A listener that answers a bare `200` — the dial evidence, on the address
+    /// the budget binds. Returns its socket address for the override map.
+    async fn http_fixture() -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        addr
+    }
+
     /// N1 re-review: the per-ADDRESS runtime bound is charged on the addresses the
     /// validating resolver actually hands to the dialer — shared across every
     /// workspace (`try_acquire`, misses counted). Two tenants' schedules aimed at
     /// one IP get one starts budget between them: a second workspace's monitor
     /// can never lift the rate at an address its neighbour already spent. The
     /// refused slot commits `missed` with its reason — our own budget's refusal
-    /// is a coverage gap, never evidence about the target.
+    /// is a coverage gap, never evidence about the target (H: on a loopback
+    /// fixture — the budget binds the address, and the 3600 s window makes the
+    /// clock irrelevant).
     #[tokio::test]
     async fn two_workspaces_on_one_address_share_the_runtime_cap() {
         let db = Db::connect("sqlite::memory:", 1).await.expect("db");
@@ -1010,17 +1039,18 @@ mod tests {
             false,
         );
         let vitals = Vitals::new(Arc::default(), Duration::from_secs(30));
-        // `victim.test` answers 8.8.8.8 through the same validating resolver the
-        // dialer uses; the budget admits one start an hour — the first probe
-        // dials, everything after it is a counted miss.
+        // `victim.test` answers the loopback fixture through the same validating
+        // resolver the dialer uses; the budget admits one start an hour — the
+        // first probe dials, everything after it is a counted miss.
         let overrides = crate::probe::test_overrides();
-        overrides.lock().expect("map").insert(
-            "victim.test".to_owned(),
-            vec!["8.8.8.8:0".parse().expect("addr")],
-        );
+        let fixture = http_fixture().await;
+        overrides
+            .lock()
+            .expect("map")
+            .insert("victim.test".to_owned(), vec![fixture]);
         let probes = ProbeClient::overridden(
             ProbePolicy {
-                allow_local_targets: false,
+                allow_local_targets: true,
                 extra_roots: Vec::new(),
             },
             64 * 1024,
@@ -1072,8 +1102,8 @@ mod tests {
         for observation in &missed {
             assert_eq!(
                 observation.slot,
-                SlotObservation::Missed,
-                "a budget refusal is a coverage gap: {observation:?}"
+                SlotObservation::Budgeted,
+                "a budget refusal is a neutral coverage gap: {observation:?}"
             );
             assert_eq!(
                 observation.detail.as_deref(),
@@ -1084,6 +1114,106 @@ mod tests {
         assert!(
             missed.iter().any(|obs| obs.workspace == other),
             "the second workspace's schedule inherits the spent address: {missed:?}"
+        );
+    }
+
+    /// B re-review: under the global per-address ceiling each workspace pays
+    /// only its own share — the heaviest spender stops at its share of the
+    /// address while a neighbour's schedule on the same IP keeps its own. The
+    /// refused starts commit `missed` + `address_budget`, neutral on streaks.
+    #[tokio::test]
+    async fn the_heaviest_spender_stops_at_its_share_and_neighbours_keep_theirs() {
+        let db = Db::connect("sqlite::memory:", 1).await.expect("db");
+        db.migrate().await.expect("migrate");
+        let (writer, _writer_task) = writer::spawn(
+            db.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            HashMap::new(),
+            Arc::default(),
+            32,
+            false,
+        );
+        let vitals = Vitals::new(Arc::default(), Duration::from_secs(30));
+        let overrides = crate::probe::test_overrides();
+        let fixture = http_fixture().await;
+        overrides
+            .lock()
+            .expect("map")
+            .insert("victim.test".to_owned(), vec![fixture]);
+        // The global ceiling admits 4; each workspace's share of the address
+        // is 2 — the heaviest spender stops at its share, the ceiling for all.
+        let probes = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides,
+            Arc::new(crate::probe::AddressBudget::with_share(
+                4,
+                Duration::from_secs(3600),
+                2,
+                Duration::from_secs(3600),
+            )),
+        )
+        .expect("probe client");
+        let (results, mut results_rx) = mpsc::channel::<Observation>(8);
+        let tracker = TaskTracker::new();
+        let spender = WorkspaceId::new();
+        let neighbour = WorkspaceId::new();
+        let dispatch = |name: &str, workspace: WorkspaceId| Dispatch {
+            monitor_id: MonitorId(uuid::Uuid::now_v7()),
+            workspace,
+            generation: 1,
+            slot_at: OffsetDateTime::now_utc(),
+            url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
+            deadline: Duration::from_millis(400),
+            _global: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+            _origin: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+        };
+        // The spender burns its own share of the address in two starts; the
+        // third meets its share spent — while the global ceiling still has room.
+        let mut plan = Plan::default();
+        plan.dispatches.push(dispatch("a1", spender));
+        plan.dispatches.push(dispatch("a2", spender));
+        plan.dispatches.push(dispatch("a3", spender));
+        plan.dispatches.push(dispatch("b1", neighbour));
+        plan.dispatch(&probes, &writer, &results, &tracker, &vitals)
+            .await;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(results_rx.recv().await.expect("an observation"));
+        }
+        let of = |workspace: WorkspaceId| {
+            seen.iter()
+                .filter(|obs| obs.workspace == workspace)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            of(spender)
+                .iter()
+                .filter(|obs| matches!(obs.slot, SlotObservation::Probe(_)))
+                .count(),
+            2,
+            "the spender's share paid its two starts: {seen:?}"
+        );
+        assert_eq!(
+            of(spender)
+                .iter()
+                .filter(|obs| matches!(obs.slot, SlotObservation::Budgeted))
+                .count(),
+            1,
+            "the spender's third start met its own spent share: {seen:?}"
+        );
+        assert!(
+            of(neighbour)
+                .iter()
+                .all(|obs| matches!(obs.slot, SlotObservation::Probe(_))),
+            "the neighbour's monitor kept its own share — never starved: {seen:?}"
         );
     }
 

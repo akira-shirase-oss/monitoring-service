@@ -1565,8 +1565,8 @@ impl WorkspaceDb<'_> {
         monitor: MonitorId,
         limit: i64,
     ) -> Result<Vec<SlotObservation>, QueryError> {
-        let rows = sqlx::query_as::<_, (String, Option<i64>)>(
-            "SELECT outcome, http_status FROM checks
+        let rows = sqlx::query_as::<_, (String, Option<i64>, Option<String>)>(
+            "SELECT outcome, http_status, detail FROM checks
              WHERE monitor_id = ? AND workspace_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
         )
         .bind(monitor.0.to_string())
@@ -1576,7 +1576,9 @@ impl WorkspaceDb<'_> {
         .await?;
         rows.iter()
             .rev()
-            .map(|(outcome, http_status)| decode_outcome(outcome, *http_status))
+            .map(|(outcome, http_status, detail)| {
+                decode_outcome(outcome, *http_status, detail.as_deref())
+            })
             .collect()
     }
 
@@ -2161,7 +2163,9 @@ async fn enqueue_outbox(
 pub fn encode_slot(slot: SlotObservation, http_status: Option<u16>) -> (&'static str, Option<i64>) {
     let status = http_status.map(i64::from);
     match slot {
-        SlotObservation::Missed => ("missed", None),
+        // A budget-refused gap is still a `missed` on the wire — the detail
+        // column (`address_budget`) is what decodes it back to `Budgeted`.
+        SlotObservation::Missed | SlotObservation::Budgeted => ("missed", None),
         SlotObservation::Probe(CheckOutcome::Pass) => ("pass", status),
         SlotObservation::Probe(CheckOutcome::HttpFail { .. }) => ("http_fail", status),
         SlotObservation::Probe(CheckOutcome::Transport) => ("transport", None),
@@ -2170,13 +2174,20 @@ pub fn encode_slot(slot: SlotObservation, http_status: Option<u16>) -> (&'static
 }
 
 /// Rebuild a `SlotObservation` from a stored row; unknown text is corruption, not a default.
-fn decode_outcome(outcome: &str, http_status: Option<i64>) -> Result<SlotObservation, QueryError> {
+/// A `missed` row whose committed detail is `address_budget` decodes to the
+/// streak-neutral `Budgeted` — the gap our own bound committed (B re-review).
+fn decode_outcome(
+    outcome: &str,
+    http_status: Option<i64>,
+    detail: Option<&str>,
+) -> Result<SlotObservation, QueryError> {
     let status = http_status
         .map(|value| {
             u16::try_from(value).map_err(|_| QueryError::Corrupt("http_status out of range".into()))
         })
         .transpose()?;
     Ok(match outcome {
+        "missed" if detail == Some("address_budget") => SlotObservation::Budgeted,
         "missed" => SlotObservation::Missed,
         "pass" => SlotObservation::Probe(CheckOutcome::Pass),
         "http_fail" => SlotObservation::Probe(CheckOutcome::HttpFail {
