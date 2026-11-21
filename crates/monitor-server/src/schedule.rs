@@ -1082,6 +1082,8 @@ mod tests {
         let (results, mut results_rx) = mpsc::channel::<Observation>(8);
         let tracker = TaskTracker::new();
         let other = WorkspaceId::new();
+        let permit =
+            || Arc::new(Semaphore::new(4)).try_acquire_owned().expect("slot");
         let dispatch = |name: &str, workspace: WorkspaceId| Dispatch {
             monitor_id: MonitorId(uuid::Uuid::now_v7()),
             workspace,
@@ -1093,8 +1095,8 @@ mod tests {
             // The fixture answers on accept; the deadline only bounds a hang,
             // so it is sized unreachable (N-6 re-review).
             deadline: Duration::from_secs(5),
-            _global: Arc::new(Semaphore::new(4)).try_acquire_owned().expect("slot"),
-            _origin: Arc::new(Semaphore::new(4)).try_acquire_owned().expect("slot"),
+            _global: permit(),
+            _origin: permit(),
         };
         // The first workspace's probe pays the address's only start.
         let mut plan = Plan::default();
