@@ -132,10 +132,11 @@ async fn a_used_invite_code_does_not_replay() -> anyhow::Result<()> {
         }))
         .send()
         .await?;
-    assert_eq!(
-        first.status(),
-        StatusCode::CREATED,
-        "first use must succeed"
+    // Setup errors propagate — only the protection's own asserts may panic.
+    anyhow::ensure!(
+        first.status() == StatusCode::CREATED,
+        "setup: first use must succeed, got {}",
+        first.status()
     );
 
     let replay = http
@@ -219,9 +220,10 @@ async fn a_stale_generation_patch_is_a_conflict() -> anyhow::Result<()> {
     let first = patch(serde_json::json!(generation), "first-write")
         .send()
         .await?;
-    assert!(
+    // Setup errors propagate — only the protection's own asserts may panic.
+    anyhow::ensure!(
         first.status().is_success(),
-        "the live generation patches fine: {}",
+        "setup: the live generation patches fine, got {}",
         first.status()
     );
     let replayed = patch(serde_json::json!(generation), "shadow-write")

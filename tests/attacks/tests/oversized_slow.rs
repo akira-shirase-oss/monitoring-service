@@ -62,20 +62,22 @@ async fn a_body_that_never_finishes_is_408() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
     let stream = tokio_stream::pending::<Result<bytes::Bytes, std::io::Error>>();
-    let response = http
+    // A hang IS the deadline dying — fold any send failure into the status the
+    // protection assert measures, so the check itself, not a setup .expect,
+    // is the line that can fail (F re-review).
+    let status = http
         .post(format!("{}/api/login", instance.base))
         .header("content-type", "application/json")
         .body(reqwest::Body::wrap_stream(stream))
         .send()
         .await
-        .expect(
-            "the server must answer inside the client timeout — a hang means the deadline is gone",
-        );
+        .map_or(StatusCode::INTERNAL_SERVER_ERROR, |response| {
+            response.status()
+        });
     assert_eq!(
-        response.status(),
+        status,
         StatusCode::REQUEST_TIMEOUT,
-        "a never-ending body must be 408, got {}",
-        response.status()
+        "a never-ending body must be 408, got {status}"
     );
     // The timed-out request must release its slot — the next normal request is
     // answered by the server, not stalled on the abandoned body's budget.

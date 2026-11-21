@@ -23,12 +23,37 @@ cd "$(dirname "$0")/.."
 mutants=(tests/attacks/mutants/*.patch)
 [[ -f "${mutants[0]}" ]] || { echo "no mutant patches under tests/attacks/mutants" >&2; exit 1; }
 
-# Untracked paths (the patches themselves before they're committed) are fine —
-# apply/checkout never touches them; tracked sources must be unmodified.
+# Tracked sources must be unmodified — apply/checkout restores only what is in
+# the index, so a dirty tree would leak one mutant's changes into the next run.
 if [[ -n "$(git status --porcelain -- crates tests | grep -v '^??')" ]]; then
     echo "check-attack-mutants needs clean tracked sources under crates/ + tests/" >&2
     exit 2
 fi
+
+# F re-review: the mutants directory is a fixed contract — every file must be
+# git-tracked and named <stem>__<test>.patch or .expect. An untracked or
+# stray file is a gate failure, never a quiet skip.
+inventory_fails=0
+for f in tests/attacks/mutants/*; do
+    base=$(basename "$f")
+    case "$base" in
+        *__*.patch|*__*.expect) ;;
+        *) echo "STRAY FILE: tests/attacks/mutants/$base is not a .patch/.expect pair member" >&2
+           inventory_fails=$((inventory_fails + 1)) ;;
+    esac
+    if ! git ls-files --error-unmatch "tests/attacks/mutants/$base" >/dev/null 2>&1; then
+        echo "UNTRACKED: tests/attacks/mutants/$base is not committed — the gate must run on the contract" >&2
+        inventory_fails=$((inventory_fails + 1))
+    fi
+done
+# And the pairs are complete both ways: a patch with no .expect cannot pin a
+# kill; an .expect with no patch is an orphan.
+for f in tests/attacks/mutants/*.expect; do
+    [[ -f "${f%.expect}.patch" ]] || {
+        echo "ORPHAN EXPECT: $f has no matching patch" >&2
+        inventory_fails=$((inventory_fails + 1)); }
+done
+[[ $inventory_fails -eq 0 ]] || exit 2
 
 # Where this build puts its binaries: honour CARGO_TARGET_DIR exactly like
 # cargo does — a hardcoded target/ either misses what it built or finds stale
@@ -57,8 +82,15 @@ clean_bin="$target_dir/monitor-server.clean"
 cp "$target_dir/monitor-server" "$clean_bin"
 
 fails=0; killed=0
+# Restore every path the LAST applied patch touched — not just crates/: a
+# mutant that edits anything else must still leave the tree it found (F).
+last_patch_paths=""
 restore() {
-    git checkout -- crates/ 2>/dev/null || true
+    if [[ -n "$last_patch_paths" ]]; then
+        echo "$last_patch_paths" | while IFS= read -r p; do
+            [[ -n "$p" ]] && git checkout -- "$p" 2>/dev/null || true
+        done
+    fi
     rm -f "$clean_bin"
 }
 trap restore EXIT
@@ -74,11 +106,33 @@ for file in tests/attacks/tests/*.rs; do
         fi
         # F re-review: a kill must land on the test's OWN protection check —
         # the .expect file pins the panic location(s) the decisive assertion
-        # produces (file:line, one per line). A panic at a setup .expect or a
+        # produces (file:line, one per line). A panic at a setup step or a
         # helper is not in it, so a server crash can never pass as a kill.
-        if [[ ! -s "tests/attacks/mutants/${stem}__${tname}.expect" ]]; then
-            echo "NO EXPECT: $stem::$tname has no ${stem}__${tname}.expect" >&2
+        expect_file="tests/attacks/mutants/${stem}__${tname}.expect"
+        if [[ ! -s "$expect_file" ]]; then
+            echo "NO EXPECT: $stem::$tname has no $expect_file" >&2
             fails=$((fails + 1))
+        else
+            # Validate EVERY pin: right file, in-range line, and the pinned
+            # line is an assertion — assert*/panic!, never a setup .expect.
+            while IFS= read -r pin; do
+                if [[ ! "$pin" =~ ^${stem}\.rs:[0-9]+:$ ]]; then
+                    echo "BAD PIN: $expect_file line '$pin' is not '<stem>.rs:<line>:'" >&2
+                    fails=$((fails + 1)); continue
+                fi
+                lineno=${pin#*:}; lineno=${lineno%:}
+                file_lines=$(wc -l < "$file")
+                if (( lineno < 1 || lineno > file_lines )); then
+                    echo "BAD PIN: $pin is outside $file (has $file_lines lines)" >&2
+                    fails=$((fails + 1)); continue
+                fi
+                pinned=$(sed -n "${lineno}p" "$file")
+                case "$pinned" in
+                    *assert*|*panic*) ;;
+                    *) echo "SETUP PIN: $pin does not land on an assertion — pins name the protection's own assert, never a setup line: $pinned" >&2
+                       fails=$((fails + 1)) ;;
+                esac
+            done < "$expect_file"
         fi
     done < <(awk '
         /^[[:space:]]*#\[(tokio::)?test/ {
@@ -129,13 +183,20 @@ for patch in "${mutants[@]}"; do
         fails=$((fails + 1)); rm -f "$log"; continue
     fi
 
-    # 2. Apply, rebuild, demand the expected red.
+    # 2. Apply, rebuild, demand the expected red. The restore list is exactly
+    # the paths THIS patch touches — a mutant may live outside crates/.
+    last_patch_paths=$(git apply --numstat "$patch" 2>/dev/null | awk '{print $3}')
     if ! git apply "$patch" 2>/dev/null; then
         echo "STALE MUTANT: $name no longer applies — refresh it against the tree" >&2
+        last_patch_paths=""
         fails=$((fails + 1)); rm -f "$log"; continue
     fi
-    if ! cargo build -p monitor-server --locked >/dev/null 2>&1; then
-        echo "DEAD MUTANT: $name does not compile — a mutant must be a real alternative" >&2
+    # -D warnings on the crates a mutant can touch — a mutant that compiles
+    # with warnings is not a real alternative (F re-review). cargo rustc keeps
+    # the flag off the (unchanged, already built) dependency graph.
+    if ! cargo rustc -p monitor-db --lib --locked -- -D warnings >/dev/null 2>&1 \
+        || ! cargo rustc -p monitor-server --bin monitor-server --locked -- -D warnings >/dev/null 2>&1; then
+        echo "DEAD MUTANT: $name does not compile under -D warnings — a mutant must be a real alternative" >&2
         fails=$((fails + 1))
     elif run_bounded "$target_dir/monitor-server" "$bin" "$test" "$log"; then
         echo "MUTANT SURVIVED: $test still passes with its protection removed" >&2
@@ -170,7 +231,10 @@ for patch in "${mutants[@]}"; do
         fi
     fi
     rm -f "$log"
-    git checkout -- crates/
+    echo "$last_patch_paths" | while IFS= read -r p; do
+        [[ -n "$p" ]] && git checkout -- "$p" 2>/dev/null || true
+    done
+    last_patch_paths=""
 done
 
 echo "check-attack-mutants: $killed killed, $fails failed (of ${#mutants[@]})"
