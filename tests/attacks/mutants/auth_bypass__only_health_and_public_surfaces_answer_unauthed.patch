@@ -1,15 +1,19 @@
 diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
-index 032dab6..5781ba4 100644
+index c19cd2e..327de9c 100644
 --- a/crates/monitor-server/src/lib.rs
 +++ b/crates/monitor-server/src/lib.rs
-@@ -477,6 +477,10 @@ fn routes(state: AppState) -> Router {
-         // throttle bounds what one client can ask for.
-         .route("/s/{slug}/status.json", get(public_status))
-         .nest("/api", api)
-+        .route_layer(axum::middleware::from_fn_with_state(
-+            state.clone(),
-+            auth::require_auth,
-+        ))
-         .with_state(state)
-         .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
-         .layer(axum::Extension(ScheduleLock::default()))
+@@ -455,13 +455,7 @@ fn routes(state: AppState) -> Router {
+             get(read_webhook).put(put_webhook).delete(delete_webhook),
+         )
+         .route("/workspace/webhook/test", post(test_webhook))
+-        .route("/backup", post(backup))
+-        // Auth wraps the whole API: /livez, /readyz and static files stay open —
+-        // the dashboard must load to *hold* a token, and readiness is not a secret.
+-        .route_layer(axum::middleware::from_fn_with_state(
+-            state.clone(),
+-            auth::require_auth,
+-        ));
++        .route("/backup", post(backup));
+ 
+     Router::new()
+         .route("/livez", get(livez))
