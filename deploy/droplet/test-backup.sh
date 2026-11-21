@@ -109,5 +109,22 @@ unset R2_FAILS
 echo "no client path reaches the server"
 ! grep -qE '\-d \{[^ }]' "$CURL_LOG" && ok "no path-shaped payload was ever sent" || bad "payload: $(cat "$CURL_LOG")"
 
+echo "absent R2 credentials are a named error — never a sed or redirect complaint"
+mv "$t/creds" "$t/creds.away"
+out=$(bash "$here/smon-backup.sh" latest 2>&1) && code=0 || code=$?
+mv "$t/creds.away" "$t/creds"
+[[ $code -ne 0 ]] && ok "latest without credentials fails" || bad "latest without credentials exited 0"
+grep -q 'R2 credentials not configured' <<<"$out" \
+  && ok "the failure names what is missing" || bad "unnamed failure: $out"
+! grep -qE "can't read|No such file" <<<"$out" \
+  && ok "no raw tool error leaks to the operator" || bad "raw tool error leaked: $out"
+# An empty secret file counts the same as absent — a half-installed credential
+# set fails the same named way.
+: >"$t/creds/s3_secret_key"
+out=$(bash "$here/smon-backup.sh" latest 2>&1) && code=0 || code=$?
+printf 'r2-secret\n' >"$t/creds/s3_secret_key"
+[[ $code -ne 0 ]] && grep -q 'R2 credentials not configured' <<<"$out" \
+  && ok "an empty secret file is the same named error" || bad "empty secret: ($code): $out"
+
 echo; echo "test-backup: $pass ok, $fail failed"
 [[ $fail -eq 0 ]]

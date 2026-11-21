@@ -30,6 +30,13 @@ backup_dir=$(setting SMON_BACKUP_DIR "$env_file")
 [ -n "$backup_dir" ] || { echo "error: SMON_BACKUP_DIR unset in $env_file" >&2; exit 1; }
 
 r2() {
+  # A backup that silently can't reach its bucket is the failure this script exists
+  # to prevent: missing R2 credentials is a named error, never a sed "can't read"
+  # or a redirect complaint leaked out of a command substitution.
+  if [[ ! -f "$creds/r2.env" || ! -s "$creds/s3_secret_key" ]]; then
+    echo "error: R2 credentials not configured — want $creds/r2.env and a non-empty $creds/s3_secret_key (install.sh's --r2-secret/--r2-env, DEPLOY.md step 9)" >&2
+    exit 1
+  fi
   RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare \
     RCLONE_CONFIG_R2_ENDPOINT="$(setting SMON_R2_ENDPOINT "$creds/r2.env")" \
     RCLONE_CONFIG_R2_ACCESS_KEY_ID="$(setting SMON_R2_ACCESS_KEY "$creds/r2.env")" \

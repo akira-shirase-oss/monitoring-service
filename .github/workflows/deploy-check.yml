@@ -76,7 +76,9 @@ jobs:
         run: |
           work="$RUNNER_TEMP/install-check"
           sudo env "PATH=$PATH" "SMOKE_LOCAL=1" deploy/droplet/install.sh \
-            --release-dir "$work/release" 2>&1 | tee "$work/install-rerun.log"
+            --release-dir "$work/release" \
+            --r2-secret "$work/secrets/s3_secret_key" --r2-env "$work/secrets/r2.env" \
+            2>&1 | tee "$work/install-rerun.log"
       - name: The install is live and the unit is what was checked in
         run: |
           systemctl is-active monitor-server

@@ -201,6 +201,19 @@ fn the_install_job_uses_a_runner_path_and_runs_install_twice() {
         2,
         "the job must run install.sh, then re-run it for idempotence"
     );
+    // The filesystem-remote stub only proves the pipeline when the credentials
+    // the pipeline reads are installed — both invocations stage them (the second
+    // hits install's "already installed" branch, which is what keeps it honest).
+    assert_eq!(
+        workflow.matches("--r2-secret").count(),
+        2,
+        "every install.sh invocation must stage the fake R2 credentials"
+    );
+    assert_eq!(
+        workflow.matches("--r2-env").count(),
+        2,
+        "every install.sh invocation must stage the fake r2.env"
+    );
 }
 
 #[test]
