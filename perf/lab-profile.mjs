@@ -7,12 +7,17 @@
 //
 //   node perf/lab-profile.mjs [--duration-s 600] [--monitors 100] [--out perf/results]
 //                             [--server-port 58430] [--fixture-port 58700] [--origins 10]
-//                             [--bin debug|release] [--mix lab|ok]
+//                             [--bin debug|release] [--mix lab|ok] [--assert]
 //
 // `--bin release` drives target/release/monitor-server (build it first). `--mix ok` points
 // every monitor at /ok — the scheduler/writer path without slow or hung targets holding
 // slots; the default `lab` mix is the guide's. More than 100 monitors raises
 // SMON_MAX_MONITORS to the count, since the harness registers them itself.
+//
+// `--assert` puts the M8 probe contract on every other monitor: an asserted monitor
+// alternates between /marked (marker present — pass path) and /unmarked (same status,
+// marker absent — assert_body miss). The un-asserted half keeps the class mix, so the
+// delta versus a no-assertion run is the assertion's own cost.
 //
 // Its own ports (server 58430, fixtures 58700…58700+origins−1) — never 58400, where an
 // installed monitor listens. A busy port refuses the run before anything starts, and the
@@ -46,6 +51,8 @@ const BIN =
 	BIN_PROFILE === 'release' ? `${ROOT}/target/release/monitor-server` : `${ROOT}/target/debug/monitor-server`;
 const MIX = arg('mix', 'lab');
 if (!['lab', 'ok'].includes(MIX)) throw new Error(`--mix ${MIX}: expected lab or ok`);
+const ASSERT = process.argv.includes('--assert');
+const MARKER = 'SMON-ALIVE';
 const TMP = process.env.SMON_TMP ?? '/tmp';
 const DB = `${TMP}/smon-load-${process.pid}.db`;
 const LOG = `${TMP}/smon-load-${process.pid}.log`;
@@ -65,18 +72,26 @@ const CLASSES = [
 const MIXES = { lab: CLASSES, ok: [{ w: 100, name: 'ok', path: () => '/ok' }] };
 
 function plan(i) {
+	const port = FIXTURE_PORT + (i % ORIGINS);
+	if (ASSERT && i % 2 === 0) {
+		// Every other monitor asserts: half see the marker (pass), half a matching
+		// status without it (assert_body miss) — both assertion code paths under load.
+		return i % 4 === 0
+			? { name: `assert-hit-${i}`, port, path: '/marked', marker: MARKER }
+			: { name: `assert-miss-${i}`, port, path: '/unmarked', marker: MARKER };
+	}
 	let x = i % 100;
 	for (const c of MIXES[MIX]) {
 		if (x < c.w) {
-			return { name: `${c.name}-${i}`, port: FIXTURE_PORT + (i % ORIGINS), path: c.path(i) };
+			return { name: `${c.name}-${i}`, port, path: c.path(i) };
 		}
 		x -= c.w;
 	}
 	throw new Error('unreachable');
 }
 
-const sqlite = (sql) =>
-	execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim() || '[]';
+const sqlite = (sql, maxBuffer = 64 * 1024 * 1024) =>
+	execFileSync('sqlite3', ['-json', DB, sql], { encoding: 'utf8', maxBuffer }).trim() || '[]';
 
 function commit() {
 	// SMON_COMMIT overrides the recorded hash for A/B runs against a staged binary —
@@ -150,7 +165,7 @@ async function main() {
 	const t0 = Date.now();
 	const ids = await Promise.all(
 		Array.from({ length: N_MONITORS }, async (_, i) => {
-			const { name, port, path } = plan(i);
+			const { name, port, path, marker } = plan(i);
 			const r = await fetch(`${BASE}/api/monitors`, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
@@ -159,6 +174,7 @@ async function main() {
 					url: `http://127.0.0.1:${port}${path}`,
 					interval_s: 15,
 					timeout_s: 3,
+					...(marker ? { expect_body: marker } : {}),
 				}),
 			});
 			if (r.status !== 201) throw new Error(`add ${name}: HTTP ${r.status}`);
@@ -167,6 +183,20 @@ async function main() {
 	);
 	const registered_ms = Date.now() - t0;
 
+	// CPU seconds consumed by the server process — `ps -o time=` formats
+	// [[dd-]hh:]mm:ss depending on magnitude; parse all three shapes.
+	const cpuS = () => {
+		try {
+			const raw = execFileSync('ps', ['-o', 'time=', '-p', String(server.pid)], { encoding: 'utf8' }).trim();
+			const parts = raw.split('-');
+			const tail = parts.at(-1).split(':').map(Number);
+			const s = tail.length === 3 ? tail[0] * 3600 + tail[1] * 60 + tail[2] : tail[0] * 60 + tail[1];
+			return parts.length === 2 ? s + Number(parts[0]) * 86400 : s;
+		} catch {
+			return null;
+		}
+	};
+	const cpuStart = cpuS();
 	const rss = [];
 	const outbox = [];
 	const sampler = setInterval(() => {
@@ -188,6 +218,7 @@ async function main() {
 			`SELECT m.name, c.outcome, c.http_status, c.detail, c.latency_ms,
 			        c.slot_at, c.recorded_at
 			   FROM checks c JOIN monitors m ON m.id = c.monitor_id`,
+			1024 * 1024 * 1024,
 		),
 	);
 	const incidents = JSON.parse(sqlite('SELECT state, COUNT(*) n FROM incidents GROUP BY state'));
@@ -209,14 +240,19 @@ async function main() {
 	const lags = [];
 	const lagsOk = [];
 	const byOutcome = {};
+	let assertBodyMisses = 0;
 	for (const c of checks) {
 		byOutcome[c.outcome] = (byOutcome[c.outcome] ?? 0) + 1;
+		if (c.detail === 'assert_body') assertBodyMisses += 1;
 		const lag = ms(c.recorded_at) - ms(c.slot_at) - (c.latency_ms ?? 0);
 		lags.push(lag);
 		if (c.name.startsWith('ok-')) lagsOk.push(lag);
 	}
 	lags.sort((a, b) => a - b);
 	lagsOk.sort((a, b) => a - b);
+	const cpuEnd = cpuS();
+	const cpuDelta =
+		cpuStart === null || cpuEnd === null ? null : Math.round((cpuEnd - cpuStart) * 100) / 100;
 
 	const rssKb = rss.map((r) => r.kb);
 	const result = {
@@ -231,6 +267,7 @@ async function main() {
 			registered_ms,
 			bin: BIN_PROFILE,
 			mix: MIX,
+			assert: ASSERT,
 			origins: ORIGINS,
 			loadavg_before: loadBefore,
 			loadavg_after: loadavg(),
@@ -238,6 +275,7 @@ async function main() {
 		checks: {
 			total: checks.length,
 			by_outcome: byOutcome,
+			assert_body_misses: assertBodyMisses,
 			error_bps:
 				checks.length === 0
 					? null
@@ -251,6 +289,11 @@ async function main() {
 			all: { p50: pct(lags, 50), p95: pct(lags, 95), max: lags.at(-1) ?? null },
 			ok_targets: { p50: pct(lagsOk, 50), p95: pct(lagsOk, 95), max: lagsOk.at(-1) ?? null },
 		},
+		cpu_s: { start: cpuStart, end: cpuEnd, delta: cpuDelta },
+		cpu_us_per_check:
+			cpuDelta === null || checks.length === 0
+				? null
+				: Math.round((cpuDelta * 1e6) / checks.length),
 		incidents,
 		outbox_rows: outboxRows,
 		outbox_pending_max: Math.max(0, ...outbox.map((o) => o.pending)),

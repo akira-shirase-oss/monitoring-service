@@ -144,6 +144,87 @@ pub(crate) async fn spawn() -> anyhow::Result<Instance> {
     Ok(instance)
 }
 
+/// Boot a fresh instance in the `lab` profile — loopback targets are allowed so
+/// assertion tests can point monitors at fixtures they own. Everything else is
+/// the strict spawn: real binary, temp store, cookie mode `auto`. Probe-behavior
+/// assertions can't run in strict profile because the target gate refuses
+/// loopback at write — the lab spawn is the honest way to exercise them.
+pub(crate) async fn spawn_lab() -> anyhow::Result<Instance> {
+    let bin = server_binary();
+    if !bin.exists() {
+        bail!("monitor-server binary not found — run `cargo build -p monitor-server`");
+    }
+    let tmp = tempfile::TempDir::new()?;
+    let envs = [
+        (
+            "SMON_DATABASE_URL",
+            format!("sqlite:{}", tmp.path().join("attack.db").display()),
+        ),
+        ("SMON_PROFILE", "lab".to_owned()),
+        (
+            "SMON_ADMIN_TOKEN",
+            "f00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafe".to_owned(),
+        ),
+        (
+            "SMON_STATUS_DIR",
+            tmp.path().join("status").display().to_string(),
+        ),
+        (
+            "SMON_DASHBOARD_DIR",
+            tmp.path().join("dash").display().to_string(),
+        ),
+        (
+            "SMON_LOG_FILE",
+            tmp.path().join("server.log").display().to_string(),
+        ),
+        // A faster snapshot beat so the public-snapshot test polls in seconds,
+        // not 30 — the writer's shape is unchanged.
+        ("SMON_STATUS_INTERVAL_S", "5".to_owned()),
+    ];
+    std::fs::create_dir(tmp.path().join("status"))?;
+    std::fs::create_dir(tmp.path().join("dash"))?;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let mut envs2 = envs.to_vec();
+    envs2.push(("SMON_LISTEN", format!("127.0.0.1:{port}")));
+    let status = std::process::Command::new(&bin)
+        .arg("--init")
+        .envs(envs2.iter().map(|(k, v)| (*k, v)))
+        .stdout(Stdio::null())
+        .status()
+        .context("--init failed to run")?;
+    if !status.success() {
+        bail!("monitor-server --init exited {status}");
+    }
+    let child = std::process::Command::new(&bin)
+        .envs(envs2.iter().map(|(k, v)| (*k, v)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning monitor-server")?;
+    let instance = Instance {
+        base: format!("http://127.0.0.1:{port}"),
+        token: "f00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafe",
+        child,
+        tmp,
+    };
+    let http = client()?;
+    let deadline = std::time::Instant::now() + BOOT_DEADLINE;
+    loop {
+        match http.get(format!("{}/livez", instance.base)).send().await {
+            Ok(response) if response.status() == reqwest::StatusCode::OK => break,
+            _ if std::time::Instant::now() > deadline => {
+                let log = std::fs::read_to_string(instance.tmp.path().join("server.log"))
+                    .unwrap_or_else(|_| "<no log>".to_owned());
+                bail!("monitor-server never answered /livez; log tail:\n{log}");
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    Ok(instance)
+}
+
 /// Bearer-authed request helper.
 #[expect(
     clippy::unwrap_used,

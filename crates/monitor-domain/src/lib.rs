@@ -308,6 +308,11 @@ pub struct Monitor {
     pub timeout: Duration,
     /// Incident sensitivity — read by the writer per committed observation.
     pub thresholds: Thresholds,
+    /// `GET` (default) or an opt-in `HEAD` — safe methods only (D-025).
+    pub method: ProbeMethod,
+    /// Response assertions on the *final* hop: the acceptable status set and an
+    /// optional literal byte marker inside the bounded body read (D-025).
+    pub expect: Expect,
     /// Bumped on every edit or pause; a probe result carrying an older generation is stale and
     /// must not update current status (the "edit/pause during a probe" failure case).
     pub generation: u64,
@@ -324,6 +329,178 @@ pub struct NewMonitor {
     pub interval: Duration,
     pub timeout: Duration,
     pub thresholds: Thresholds,
+    /// `GET` (default) or opt-in `HEAD` (D-025).
+    pub method: ProbeMethod,
+    /// Response assertions — `Expect::standard()` keeps the pre-M8 contract.
+    pub expect: Expect,
+}
+
+/// How the health URL is probed. Only safe methods exist — the type cannot
+/// express `POST`/`PUT`/`DELETE`, so nothing downstream re-checks (D-025).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProbeMethod {
+    #[default]
+    Get,
+    Head,
+}
+
+impl ProbeMethod {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+        }
+    }
+
+    /// The exact wire token — any other method word is refused (D-025).
+    pub fn parse(value: &str) -> Result<Self, ValidationError> {
+        match value {
+            "GET" => Ok(Self::Get),
+            "HEAD" => Ok(Self::Head),
+            _ => Err(ValidationError::UnknownMethod {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+/// The most acceptable-status ranges one monitor may name (D-025).
+pub const MAX_STATUS_RANGES: usize = 8;
+/// The byte bound on `expect.body_contains` (D-025).
+pub const MAX_EXPECT_BODY: usize = 256;
+
+/// One inclusive range of acceptable response statuses, validated `1..=599`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusRange {
+    pub lo: u16,
+    pub hi: u16,
+}
+
+/// What one probe asserts about the *final* response of its redirect chain (D-025):
+/// an acceptable status set plus an optional literal byte marker the bounded body
+/// read must contain. The marker is never a regex — there is no engine, so no
+/// ReDoS class exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expect {
+    /// Sorted, non-overlapping, `1..=MAX_STATUS_RANGES` ranges — the contract's
+    /// `200-299` default is `Expect::standard`.
+    pub statuses: Vec<StatusRange>,
+    /// Literal bytes searched in the observed `<= 64 KiB` body prefix.
+    pub body_contains: Option<Vec<u8>>,
+}
+
+impl Expect {
+    /// The default assertion set: any `2xx` is acceptable, no marker — exactly the
+    /// pre-assertion behavior (D-025).
+    #[must_use]
+    pub fn standard() -> Self {
+        Self {
+            statuses: vec![StatusRange { lo: 200, hi: 299 }],
+            body_contains: None,
+        }
+    }
+
+    /// Whether `status` lands inside the acceptable set.
+    #[must_use]
+    pub fn accepts(&self, status: u16) -> bool {
+        self.statuses
+            .iter()
+            .any(|r| r.lo <= status && status <= r.hi)
+    }
+}
+
+impl Default for Expect {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+/// Parse one `lo`/`lo-hi` spec into a validated `StatusRange`.
+pub fn parse_status_range(spec: &str) -> Result<StatusRange, ValidationError> {
+    let invalid = || ValidationError::StatusSpecInvalid {
+        spec: spec.to_owned(),
+    };
+    let (lo_s, hi_s) = spec
+        .split_once('-')
+        .map_or((spec, spec), |(lo, hi)| (lo, hi));
+    let lo: u16 = lo_s.trim().parse().map_err(|_| invalid())?;
+    let hi: u16 = hi_s.trim().parse().map_err(|_| invalid())?;
+    if lo == 0 || hi > 599 || lo > hi {
+        return Err(invalid());
+    }
+    Ok(StatusRange { lo, hi })
+}
+
+/// Canonical wire/storage form: `"200-299,418"` — ranges sorted by `lo`, a bare
+/// integer when `lo == hi`.
+#[must_use]
+pub fn encode_statuses(statuses: &[StatusRange]) -> String {
+    statuses
+        .iter()
+        .map(|r| {
+            if r.lo == r.hi {
+                r.lo.to_string()
+            } else {
+                format!("{}-{}", r.lo, r.hi)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse the storage form back — the same rules as the write boundary (stored
+/// rows were written through it; anything else is corruption, not a default).
+pub fn parse_statuses(spec: &str) -> Result<Vec<StatusRange>, ValidationError> {
+    let mut statuses = spec
+        .split(',')
+        .map(|s| parse_status_range(s.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    statuses.sort_by_key(|r| r.lo);
+    validate_statuses(&mut statuses)?;
+    Ok(statuses)
+}
+
+/// Sort the caller's set in place, then bound it: nonempty, at most
+/// `MAX_STATUS_RANGES`, and non-overlapping (adjacent is allowed, overlapping is not).
+pub fn validate_statuses(statuses: &mut Vec<StatusRange>) -> Result<(), ValidationError> {
+    statuses.sort_by_key(|r| r.lo);
+    if statuses.is_empty() {
+        return Err(ValidationError::StatusRangesEmpty);
+    }
+    if statuses.len() > MAX_STATUS_RANGES {
+        return Err(ValidationError::StatusRangesTooMany {
+            count: statuses.len(),
+        });
+    }
+    for pair in statuses.windows(2) {
+        if pair[0].hi >= pair[1].lo {
+            return Err(ValidationError::StatusRangesOverlap);
+        }
+    }
+    Ok(())
+}
+
+/// The whole expectations bundle, including the cross-field rule: a `HEAD` probe
+/// carries no body, so a body marker under `HEAD` is a write-time refusal (D-025).
+pub fn validate_expect(
+    method: ProbeMethod,
+    statuses: &mut Vec<StatusRange>,
+    body_contains: Option<&[u8]>,
+) -> Result<(), ValidationError> {
+    validate_statuses(statuses)?;
+    if let Some(body) = body_contains {
+        if body.is_empty() {
+            return Err(ValidationError::ExpectBodyEmpty);
+        }
+        if body.len() > MAX_EXPECT_BODY {
+            return Err(ValidationError::ExpectBodyTooLong { len: body.len() });
+        }
+        if method == ProbeMethod::Head {
+            return Err(ValidationError::HeadCannotAssertBody);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -341,6 +518,22 @@ pub enum ValidationError {
     },
     #[error("{field} {value} is outside 1..={MAX_THRESHOLD}")]
     ThresholdOutOfRange { field: &'static str, value: u8 },
+    #[error("probe method `{value}` is not GET or HEAD")]
+    UnknownMethod { value: String },
+    #[error("status spec `{spec}` is not `lo`/`lo-hi` of statuses 1..=599 with low <= high")]
+    StatusSpecInvalid { spec: String },
+    #[error("expect_statuses must name at least one range")]
+    StatusRangesEmpty,
+    #[error("expect_statuses has {count} ranges, over the {MAX_STATUS_RANGES} bound")]
+    StatusRangesTooMany { count: usize },
+    #[error("status ranges overlap")]
+    StatusRangesOverlap,
+    #[error("expect_body is empty")]
+    ExpectBodyEmpty,
+    #[error("expect_body is {len} bytes, over the {MAX_EXPECT_BODY} bound")]
+    ExpectBodyTooLong { len: usize },
+    #[error("a HEAD probe carries no body to assert")]
+    HeadCannotAssertBody,
 }
 
 fn validate_fields(
@@ -386,7 +579,27 @@ impl NewMonitor {
             interval,
             timeout,
             thresholds: Thresholds::default(),
+            method: ProbeMethod::Get,
+            expect: Expect::standard(),
         })
+    }
+
+    /// Probe method + response assertions (D-025). `statuses` is sorted and bounded
+    /// here (`1..=599`, nonempty, `<= MAX_STATUS_RANGES`, non-overlapping); `HEAD` +
+    /// a body marker refuses — a `HEAD` response has no body to search.
+    pub fn with_expect(
+        mut self,
+        method: ProbeMethod,
+        mut statuses: Vec<StatusRange>,
+        body_contains: Option<Vec<u8>>,
+    ) -> Result<Self, ValidationError> {
+        validate_expect(method, &mut statuses, body_contains.as_deref())?;
+        self.method = method;
+        self.expect = Expect {
+            statuses,
+            body_contains,
+        };
+        Ok(self)
     }
 
     /// Override the default 3-fail / 2-pass sensitivity for this monitor.
@@ -415,6 +628,8 @@ impl NewMonitor {
             interval: self.interval,
             timeout: self.timeout,
             thresholds: self.thresholds,
+            method: self.method,
+            expect: self.expect,
             generation: 1,
             paused: false,
         }
@@ -434,6 +649,13 @@ pub struct MonitorPatch {
     pub failures_to_open: Option<u8>,
     pub passes_to_recover: Option<u8>,
     pub paused: Option<bool>,
+    /// Probe method swap (D-025). Merging `HEAD` onto a monitor that holds a body
+    /// marker fails the same cross-field check a create would.
+    pub method: Option<ProbeMethod>,
+    /// Replacement status set — validated like a create (sorted, bounded, no overlap).
+    pub expect_statuses: Option<Vec<StatusRange>>,
+    /// `Some(None)` clears the marker; `Some(Some(_))` sets it; `None` keeps the stored one.
+    pub expect_body: Option<Option<Vec<u8>>>,
 }
 
 impl MonitorPatch {
@@ -454,8 +676,27 @@ impl MonitorPatch {
             )?,
             generation: monitor.generation,
             paused: self.paused.unwrap_or(monitor.paused),
+            method: self.method.unwrap_or(monitor.method),
+            expect: Expect {
+                statuses: self
+                    .expect_statuses
+                    .clone()
+                    .unwrap_or_else(|| monitor.expect.statuses.clone()),
+                body_contains: match &self.expect_body {
+                    Some(body) => body.clone(),
+                    None => monitor.expect.body_contains.clone(),
+                },
+            },
         };
         validate_fields(&merged.name, &merged.url, merged.interval, merged.timeout)?;
+        // The merged bundle faces the same cross-field rule a create does — a patch
+        // swapping GET->HEAD onto a monitor that holds a marker fails here (D-025).
+        let mut statuses = merged.expect.statuses.clone();
+        validate_expect(
+            merged.method,
+            &mut statuses,
+            merged.expect.body_contains.as_deref(),
+        )?;
         Ok(merged)
     }
 }

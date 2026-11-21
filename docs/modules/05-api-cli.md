@@ -89,6 +89,17 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Writes bump generation** on any schedule/target/threshold/paused change (module 01
   invariant). `failures_to_open` / `passes_to_recover` (`1..=10`, default 3/2) are settable
   on create and patch; out-of-range → `invalid_request`.
+- **Probe contract (M8):** `method` is `GET` (default) or `HEAD`, and `expect`
+  carries `statuses` — ≤8 non-overlapping inclusive ranges (`"200-299,418"`,
+  each endpoint 1–599, `lo ≤ hi`) — and `body_contains`, a literal 1–256-byte
+  marker searched in the first 64 KiB received inside the probe deadline
+  (never a regex; the client never decompresses, so compressed wire bytes are
+  searched as-is). `HEAD` + `body_contains` is refused at write — there is no
+  body to read — and a marker miss on an acceptable status commits
+  `http_fail` + `detail: "assert_body"` (D-025). Create and PATCH apply the
+  same rules — an edit proposing bad ranges or a HEAD/marker pair is 422 —
+  and the patch can shrink but never skip validation. None of it reaches the
+  public `status.json` (module 07's allowlist).
 - **CLI parity:** `monitor ping`, `monitors list|add|show|edit|pause|unpause|delete`,
   `maintenance add|list|rm`, `backup` — every management operation the API offers.
   `monitor maintenance add <id> --from now|<rfc3339> --to <rfc3339> [--reason s]` — a bad

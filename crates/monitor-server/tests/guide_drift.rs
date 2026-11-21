@@ -102,6 +102,7 @@ fn every_transport_detail_is_in_the_guide() {
         "cert_name_mismatch",
         "cert_untrusted",
         "cert_revoked",
+        "assert_body",
     ] {
         assert!(details.contains(detail), "guide missing detail {detail}");
     }

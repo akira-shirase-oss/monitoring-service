@@ -553,7 +553,8 @@ impl Db {
     pub async fn list_monitors_engine(&self) -> Result<Vec<MonitorRow>, QueryError> {
         let rows = sqlx::query_as::<_, MonitorRow>(
             "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
-                    recover_threshold, generation, paused, created_at
+                    recover_threshold, generation, paused, method, expect_statuses, expect_body,
+                    created_at
              FROM monitors ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -1157,8 +1158,9 @@ impl WorkspaceDb<'_> {
         }
         let inserted = sqlx::query(
             "INSERT INTO monitors (id, workspace_id, name, url, interval_s, timeout_s,
-                                  fail_threshold, recover_threshold, generation, paused, created_at)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?
+                                  fail_threshold, recover_threshold, generation, paused,
+                                  method, expect_statuses, expect_body, created_at)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?
              WHERE (SELECT COUNT(*) FROM monitors WHERE workspace_id = ?) < ?",
         )
         .bind(monitor.id.0.to_string())
@@ -1176,6 +1178,9 @@ impl WorkspaceDb<'_> {
         .bind(i64::from(monitor.thresholds.failures_to_open))
         .bind(i64::from(monitor.thresholds.passes_to_recover))
         .bind(i64::try_from(monitor.generation).map_err(|_| QueryError::OutOfRange("generation"))?)
+        .bind(monitor.method.as_str())
+        .bind(monitor_domain::encode_statuses(&monitor.expect.statuses))
+        .bind(monitor.expect.body_contains.as_deref())
         .bind(OffsetDateTime::now_utc())
         .bind(self.workspace.0.to_string())
         .bind(i64::try_from(max_monitors).unwrap_or(i64::MAX))
@@ -1187,7 +1192,8 @@ impl WorkspaceDb<'_> {
     pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
         let rows = sqlx::query_as::<_, MonitorRow>(
             "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
-                    recover_threshold, generation, paused, created_at
+                    recover_threshold, generation, paused, method, expect_statuses, expect_body,
+                    created_at
              FROM monitors WHERE workspace_id = ? ORDER BY created_at",
         )
         .bind(self.workspace.0.to_string())
@@ -1201,7 +1207,8 @@ impl WorkspaceDb<'_> {
     pub async fn monitor_row(&self, monitor: MonitorId) -> Result<Option<MonitorRow>, QueryError> {
         let row = sqlx::query_as::<_, MonitorRow>(
             "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
-                    recover_threshold, generation, paused, created_at
+                    recover_threshold, generation, paused, method, expect_statuses, expect_body,
+                    created_at
              FROM monitors WHERE id = ? AND workspace_id = ?",
         )
         .bind(monitor.0.to_string())
@@ -1245,6 +1252,7 @@ impl WorkspaceDb<'_> {
             "UPDATE monitors
              SET name = ?, url = ?, interval_s = ?, timeout_s = ?, paused = ?,
                  fail_threshold = ?, recover_threshold = ?,
+                 method = ?, expect_statuses = ?, expect_body = ?,
                  generation = generation + 1
              WHERE id = ? AND generation = ? AND workspace_id = ?",
         )
@@ -1261,6 +1269,9 @@ impl WorkspaceDb<'_> {
         .bind(monitor.paused)
         .bind(i64::from(monitor.thresholds.failures_to_open))
         .bind(i64::from(monitor.thresholds.passes_to_recover))
+        .bind(monitor.method.as_str())
+        .bind(monitor_domain::encode_statuses(&monitor.expect.statuses))
+        .bind(monitor.expect.body_contains.as_deref())
         .bind(monitor.id.0.to_string())
         .bind(i64::try_from(expected_generation).map_err(|_| QueryError::OutOfRange("generation"))?)
         .bind(self.workspace.0.to_string())
@@ -3105,6 +3116,12 @@ pub struct MonitorRow {
     pub recover_threshold: i64,
     pub generation: i64,
     pub paused: bool,
+    /// `GET`/`HEAD` — validated at write; anything else is corruption (D-025).
+    pub method: String,
+    /// Canonical "200-299,418" status set (D-025).
+    pub expect_statuses: String,
+    /// Literal byte marker for the bounded body read; NULL = none (D-025).
+    pub expect_body: Option<Vec<u8>>,
     pub created_at: OffsetDateTime,
 }
 
@@ -3141,6 +3158,13 @@ impl TryFrom<MonitorRow> for Monitor {
             thresholds,
             generation,
             paused: row.paused,
+            method: monitor_domain::ProbeMethod::parse(&row.method)
+                .map_err(|_| QueryError::Corrupt("monitor method".into()))?,
+            expect: monitor_domain::Expect {
+                statuses: monitor_domain::parse_statuses(&row.expect_statuses)
+                    .map_err(|_| QueryError::Corrupt("expect_statuses".into()))?,
+                body_contains: row.expect_body,
+            },
         })
     }
 }

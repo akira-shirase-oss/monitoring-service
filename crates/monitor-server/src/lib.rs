@@ -40,8 +40,8 @@ use monitor_db::{
     CheckRow, Db, IncidentRow, MaintenanceRow, MonitorRow, QueryError, SharedStatuses,
 };
 use monitor_domain::{
-    AccountId, ApiTokenId, Monitor, MonitorId, MonitorPatch, NewMonitor, Plan, Role, Status,
-    ValidationError,
+    AccountId, ApiTokenId, Expect, Monitor, MonitorId, MonitorPatch, NewMonitor, Plan, Role,
+    Status, ValidationError,
 };
 
 /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
@@ -2044,6 +2044,11 @@ struct MonitorView {
     passes_to_recover: u8,
     generation: u64,
     paused: bool,
+    /// The monitor's own probe config — workspace-owned data, served to the owner
+    /// only (never the public snapshot; D-025).
+    method: String,
+    expect_statuses: String,
+    expect_body: Option<String>,
     /// From the committed-evidence map only — a monitor with no committed observations is
     /// `unknown`, and an unwritten result can never appear here.
     status: Status,
@@ -2092,6 +2097,13 @@ pub struct CreateMonitor {
     /// Optional incident sensitivity — both fall back to the contract's 3/2 when absent.
     pub failures_to_open: Option<u8>,
     pub passes_to_recover: Option<u8>,
+    /// `GET` (default) or opt-in `HEAD` (D-025).
+    pub method: Option<String>,
+    /// Acceptable statuses as `lo`/`lo-hi` specs — default `200-299` (D-025).
+    pub expect_statuses: Option<Vec<String>>,
+    /// A literal byte marker searched in the bounded body read — 1..=256 bytes,
+    /// never regex; refused under `HEAD` (D-025).
+    pub expect_body: Option<String>,
 }
 
 async fn create_monitor(
@@ -2113,6 +2125,26 @@ async fn create_monitor(
     }
     .map_err(ApiError::Validation)?;
     check_target(&state, &new.url)?;
+    let new = new
+        .with_expect(
+            input
+                .method
+                .as_deref()
+                .map_or(Ok(monitor_domain::ProbeMethod::Get), |m| {
+                    monitor_domain::ProbeMethod::parse(m)
+                })
+                .map_err(ApiError::Validation)?,
+            match &input.expect_statuses {
+                None => Expect::standard().statuses,
+                Some(specs) => specs
+                    .iter()
+                    .map(|spec| monitor_domain::parse_status_range(spec))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ApiError::Validation)?,
+            },
+            input.expect_body.map(String::into_bytes),
+        )
+        .map_err(ApiError::Validation)?;
     let new = match (input.failures_to_open, input.passes_to_recover) {
         (None, None) => new,
         (fail, recover) => new
@@ -2175,6 +2207,12 @@ pub struct PatchMonitor {
     pub failures_to_open: Option<u8>,
     pub passes_to_recover: Option<u8>,
     pub paused: Option<bool>,
+    /// Probe method swap — `HEAD` merged onto a monitor holding a marker 422s (D-025).
+    pub method: Option<String>,
+    /// Replacement status set — validated like a create.
+    pub expect_statuses: Option<Vec<String>>,
+    /// `null` clears the marker; a string sets it; absent keeps the stored one.
+    pub expect_body: Option<Option<String>>,
     /// Optional optimistic-concurrency guard: when present and stale, the write is a
     /// conflict rather than a blind last-writer-wins.
     pub generation: Option<u64>,
@@ -2213,6 +2251,23 @@ async fn patch_monitor(
         failures_to_open: input.failures_to_open,
         passes_to_recover: input.passes_to_recover,
         paused: input.paused,
+        method: input
+            .method
+            .as_deref()
+            .map(monitor_domain::ProbeMethod::parse)
+            .transpose()
+            .map_err(ApiError::Validation)?,
+        expect_statuses: input
+            .expect_statuses
+            .map(|specs| {
+                specs
+                    .iter()
+                    .map(|spec| monitor_domain::parse_status_range(spec))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(ApiError::Validation)?,
+        expect_body: input.expect_body.map(|body| body.map(String::into_bytes)),
     };
     if let Some(url) = &patch.url {
         check_target(&state, url)?;
@@ -2684,6 +2739,12 @@ fn view_from_row(
         passes_to_recover: monitor.thresholds.passes_to_recover,
         generation: monitor.generation,
         paused: monitor.paused,
+        method: monitor.method.as_str().to_owned(),
+        expect_statuses: monitor_domain::encode_statuses(&monitor.expect.statuses),
+        expect_body: monitor
+            .expect
+            .body_contains
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
         status,
         created_at,
     })

@@ -269,6 +269,10 @@ struct Dispatch {
     generation: u64,
     slot_at: OffsetDateTime,
     url: Url,
+    /// The monitor's probe method + response assertions (D-025) — snapshotted at
+    /// claim so an edit mid-flight stays inside its own generation.
+    method: monitor_domain::ProbeMethod,
+    expect: monitor_domain::Expect,
     deadline: Duration,
     _global: tokio::sync::OwnedSemaphorePermit,
     _origin: tokio::sync::OwnedSemaphorePermit,
@@ -434,6 +438,8 @@ fn plan_due(
             generation: entry.monitor.generation,
             slot_at: entry.next_slot_at,
             url: entry.monitor.url.clone(),
+            method: entry.monitor.method,
+            expect: entry.monitor.expect.clone(),
             deadline: entry.monitor.timeout,
             _global: global_permit,
             _origin: origin_permit,
@@ -494,7 +500,12 @@ impl Plan {
                 let result = crate::probe::PROBE_WORKSPACE
                     .scope(
                         dispatch.workspace,
-                        probes.probe(&dispatch.url, dispatch.deadline),
+                        probes.probe_expect(
+                            &dispatch.url,
+                            dispatch.method,
+                            &dispatch.expect,
+                            dispatch.deadline,
+                        ),
                     )
                     .await;
                 // A probe the SSRF guard refused at probe time (a name resolving to a local
@@ -1080,6 +1091,8 @@ mod tests {
             generation: 1,
             slot_at: OffsetDateTime::now_utc(),
             url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
+            method: monitor_domain::ProbeMethod::Get,
+            expect: monitor_domain::Expect::standard(),
             // The fixture answers on accept; the deadline only bounds a hang,
             // so it is sized unreachable — a tight real-time budget would
             // flake machine-speed-dependent (N-6 re-review).
@@ -1199,6 +1212,8 @@ mod tests {
             generation: 1,
             slot_at: OffsetDateTime::now_utc(),
             url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
+            method: monitor_domain::ProbeMethod::Get,
+            expect: monitor_domain::Expect::standard(),
             // The fixture answers on accept; the deadline only bounds a hang,
             // so it is sized unreachable — a tight real-time budget would
             // flake machine-speed-dependent (N-6 re-review).

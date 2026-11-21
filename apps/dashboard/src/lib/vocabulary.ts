@@ -80,6 +80,7 @@ export const VOCABULARY: GuideWord[] = [
 	{ word: 'rejected_local', kind: 'detail', title: 'rejected (local address)', body: 'The target (or a redirect it sent) resolved to a local/private address — refused by the SSRF policy before dialing. Counted as a failure: every real visitor of that target is broken too, so it can open an incident and page.' },
 	{ word: 'body', kind: 'detail', title: 'body read', body: 'Connected and got a response, but reading the body failed (incl. over the 64 KiB cap).' },
 	{ word: 'request', kind: 'detail', title: 'request', body: 'The request itself could not be built or sent.' },
+	{ word: 'assert_body', kind: 'detail', title: 'body marker missing', body: 'The status was acceptable but the body marker was absent from the observed ≤ 64 KiB prefix — assertion over the observed prefix, never "the target doesn\'t have it".' },
 
 	// --- incident fields/state ---
 	{

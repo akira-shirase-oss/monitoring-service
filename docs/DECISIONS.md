@@ -474,3 +474,26 @@ budget: sends are member- or incident-initiated, outbox- and retry-bounded —
 a different bound for a different channel, and charging them here would let a
 busy webhook URL starve unrelated probes at the same address (explicit gap,
 N-6).
+
+## D-025 — A response-body assertion miss is `http_fail` evidence, never a new outcome
+
+A monitor can carry a bounded response contract — a status set (≤8 inclusive
+ranges over 1–599) and an optional literal body marker (1–256 wire bytes,
+searched only in the first 64 KiB actually received inside the probe deadline;
+the client never decompresses, so compressed bytes are searched exactly as they
+arrive and no compressed bomb can inflate in-process). When the status is
+acceptable but the marker is absent from that bounded prefix the check commits
+`http_fail` with `detail = 'assert_body'` and the observed status — the target
+*answered correctly* and the *observed evidence* contradicts the contract, so
+the failure is HTTP-visible, streak-counting failure evidence — a real miss,
+not a coverage gap. The alternative, a new `CheckOutcome` variant, was
+rejected: it would need a decode migration for stored `outcome` strings,
+dashboard/outbox/aggregation vocabulary churn, and a semantic claim ("the
+assertion failed") that the wire already encodes — status acceptable, content
+wrong. `assert_body` joins the detail vocabulary beside `address_budget` and
+the guide-drift pins cover it in both directions. Two honest edges: a marker
+that lands past the 64 KiB cap misses — the prefix is all the evidence there
+is — and HEAD can never pair with a body marker (refused at write, create and
+edit alike, because a HEAD probe reads nothing to assert on). Method is opt-in
+`GET`/`HEAD`; HEAD is preserved across every redirect including 303 and a 405
+or 501 answer is committed as that status — never rewritten to GET or retried.

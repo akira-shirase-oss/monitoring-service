@@ -12,7 +12,7 @@ use reqwest::redirect;
 use tokio::time::Instant;
 use url::{Host, Url};
 
-use monitor_domain::{CheckOutcome, WorkspaceId};
+use monitor_domain::{CheckOutcome, Expect, ProbeMethod, WorkspaceId};
 
 /// Redirects followed per hop, each revalidated — a hop limit, never a free pass.
 const MAX_REDIRECT_HOPS: usize = 5;
@@ -721,8 +721,26 @@ impl ProbeClient {
         })
     }
 
-    /// Run one probe against `url`, bounded by `deadline` for the *entire* attempt.
+    /// A `GET` with the standard `200-299` expectation and no marker — the pre-M8
+    /// behavior, kept as the convenience entry for callers without assertions.
     pub async fn probe(&self, url: &Url, deadline: Duration) -> ProbeResult {
+        self.probe_expect(url, ProbeMethod::Get, &Expect::standard(), deadline)
+            .await
+    }
+
+    /// One probe with the monitor's method and assertions (D-025). `expect` is the
+    /// domain's already-validated set: an acceptable status plus an optional literal
+    /// marker searched in the bounded body prefix — never regex, never a target.
+    /// `HEAD` is opt-in: it rides the same redirect chain (preserved as `HEAD`,
+    /// never rewritten to `GET`), answers `405`/`501` honestly, and never reads a
+    /// body — a body marker under `HEAD` can't exist past the write boundary.
+    pub async fn probe_expect(
+        &self,
+        url: &Url,
+        method: ProbeMethod,
+        expect: &Expect,
+        deadline: Duration,
+    ) -> ProbeResult {
         let start = Instant::now();
         let attempt = async {
             if let Err(rejected) = self.policy.check(url) {
@@ -737,13 +755,19 @@ impl ProbeClient {
             {
                 return Attempt::Budgeted;
             }
-            match self.client.get(url.clone()).send().await {
+            match self
+                .client
+                .request(wire_method(method), url.clone())
+                .send()
+                .await
+            {
                 Err(error) => Attempt::Failed(error),
                 Ok(mut response) => {
                     let status = response.status();
                     // Read the body bounded: a target that streams forever must not hold a
                     // worker past the deadline, and we only need enough to know it answered.
                     let mut read = 0usize;
+                    let mut body = expect.body_contains.as_ref().map(|_| Vec::new());
                     let mut failed = None;
                     while failed.is_none() {
                         match response.chunk().await {
@@ -751,6 +775,10 @@ impl ProbeClient {
                             Ok(None) => break,
                             Ok(Some(chunk)) => {
                                 read += chunk.len();
+                                if let Some(buf) = body.as_mut() {
+                                    let room = self.max_body.saturating_sub(buf.len());
+                                    buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                                }
                                 if read > self.max_body {
                                     break;
                                 }
@@ -759,7 +787,7 @@ impl ProbeClient {
                     }
                     match failed {
                         Some(error) => Attempt::Failed(error),
-                        None => Attempt::Answered(status),
+                        None => Attempt::Answered { status, body },
                     }
                 }
             }
@@ -813,14 +841,40 @@ impl ProbeClient {
                 detail: Some(classify(&error)),
                 limited: false,
             },
-            Ok(Attempt::Answered(status)) if status.is_success() => ProbeResult {
-                outcome: CheckOutcome::Pass,
-                http_status: Some(status.as_u16()),
-                latency: start.elapsed(),
-                detail: None,
-                limited: false,
-            },
-            Ok(Attempt::Answered(status)) => ProbeResult {
+            Ok(Attempt::Answered { status, body }) if expect.accepts(status.as_u16()) => {
+                // An acceptable status is still failure evidence when the marker
+                // is absent from the observed <= max_body prefix (D-025): a miss
+                // is `http_fail`/`assert_body`, never a pass.
+                let missed = match (&expect.body_contains, body.as_deref()) {
+                    (Some(marker), Some(buf)) => {
+                        !buf.windows(marker.len()).any(|w| w == marker.as_slice())
+                    }
+                    // Marker expected but no body was ever buffered — treat as a
+                    // miss, never a silent pass.
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if missed {
+                    ProbeResult {
+                        outcome: CheckOutcome::HttpFail {
+                            status: status.as_u16(),
+                        },
+                        http_status: Some(status.as_u16()),
+                        latency: start.elapsed(),
+                        detail: Some("assert_body"),
+                        limited: false,
+                    }
+                } else {
+                    ProbeResult {
+                        outcome: CheckOutcome::Pass,
+                        http_status: Some(status.as_u16()),
+                        latency: start.elapsed(),
+                        detail: None,
+                        limited: false,
+                    }
+                }
+            }
+            Ok(Attempt::Answered { status, .. }) => ProbeResult {
                 outcome: CheckOutcome::HttpFail {
                     status: status.as_u16(),
                 },
@@ -833,13 +887,27 @@ impl ProbeClient {
     }
 }
 
+/// The wire method — `monitor-domain` holds no I/O, so `ProbeMethod` maps to
+/// reqwest's here. Only safe methods exist on the enum (D-025).
+fn wire_method(method: ProbeMethod) -> reqwest::Method {
+    match method {
+        ProbeMethod::Get => reqwest::Method::GET,
+        ProbeMethod::Head => reqwest::Method::HEAD,
+    }
+}
+
 enum Attempt {
     Rejected(Rejected),
     /// The literal's own per-address bound refused the start (A re-review) —
     /// a reqwest error cannot be built by hand, so this carries the refusal.
     Budgeted,
     Failed(reqwest::Error),
-    Answered(reqwest::StatusCode),
+    /// The final answer plus the body prefix when a marker was asserted — kept
+    /// only while the marker needs it, bounded by `max_body` like any read.
+    Answered {
+        status: reqwest::StatusCode,
+        body: Option<Vec<u8>>,
+    },
 }
 
 /// A TLS failure gets its own committed detail — "couldn't connect" is the least useful
@@ -1658,6 +1726,292 @@ mod tests {
                 .await
                 .is_ok(),
             "b's share at the same address is untouched"
+        );
+    }
+
+    /// A loopback axum fixture for the M8 tests: arbitrary router, literal host —
+    /// the `for_test` policy allows local targets and its resolver has no budget,
+    /// so literal probes dial free of the starts accounting.
+    async fn serve(router: axum::Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        addr
+    }
+
+    fn lab_client(max_body: usize) -> ProbeClient {
+        ProbeClient::pinned(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            max_body,
+            &[],
+        )
+        .expect("client")
+    }
+
+    /// D-025: a `HEAD` probe stays `HEAD` through a 303 — the one redirect status
+    /// that rewrites every other method to `GET`. The landing handler answers 501
+    /// to anything but `HEAD`, so a rewrite could only land as `http_fail`.
+    #[tokio::test]
+    async fn head_stays_head_across_a_redirect() {
+        use axum::extract::Request;
+        use axum::response::IntoResponse;
+        let land = |req: Request| async move {
+            if req.method() == reqwest::Method::HEAD {
+                axum::http::StatusCode::OK.into_response()
+            } else {
+                axum::http::StatusCode::NOT_IMPLEMENTED.into_response()
+            }
+        };
+        let router = axum::Router::new()
+            .route(
+                "/go",
+                axum::routing::any(|| async {
+                    (
+                        axum::http::StatusCode::SEE_OTHER,
+                        [(axum::http::header::LOCATION, "/land")],
+                    )
+                }),
+            )
+            .route("/land", axum::routing::any(land));
+        let url: Url = format!("http://{}/go", serve(router).await)
+            .parse()
+            .expect("url");
+        let result = lab_client(64 * 1024)
+            .probe_expect(
+                &url,
+                ProbeMethod::Head,
+                &Expect::standard(),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            result.outcome,
+            CheckOutcome::Pass,
+            "HEAD must land as HEAD through the 303: {result:?}"
+        );
+    }
+
+    /// D-025: a `HEAD` answered `405`/`501` is recorded as that answer — never
+    /// silently retried as `GET` (a GET retry would see this fixture's 200).
+    #[tokio::test]
+    async fn a_head_probe_that_answers_405_is_recorded_honestly() {
+        use axum::extract::Request;
+        use axum::response::IntoResponse;
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::any(|req: Request| async move {
+                if req.method() == reqwest::Method::GET {
+                    "ok".into_response()
+                } else {
+                    axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response()
+                }
+            }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let result = lab_client(64 * 1024)
+            .probe_expect(
+                &url,
+                ProbeMethod::Head,
+                &Expect::standard(),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            result.outcome,
+            CheckOutcome::HttpFail { status: 405 },
+            "the 405 is the committed answer, not a GET retry: {result:?}"
+        );
+    }
+
+    /// D-025: the marker is searched literally in the observed prefix — a present
+    /// marker passes, an absent one is `http_fail`/`assert_body`, and `.*` is just
+    /// bytes (no engine exists to exploit).
+    #[tokio::test]
+    async fn the_marker_is_literal_and_the_miss_is_failure_evidence() {
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "xZZy" }));
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let client = lab_client(64 * 1024);
+        let expect = Expect {
+            body_contains: Some(b"x.*y".to_vec()),
+            ..Expect::standard()
+        };
+        let miss = client
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(miss.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            miss.detail,
+            Some("assert_body"),
+            "a body that only matches the pattern loosely still misses: {miss:?}"
+        );
+        // The literal string `x.*y` in the body is the only thing that passes.
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { "contains x.*y literally" }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let hit = client
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(hit.outcome, CheckOutcome::Pass, "the literal bytes pass");
+    }
+
+    /// D-025: the assertion reads only the observed `<= max_body` prefix — a
+    /// marker split across the read boundary, or entirely past it, is a miss.
+    #[tokio::test]
+    async fn a_marker_past_the_body_bound_never_passes() {
+        // max_body 16: `MARK` lands at bytes 13..17 — split across the bound.
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { "AAAAAAAAAAAAMARKER" }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let client = lab_client(16);
+        let expect = Expect {
+            body_contains: Some(b"MARKER".to_vec()),
+            ..Expect::standard()
+        };
+        let result = client
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(result.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            result.detail,
+            Some("assert_body"),
+            "a marker straddling the bound misses: {result:?}"
+        );
+    }
+
+    /// D-025: the client is built without decompression features — the marker is
+    /// searched on the wire bytes, so a compressed bomb only ever costs the
+    /// bounded read. A gzipped marker is a miss, never inflation.
+    #[tokio::test]
+    async fn compressed_bytes_are_searched_as_received() {
+        let gzipped: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 11, 118, 245, 11, 241, 244, 115, 245, 209, 205,
+            72, 45, 74, 5, 0, 125, 143, 180, 174, 13, 0, 0, 0,
+        ];
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_ENCODING, "gzip")],
+                    axum::body::Body::from(gzipped.to_vec()),
+                )
+            }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let expect = Expect {
+            body_contains: Some(b"SENTINEL-here".to_vec()),
+            ..Expect::standard()
+        };
+        let result = lab_client(64 * 1024)
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(result.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            result.detail,
+            Some("assert_body"),
+            "wire bytes are searched, never inflated: {result:?}"
+        );
+    }
+
+    /// A raw fixture that answers 200 and then dribbles one byte a beat forever —
+    /// a slowloris body that no buffer bound would ever finish.
+    async fn drip_fixture() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n";
+                    if sock.write_all(head).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if sock.write_all(b"1\r\nM\r\n").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// D-025: a slowloris body meets the probe's deadline — the whole attempt,
+    /// body read included, sits inside `tokio::time::timeout`.
+    #[tokio::test]
+    async fn a_body_that_dribbles_meets_the_deadline() {
+        let url: Url = format!("http://{}/", drip_fixture().await)
+            .parse()
+            .expect("url");
+        let expect = Expect {
+            body_contains: Some(b"SENTINEL".to_vec()),
+            ..Expect::standard()
+        };
+        let result = lab_client(64 * 1024)
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(1))
+            .await;
+        assert_eq!(
+            result.outcome,
+            CheckOutcome::Timeout,
+            "a dribbling body dies on the deadline: {result:?}"
+        );
+    }
+
+    /// D-025: an assertion string is evidence to search, never a request target —
+    /// a marker that looks like a URL is matched against the already-validated
+    /// response and dials nothing.
+    #[tokio::test]
+    async fn a_marker_is_searched_never_dialed() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "plain body"
+                }
+            }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let expect = Expect {
+            // A marker shaped exactly like a URL — it is data, not a request.
+            body_contains: Some(b"http://127.0.0.1:9/internal".to_vec()),
+            ..Expect::standard()
+        };
+        let result = lab_client(64 * 1024)
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(result.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the only dial is the validated target: {result:?}"
         );
     }
 }
