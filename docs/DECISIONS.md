@@ -438,15 +438,24 @@ ceiling has room the static share is the whole rule; once it is spent the
 ceiling becomes **max-min fair**: a workspace still below its fair split of it
 (8 ÷ the workspaces at that address) keeps starting, and the spender already
 holding its split is who refuses — four busy tenants behind one CDN address
-can't turn a fifth's monitor `unknown` forever. The honest cost: under
-contention the effective ceiling is the burst plus at most one in-flight
-start per waiting workspace — the ceiling refills, the overshoot is bounded.
-The charge lives inside the SSRF validating resolver on the ONE candidate
-offered to the dialer — the first paying address in answer order; a fallback
-family or a sprayed answer's tail is never dialed and never pays — and beside
-it for the paths that never touch DNS: an IP-literal URL pays its own literal,
-and the redirect closure pays each hop's literal host before following it,
-refusing the hop as `address_budget`. IPv4-mapped IPv6 spellings normalize to
+can't turn a fifth's monitor `unknown` forever. Every admit pays a global
+token even when the ceiling is spent (debt capped at the active-workspace
+count at that address, "active" = an admitted start inside the last ceiling
+window), so the ceiling binds paced tenants at its refill rate, not only
+burst ones; the honest cost is a bounded overshoot of at most one start per
+active workspace. The charge lives inside the SSRF validating resolver on the
+ONE candidate offered to the dialer — the first paying address in answer
+order; a fallback family or a sprayed answer's tail is never dialed and never
+pays. The honest trade-off of offering one: hyper collects the offered
+addresses eagerly and reqwest exposes no dial hook, so a multi-candidate
+answer could only be charged upfront — paying for addresses never dialed
+(the N-2 hole) — and there is no Happy-Eyeballs fallback: a dual-stack
+target whose first answer is a dead family records a transport failure
+instead of falling back. That misclassification can page, and it is the
+chosen price of never charging the victim for connections that never happen.
+Beside the resolver, for the paths that never touch DNS: an IP-literal URL
+pays its own literal, and the redirect closure pays each hop's literal host
+before following it, refusing the hop as `address_budget`. IPv4-mapped IPv6 spellings normalize to
 the IPv4 key — `::ffff:8.8.8.8` and `8.8.8.8` share one bucket. The bucket map
 is bounded (8192 entries); when it fills it evicts only buckets that have
 fully refilled, and when none qualify it refuses the *new* address as a

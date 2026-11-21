@@ -22,9 +22,12 @@ it to the writer — without ever letting a slow target stall the schedule.
   `(origin, workspace)`), one in-flight probe per monitor, and a cross-tenant starts budget
   per IP: 8/s shared across all workspaces under a 2/s per-workspace share, max-min fair
   once the ceiling is spent (a workspace below its split of it still starts; the spender
-  at its split is who refuses — D-024). It is charged inside the SSRF resolver on the ONE
+  at its split is who refuses — D-024), with every admit paying a global token so the
+  ceiling binds paced tenants too. It is charged inside the SSRF resolver on the ONE
   candidate offered to the dialer — the first paying address in answer order, so a fallback
-  family or a sprayed answer's tail is never dialed and never pays — on IP-literal URLs and
+  family or a sprayed answer's tail is never dialed and never pays (the trade-off: no
+  multi-address fallback — a dual-stack target whose first answer is a dead family records
+  a transport failure rather than falling back; D-024) — on IP-literal URLs and
   on every redirect hop's literal host: a literal never skips the charge because it never
   touched DNS. A refusal commits `missed` + `address_budget`: a *neutral* coverage gap that
   shows `unknown` but never resets an outage's streaks — in memory and in the SQL
