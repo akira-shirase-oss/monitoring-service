@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..5ef0b56 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -47,7 +47,7 @@ use monitor_domain::{
+ /// Management requests are tiny JSON bodies; anything bigger is rejected before parsing.
+ const BODY_LIMIT: usize = 16 * 1024;
+ /// Every handler answers inside this; probes run on their own deadlines elsewhere.
+-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
++const REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
+ /// The penalty a wrong login token pays (`throttle::PENALTY_SLOTS` at once at most).
+ const WRONG_TOKEN_DELAY: Duration = Duration::from_millis(300);
+ 

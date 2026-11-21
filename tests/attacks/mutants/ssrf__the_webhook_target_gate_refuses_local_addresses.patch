@@ -1,0 +1,20 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..b5d8125 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -1288,13 +1288,8 @@ async fn check_webhook_target(state: &AppState, url: &url::Url) -> Result<(), Ap
+         allow_local_targets: state.allow_local_targets,
+         extra_roots: Vec::new(),
+     };
+-    match policy.check_resolved(url).await {
+-        Ok(()) => Ok(()),
+-        Err(probe::Rejected::Unresolvable) => Err(ApiError::Invalid(
+-            "the webhook host did not resolve to a public address".into(),
+-        )),
+-        Err(_) => Err(ApiError::RefusedTarget),
+-    }
++    let _ = policy;
++    Ok(())
+ }
+ 
+ /// The caller's workspaces (S2) — the memberships the sidebar switcher lists. Each

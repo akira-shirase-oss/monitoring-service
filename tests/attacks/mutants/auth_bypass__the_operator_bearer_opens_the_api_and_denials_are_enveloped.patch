@@ -1,0 +1,17 @@
+diff --git a/crates/monitor-server/src/auth.rs b/crates/monitor-server/src/auth.rs
+index 046b9e4..677072f 100644
+--- a/crates/monitor-server/src/auth.rs
++++ b/crates/monitor-server/src/auth.rs
+@@ -177,11 +177,7 @@ pub async fn require_auth(
+         }
+         _ => {
+             let Some(session) = session else {
+-                return deny(
+-                    StatusCode::UNAUTHORIZED,
+-                    "unauthenticated",
+-                    "a valid Bearer token or session cookie is required",
+-                );
++                return StatusCode::OK.into_response();
+             };
+             match cookie_principal(&state, request.headers(), request.method(), session).await {
+                 Ok(principal) => {

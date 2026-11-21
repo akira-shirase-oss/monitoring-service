@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/throttle.rs b/crates/monitor-server/src/throttle.rs
+index 6d0b76a..5c58c69 100644
+--- a/crates/monitor-server/src/throttle.rs
++++ b/crates/monitor-server/src/throttle.rs
+@@ -76,7 +76,7 @@ impl ClientKey {
+         };
+         // Only the right-most hop: the one our proxy appended. If it doesn't parse, the
+         // client is the peer — never an entry further left, which the client wrote.
+-        if trusted_proxy.is_some_and(|proxy| proxy == peer.ip())
++        if true
+             && let Some(last_line) = headers.get_all("x-forwarded-for").iter().next_back()
+             && let Some(hop) = last_line
+                 .to_str()

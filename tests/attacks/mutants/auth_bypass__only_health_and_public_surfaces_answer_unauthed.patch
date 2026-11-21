@@ -1,0 +1,15 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..5781ba4 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -477,6 +477,10 @@ fn routes(state: AppState) -> Router {
+         // throttle bounds what one client can ask for.
+         .route("/s/{slug}/status.json", get(public_status))
+         .nest("/api", api)
++        .route_layer(axum::middleware::from_fn_with_state(
++            state.clone(),
++            auth::require_auth,
++        ))
+         .with_state(state)
+         .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
+         .layer(axum::Extension(ScheduleLock::default()))

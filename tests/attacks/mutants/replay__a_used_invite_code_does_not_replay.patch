@@ -1,0 +1,26 @@
+diff --git a/crates/monitor-db/src/lib.rs b/crates/monitor-db/src/lib.rs
+index c7f7d57..ad561b2 100644
+--- a/crates/monitor-db/src/lib.rs
++++ b/crates/monitor-db/src/lib.rs
+@@ -691,7 +691,7 @@ impl Db {
+         // FK per-statement, not at commit) — the consume is last, still atomic.
+         let consumed = sqlx::query(
+             "UPDATE invites SET used_at = ?, used_by = ?
+-             WHERE id = ? AND used_at IS NULL AND expires_at > ?",
++             WHERE id = ? AND expires_at > ?",
+         )
+         .bind(now)
+         .bind(account.id.0.to_string())
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..bb2b584 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -1847,7 +1847,7 @@ async fn signup(
+     };
+     // Used and expired deny the same as unknown — before the email check can say
+     // anything else, so a spent code never reads differently than a forged one.
+-    if invite.used_at.is_some() || invite.expires_at <= (state.clock)() {
++    if invite.expires_at <= (state.clock)() {
+         return invite_denied(attempt);
+     }
+     // A taken email is told before the invite burns — the invite stays spendable.

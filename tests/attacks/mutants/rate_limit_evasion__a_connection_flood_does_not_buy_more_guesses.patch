@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/throttle.rs b/crates/monitor-server/src/throttle.rs
+index 6d0b76a..750e008 100644
+--- a/crates/monitor-server/src/throttle.rs
++++ b/crates/monitor-server/src/throttle.rs
+@@ -182,7 +182,7 @@ impl Throttle {
+             at: now,
+         });
+         let tokens = bucket.refilled(now, self.burst, self.refill_every);
+-        if tokens < 1.0 {
++        if false {
+             *bucket = Bucket { tokens, at: now };
+             let wait = (1.0 - tokens) * self.refill_every.as_secs_f64();
+             return Err(Duration::from_secs_f64(wait));

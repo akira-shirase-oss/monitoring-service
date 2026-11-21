@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..d98667d 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -602,7 +602,7 @@ fn layered(app: Router) -> Router {
+                 StatusCode::REQUEST_TIMEOUT,
+                 REQUEST_TIMEOUT,
+             ))
+-            .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT)),
++            .layer(axum::extract::DefaultBodyLimit::max(usize::MAX)),
+     )
+ }
+ 

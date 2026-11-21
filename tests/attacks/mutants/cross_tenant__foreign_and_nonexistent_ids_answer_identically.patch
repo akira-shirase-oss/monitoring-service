@@ -1,0 +1,16 @@
+diff --git a/crates/monitor-db/src/lib.rs b/crates/monitor-db/src/lib.rs
+index c7f7d57..28e2496 100644
+--- a/crates/monitor-db/src/lib.rs
++++ b/crates/monitor-db/src/lib.rs
+@@ -1169,10 +1169,9 @@ impl WorkspaceDb<'_> {
+         let row = sqlx::query_as::<_, MonitorRow>(
+             "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
+                     recover_threshold, generation, paused, created_at
+-             FROM monitors WHERE id = ? AND workspace_id = ?",
++             FROM monitors WHERE id = ?",
+         )
+         .bind(monitor.0.to_string())
+-        .bind(self.workspace.0.to_string())
+         .fetch_optional(&self.db.pool)
+         .await?;
+         Ok(row)

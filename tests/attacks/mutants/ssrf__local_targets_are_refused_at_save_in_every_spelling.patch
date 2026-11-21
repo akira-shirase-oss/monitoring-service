@@ -1,0 +1,14 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..9b60e69 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -2252,7 +2252,8 @@ fn check_target(state: &AppState, url: &url::Url) -> Result<(), ApiError> {
+         allow_local_targets: state.allow_local_targets,
+         extra_roots: Vec::new(),
+     };
+-    policy.check(url).map_err(|_| ApiError::RefusedTarget)
++    let _ = policy.check(url);
++    Ok(())
+ }
+ 
+ #[derive(Debug, Deserialize)]

@@ -1,0 +1,19 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..209b867 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -1923,14 +1923,6 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
+             tracing::error!(%error, "session delete failed");
+             return ApiError::Db(error).into_response();
+         }
+-        if let Err(error) = state
+-            .db
+-            .delete_session(&auth::account_session_key(id))
+-            .await
+-        {
+-            tracing::error!(%error, "account session delete failed");
+-            return ApiError::Db(error).into_response();
+-        }
+     }
+     (
+         StatusCode::NO_CONTENT,

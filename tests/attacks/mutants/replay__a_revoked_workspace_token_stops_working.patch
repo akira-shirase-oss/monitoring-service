@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/auth.rs b/crates/monitor-server/src/auth.rs
+index 046b9e4..ab16cd2 100644
+--- a/crates/monitor-server/src/auth.rs
++++ b/crates/monitor-server/src/auth.rs
+@@ -379,7 +379,7 @@ async fn api_token_principal(
+         }
+     };
+     let Some(row) = row else { return Ok(None) };
+-    if !row.live() || !digests_match(digest.as_bytes(), row.token_digest.as_bytes()) {
++    if !digests_match(digest.as_bytes(), row.token_digest.as_bytes()) {
+         return Ok(None);
+     }
+     let (Some(token), Some(workspace), Some(role)) = (row.token(), row.workspace(), row.role())

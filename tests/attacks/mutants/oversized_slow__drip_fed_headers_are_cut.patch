@@ -1,0 +1,12 @@
+diff --git a/crates/monitor-server/src/serve.rs b/crates/monitor-server/src/serve.rs
+index d802c5c..498efe0 100644
+--- a/crates/monitor-server/src/serve.rs
++++ b/crates/monitor-server/src/serve.rs
+@@ -225,7 +225,6 @@ async fn serve_connection(
+     };
+     let connection = hyper::server::conn::http1::Builder::new()
+         .timer(TokioTimer::new())
+-        .header_read_timeout(limits.header_read_timeout)
+         .serve_connection(
+             TokioIo::new(StallGuard::new(stream, limits.write_stall)),
+             service,

@@ -1,0 +1,21 @@
+diff --git a/crates/monitor-server/src/auth.rs b/crates/monitor-server/src/auth.rs
+index 046b9e4..9b59738 100644
+--- a/crates/monitor-server/src/auth.rs
++++ b/crates/monitor-server/src/auth.rs
+@@ -96,16 +96,6 @@ pub async fn require_auth(
+         .and_then(|value| value.to_str().ok())
+         .map(str::to_owned)
+         .or_else(|| request.uri().authority().map(|a| a.as_str().to_owned()));
+-    if let Some(origin) = request.headers().get(header::ORIGIN)
+-        && !origin_matches_host(origin, authority.as_deref())
+-    {
+-        return deny(
+-            StatusCode::FORBIDDEN,
+-            "origin_mismatch",
+-            "Origin does not match Host",
+-        );
+-    }
+-
+     // A presented cookie is resolved before anything else (S1b): an account session
+     // authorizes in every mode — tokenless dev included — and scopes to a workspace
+     // the account belongs to, never the operator's.

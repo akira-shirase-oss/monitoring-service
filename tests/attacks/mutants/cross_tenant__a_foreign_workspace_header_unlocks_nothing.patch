@@ -1,0 +1,17 @@
+diff --git a/crates/monitor-server/src/auth.rs b/crates/monitor-server/src/auth.rs
+index 046b9e4..f2063c8 100644
+--- a/crates/monitor-server/src/auth.rs
++++ b/crates/monitor-server/src/auth.rs
+@@ -346,7 +346,11 @@ async fn scope_account(
+             workspace,
+             role,
+         }),
+-        Ok(None) => Err(Box::new(deny_not_a_member())),
++        Ok(None) => Ok(Principal::Account {
++            account,
++            workspace,
++            role: Role::Viewer,
++        }),
+         Err(error) => {
+             tracing::error!(%error, "membership lookup failed");
+             Err(Box::new(deny(
