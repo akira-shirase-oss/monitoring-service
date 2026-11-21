@@ -20,16 +20,40 @@ fn every_migration_matches_its_committed_checksum() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations.sha256");
     let manifest = fs::read_to_string(&manifest_path).expect("the committed manifest");
-    let expected: BTreeMap<String, String> = manifest
+    let mut expected: BTreeMap<String, String> = BTreeMap::new();
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
+    for line in manifest
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .map(|line| {
-            let (sum, name) = line
-                .split_once("  ")
-                .unwrap_or_else(|| panic!("manifest line is not `sha256  name`: {line:?}"));
-            (name.trim().to_owned(), sum.trim().to_owned())
-        })
-        .collect();
+    {
+        let (sum, name) = line
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("manifest line is not `sha256  name`: {line:?}"));
+        let name = name.trim();
+        // N-3 re-review: a name must appear exactly once — collecting into a
+        // map made the LAST line win, so an appended shadow line could bless
+        // an in-place edit while the base line stayed verbatim. And one
+        // version number is one file: a renamed file under the same version
+        // prefix is the same applied bytes under a new name.
+        assert!(
+            expected
+                .insert(name.to_owned(), sum.trim().to_owned())
+                .is_none(),
+            "the manifest names {name} twice — an appended shadow line may never \
+             re-bless an existing migration"
+        );
+        let version = name
+            .split('_')
+            .next()
+            .unwrap_or_else(|| panic!("unnamed migration line: {line:?}"));
+        assert!(
+            versions
+                .insert(version.to_owned(), name.to_owned())
+                .is_none(),
+            "two manifest lines share version prefix {version} ({name}) — one \
+             applied version is one file's bytes, whatever it is renamed to"
+        );
+    }
 
     let mut files: Vec<String> = fs::read_dir(&dir)
         .expect("the migrations directory")
