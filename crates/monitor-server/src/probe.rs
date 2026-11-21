@@ -849,7 +849,7 @@ impl ProbeClient {
 
     /// The response made it — classify it against the monitor's contract.
     /// An acceptable status is still failure evidence when the marker is absent
-    /// from the observed <= max_body prefix (D-025): a miss is
+    /// from the observed <= `max_body` prefix (D-025): a miss is
     /// `http_fail`/`assert_body`, never a pass.
     fn answered_result(
         status: reqwest::StatusCode,
