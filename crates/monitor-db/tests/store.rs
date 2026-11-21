@@ -516,6 +516,59 @@ async fn an_outage_of_ordinary_misses_keeps_the_rebuild_tail_bounded() -> anyhow
     Ok(())
 }
 
+/// G3 re-review: the rebuild tail must be index-served, not sorted — the only
+/// checks index before 0020 ordered by slot_at, so every monitor's boot
+/// rebuild pushed its whole match set through a temp B-tree and restart time
+/// grew with fleet history until upgrades out-waited the readiness poll.
+/// These are the exact queries `recent_outcomes` runs; both must come back as
+/// an index SEARCH — a temp B-tree or a full-table scan fails the test.
+#[tokio::test]
+async fn the_rebuild_tail_queries_use_the_0020_indexes() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("plan.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let queries = [
+        "EXPLAIN QUERY PLAN
+         SELECT id, outcome, http_status, detail FROM checks
+         WHERE monitor_id = ? AND workspace_id = ?
+           AND NOT (outcome = 'missed' AND detail IS 'address_budget')
+         ORDER BY id DESC LIMIT ?",
+        "EXPLAIN QUERY PLAN
+         SELECT id, outcome, http_status, detail FROM checks
+         WHERE monitor_id = ? AND workspace_id = ?
+           AND outcome = 'missed' AND detail IS 'address_budget'
+         ORDER BY id DESC LIMIT ?",
+    ];
+    for sql in queries {
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sql)
+            .bind("m")
+            .bind("w")
+            .bind(10_i64)
+            .fetch_all(&pool)
+            .await?;
+        let detail = plan
+            .iter()
+            .map(|(.., step)| step.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            !detail.contains("USE TEMP B-TREE"),
+            "the rebuild tail sorts in memory — no index served its ORDER BY: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN checks"),
+            "the rebuild tail scans the whole checks table: {detail}"
+        );
+        assert!(
+            detail.contains("checks"),
+            "the plan does not even touch the checks table: {detail}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn check_stats_counts_window_rows_and_leaves_expected_to_the_caller() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;

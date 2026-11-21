@@ -90,3 +90,30 @@ fn every_migration_matches_its_committed_checksum() {
         "the manifest must cover exactly the migration files"
     );
 }
+
+/// G5: the binary's embedded manifest is `version|sha384|file` and the file
+/// column must be the real migration filename — sqlx stores the description
+/// with spaces ("check stats daily"), so printing it raw produced
+/// `0002_check stats daily.sql`, a name that matches nothing on disk. The
+/// manifest must name files the inspector and an operator can find.
+#[test]
+fn the_binary_manifest_names_real_migration_files() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for line in monitor_db::Db::migration_manifest().lines() {
+        let fields: Vec<&str> = line.split('|').collect();
+        assert_eq!(
+            fields.len(),
+            3,
+            "manifest line is not version|sha384|file: {line:?}"
+        );
+        let file = fields[2];
+        assert!(
+            !file.contains(' '),
+            "the manifest's file column kept sqlx's spaced description: {file}"
+        );
+        assert!(
+            dir.join(file).is_file(),
+            "the manifest names a file that does not exist: {file}"
+        );
+    }
+}

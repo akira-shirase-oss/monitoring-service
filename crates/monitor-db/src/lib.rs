@@ -472,7 +472,13 @@ impl Db {
                 );
                 format!(
                     "{}|{}|{:04}_{}.sql",
-                    migration.version, checksum, migration.version, migration.description,
+                    migration.version,
+                    checksum,
+                    migration.version,
+                    // sqlx renders the filename's description with spaces
+                    // ("check stats daily") — the manifest column must be the
+                    // real file name, so the transform runs back (G5).
+                    migration.description.replace(' ', "_"),
                 )
             })
             .collect::<Vec<_>>()
@@ -1632,7 +1638,10 @@ impl WorkspaceDb<'_> {
         .fetch_all(&self.db.pool)
         .await?;
         rows.extend(gaps);
-        rows.sort_by_key(|(id, ..)| *id); // append order == slot order
+        // id is COMMIT order, not slot order — a slot written late lands where
+        // it was committed; the replay wants the evidence in the order the
+        // machine actually saw it.
+        rows.sort_by_key(|(id, ..)| *id);
         rows.iter()
             .map(|(_, outcome, http_status, detail)| {
                 decode_outcome(outcome, *http_status, detail.as_deref())
