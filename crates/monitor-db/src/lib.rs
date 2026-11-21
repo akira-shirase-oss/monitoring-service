@@ -2677,10 +2677,13 @@ impl MemberDb<'_> {
                 // The held set stays bounded per workspace (S3 review): a rename
                 // loop would otherwise grow a tombstone per call. The newest 64
                 // stay — a name older than that has been recycled so many times
-                // the association is gone anyway.
+                // the association is gone anyway. `default` is exempt from the
+                // cap (N4 review): it is the seeded page's name, so every reader
+                // who ever knew it keeps it pointing at the seeded workspace —
+                // a rename loop must never free it for another tenant.
                 sqlx::query(
                     "DELETE FROM status_held_slugs
-                      WHERE workspace_id = ? AND slug NOT IN (
+                      WHERE workspace_id = ? AND slug != 'default' AND slug NOT IN (
                         SELECT slug FROM status_held_slugs
                          WHERE workspace_id = ?
                          ORDER BY released_at DESC, slug DESC LIMIT 64)",

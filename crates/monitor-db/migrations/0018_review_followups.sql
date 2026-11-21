@@ -19,15 +19,7 @@ UPDATE workspace_invitations SET email = lower(email) WHERE email != lower(email
 --    carry an email-derived slug. Pages that are not published get a fresh
 --    random name — a published page keeps its slug because it is the URL the
 --    world already knows, and releasing it would put the name on the held list
---    under a live page. Every name being replaced is held first (S3 review):
---    released unheld, a fresh install's seeded `default` and a turned-off
---    page's chosen slug alike would be claimable by another tenant while
---    readers still associate the name with its previous owner (0016's rule).
-INSERT OR IGNORE INTO status_held_slugs (slug, workspace_id, released_at)
-SELECT slug, id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-  FROM workspaces
- WHERE slug NOT LIKE 'ws-%'
-   AND status_title IS NULL;
+--    under a live page.
 UPDATE workspaces
 SET slug = 'ws-' || lower(hex(randomblob(6)))
 WHERE slug NOT LIKE 'ws-%'

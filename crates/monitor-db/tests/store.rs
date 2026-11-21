@@ -2479,12 +2479,13 @@ async fn released_slugs_are_held_but_capped_per_workspace() -> anyhow::Result<()
     Ok(())
 }
 
-/// S3 re-review: 0018's slug backfill must hold every name it replaces. Released
-/// unheld, a fresh install's seeded `default` — and any turned-off page's chosen
-/// slug — becomes claimable by another tenant while readers still associate the
-/// name with its previous owner (0016's whole point). Fresh migrate proves the
-/// seed row keeps its name held; the real migration file is then replayed
-/// against fixture rows standing in for a pre-0018 store.
+/// S3 re-review + N3 ruling: 0018 is restored byte-for-byte to its applied
+/// content, so the hold lands in 0019 — where it can only name what survives
+/// the rename: `default`, the seeded workspace's known name. Names other
+/// workspaces lost to the backfill were already rewritten before any hold
+/// existed — on an applied database they are unrecoverable, and the test marks
+/// that residual honestly rather than pretend coverage. Fresh migrate proves
+/// `default` held; the real files are then replayed against pre-0018 fixtures.
 #[tokio::test]
 async fn the_slug_backfill_holds_every_name_it_replaces() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -2530,7 +2531,13 @@ async fn the_slug_backfill_holds_every_name_it_replaces() -> anyhow::Result<()> 
         .execute(&raw)
         .await?;
     }
+    // The hold lives in its own migration (N3 ruling: 0018 is restored to its
+    // applied bytes; the hold arrives as 0019). Replay the pair in order against
+    // the pre-0018 fixtures.
     sqlx::raw_sql(include_str!("../migrations/0018_review_followups.sql"))
+        .execute(&raw)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations/0019_hold_backfilled_slugs.sql"))
         .execute(&raw)
         .await?;
 
@@ -2544,10 +2551,13 @@ async fn the_slug_backfill_holds_every_name_it_replaces() -> anyhow::Result<()> 
     )
     .fetch_optional(&raw)
     .await?;
+    // The name was already rewritten by 0018 before 0019 could see it — on an
+    // applied database this residual is unrecoverable; `default` is the only
+    // replaced name the migration can still hold (N3 ruling).
     assert_eq!(
         held_old.as_deref(),
-        Some(old.as_str()),
-        "a turned-off page's name must stay held by its owner"
+        None,
+        "unrecoverable post-rename: only `default` can still be held"
     );
     let bob_slug: String = sqlx::query_scalar("SELECT slug FROM workspaces WHERE id = ?")
         .bind(&published)
@@ -2563,19 +2573,57 @@ async fn the_slug_backfill_holds_every_name_it_replaces() -> anyhow::Result<()> 
             .await?;
     assert_eq!(held_bob, 0, "a name still in use is not tombstoned");
 
-    // The contract end to end: the outsider's claim is a conflict, and the
-    // original owner may re-take its own release.
+    // The contract end to end on the recoverable name: `default` is held under
+    // the seeded workspace, so the outsider's claim is a conflict — while the
+    // backfilled name that was already rewritten is claimable again (the
+    // accepted residual: its old value no longer exists anywhere to hold).
     let outsider_view = db.owner(WorkspaceId(uuid::Uuid::parse_str(&outsider)?));
     let claimed = outsider_view
-        .set_status_page(Some("alice.example.com"), Some("Theirs"), &[])
+        .set_status_page(Some("default"), Some("Theirs"), &[])
         .await;
     assert!(
         matches!(claimed, Err(QueryError::Conflict(_))),
-        "another tenant took the released name: {claimed:?}"
+        "another tenant took the seeded name: {claimed:?}"
     );
-    db.owner(WorkspaceId(uuid::Uuid::parse_str(&old)?))
-        .set_status_page(Some("alice.example.com"), Some("Mine"), &[])
-        .await?;
+    let backfilled = outsider_view
+        .set_status_page(Some("alice.example.com"), Some("Theirs"), &[])
+        .await;
+    assert!(
+        backfilled.is_ok(),
+        "the post-rename name is unrecoverable — claimable, not held: {backfilled:?}"
+    );
+    raw.close().await;
+    Ok(())
+}
+
+/// N4: the `default` hold must not lapse. The bounded held-set (newest 64 per
+/// workspace) exists for churned tenant names, but `default` is the seeded
+/// page's name — readers who knew it must never see it serve a new tenant,
+/// however many renames the operator does afterwards.
+#[tokio::test]
+async fn the_default_slug_never_lapses_out_of_its_hold() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("store.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let seed = WorkspaceId::DEFAULT;
+    // 65 renames: one more than the per-workspace held cap. Each rename holds the
+    // name it leaves behind and prunes the oldest holds.
+    for i in 0..65 {
+        db.owner(seed)
+            .set_status_page(Some(&format!("renamed-{i}")), None, &[])
+            .await?;
+    }
+    let raw = sqlx::SqlitePool::connect(&url).await?;
+    let held: Option<String> =
+        sqlx::query_scalar("SELECT workspace_id FROM status_held_slugs WHERE slug = 'default'")
+            .fetch_optional(&raw)
+            .await?;
+    assert_eq!(
+        held.as_deref(),
+        Some(seed.0.to_string().as_str()),
+        "`default` fell out of the held set after the cap — any tenant can claim it"
+    );
     raw.close().await;
     Ok(())
 }

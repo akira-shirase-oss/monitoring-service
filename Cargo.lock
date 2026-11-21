@@ -1326,6 +1326,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "anyhow",
  "monitor-domain",
+ "sha2 0.11.1",
  "sqlx",
  "tempfile",
  "thiserror",
