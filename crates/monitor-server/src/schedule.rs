@@ -1092,8 +1092,7 @@ mod tests {
             method: monitor_domain::ProbeMethod::Get,
             expect: monitor_domain::Expect::standard(),
             // The fixture answers on accept; the deadline only bounds a hang,
-            // so it is sized unreachable — a tight real-time budget would
-            // flake machine-speed-dependent (N-6 re-review).
+            // so it is sized unreachable (N-6 re-review).
             deadline: Duration::from_secs(5),
             _global: Arc::new(Semaphore::new(4))
                 .try_acquire_owned()
@@ -1213,8 +1212,7 @@ mod tests {
             method: monitor_domain::ProbeMethod::Get,
             expect: monitor_domain::Expect::standard(),
             // The fixture answers on accept; the deadline only bounds a hang,
-            // so it is sized unreachable — a tight real-time budget would
-            // flake machine-speed-dependent (N-6 re-review).
+            // so it is sized unreachable (N-6 re-review).
             deadline: Duration::from_secs(5),
             _global: Arc::new(Semaphore::new(4))
                 .try_acquire_owned()
