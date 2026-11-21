@@ -266,7 +266,14 @@ async fn tls_fixture_chain(
         .with_no_client_auth()
         .with_single_cert(chain, key.into())?;
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    // The resolver offers exactly ONE candidate (N-2): the first answer, not a
+    // family fallback — so the fixture must bind where `localhost` actually
+    // resolves first, not assume v4 is reachable as a fallback.
+    let bind = tokio::net::lookup_host("localhost:0")
+        .await?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("localhost resolves to nothing"))?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
     let port = listener.local_addr()?.port();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {

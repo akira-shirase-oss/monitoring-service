@@ -199,13 +199,36 @@ impl AddressBudget {
         });
         refill(&mut bucket.global, self.burst, self.rate, now);
         if let Some(workspace) = workspace {
+            let workspaces =
+                bucket.shares.len() + usize::from(!bucket.shares.contains_key(&workspace));
+            let workspaces = f64::from(u32::try_from(workspaces).unwrap_or(u32::MAX));
             let share = bucket.shares.entry(workspace).or_insert(Bucket {
                 tokens: self.share_burst,
                 at: now,
             });
             refill(share, self.share_burst, self.share_rate, now);
-            if bucket.global.tokens >= 1.0 && share.tokens >= 1.0 {
+            if share.tokens < 1.0 {
+                return false; // the workspace's own share of the address is spent
+            }
+            if bucket.global.tokens >= 1.0 {
                 bucket.global.tokens -= 1.0;
+                share.tokens -= 1.0;
+                return true;
+            }
+            // Ceiling spent (N-1 re-review): first-come would starve whoever
+            // arrives next — four tenants inside their shares could turn a
+            // fifth's monitor `unknown` forever. Instead the ceiling becomes
+            // max-min fair: a workspace still below its fair split of it —
+            // global burst / workspaces at this address — keeps starting; the
+            // spender already holding its split is who refuses. The cost is
+            // an honest overshoot: under contention the effective ceiling is
+            // burst + at most one in-flight start per waiting workspace,
+            // traded for no tenant's coverage going dark.
+            let fair_split = (self.burst / workspaces).min(self.share_burst);
+            // Compare in whole starts: `tokens` carries sub-token refill
+            // jitter, so a share that just touched its split reads a hair
+            // under it — floor it first or the boundary case admits one more.
+            if share.tokens.floor() > self.share_burst - fair_split {
                 share.tokens -= 1.0;
                 return true;
             }
@@ -342,31 +365,32 @@ impl Resolve for PolicyResolver {
             let Some(budget) = &budget else {
                 return Ok(Box::new(addrs.into_iter()) as Addrs);
             };
-            // The bound pays only what the dialer can take (B re-review): the
-            // first paying candidate per address family — offering the rest
-            // would charge addresses that are never dialed, so a sprayed
-            // answer could tax two hundred buckets for one connect. A
-            // redirect hop re-enters here on the address it lands on, and a
-            // name whose whole answer is spent gets no dial.
-            let mut v4 = None;
-            let mut v6 = None;
+            // The bound pays only what the dialer can take (B re-review), and
+            // the dialer takes only what resolve() offers (N-2 re-review):
+            // offer exactly ONE candidate — the first paying address in answer
+            // order — so a fallback family or a sprayed answer's tail is never
+            // charged for a connect it never produces. A redirect hop
+            // re-enters here on the address it lands on, and a name whose
+            // whole answer is spent gets no dial.
+            let mut paid = None;
             let mut any_refused = false;
             for addr in addrs {
-                let slot = if addr.is_ipv4() { &mut v4 } else { &mut v6 };
-                if slot.is_some() {
-                    continue;
+                if paid.is_some() {
+                    break;
                 }
                 if budget.take(addr.ip(), workspace()) {
-                    *slot = Some(addr);
+                    paid = Some(addr);
                 } else {
                     any_refused = true;
                 }
             }
-            let paid: Vec<SocketAddr> = [v4, v6].into_iter().flatten().collect();
-            if paid.is_empty() && any_refused {
-                return Err(Box::new(AddressBusy) as Box<dyn std::error::Error + Send + Sync>);
+            match paid {
+                Some(addr) => Ok(Box::new(std::iter::once(addr)) as Addrs),
+                None if any_refused => {
+                    Err(Box::new(AddressBusy) as Box<dyn std::error::Error + Send + Sync>)
+                }
+                None => Ok(Box::new(std::iter::empty()) as Addrs),
             }
-            Ok(Box::new(paid.into_iter()) as Addrs)
         })
     }
 }
@@ -1314,11 +1338,69 @@ mod tests {
         );
     }
 
-    /// B re-review: only the address the dialer can take pays — the first
-    /// paying candidate per family. A name spraying two hundred answers taxes
-    /// exactly one bucket for the connect it produces.
+    /// N-1 re-review: the global ceiling is max-min FAIR, not first-come. When
+    /// the ceiling is spent, a workspace below the fair split — ceiling /
+    /// workspaces at the address — still starts: four tenants inside their
+    /// shares can fill the ceiling without a fifth's monitor going dark.
+    /// Only a spender already at (or above) the split refuses.
     #[tokio::test]
-    async fn the_resolver_charges_only_the_dialed_candidates() {
+    async fn the_spent_ceiling_admits_a_workspace_below_the_fair_split() {
+        let budget =
+            AddressBudget::with_share(4, Duration::from_secs(3600), 2, Duration::from_secs(3600));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let (a, b, c) = (WorkspaceId::new(), WorkspaceId::new(), WorkspaceId::new());
+        assert!(budget.take(ip, Some(a)));
+        assert!(budget.take(ip, Some(a)));
+        assert!(budget.take(ip, Some(b)));
+        assert!(budget.take(ip, Some(b)));
+        // The ceiling is spent 2+2 — first-come would refuse c on every slot,
+        // unknown forever, no alert. Max-min: c has spent nothing of its fair
+        // split (4/3) → it starts; a and b already hold theirs.
+        assert!(
+            budget.take(ip, Some(c)),
+            "a workspace below the fair split still starts"
+        );
+        assert!(
+            !budget.take(ip, Some(a)),
+            "a spender at its split is the one that refuses, not the newcomer"
+        );
+        // And the ceiling is not decorative: c's fair split is spent with it —
+        // once c reaches the split it stops too.
+        assert!(budget.take(ip, Some(c)), "still under its fair split");
+        assert!(
+            !budget.take(ip, Some(c)),
+            "at the fair split the ceiling binds again"
+        );
+    }
+
+    /// N-6 re-review: the global ceiling itself must bind — earlier tests
+    /// only ever refused on a workspace's own share, so deleting the global
+    /// check survived them. Give the share more than the ceiling: the only
+    /// thing that can refuse the fifth take is the ceiling.
+    #[tokio::test]
+    async fn a_workspace_cannot_exceed_the_global_ceiling_even_inside_its_share() {
+        let budget =
+            AddressBudget::with_share(4, Duration::from_secs(3600), 8, Duration::from_secs(3600));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let a = WorkspaceId::new();
+        for _ in 0..4 {
+            assert!(budget.take(ip, Some(a)));
+        }
+        // Share 8, spent 4 — plenty of share left; the ceiling is the refusal.
+        // Max-min: one workspace's fair split of the ceiling is the ceiling.
+        assert!(
+            !budget.take(ip, Some(a)),
+            "the ceiling refuses past the split even with share to spare"
+        );
+    }
+
+    /// N-2 re-review: hyper dials what `resolve()` hands it — so the resolver
+    /// offers AND charges only the candidate actually offered: the first paying
+    /// address in answer order. A second candidate — including the other
+    /// family's — is never dialed, so it must leave its bucket untouched: a
+    /// sprayed [own-v6, victim-v4] answer taxes the victim nothing per hop.
+    #[tokio::test]
+    async fn the_resolver_offers_and_charges_only_the_dialed_candidate() {
         let map = overrides();
         let many: Vec<SocketAddr> = (0..200)
             .map(|i| {
@@ -1340,7 +1422,7 @@ mod tests {
         assert_eq!(
             yielded,
             vec![many[0]],
-            "only the first paying address per family is offered to the dialer"
+            "exactly one candidate is offered — the one the dialer will use"
         );
         assert!(
             !budget.take(many[0].ip(), None),
@@ -1350,6 +1432,32 @@ mod tests {
             budget.take(many[50].ip(), None),
             "an undialed candidate was never charged"
         );
+    }
+
+    /// N-2 re-review: the mixed-family case the ruling names — an answer of
+    /// [attacker-v6, victim-v4] leaves the victim's bucket untouched: the v6 is
+    /// the candidate offered, the v4 fallback is never dialed, never charged.
+    #[tokio::test]
+    async fn the_fallback_family_leaves_its_bucket_untouched() {
+        let map = overrides();
+        let v6: SocketAddr = "[2001:4860:4860::8888]:0".parse().expect("addr");
+        let v4: SocketAddr = "8.8.8.8:0".parse().expect("addr");
+        map.lock()
+            .expect("map")
+            .insert("mixed.test".to_owned(), vec![v6, v4]);
+        let budget = Arc::new(AddressBudget::new(1, Duration::from_secs(3600)));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget.clone());
+        let yielded = resolver
+            .resolve(Name::from_str("mixed.test").expect("name"))
+            .await
+            .expect("the paying v6 pays")
+            .collect::<Vec<_>>();
+        assert_eq!(yielded, vec![v6], "only the dialed candidate is offered");
+        assert!(
+            budget.take(v4.ip(), None),
+            "the fallback v4 was never charged — it was never dialed"
+        );
+        assert!(!budget.take(v6.ip(), None), "the offered v6 paid");
     }
 
     /// B re-review: the workspace attribution reaches the resolver through the

@@ -646,7 +646,11 @@ mod tests {
             .expect("insert");
         let mut monitor = stored.clone();
         monitor.interval = Duration::from_millis(60);
-        monitor.timeout = Duration::from_millis(400);
+        // The loopback fixture answers on accept — the deadline only bounds a
+        // pathological hang, it is never the measured quantity, so it is sized
+        // to be unreachable rather than "usually fast enough" (N-6 re-review:
+        // a 400 ms real-time budget can flake a loaded CI box).
+        monitor.timeout = Duration::from_secs(5);
 
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let (handle, _writer) = writer::spawn(
@@ -1017,15 +1021,16 @@ mod tests {
         addr
     }
 
-    /// N1 re-review: the per-ADDRESS runtime bound is charged on the addresses the
-    /// validating resolver actually hands to the dialer — shared across every
-    /// workspace (`try_acquire`, misses counted). Two tenants' schedules aimed at
-    /// one IP get one starts budget between them: a second workspace's monitor
-    /// can never lift the rate at an address its neighbour already spent. The
-    /// refused slot commits `missed` with its reason — our own budget's refusal
-    /// is a coverage gap, never evidence about the target (H: on a loopback
-    /// fixture — the budget binds the address, and the 3600 s window makes the
-    /// clock irrelevant).
+    /// N1 re-review: the per-ADDRESS runtime bound is charged on the ONE
+    /// candidate the validating resolver hands to the dialer — shared across
+    /// every workspace (`try_acquire`, misses counted), and max-min fair once
+    /// the ceiling is spent: a second workspace's first starts still pay (a
+    /// tenant behind the same IP never goes dark), and only a workspace
+    /// already holding its fair split is refused (N-1). The refused slot
+    /// commits `missed` with its reason — our own budget's refusal is a
+    /// coverage gap, never evidence about the target (H: on a loopback
+    /// fixture — the budget binds the address, and the 3600 s window makes
+    /// the clock irrelevant).
     #[tokio::test]
     async fn two_workspaces_on_one_address_share_the_runtime_cap() {
         let db = Db::connect("sqlite::memory:", 1).await.expect("db");
@@ -1070,7 +1075,10 @@ mod tests {
             generation: 1,
             slot_at: OffsetDateTime::now_utc(),
             url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
-            deadline: Duration::from_millis(400),
+            // The fixture answers on accept; the deadline only bounds a hang,
+            // so it is sized unreachable — a tight real-time budget would
+            // flake machine-speed-dependent (N-6 re-review).
+            deadline: Duration::from_secs(5),
             _global: Arc::new(Semaphore::new(4))
                 .try_acquire_owned()
                 .expect("slot"),
@@ -1088,33 +1096,52 @@ mod tests {
             matches!(first.slot, SlotObservation::Probe(_)),
             "the paying probe produces evidence, not a miss: {first:?}"
         );
-        // The same workspace's next probe and the OTHER workspace's probe both
-        // meet a spent address — the bound is the address, not the tenant.
+        // The same workspace's next probe meets its spent share — but the OTHER
+        // workspace's FIRST probe is still admitted (N-1): once the ceiling is
+        // spent the split is max-min fair, so a second tenant behind the same
+        // address never goes dark. Its SECOND probe — the fair split now held —
+        // is the counted miss.
         let mut plan = Plan::default();
         plan.dispatches.push(dispatch("b", WorkspaceId::DEFAULT));
-        plan.dispatches.push(dispatch("c", other));
+        plan.dispatches.push(dispatch("c1", other));
+        plan.dispatches.push(dispatch("c2", other));
         plan.dispatch(&probes, &writer, &results, &tracker, &vitals)
             .await;
-        let mut missed = Vec::new();
-        for _ in 0..2 {
-            missed.push(results_rx.recv().await.expect("an observation"));
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(results_rx.recv().await.expect("an observation"));
         }
-        for observation in &missed {
-            assert_eq!(
-                observation.slot,
-                SlotObservation::Budgeted,
-                "a budget refusal is a neutral coverage gap: {observation:?}"
-            );
-            assert_eq!(
-                observation.detail.as_deref(),
-                Some("address_budget"),
-                "the miss names its cause: {observation:?}"
-            );
-        }
-        assert!(
-            missed.iter().any(|obs| obs.workspace == other),
-            "the second workspace's schedule inherits the spent address: {missed:?}"
+        let of = |workspace: WorkspaceId| {
+            seen.iter()
+                .filter(|obs| obs.workspace == workspace)
+                .collect::<Vec<_>>()
+        };
+        let b = of(WorkspaceId::DEFAULT);
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            b[0].slot,
+            SlotObservation::Budgeted,
+            "the same workspace's share is spent: {b:?}"
         );
+        assert_eq!(b[0].detail.as_deref(), Some("address_budget"));
+        let c = of(other);
+        assert_eq!(
+            c.iter()
+                .filter(|obs| matches!(obs.slot, SlotObservation::Probe(_)))
+                .count(),
+            1,
+            "the second workspace keeps its fair split — one start pays: {c:?}"
+        );
+        let c_missed: Vec<_> = c
+            .iter()
+            .filter(|obs| obs.slot == SlotObservation::Budgeted)
+            .collect();
+        assert_eq!(
+            c_missed.len(),
+            1,
+            "past its split the second workspace misses too: {c:?}"
+        );
+        assert_eq!(c_missed[0].detail.as_deref(), Some("address_budget"));
     }
 
     /// B re-review: under the global per-address ceiling each workspace pays
@@ -1167,7 +1194,10 @@ mod tests {
             generation: 1,
             slot_at: OffsetDateTime::now_utc(),
             url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
-            deadline: Duration::from_millis(400),
+            // The fixture answers on accept; the deadline only bounds a hang,
+            // so it is sized unreachable — a tight real-time budget would
+            // flake machine-speed-dependent (N-6 re-review).
+            deadline: Duration::from_secs(5),
             _global: Arc::new(Semaphore::new(4))
                 .try_acquire_owned()
                 .expect("slot"),
