@@ -187,12 +187,22 @@ async function main() {
 		);
 	for (let w = cookies.length; w < WORKSPACES; w++) {
 		const before = await workspaceIds();
-		const invite = await fetch(`${BASE}/api/invites`, {
-			method: 'POST',
-			headers: { authorization: `Bearer ${ADMIN_TOKEN}`, 'content-type': 'application/json' },
-			body: '{}',
-		});
-		const { invite: { code } } = await invite.json();
+		let code;
+		// Invite writes spend their own 6-per-minute budget — honour Retry-After.
+		for (let tries = 0; ; tries++) {
+			const invite = await fetch(`${BASE}/api/invites`, {
+				method: 'POST',
+				headers: { authorization: `Bearer ${ADMIN_TOKEN}`, 'content-type': 'application/json' },
+				body: '{}',
+			});
+			if (invite.status === 429 && tries < 8) {
+				await sleep(Number(invite.headers.get('retry-after') ?? 1) * 1000);
+				continue;
+			}
+			if (invite.status !== 201) throw new Error(`invite: HTTP ${invite.status}`);
+			({ invite: { code } } = await invite.json());
+			break;
+		}
 		const email = `load-${w}@tenant.example`;
 		const signup = await fetch(`${BASE}/api/signup`, {
 			method: 'POST',
@@ -221,24 +231,32 @@ async function main() {
 	const addMonitor = async (i) => {
 		const { name, port, path, marker } = plan(i);
 		const cookie = cookies[i % WORKSPACES];
-		const r = await fetch(`${BASE}/api/monitors`, {
-			method: 'POST',
-			headers: {
-				'content-type': 'application/json',
-				// Cookie-authed writes carry the server's own origin — the
-				// cross-site check refuses a missing or foreign one.
-				...(cookie ? { cookie, origin: BASE } : {}),
-			},
-			body: JSON.stringify({
-				name,
-				url: `http://127.0.0.1:${port}${path}`,
-				interval_s: 15,
-				timeout_s: TIMEOUT_S,
-				...(marker ? { expect_body: marker } : {}),
-			}),
-		});
-		if (r.status !== 201) throw new Error(`add ${name}: HTTP ${r.status}`);
-		return (await r.json()).id;
+		for (let tries = 0; ; tries++) {
+			const r = await fetch(`${BASE}/api/monitors`, {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json',
+					// Cookie-authed writes carry the server's own origin — the
+					// cross-site check refuses a missing or foreign one.
+					...(cookie ? { cookie, origin: BASE } : {}),
+				},
+				body: JSON.stringify({
+					name,
+					url: `http://127.0.0.1:${port}${path}`,
+					interval_s: 15,
+					timeout_s: TIMEOUT_S,
+					...(marker ? { expect_body: marker } : {}),
+				}),
+			});
+			// The per-workspace write budget is 12 writes per rolling minute —
+			// a 429 names its own wait in Retry-After; honour it, don't bypass.
+			if (r.status === 429 && tries < 8) {
+				await sleep(Number(r.headers.get('retry-after') ?? 1) * 1000);
+				continue;
+			}
+			if (r.status !== 201) throw new Error(`add ${name}: HTTP ${r.status}`);
+			return (await r.json()).id;
+		}
 	};
 	// Bounded parallelism — thousands of concurrent writes would pile onto the
 	// server's write limits; 64-wide chunks register the set steadily.
