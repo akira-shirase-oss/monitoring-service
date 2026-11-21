@@ -44,7 +44,7 @@ async fn account(instance: &common::Instance, email: &str) -> anyhow::Result<Str
         .send()
         .await?;
     assert_eq!(login.status(), StatusCode::NO_CONTENT, "login for {email}");
-    Ok(login
+    let cookie = login
         .headers()
         .get_all("set-cookie")
         .iter()
@@ -54,7 +54,25 @@ async fn account(instance: &common::Instance, email: &str) -> anyhow::Result<Str
         .split(';')
         .next()
         .expect("cookie pair")
-        .to_owned())
+        .to_owned();
+    // The fixtures' 15 s intervals are below the free floor — lift the new
+    // tenant to `operator` so the plan gate stays out of the assertion's way.
+    let mine: Value = http
+        .get(format!("{}/api/workspaces", instance.base))
+        .header("cookie", &cookie)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let id = mine["workspaces"][0]["id"].as_str().unwrap_or_default().to_owned();
+    let lift = http
+        .patch(format!("{}/api/workspaces/{id}/plan", instance.base))
+        .bearer_auth(&instance.token)
+        .json(&json!({"plan": "operator"}))
+        .send()
+        .await?;
+    assert_eq!(lift.status(), StatusCode::OK, "operator lift for {email}");
+    Ok(cookie)
 }
 
 /// Read one request head (through the blank line) — method + path is all a
