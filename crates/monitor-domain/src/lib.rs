@@ -380,7 +380,7 @@ pub struct StatusRange {
 /// What one probe asserts about the *final* response of its redirect chain (D-025):
 /// an acceptable status set plus an optional literal byte marker the bounded body
 /// read must contain. The marker is never a regex — there is no engine, so no
-/// ReDoS class exists.
+/// `ReDoS` class exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expect {
     /// Sorted, non-overlapping, `1..=MAX_STATUS_RANGES` ranges — the contract's
@@ -463,7 +463,7 @@ pub fn parse_statuses(spec: &str) -> Result<Vec<StatusRange>, ValidationError> {
 
 /// Sort the caller's set in place, then bound it: nonempty, at most
 /// `MAX_STATUS_RANGES`, and non-overlapping (adjacent is allowed, overlapping is not).
-pub fn validate_statuses(statuses: &mut Vec<StatusRange>) -> Result<(), ValidationError> {
+pub fn validate_statuses(statuses: &mut [StatusRange]) -> Result<(), ValidationError> {
     statuses.sort_by_key(|r| r.lo);
     if statuses.is_empty() {
         return Err(ValidationError::StatusRangesEmpty);
@@ -485,7 +485,7 @@ pub fn validate_statuses(statuses: &mut Vec<StatusRange>) -> Result<(), Validati
 /// carries no body, so a body marker under `HEAD` is a write-time refusal (D-025).
 pub fn validate_expect(
     method: ProbeMethod,
-    statuses: &mut Vec<StatusRange>,
+    statuses: &mut [StatusRange],
     body_contains: Option<&[u8]>,
 ) -> Result<(), ValidationError> {
     validate_statuses(statuses)?;

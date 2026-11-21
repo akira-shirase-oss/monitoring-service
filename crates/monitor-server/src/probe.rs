@@ -1872,10 +1872,8 @@ mod tests {
     #[tokio::test]
     async fn a_marker_past_the_body_bound_never_passes() {
         // max_body 16: `MARK` lands at bytes 13..17 — split across the bound.
-        let router = axum::Router::new().route(
-            "/",
-            axum::routing::get(|| async { "AAAAAAAAAAAAMARKER" }),
-        );
+        let router =
+            axum::Router::new().route("/", axum::routing::get(|| async { "AAAAAAAAAAAAMARKER" }));
         let url: Url = format!("http://{}/", serve(router).await)
             .parse()
             .expect("url");
@@ -1901,8 +1899,8 @@ mod tests {
     #[tokio::test]
     async fn compressed_bytes_are_searched_as_received() {
         let gzipped: &[u8] = &[
-            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 11, 118, 245, 11, 241, 244, 115, 245, 209, 205,
-            72, 45, 74, 5, 0, 125, 143, 180, 174, 13, 0, 0, 0,
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 11, 118, 245, 11, 241, 244, 115, 245, 209, 205, 72,
+            45, 74, 5, 0, 125, 143, 180, 174, 13, 0, 0, 0,
         ];
         let router = axum::Router::new().route(
             "/",

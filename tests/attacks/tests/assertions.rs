@@ -74,6 +74,7 @@ async fn read_head(sock: &mut tokio::net::TcpStream) -> String {
 
 /// Serve `body` with a 200 and a content-length forever — one task per
 /// connection, so a probe chain gets an answer on every hop it owns.
+#[expect(clippy::expect_used)]
 fn serve_body(body: &'static [u8]) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture bind");
     let addr = listener.local_addr().expect("fixture addr");
@@ -98,6 +99,7 @@ fn serve_body(body: &'static [u8]) -> SocketAddr {
 /// The `HEAD` redirect probe: `/go` 303s to `/land`; `/land` answers 200 only to
 /// `HEAD` — any other method gets 501. A `HEAD` rewritten to `GET` lands as a
 /// failure, which is exactly what the honest answer must NOT be.
+#[expect(clippy::expect_used)]
 fn serve_redirect(methods: Arc<Mutex<Vec<String>>>) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture bind");
     let addr = listener.local_addr().expect("fixture addr");
@@ -129,6 +131,7 @@ fn serve_redirect(methods: Arc<Mutex<Vec<String>>>) -> SocketAddr {
 }
 
 /// A body that never finishes: headers then one chunked byte a beat, forever.
+#[expect(clippy::expect_used)]
 fn serve_dribble() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture bind");
     let addr = listener.local_addr().expect("fixture addr");
@@ -177,6 +180,10 @@ async fn wait_check(cookie: &str, base: &str, monitor_id: &str) -> anyhow::Resul
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "attack fixture: a create reply without an id is a failed test"
+)]
 async fn create(instance: &common::Instance, cookie: &str, body: Value) -> anyhow::Result<String> {
     let response = client()?
         .post(format!("{}/api/monitors", instance.base))
