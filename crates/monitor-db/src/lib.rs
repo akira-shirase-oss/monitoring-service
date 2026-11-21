@@ -452,6 +452,33 @@ impl Db {
             .unwrap_or(0)
     }
 
+    /// The migrations compiled into this build as `version|sha384-hex|file`
+    /// lines — the deploy-time `_sqlx_migrations` inspection
+    /// (`deploy/droplet/inspect-migrations.sh`) compares a database's applied
+    /// checksums against these without needing the source tree on the host.
+    /// sqlx's stored checksum is SHA-384, so `hex(checksum)` in SQLite compares
+    /// directly against what `shasum -a 384` prints for a file.
+    pub fn migration_manifest() -> String {
+        sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|migration| {
+                let checksum = migration.checksum.iter().fold(
+                    String::with_capacity(migration.checksum.len() * 2),
+                    |mut hex, byte| {
+                        let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                        hex
+                    },
+                );
+                format!(
+                    "{}|{}|{:04}_{}.sql",
+                    migration.version, checksum, migration.version, migration.description,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Online backup: `VACUUM INTO` writes one consistent snapshot file — the WAL-aware
     /// way to copy a live database without quiescing it. This reads the store; it does
     /// not write it, so the single-writer invariant is untouched. Returns the backup's
@@ -1558,39 +1585,56 @@ impl WorkspaceDb<'_> {
         Ok(last)
     }
 
+    /// Coverage-gap rows kept in the rebuild tail on top of the `limit` real
+    /// rows — the tail's hard bound is `limit + GAP_TAIL` (C re-review).
+    const GAP_TAIL: i64 = 64;
+
     /// The tail the restart rebuild replays through `Health`, oldest→newest: the
     /// `limit` most recent *real* slot observations — everything but the monitor's
-    /// own `address_budget` coverage gaps — plus the gaps that fell inside that
-    /// window (N-5 re-review: a starving address could otherwise fill the whole
-    /// tail with gaps and a restart would rebuild a shorter streak than the live
-    /// machine was holding; the gaps stay because they are freshness truth).
+    /// own `address_budget` coverage gaps — plus up to `GAP_TAIL` of the newest
+    /// gaps, merged in commit order (N-5 re-review: a starving address could
+    /// otherwise fill the whole tail with gaps and a restart would rebuild a
+    /// shorter streak than the live machine was holding; the gaps stay because
+    /// they are freshness truth). C re-review: the tail is strictly bounded —
+    /// `limit + GAP_TAIL` rows no matter how much history lies behind it — and
+    /// ordinary `missed` rows (no `detail`) count as real evidence, matching
+    /// the live machine's own accounting.
     pub async fn recent_outcomes(
         &self,
         monitor: MonitorId,
         limit: i64,
     ) -> Result<Vec<SlotObservation>, QueryError> {
-        let rows = sqlx::query_as::<_, (String, Option<i64>, Option<String>)>(
-            "SELECT outcome, http_status, detail FROM checks
+        // Real rows: `IS` is NULL-safe equality — an ordinary missed row has
+        // NULL detail and `NULL IS 'address_budget'` is false, so it counts
+        // toward the limit like any other real observation.
+        let mut rows = sqlx::query_as::<_, (i64, String, Option<i64>, Option<String>)>(
+            "SELECT id, outcome, http_status, detail FROM checks
              WHERE monitor_id = ? AND workspace_id = ?
-               AND slot_at >= COALESCE((
-                     SELECT MIN(slot_at) FROM (
-                       SELECT slot_at FROM checks
-                       WHERE monitor_id = ? AND workspace_id = ?
-                         AND NOT (outcome = 'missed' AND detail = 'address_budget')
-                       ORDER BY slot_at DESC, id DESC LIMIT ?)),
-                     '')
-             ORDER BY slot_at DESC, id DESC",
+               AND NOT (outcome = 'missed' AND detail IS 'address_budget')
+             ORDER BY id DESC LIMIT ?",
         )
-        .bind(monitor.0.to_string())
-        .bind(self.workspace.0.to_string())
         .bind(monitor.0.to_string())
         .bind(self.workspace.0.to_string())
         .bind(limit)
         .fetch_all(&self.db.pool)
         .await?;
+        // The newest coverage gaps — freshness truth, bounded so starvation
+        // history cannot crowd the real rows out of memory or the replay.
+        let gaps = sqlx::query_as::<_, (i64, String, Option<i64>, Option<String>)>(
+            "SELECT id, outcome, http_status, detail FROM checks
+             WHERE monitor_id = ? AND workspace_id = ?
+               AND outcome = 'missed' AND detail IS 'address_budget'
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
+        .bind(Self::GAP_TAIL)
+        .fetch_all(&self.db.pool)
+        .await?;
+        rows.extend(gaps);
+        rows.sort_by_key(|(id, ..)| *id); // append order == slot order
         rows.iter()
-            .rev()
-            .map(|(outcome, http_status, detail)| {
+            .map(|(_, outcome, http_status, detail)| {
                 decode_outcome(outcome, *http_status, detail.as_deref())
             })
             .collect()

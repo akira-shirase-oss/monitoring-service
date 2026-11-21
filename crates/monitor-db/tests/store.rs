@@ -476,6 +476,46 @@ async fn a_budget_gap_is_neutral_in_first_fail_at_and_the_rebuild_tail() -> anyh
     Ok(())
 }
 
+/// C re-review: ordinary `missed` rows carry no `detail` — under the old
+/// windowed query they were silently dropped from the real-row count, so a
+/// host outage (one missed row per slot) made every restart fetch the whole
+/// outage as "inside the window". The tail is now strictly bounded and those
+/// misses count as the real evidence they are.
+#[tokio::test]
+async fn an_outage_of_ordinary_misses_keeps_the_rebuild_tail_bounded() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(30 * 60);
+    let slot = |offset: i64| base + time::Duration::seconds(offset);
+    for offset in 0..3 {
+        let mut real = pass(&monitor);
+        real.slot_at = slot(offset);
+        writer.record(real).await?;
+    }
+    for offset in 3..3 + 5_000 {
+        let mut gap = missed(&monitor);
+        gap.slot_at = slot(offset);
+        writer.record(gap).await?;
+    }
+
+    let limit: i64 = 3;
+    let tail = db
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, limit)
+        .await?;
+    assert!(
+        tail.len() <= usize::try_from(limit).expect("limit") + 64,
+        "limit + GAP_TAIL bounds every tail, outage history or not: {}",
+        tail.len()
+    );
+    // And the misses are real evidence: the newest `limit` rows of history are
+    // exactly the newest `limit` ordinary misses.
+    assert!(
+        tail.iter().all(|o| matches!(o, SlotObservation::Missed)),
+        "the newest {limit} observations are the outage's own misses: {tail:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn check_stats_counts_window_rows_and_leaves_expected_to_the_caller() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
