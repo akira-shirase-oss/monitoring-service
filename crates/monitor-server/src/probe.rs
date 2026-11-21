@@ -113,6 +113,9 @@ pub struct AddressBudget {
     burst: f64,
     /// Sustained refill — tokens per second.
     rate: f64,
+    /// The window "active" is measured over for the fair split: a workspace
+    /// with an admitted start inside the last `per` counts toward it.
+    per: Duration,
     /// The per-workspace sub-bucket's burst and refill at one address — the
     /// same share the write-time per-address cap sells a workspace.
     share_burst: f64,
@@ -131,6 +134,8 @@ struct IpBucket {
 struct Bucket {
     tokens: f64,
     at: tokio::time::Instant,
+    /// The last time a take succeeded (share buckets only — `active` counts).
+    last_admit: Option<tokio::time::Instant>,
 }
 
 /// Addresses remembered at once — a wildcard-DNS spray must not grow it unbounded.
@@ -154,6 +159,7 @@ impl AddressBudget {
         Self {
             burst: f64::from(burst),
             rate: f64::from(burst) / per.as_secs_f64().max(f64::EPSILON),
+            per,
             share_burst: f64::from(share_burst),
             share_rate: f64::from(share_burst) / share_per.as_secs_f64().max(f64::EPSILON),
             buckets: std::sync::Mutex::new(HashMap::new()),
@@ -194,45 +200,59 @@ impl AddressBudget {
             global: Bucket {
                 tokens: self.burst,
                 at: now,
+                last_admit: None,
             },
             shares: HashMap::new(),
         });
         refill(&mut bucket.global, self.burst, self.rate, now);
         if let Some(workspace) = workspace {
-            let workspaces =
-                bucket.shares.len() + usize::from(!bucket.shares.contains_key(&workspace));
-            let workspaces = f64::from(u32::try_from(workspaces).unwrap_or(u32::MAX));
+            // A re-review: every admit pays a GLOBAL token, debt capped at the
+            // count of workspaces active at this address — the ceiling binds
+            // paced tenants, not just burst ones (fairness admits used to pay
+            // nothing, so the real cap was share × workspaces). Active = an
+            // admitted start within the last `per` window; idle shares drop
+            // out of the split rather than counting forever.
+            let active_now = |shares: &HashMap<WorkspaceId, Bucket>| {
+                shares
+                    .values()
+                    .filter(|s| {
+                        s.last_admit
+                            .is_some_and(|t| now.duration_since(t) < self.per)
+                    })
+                    .count()
+            };
+            let mut active = active_now(&bucket.shares);
+            if !bucket.shares.get(&workspace).is_some_and(|s| {
+                s.last_admit
+                    .is_some_and(|t| now.duration_since(t) < self.per)
+            }) {
+                active += 1; // this workspace counts toward the split it asks for
+            }
+            let active = f64::from(u32::try_from(active).unwrap_or(u32::MAX));
             let share = bucket.shares.entry(workspace).or_insert(Bucket {
                 tokens: self.share_burst,
                 at: now,
+                last_admit: None,
             });
             refill(share, self.share_burst, self.share_rate, now);
-            if share.tokens < 1.0 {
-                return false; // the workspace's own share of the address is spent
+            // The workspace's cap at this address is the smaller of its own
+            // share and its fair split of the ceiling (N-1/A re-review: a
+            // below-split tenant still starts — nobody goes dark — and a take
+            // that would carry it past the split is the one that refuses).
+            let fair_split = (self.burst / active).min(self.share_burst);
+            if self.share_burst - share.tokens + 1.0 > fair_split {
+                return false;
             }
-            if bucket.global.tokens >= 1.0 {
-                bucket.global.tokens -= 1.0;
-                share.tokens -= 1.0;
-                return true;
+            // Debt room: the ceiling may be overspent by one start per active
+            // workspace — the price of letting a below-split tenant in while
+            // the ceiling is exhausted — and no further.
+            if bucket.global.tokens <= -active {
+                return false;
             }
-            // Ceiling spent (N-1 re-review): first-come would starve whoever
-            // arrives next — four tenants inside their shares could turn a
-            // fifth's monitor `unknown` forever. Instead the ceiling becomes
-            // max-min fair: a workspace still below its fair split of it —
-            // global burst / workspaces at this address — keeps starting; the
-            // spender already holding its split is who refuses. The cost is
-            // an honest overshoot: under contention the effective ceiling is
-            // burst + at most one in-flight start per waiting workspace,
-            // traded for no tenant's coverage going dark.
-            let fair_split = (self.burst / workspaces).min(self.share_burst);
-            // Compare in whole starts: `tokens` carries sub-token refill
-            // jitter, so a share that just touched its split reads a hair
-            // under it — floor it first or the boundary case admits one more.
-            if share.tokens.floor() > self.share_burst - fair_split {
-                share.tokens -= 1.0;
-                return true;
-            }
-            return false;
+            bucket.global.tokens -= 1.0;
+            share.tokens -= 1.0;
+            share.last_admit = Some(now);
+            return true;
         }
         if bucket.global.tokens >= 1.0 {
             bucket.global.tokens -= 1.0;
@@ -1364,12 +1384,34 @@ mod tests {
             !budget.take(ip, Some(a)),
             "a spender at its split is the one that refuses, not the newcomer"
         );
-        // And the ceiling is not decorative: c's fair split is spent with it —
-        // once c reaches the split it stops too.
-        assert!(budget.take(ip, Some(c)), "still under its fair split");
+        // And the ceiling is not decorative: c's fair split is 4/3 — its first
+        // take pays it, and the second would carry it past the split.
         assert!(
             !budget.take(ip, Some(c)),
-            "at the fair split the ceiling binds again"
+            "the fair split is a cap, not a floor of two: 4/3 admits exactly one start"
+        );
+    }
+
+    /// A re-review: every admit must take a global token — the ceiling has to
+    /// bind PACED tenants, not only burst ones. Seven workspaces each doing two
+    /// starts against an 8-start ceiling must not get all fourteen: once
+    /// everyone is active each workspace's fair split is one start, so the
+    /// second round is refused wholesale.
+    #[tokio::test]
+    async fn paced_workspaces_cannot_exceed_the_global_ceiling() {
+        let budget =
+            AddressBudget::with_share(8, Duration::from_secs(3600), 2, Duration::from_secs(3600));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let workspaces: Vec<WorkspaceId> = (0..7).map(|_| WorkspaceId::new()).collect();
+        let mut admitted = 0;
+        for _round in 0..2 {
+            for workspace in &workspaces {
+                admitted += usize::from(budget.take(ip, Some(*workspace)));
+            }
+        }
+        assert_eq!(
+            admitted, 7,
+            "each of seven workspaces keeps its fair start — and the ceiling binds the paced second round"
         );
     }
 

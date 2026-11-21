@@ -1060,7 +1060,12 @@ mod tests {
             },
             64 * 1024,
             overrides,
-            Arc::new(crate::probe::AddressBudget::new(
+            // Ceiling 2, share 1: one workspace's take leaves exactly a second
+            // workspace's fair split — a fair split can never pay less than
+            // one whole start.
+            Arc::new(crate::probe::AddressBudget::with_share(
+                2,
+                Duration::from_secs(3600),
                 1,
                 Duration::from_secs(3600),
             )),
