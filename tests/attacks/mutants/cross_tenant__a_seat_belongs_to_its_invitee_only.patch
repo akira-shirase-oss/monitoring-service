@@ -1,8 +1,15 @@
 diff --git a/crates/monitor-db/src/lib.rs b/crates/monitor-db/src/lib.rs
-index c7f7d57..c005eff 100644
+index 8514963..54fb323 100644
 --- a/crates/monitor-db/src/lib.rs
 +++ b/crates/monitor-db/src/lib.rs
-@@ -725,11 +725,9 @@ impl Db {
+@@ -752,17 +752,15 @@ impl Db {
+     /// never be claimed by whoever it bounced to.
+     pub async fn invitations_for_account(
+         &self,
+-        account: AccountId,
++        _account: AccountId,
+         now: OffsetDateTime,
+     ) -> Result<Vec<PendingInvitation>, QueryError> {
          sqlx::query_as::<_, PendingInvitation>(
              "SELECT i.id, i.workspace_id, w.name AS workspace_name, i.role, i.created_at
                 FROM workspace_invitations i
