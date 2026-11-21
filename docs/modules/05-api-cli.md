@@ -63,9 +63,9 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `sessions` row (migration 0007) + `Set-Cookie: __Host-smon_session=<id>; HttpOnly;
   SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>; Secure` —
   the `__Host-` pin means `Secure` is unconditional (browsers reject the name without
-  it). `SMON_COOKIE_SECURE=off` is the plain-HTTP development escape: it emits the
-  plain `smon_session` name with no `Secure`, the only way a self-hosted
-  `http://<host>:<port>` install can sign in. Logout's expiring cookie carries the
+  it) — there is no `off`: sign-in is HTTPS-only in every profile, so a self-hosted
+  `http://` install must put TLS in front before the dashboard can be used. Logout's
+  expiring cookie carries the
   same shape. Store-side
   `expires_at` is the authority — the cookie's Max-Age is a browser hint. The token
   itself never lands in browser storage; it can be rotated without stranding copies.

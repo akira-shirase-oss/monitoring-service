@@ -53,32 +53,19 @@ pub enum CookieSecure {
     Auto,
     /// On every cookie — for a proxy that does not forward the scheme.
     Always,
-    /// Plain-HTTP development only (`SMON_COOKIE_SECURE=off`): no `Secure`, and the
-    /// plain `smon_session` name — browsers reject a `__Host-` cookie without
-    /// `Secure`, so the escape changes the name rather than emit a dead cookie.
-    /// Anything but loopback self-hosting should leave this alone: production is
-    /// HTTPS-only.
-    Off,
 }
 
 impl CookieSecure {
-    /// The cookie's name — the `__Host-` pin in every secure mode, the plain
-    /// fallback only where the dev escape is configured.
+    /// The cookie's name — the `__Host-` pin in every mode (D re-review: there
+    /// is no `off` — a plain-name fallback would re-open the fixation hole).
     pub fn name(self) -> &'static str {
-        match self {
-            Self::Auto | Self::Always => SESSION_COOKIE,
-            Self::Off => "smon_session",
-        }
+        SESSION_COOKIE
     }
 
-    /// The cookie attribute: `"; Secure"` in every secure mode — `__Host-` names
-    /// are rejected without it, so there the choice no longer exists. Only the
-    /// explicit `off` escape drops it, and it drops the `__Host-` name with it.
+    /// The cookie attribute: `"; Secure"` in every mode — `__Host-` names are
+    /// rejected without it, so the choice no longer exists.
     pub fn attribute(self, _headers: &header::HeaderMap) -> &'static str {
-        match self {
-            Self::Off => "",
-            Self::Auto | Self::Always => "; Secure",
-        }
+        "; Secure"
     }
 }
 
@@ -829,15 +816,15 @@ mod tests {
             None
         );
         assert_eq!(session_cookie(None, name), None);
-        // The dev escape emits and parses the plain name — and a `__Host-` cookie
-        // presented under it is not the session.
-        let off = CookieSecure::Off.name();
-        assert_eq!(off, "smon_session");
+        // The plain `smon_session` name is never the session in any mode — the
+        // dev escape is gone, so a plain-name cookie presented is a stranger's.
         assert_eq!(
-            session_cookie(Some(&HeaderValue::from_static("smon_session=abc-123")), off),
-            Some("abc-123")
+            session_cookie(
+                Some(&HeaderValue::from_static("smon_session=abc-123")),
+                name
+            ),
+            None
         );
-        assert_eq!(session_cookie(Some(&header), off), None);
     }
 
     /// Known answer (computed independently with Python's hashlib): a sha2 upgrade that

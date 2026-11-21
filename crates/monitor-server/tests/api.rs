@@ -1489,47 +1489,6 @@ async fn the_session_cookie_is_host_pinned_and_always_secure() {
     }
 }
 
-/// N4: `SMON_COOKIE_SECURE=off` is the plain-HTTP development escape — it emits
-/// the plain `smon_session` name with no `Secure` (a `__Host-` cookie without it
-/// is rejected by browsers, so the name changes too), and the emitted cookie
-/// authorizes requests. Secure modes never emit it.
-#[tokio::test]
-async fn the_cookie_secure_off_escape_emits_a_plain_dev_cookie() {
-    let (app, _db, _tmp) = authed_with(
-        "s3cret",
-        Duration::from_secs(3600),
-        monitor_server::auth::CookieSecure::Off,
-    )
-    .await
-    .unwrap();
-    let cookie = cookie_header(&app, "/api/login", &[]).await.unwrap();
-    assert!(cookie.starts_with("smon_session="), "{cookie}");
-    assert!(!cookie.contains("; Secure"), "{cookie}");
-    assert!(cookie.contains("; HttpOnly"), "{cookie}");
-    // The cookie it issued is the session credential under the same plain name.
-    let id = cookie
-        .strip_prefix("smon_session=")
-        .and_then(|rest| rest.split(';').next())
-        .unwrap_or_else(|| panic!("session id in {cookie}"))
-        .to_owned();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::get("/api/monitors")
-                .header("host", "127.0.0.1:58400")
-                .header("cookie", format!("smon_session={id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the dev cookie authorizes"
-    );
-}
-
 /// Refused-target honesty, at registration: a target the SSRF policy will refuse can't be
 /// registered (or edited in) under the strict profile — it would only ever report the
 /// monitor's own refusal as the target being down. The lab profile still allows fixtures.

@@ -208,44 +208,22 @@ impl<F: Fn(&str) -> Option<String>> Reader<F> {
         }
     }
 
-    /// `SMON_COOKIE_SECURE` — the emitted session cookie's `Secure`/name mode.
-    /// `off` is the lab escape only (the emitted cookie drops `Secure` and the
-    /// `__Host-` name so a fixture server can sign in over plain HTTP). S3
-    /// review: behind a trusted proxy or on a routable listen a plain
-    /// `smon_session` is a session-fixation hole — a sibling subdomain can plant
-    /// `Domain=<parent>; Path=/api` and the victim works in the attacker's
-    /// session (no `Secure`, no HSTS). N2 review: the default profile on
-    /// loopback with no proxy is the same hole in tunnel clothes — a
-    /// cloudflared/SSH/Tailscale forward to 127.0.0.1, or Caddy with the proxy
-    /// setting unset — so `off` needs lab profile AND loopback AND no proxy.
-    fn cookie_secure(
-        &mut self,
-        proxied: bool,
-        listen: &SocketAddr,
-        lab: bool,
-    ) -> crate::auth::CookieSecure {
-        let secure = match self.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
+    /// `SMON_COOKIE_SECURE` — the emitted session cookie's `Secure` mode.
+    /// There is no `off` (D re-review): the lab gate that once scoped it only
+    /// moved the hole — lab also turns the SSRF guard off, and lab + loopback +
+    /// a tunnel is the same plain-cookie fixation shape production refused.
+    /// Sign-in is HTTPS-only in every profile.
+    fn cookie_secure(&mut self) -> crate::auth::CookieSecure {
+        match self.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
             None | Some("auto") => crate::auth::CookieSecure::Auto,
             Some("always") => crate::auth::CookieSecure::Always,
-            Some("off") => crate::auth::CookieSecure::Off,
             Some(other) => {
                 self.problems.push(format!(
-                    "SMON_COOKIE_SECURE={other:?}: expected `auto`, `always` or `off`"
+                    "SMON_COOKIE_SECURE={other:?}: expected `auto` or `always`"
                 ));
                 crate::auth::CookieSecure::Auto
             }
-        };
-        if matches!(secure, crate::auth::CookieSecure::Off)
-            && !(lab && !proxied && listen.ip().is_loopback())
-        {
-            self.problems.push(
-                "SMON_COOKIE_SECURE=off is refused outside the lab profile — it is \
-                 a development escape, not a mode (needs SMON_PROFILE=lab, a \
-                 loopback listen and no trusted proxy)"
-                    .to_owned(),
-            );
         }
-        secure
     }
 
     /// The backup confinement root (D-019): absolute only — a relative one would let
@@ -455,7 +433,7 @@ impl Config {
             Duration::from_hours(1),
             60..=MAX_HORIZON_S,
         );
-        let cookie_secure = env.cookie_secure(trusted_proxy.is_some(), &listen, lab);
+        let cookie_secure = env.cookie_secure();
         let max_monitors = env.ranged("SMON_MAX_MONITORS", 100, 1..=100_000);
         let max_connections =
             usize::try_from(env.ranged("SMON_MAX_CONNECTIONS", 1024, 8..=65_535)).unwrap_or(1024);
@@ -665,17 +643,14 @@ mod tests {
         assert!(error.to_string().contains("set together"));
     }
 
-    /// S3 re-review: `off` is the plain-HTTP development escape only — never a
-    /// production shape. Behind a trusted proxy or on a routable listen a plain
-    /// `smon_session` is a session-fixation hole: a sibling subdomain can plant
-    /// `Domain=<parent>; Path=/api` and the victim works in the attacker's
-    /// session (no `Secure`, no HSTS). The default profile + loopback + no proxy
-    /// is the same hole in tunnel clothes — a cloudflared/SSH/Tailscale forward
-    /// to 127.0.0.1, or Caddy with the proxy setting unset (N2 re-review). `off`
-    /// is a lab escape only: refuse to boot instead of shipping it.
+    /// D re-review: `off` is gone entirely — the lab gate that once scoped it
+    /// only moved the hole (lab + loopback + a tunnel is the same plain-cookie
+    /// shape), so every spelling and profile refuses it now. Sign-in is
+    /// HTTPS-only in every profile.
     #[test]
-    fn the_cookie_off_escape_is_refused_in_production_shapes() {
+    fn the_cookie_off_escape_is_refused_everywhere() {
         for pairs in [
+            &[("SMON_COOKIE_SECURE", "off")][..],
             &[
                 ("SMON_COOKIE_SECURE", "off"),
                 ("SMON_LISTEN", "0.0.0.0:8080"),
@@ -686,13 +661,18 @@ mod tests {
             ][..],
             &[
                 ("SMON_COOKIE_SECURE", "off"),
-                ("SMON_LISTEN", "203.0.113.5:80"),
+                ("SMON_LISTEN", "127.0.0.1:8080"),
             ][..],
-            // The named N2 case: the default profile on loopback with no proxy —
-            // the tunnel shape that *looks* like the development escape but isn't.
+            // The shapes that once escaped — lab included — refuse identically.
             &[
                 ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_PROFILE", "lab"),
                 ("SMON_LISTEN", "127.0.0.1:8080"),
+            ][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_PROFILE", "lab"),
+                ("SMON_LISTEN", "[::1]:8080"),
             ][..],
             &[
                 ("SMON_COOKIE_SECURE", "off"),
@@ -700,33 +680,9 @@ mod tests {
                 ("SMON_LISTEN", "127.0.0.1:8080"),
             ][..],
         ] {
-            let error = load(pairs).expect_err("off must be refused outside lab");
+            let error = load(pairs).expect_err("off must be refused in every shape");
             assert!(error.to_string().contains("SMON_COOKIE_SECURE"), "{error}");
         }
-        // The development escape itself still works — but it is the *lab*
-        // escape now: lab profile, loopback, no proxy.
-        let config = load(&[
-            ("SMON_COOKIE_SECURE", "off"),
-            ("SMON_PROFILE", "lab"),
-            ("SMON_LISTEN", "127.0.0.1:8080"),
-        ])
-        .expect("off on loopback under lab is the development escape");
-        assert_eq!(config.cookie_secure, crate::auth::CookieSecure::Off);
-        let config = load(&[
-            ("SMON_COOKIE_SECURE", "off"),
-            ("SMON_PROFILE", "lab"),
-            ("SMON_LISTEN", "[::1]:8080"),
-        ])
-        .expect("v6 loopback is still loopback");
-        assert_eq!(config.cookie_secure, crate::auth::CookieSecure::Off);
-        // Lab doesn't buy `off` on a routable listen or behind a proxy either.
-        let error = load(&[
-            ("SMON_COOKIE_SECURE", "off"),
-            ("SMON_PROFILE", "lab"),
-            ("SMON_LISTEN", "0.0.0.0:8080"),
-        ])
-        .expect_err("lab on a routable listen still can't serve a plain cookie");
-        assert!(error.to_string().contains("SMON_COOKIE_SECURE"), "{error}");
     }
 
     #[test]
