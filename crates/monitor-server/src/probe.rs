@@ -1397,54 +1397,54 @@ mod tests {
         let budget =
             AddressBudget::with_share(4, Duration::from_secs(4), 2, Duration::from_secs(3600));
         let ip: IpAddr = "9.9.9.9".parse().expect("ip");
-        let (a, b, c, d) = (
+        let (spender_a, spender_b, waiter_c, waiter_d) = (
             WorkspaceId::new(),
             WorkspaceId::new(),
             WorkspaceId::new(),
             WorkspaceId::new(),
         );
-        assert!(budget.take(ip, Some(a)));
-        assert!(budget.take(ip, Some(a)));
-        assert!(budget.take(ip, Some(b)));
-        assert!(budget.take(ip, Some(b)));
+        assert!(budget.take(ip, Some(spender_a)));
+        assert!(budget.take(ip, Some(spender_a)));
+        assert!(budget.take(ip, Some(spender_b)));
+        assert!(budget.take(ip, Some(spender_b)));
         // The ceiling is spent 2+2 — first-come refused c on every slot,
         // unknown forever, no alert. Round-robin: each refusal registers a
         // pending start; c and d hold their places in arrival order.
         assert!(
-            !budget.take(ip, Some(c)),
+            !budget.take(ip, Some(waiter_c)),
             "no global token left — c's start is pending"
         );
         assert!(
-            !budget.take(ip, Some(d)),
+            !budget.take(ip, Some(waiter_d)),
             "d queues behind c in arrival order"
         );
         // One refill token per second: it goes to the head — c — not to d,
         // and not to the spenders who emptied the bucket.
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(
-            !budget.take(ip, Some(d)),
+            !budget.take(ip, Some(waiter_d)),
             "still c's turn — the head is served first"
         );
         assert!(
-            budget.take(ip, Some(c)),
+            budget.take(ip, Some(waiter_c)),
             "the first refill serves the head of the queue"
         );
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(
-            budget.take(ip, Some(d)),
+            budget.take(ip, Some(waiter_d)),
             "the next token serves the next in order"
         );
         // And the spenders do not jump the queue: even a fresh workspace waits
         // behind whatever is pending once the ceiling is gone.
-        let e = WorkspaceId::new();
-        let f = WorkspaceId::new();
+        let late_e = WorkspaceId::new();
+        let later_f = WorkspaceId::new();
         assert!(
-            !budget.take(ip, Some(e)),
+            !budget.take(ip, Some(late_e)),
             "the queue is empty but the ceiling is spent — e's start is pending"
         );
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(!budget.take(ip, Some(f)), "f waits behind e");
-        assert!(budget.take(ip, Some(e)), "e's claim was first");
+        assert!(!budget.take(ip, Some(later_f)), "f waits behind e");
+        assert!(budget.take(ip, Some(late_e)), "e's claim was first");
     }
 
     /// A re-review: every admit takes a global token — the ceiling binds PACED
@@ -1501,9 +1501,7 @@ mod tests {
                 *first,
                 Some(u64::try_from(i / 8).expect("small")),
                 "workspace {i} waits only its position in line: {}",
-                first
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "never".to_owned())
+                first.map_or_else(|| "never".to_owned(), |s| s.to_string())
             );
         }
     }

@@ -517,7 +517,7 @@ async fn an_outage_of_ordinary_misses_keeps_the_rebuild_tail_bounded() -> anyhow
 }
 
 /// G3 re-review: the rebuild tail must be index-served, not sorted — the only
-/// checks index before 0020 ordered by slot_at, so every monitor's boot
+/// checks index before 0020 ordered by `slot_at`, so every monitor's boot
 /// rebuild pushed its whole match set through a temp B-tree and restart time
 /// grew with fleet history until upgrades out-waited the readiness poll.
 /// These are the exact queries `recent_outcomes` runs; both must come back as
