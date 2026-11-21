@@ -35,6 +35,16 @@ if [[ -z "$base" ]] || ! git rev-parse --verify --quiet "$base^{commit}" >/dev/n
     echo "check-migrations-append-only: no main ref to compare against — skipping" >&2
     exit 0
 fi
+# E re-review: on a push to main the resolved base IS the checked-out commit —
+# comparing the manifest to itself always passes. Compare against the parent
+# (what main held before this push) instead.
+if [[ "$(git rev-parse "$base^{commit}")" == "$(git rev-parse HEAD)" ]]; then
+    if git rev-parse --verify --quiet "$base~1^{commit}" >/dev/null; then
+        base="$base~1"
+    else
+        exit 0 # root commit — there is no earlier manifest to keep immutable
+    fi
+fi
 if ! git cat-file -e "$base:$manifest" 2>/dev/null; then
     exit 0 # the base predates the manifest — nothing yet to keep immutable
 fi
@@ -66,7 +76,9 @@ fi
 # line gives the same migration file new bytes. Names (and version prefixes —
 # one applied version is one file) must be unique across the whole manifest.
 dups=$(strip <"$manifest" | awk '{print $2}' | sort | uniq -d)
-vers=$(strip <"$manifest" | awk -F_ '{print $1}' | sort | uniq -d)
+# Version prefix = the filename's leading digits — `awk -F_ '{print $1}'` would
+# yield "<sum>  NNNN" and a duplicate version could never collide.
+vers=$(strip <"$manifest" | awk '{n=$2; sub(/_.*/, "", n); print n}' | sort | uniq -d)
 if [[ -n "$dups" ]]; then
     echo "check-migrations-append-only: migration named twice — an appended shadow line may never re-bless a file:" >&2
     printf '%s\n' "$dups" >&2
