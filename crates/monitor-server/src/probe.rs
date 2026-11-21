@@ -841,48 +841,46 @@ impl ProbeClient {
                 detail: Some(classify(&error)),
                 limited: false,
             },
-            Ok(Attempt::Answered { status, body }) if expect.accepts(status.as_u16()) => {
-                // An acceptable status is still failure evidence when the marker
-                // is absent from the observed <= max_body prefix (D-025): a miss
-                // is `http_fail`/`assert_body`, never a pass.
-                let missed = match (&expect.body_contains, body.as_deref()) {
-                    (Some(marker), Some(buf)) => {
-                        !buf.windows(marker.len()).any(|w| w == marker.as_slice())
-                    }
-                    // Marker expected but no body was ever buffered — treat as a
-                    // miss, never a silent pass.
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
-                if missed {
-                    ProbeResult {
-                        outcome: CheckOutcome::HttpFail {
-                            status: status.as_u16(),
-                        },
-                        http_status: Some(status.as_u16()),
-                        latency: start.elapsed(),
-                        detail: Some("assert_body"),
-                        limited: false,
-                    }
-                } else {
-                    ProbeResult {
-                        outcome: CheckOutcome::Pass,
-                        http_status: Some(status.as_u16()),
-                        latency: start.elapsed(),
-                        detail: None,
-                        limited: false,
-                    }
-                }
+            Ok(Attempt::Answered { status, body }) => {
+                Self::answered_result(status, body.as_deref(), expect, start.elapsed())
             }
-            Ok(Attempt::Answered { status, .. }) => ProbeResult {
-                outcome: CheckOutcome::HttpFail {
-                    status: status.as_u16(),
-                },
-                http_status: Some(status.as_u16()),
-                latency: start.elapsed(),
-                detail: None,
-                limited: false,
-            },
+        }
+    }
+
+    /// The response made it — classify it against the monitor's contract.
+    /// An acceptable status is still failure evidence when the marker is absent
+    /// from the observed <= max_body prefix (D-025): a miss is
+    /// `http_fail`/`assert_body`, never a pass.
+    fn answered_result(
+        status: reqwest::StatusCode,
+        body: Option<&[u8]>,
+        expect: &Expect,
+        latency: Duration,
+    ) -> ProbeResult {
+        let u16_status = status.as_u16();
+        let missed = expect.accepts(u16_status)
+            && match (&expect.body_contains, body) {
+                (Some(marker), Some(buf)) => {
+                    !buf.windows(marker.len()).any(|w| w == marker.as_slice())
+                }
+                // Marker expected but no body was ever buffered — treat as a
+                // miss, never a silent pass.
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+        let (outcome, detail) = if expect.accepts(u16_status) && missed {
+            (CheckOutcome::HttpFail { status: u16_status }, Some("assert_body"))
+        } else if expect.accepts(u16_status) {
+            (CheckOutcome::Pass, None)
+        } else {
+            (CheckOutcome::HttpFail { status: u16_status }, None)
+        };
+        ProbeResult {
+            outcome,
+            http_status: Some(u16_status),
+            latency,
+            detail,
+            limited: false,
         }
     }
 }
