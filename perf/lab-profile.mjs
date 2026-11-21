@@ -171,8 +171,10 @@ async function main() {
 	await waitOwnServer(BASE, server);
 
 	const t0 = Date.now();
-	// One session cookie per tenant (null = dev mode's default workspace).
-	const cookies = [null];
+	// One session cookie per tenant — `null` is dev mode's default workspace,
+	// which exists only with no admin token; a multi-workspace run signs up
+	// every tenant, index 0 included.
+	const cookies = WORKSPACES > 1 ? [] : [null];
 	const workspaceIds = async () =>
 		new Set(
 			(
@@ -183,7 +185,7 @@ async function main() {
 				).json()
 			).workspaces.map((w) => w.id),
 		);
-	for (let w = 1; w < WORKSPACES; w++) {
+	for (let w = cookies.length; w < WORKSPACES; w++) {
 		const before = await workspaceIds();
 		const invite = await fetch(`${BASE}/api/invites`, {
 			method: 'POST',
@@ -215,28 +217,38 @@ async function main() {
 		if (login.status !== 204) throw new Error(`login ${email}: HTTP ${login.status}`);
 		cookies.push(login.headers.get('set-cookie').split(';')[0]);
 	}
-	const ids = await Promise.all(
-		Array.from({ length: N_MONITORS }, async (_, i) => {
-			const { name, port, path, marker } = plan(i);
-			const cookie = cookies[i % WORKSPACES];
-			const r = await fetch(`${BASE}/api/monitors`, {
-				method: 'POST',
-				headers: {
-					'content-type': 'application/json',
-					...(cookie ? { cookie } : {}),
-				},
-				body: JSON.stringify({
-					name,
-					url: `http://127.0.0.1:${port}${path}`,
-					interval_s: 15,
-					timeout_s: TIMEOUT_S,
-					...(marker ? { expect_body: marker } : {}),
-				}),
-			});
-			if (r.status !== 201) throw new Error(`add ${name}: HTTP ${r.status}`);
-			return (await r.json()).id;
-		}),
-	);
+	const ids = [];
+	const addMonitor = async (i) => {
+		const { name, port, path, marker } = plan(i);
+		const cookie = cookies[i % WORKSPACES];
+		const r = await fetch(`${BASE}/api/monitors`, {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/json',
+				...(cookie ? { cookie } : {}),
+			},
+			body: JSON.stringify({
+				name,
+				url: `http://127.0.0.1:${port}${path}`,
+				interval_s: 15,
+				timeout_s: TIMEOUT_S,
+				...(marker ? { expect_body: marker } : {}),
+			}),
+		});
+		if (r.status !== 201) throw new Error(`add ${name}: HTTP ${r.status}`);
+		return (await r.json()).id;
+	};
+	// Bounded parallelism — thousands of concurrent writes would pile onto the
+	// server's write limits; 64-wide chunks register the set steadily.
+	for (let base = 0; base < N_MONITORS; base += 64) {
+		ids.push(
+			...(await Promise.all(
+				Array.from({ length: Math.min(64, N_MONITORS - base) }, (_, k) =>
+					addMonitor(base + k),
+				),
+			)),
+		);
+	}
 	const registered_ms = Date.now() - t0;
 
 	// CPU seconds consumed by the server process — `ps -o time=` formats
