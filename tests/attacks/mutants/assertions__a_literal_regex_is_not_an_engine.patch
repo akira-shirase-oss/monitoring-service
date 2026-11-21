@@ -1,17 +1,17 @@
 diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
-index 5b1bfb9..28485f8 100644
+index 6fd377f..c6abcbe 100644
 --- a/crates/monitor-server/src/probe.rs
 +++ b/crates/monitor-server/src/probe.rs
-@@ -847,7 +847,11 @@ impl ProbeClient {
-                 // is `http_fail`/`assert_body`, never a pass.
-                 let missed = match (&expect.body_contains, body.as_deref()) {
-                     (Some(marker), Some(buf)) => {
--                        !buf.windows(marker.len()).any(|w| w == marker.as_slice())
-+                        !buf.windows(marker.len()).any(|w| {
-+                            w.iter()
-+                                .zip(marker.iter())
-+                                .all(|(a, b)| *b == b'.' || *b == b'*' || a == b)
-+                        })
-                     }
-                     // Marker expected but no body was ever buffered — treat as a
-                     // miss, never a silent pass.
+@@ -861,7 +861,11 @@ impl ProbeClient {
+         let missed = expect.accepts(u16_status)
+             && match (&expect.body_contains, body) {
+                 (Some(marker), Some(buf)) => {
+-                    !buf.windows(marker.len()).any(|w| w == marker.as_slice())
++                    !buf.windows(marker.len()).any(|w| {
++                        w.iter()
++                            .zip(marker.iter())
++                            .all(|(a, b)| *b == b'.' || *b == b'*' || a == b)
++                    })
+                 }
+                 // Marker expected but no body was ever buffered — treat as a
+                 // miss, never a silent pass.

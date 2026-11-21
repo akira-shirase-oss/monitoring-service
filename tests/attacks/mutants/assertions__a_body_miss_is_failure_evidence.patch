@@ -1,0 +1,22 @@
+diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
+index 6fd377f..0d1dfc2 100644
+--- a/crates/monitor-server/src/probe.rs
++++ b/crates/monitor-server/src/probe.rs
+@@ -858,16 +858,7 @@ impl ProbeClient {
+         latency: Duration,
+     ) -> ProbeResult {
+         let u16_status = status.as_u16();
+-        let missed = expect.accepts(u16_status)
+-            && match (&expect.body_contains, body) {
+-                (Some(marker), Some(buf)) => {
+-                    !buf.windows(marker.len()).any(|w| w == marker.as_slice())
+-                }
+-                // Marker expected but no body was ever buffered — treat as a
+-                // miss, never a silent pass.
+-                (Some(_), None) => true,
+-                (None, _) => false,
+-            };
++        let missed = expect.accepts(u16_status) && body.is_some_and(|b| b.is_empty());
+         let (outcome, detail) = if expect.accepts(u16_status) && missed {
+             (CheckOutcome::HttpFail { status: u16_status }, Some("assert_body"))
+         } else if expect.accepts(u16_status) {
