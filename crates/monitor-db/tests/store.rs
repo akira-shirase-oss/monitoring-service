@@ -70,6 +70,21 @@ fn missed(monitor: &Monitor) -> Observation {
     }
 }
 
+/// A monitor-owned coverage gap: `missed` on the wire, `address_budget` in the
+/// detail column — the scheduler's commit for a start the per-address bound refused.
+fn budgeted(monitor: &Monitor, at: OffsetDateTime) -> Observation {
+    Observation {
+        monitor_id: monitor.id,
+        workspace: monitor.workspace,
+        generation: monitor.generation,
+        slot_at: at,
+        slot: SlotObservation::Budgeted,
+        http_status: None,
+        latency_ms: None,
+        detail: Some("address_budget".to_owned()),
+    }
+}
+
 /// M6.2: the incident machine reads thresholds from the same committed gate row as the
 /// generation — a strict monitor opens on its first failure while a default one waits
 /// for three, and an edit takes effect on the next observation.
@@ -395,6 +410,69 @@ async fn a_missed_slot_is_stored_but_resets_the_streak() -> anyhow::Result<()> {
         .recent_outcomes(monitor.id, 10)
         .await?;
     assert!(outcomes.contains(&SlotObservation::Missed));
+    Ok(())
+}
+
+/// N-5 re-review: a budget gap is neutral in the SQL too. `first_fail_at`
+/// must span it — a `missed`+`address_budget` row is not a streak boundary —
+/// and the rebuild tail must hand `Health::rebuild` the window of *real*
+/// evidence with its gaps interleaved, never a tail of nothing but budget
+/// rows (a starved restart would lose the streak it was holding).
+#[tokio::test]
+async fn a_budget_gap_is_neutral_in_first_fail_at_and_the_rebuild_tail() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let base = OffsetDateTime::now_utc();
+    let slot = |offset_s: i64| base + time::Duration::seconds(offset_s);
+    // The streak starts at slot 1; a budget gap at slot 3 sits inside it.
+    for offset in 1..=2 {
+        writer
+            .record(probe_at(&monitor, CheckOutcome::Transport, slot(offset)))
+            .await?;
+    }
+    writer.record(budgeted(&monitor, slot(3))).await?;
+    writer
+        .record(probe_at(&monitor, CheckOutcome::Transport, slot(4)))
+        .await?;
+
+    let incident = db
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
+        .await?
+        .expect("three real failures around one gap open the incident");
+    assert_eq!(
+        incident.first_fail_at.map(OffsetDateTime::unix_timestamp),
+        Some(slot(1).unix_timestamp()),
+        "the gap is not a boundary — the streak began at slot 1"
+    );
+
+    // The rebuild tail: starve the tail harder than rebuild_tail() is long —
+    // the real evidence must survive inside its own window, gaps included.
+    for offset in 5..=8 {
+        writer.record(budgeted(&monitor, slot(offset))).await?;
+    }
+    writer
+        .record(probe_at(&monitor, CheckOutcome::Transport, slot(9)))
+        .await?;
+    for offset in 10..=20 {
+        writer.record(budgeted(&monitor, slot(offset))).await?;
+    }
+    let tail = db
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
+        .await?;
+    let real: Vec<_> = tail
+        .iter()
+        .filter(|o| matches!(o, SlotObservation::Probe(_)))
+        .collect();
+    assert_eq!(
+        real.len(),
+        3,
+        "the tail kept the last rebuild_tail real slots — gaps never crowd out evidence: {tail:?}"
+    );
+    assert!(
+        tail.contains(&SlotObservation::Budgeted),
+        "the gaps stay in the window — they are freshness truth"
+    );
     Ok(())
 }
 

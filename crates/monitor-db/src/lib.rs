@@ -1558,8 +1558,12 @@ impl WorkspaceDb<'_> {
         Ok(last)
     }
 
-    /// The `limit` most recent slot observations for a monitor, oldest→newest — the tail the
-    /// restart rebuild replays through `Health`.
+    /// The tail the restart rebuild replays through `Health`, oldest→newest: the
+    /// `limit` most recent *real* slot observations — everything but the monitor's
+    /// own `address_budget` coverage gaps — plus the gaps that fell inside that
+    /// window (N-5 re-review: a starving address could otherwise fill the whole
+    /// tail with gaps and a restart would rebuild a shorter streak than the live
+    /// machine was holding; the gaps stay because they are freshness truth).
     pub async fn recent_outcomes(
         &self,
         monitor: MonitorId,
@@ -1567,8 +1571,18 @@ impl WorkspaceDb<'_> {
     ) -> Result<Vec<SlotObservation>, QueryError> {
         let rows = sqlx::query_as::<_, (String, Option<i64>, Option<String>)>(
             "SELECT outcome, http_status, detail FROM checks
-             WHERE monitor_id = ? AND workspace_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
+             WHERE monitor_id = ? AND workspace_id = ?
+               AND slot_at >= COALESCE((
+                     SELECT MIN(slot_at) FROM (
+                       SELECT slot_at FROM checks
+                       WHERE monitor_id = ? AND workspace_id = ?
+                         AND NOT (outcome = 'missed' AND detail = 'address_budget')
+                       ORDER BY slot_at DESC, id DESC LIMIT ?)),
+                     '')
+             ORDER BY slot_at DESC, id DESC",
         )
+        .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
         .bind(monitor.0.to_string())
         .bind(self.workspace.0.to_string())
         .bind(limit)
@@ -1855,8 +1869,8 @@ impl Db {
             }
             Effect::IncidentOpened => {
                 // first_fail_at = the streak's start: the oldest consecutive failing
-                // slot since the last pass/missed — derived from committed rows, so it
-                // is right no matter when the machine was last in memory.
+                // slot since the last pass/missed — derived from committed rows. A
+                // budget gap (missed + address_budget) is neutral (N-5 re-review).
                 let first_fail_at: Option<OffsetDateTime> = sqlx::query_scalar(
                     "SELECT MIN(slot_at) FROM checks
                      WHERE monitor_id = ?1
@@ -1864,7 +1878,7 @@ impl Db {
                        AND slot_at > COALESCE(
                              (SELECT MAX(slot_at) FROM checks
                               WHERE monitor_id = ?1
-                                AND outcome IN ('pass', 'missed')),
+                                AND (outcome = 'pass' OR (outcome = 'missed' AND detail IS NOT 'address_budget'))),
                              '')",
                 )
                 .bind(observation.monitor_id.0.to_string())
