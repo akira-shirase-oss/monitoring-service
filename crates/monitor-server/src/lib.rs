@@ -521,7 +521,9 @@ async fn check_capacity(
     // (S2 re-review): another tenant's load on a shared host is theirs, never a
     // reason to refuse this write. Every origin this workspace's proposed share
     // overloads is judged, not just the worst — a change pushing a *second*
-    // origin over must not pass because another is already saturated.
+    // origin over must not pass because another is already saturated. The same
+    // share is judged again on the address alone, summed across hosts, below
+    // (N1 re-review): host aliasing must never widen an IP's rate.
     let origin_limit = schedule::slots_f64(config.per_origin_slots);
     let workspace = principal.workspace();
     let own_loads = |monitors: &[Monitor]| {
@@ -532,31 +534,34 @@ async fn check_capacity(
             config.tick,
         )
     };
-    let before_origins = own_loads(&before);
-    let worsened = own_loads(&monitors)
-        .into_iter()
-        .filter(|(origin, per_tick)| {
-            *per_tick > origin_limit
-                && *per_tick > before_origins.get(origin).copied().unwrap_or(0.0)
-        })
-        .max_by(|a, b| a.1.total_cmp(&b.1));
-    if let Some((origin, per_tick)) = worsened {
-        // The origin name would tell a tenant about another tenant's targets —
-        // operators get it, accounts get the shape of the limit instead (D-020).
-        let detail = match principal {
-            auth::Principal::Operator { .. } => {
-                format!("{origin} would need {per_tick:.1} probe starts a second")
-            }
-            auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
-                "one origin would exceed its probe rate".to_owned()
-            }
-        };
-        return Err(ApiError::Capacity(format!(
-            "{detail}; one workspace gets at most {} probe starts a second against \
-             one origin. Lengthen the intervals of its monitors",
-            config.per_origin_slots
-        )));
-    }
+    refused_share(
+        own_loads(&monitors),
+        &own_loads(&before),
+        origin_limit,
+        principal,
+        "origin",
+        config.per_origin_slots,
+    )?;
+    // N1 re-review: the same bound on the resolved ADDRESS alone, summed across
+    // hosts — `localhost` and `127.0.0.1` are different origins but one address,
+    // so an alias of a spent IP is refused too. The caller's own load only: a
+    // change that adds nothing can't be refused, and a pause still frees.
+    let own_addresses = |monitors: &[Monitor]| {
+        schedule::per_address_loads(
+            monitors
+                .iter()
+                .filter(|monitor| monitor.workspace == workspace),
+            config.tick,
+        )
+    };
+    refused_share(
+        own_addresses(&monitors),
+        &own_addresses(&before),
+        origin_limit,
+        principal,
+        "address",
+        config.per_origin_slots,
+    )?;
     // S3: a workspace's *own* share of the probe budget — named here, at the
     // write, instead of one tenant's schedule quietly crowding the engine's
     // global slots later. Paused monitors cost nothing (`required_slots` skips
@@ -584,6 +589,44 @@ async fn check_capacity(
         )));
     }
     Ok(())
+}
+
+/// One share bound of `check_capacity`, keyed by `thing` (`"origin"` for the
+/// (address, host) pair, `"address"` for the resolved IP:port alone): refuse
+/// when the proposed set spends more than `limit` starts a second on one key
+/// AND worse than before this change — a write that adds nothing is never
+/// refused and a pause always frees. The worst offender names the bound.
+fn refused_share(
+    after: std::collections::HashMap<String, f64>,
+    before: &std::collections::HashMap<String, f64>,
+    limit: f64,
+    principal: &auth::Principal,
+    thing: &str,
+    per_origin_slots: usize,
+) -> Result<(), ApiError> {
+    let Some((key, per_tick)) = after
+        .into_iter()
+        .filter(|(key, per_tick)| {
+            *per_tick > limit && *per_tick > before.get(key).copied().unwrap_or(0.0)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        return Ok(());
+    };
+    // The key would tell a tenant about another tenant's targets — operators
+    // get it, accounts get the shape of the limit instead (D-020).
+    let detail = match principal {
+        auth::Principal::Operator { .. } => {
+            format!("{key} would need {per_tick:.1} probe starts a second")
+        }
+        auth::Principal::Account { .. } | auth::Principal::Token { .. } => {
+            format!("one {thing} would exceed its probe rate")
+        }
+    };
+    Err(ApiError::Capacity(format!(
+        "{detail}; one workspace gets at most {per_origin_slots} probe starts a second against \
+         one {thing}. Lengthen the intervals of its monitors"
+    )))
 }
 
 /// The service stack, as one `ServiceBuilder` — its *first* layer is the outermost

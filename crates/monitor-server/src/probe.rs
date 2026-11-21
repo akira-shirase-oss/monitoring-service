@@ -2,6 +2,7 @@
 //! honestly. A redirect, a refused connection and a hung socket are different evidence and
 //! never collapse into each other.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,9 +58,102 @@ impl std::fmt::Display for ResolvedLocal {
 
 impl std::error::Error for ResolvedLocal {}
 
+/// A probe start refused because the address's shared budget is spent (N1
+/// re-review): the scheduler commits it as a counted `missed` — our own bound's
+/// refusal, a coverage gap, never evidence about the target.
+#[derive(Debug)]
+pub(crate) struct AddressBusy;
+
+impl std::fmt::Display for AddressBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the address's probe-start budget is spent")
+    }
+}
+
+impl std::error::Error for AddressBusy {}
+
+/// Token bucket per resolved address — the cross-tenant bound on probe starts
+/// at one IP (N1 re-review). The per-workspace (origin, host) share keeps
+/// fairness between sites, but it cannot bound what many names or many tenants
+/// aim at one address: this cap rides the address the validating resolver
+/// actually hands to the dialer — every tenant, every redirect hop. Ports are
+/// invisible to DNS, so the bucket's key is the address alone.
+#[derive(Debug)]
+pub struct AddressBudget {
+    /// Burst size — the most starts one address may pay at once.
+    burst: f64,
+    /// Sustained refill — tokens per second.
+    rate: f64,
+    buckets: std::sync::Mutex<HashMap<IpAddr, Bucket>>,
+}
+
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    at: tokio::time::Instant,
+}
+
+/// Addresses remembered at once — a wildcard-DNS spray must not grow it unbounded.
+const MAX_BUCKETS: usize = 8192;
+
+impl AddressBudget {
+    /// `burst` paid starts at once, refilling to `burst` over `per`.
+    pub fn new(burst: u32, per: Duration) -> Self {
+        Self {
+            burst: f64::from(burst),
+            rate: f64::from(burst) / per.as_secs_f64().max(f64::EPSILON),
+            buckets: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Charge one probe start at `ip`: false while its window is spent. `Instant`
+    /// is tokio's clock — under paused time the refill is a test-clock fact.
+    pub fn take(&self, ip: IpAddr) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !buckets.contains_key(&ip) && buckets.len() >= MAX_BUCKETS {
+            buckets.retain(|_, b| now.duration_since(b.at) < Duration::from_secs(3600));
+            if buckets.len() >= MAX_BUCKETS {
+                buckets.clear();
+            }
+        }
+        let bucket = buckets.entry(ip).or_insert(Bucket {
+            tokens: self.burst,
+            at: now,
+        });
+        bucket.tokens = (bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * self.rate)
+            .min(self.burst);
+        bucket.at = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The budget every probe shares (N1 re-review): the write-time cap already
+/// gives one workspace 2 starts a second on an address; 8 starts a second
+/// across ALL tenants leaves headroom for a few workspaces sharing an IP
+/// legitimately while keeping a wildcard-DNS spray an order under the engine's
+/// 512-slot ceiling.
+static PER_ADDRESS: std::sync::LazyLock<Arc<AddressBudget>> =
+    std::sync::LazyLock::new(|| Arc::new(AddressBudget::new(8, Duration::from_secs(1))));
+
 /// Test-only DNS answers, keyed by name — see `PolicyResolver::for_test`.
 #[cfg(test)]
-type Overrides = Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<SocketAddr>>>>;
+pub(crate) type Overrides =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<SocketAddr>>>>;
+
+/// A fresh overrides map for tests that drive a `PolicyResolver` by hand.
+#[cfg(test)]
+pub(crate) fn test_overrides() -> Overrides {
+    Overrides::default()
+}
 
 /// reqwest's resolver with the policy inside: names resolve through the OS, then every
 /// returned address must be public (unless `lab`). reqwest receives only the validated
@@ -67,6 +161,9 @@ type Overrides = Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<Sock
 #[derive(Debug, Clone)]
 pub struct PolicyResolver {
     allow_local_targets: bool,
+    /// The cross-tenant per-address starts budget — `Some` on the probe path,
+    /// `None` on the tenant-webhook deliverer (its sends are not probe slots).
+    budget: Option<Arc<AddressBudget>>,
     /// Test-only DNS answers: present names return these addresses *through the same
     /// `validate_addrs` gate* — validation is never bypassed, only the lookup source is
     /// swapped. `None` in every build but tests.
@@ -76,11 +173,23 @@ pub struct PolicyResolver {
 
 impl PolicyResolver {
     /// The production constructor: strict unless `SMON_PROFILE=lab` (fixtures and drills
-    /// on loopback). The tenant-webhook sink is built with this; probes build their own
-    /// inside `ProbeClient`.
+    /// on loopback). The tenant-webhook sink is built with this — its sends are not
+    /// probe slots, so it shares no starts budget.
     pub fn new(allow_local_targets: bool) -> Self {
         Self {
             allow_local_targets,
+            budget: None,
+            #[cfg(test)]
+            overrides: None,
+        }
+    }
+
+    /// The resolver the probe client dials through: the strict gate plus the
+    /// shared per-address starts budget (N1 re-review).
+    fn for_probes(allow_local_targets: bool) -> Self {
+        Self {
+            allow_local_targets,
+            budget: Some(PER_ADDRESS.clone()),
             #[cfg(test)]
             overrides: None,
         }
@@ -93,6 +202,22 @@ impl PolicyResolver {
     pub(crate) fn for_test(allow_local_targets: bool, overrides: Overrides) -> Self {
         Self {
             allow_local_targets,
+            budget: None,
+            overrides: Some(overrides),
+        }
+    }
+
+    /// `for_test` plus an injected starts budget — the runtime cap's tests drive
+    /// it directly so a crowded address is a fact, not a race.
+    #[cfg(test)]
+    pub(crate) fn for_test_budgeted(
+        allow_local_targets: bool,
+        overrides: Overrides,
+        budget: Arc<AddressBudget>,
+    ) -> Self {
+        Self {
+            allow_local_targets,
+            budget: Some(budget),
             overrides: Some(overrides),
         }
     }
@@ -107,21 +232,34 @@ impl PolicyResolver {
 impl Resolve for PolicyResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let allow = self.allow_local_targets;
+        let budget = self.budget.clone();
         #[cfg(test)]
         let overrides = self.overrides.clone();
         Box::pin(async move {
             let host = name.as_str().to_owned();
             #[cfg(test)]
-            if let Some(map) = &overrides
-                && let Some(addrs) = map.lock().ok().and_then(|m| m.get(&host).cloned())
-            {
-                validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
-                return Ok(Box::new(addrs.into_iter()) as Addrs);
-            }
-            let addrs: Vec<SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let mapped = overrides
+                .as_ref()
+                .and_then(|m| m.lock().ok().and_then(|m| m.get(&host).cloned()));
+            #[cfg(not(test))]
+            let mapped: Option<Vec<SocketAddr>> = None;
+            let addrs: Vec<SocketAddr> = match mapped {
+                Some(addrs) => addrs,
+                None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
+            };
             validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
-            Ok(Box::new(addrs.into_iter()) as Addrs)
+            // The per-address bound pays where the truth is (N1 re-review): every
+            // candidate in the answer pays for the start it may take — happy
+            // eyeballs may dial several, and a redirect hop re-enters here on the
+            // address it lands on. A name whose whole answer is spent gets no dial.
+            let paid: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|addr| budget.as_ref().is_none_or(|b| b.take(addr.ip())))
+                .collect();
+            if paid.is_empty() {
+                return Err(Box::new(AddressBusy) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(paid.into_iter()) as Addrs)
         })
     }
 }
@@ -278,6 +416,10 @@ pub struct ProbeResult {
     /// Classified detail for the `checks.detail` column — never the error string itself
     /// (reqwest errors can embed URLs and headers).
     pub detail: Option<&'static str>,
+    /// `true` when OUR bound refused the start (the resolver's per-address
+    /// budget): the slot is the monitor's coverage gap — a `missed`, never an
+    /// outcome worth reporting about the target.
+    pub limited: bool,
 }
 
 /// One reqwest client shared by every probe: connection reuse, policy-checked DNS, and
@@ -293,7 +435,8 @@ pub struct ProbeClient {
 
 impl ProbeClient {
     pub fn new(policy: ProbePolicy, max_body: usize) -> Result<Self, reqwest::Error> {
-        Self::build(policy, max_body, &[])
+        let resolver = PolicyResolver::for_probes(policy.allow_local_targets);
+        Self::build(policy, max_body, &[], resolver)
     }
 
     /// A client whose DNS answers for `pins` bypass the policy — unit tests only: it lets an
@@ -305,13 +448,30 @@ impl ProbeClient {
         max_body: usize,
         pins: &[(&str, SocketAddr)],
     ) -> Result<Self, reqwest::Error> {
-        Self::build(policy, max_body, pins)
+        let resolver = PolicyResolver::for_test(policy.allow_local_targets, Overrides::default());
+        Self::build(policy, max_body, pins, resolver)
+    }
+
+    /// A client whose DNS answers come from `overrides` through the same validating
+    /// resolver the dialer uses, with an injected starts budget — the runtime
+    /// cap's tests (N1 re-review). Never reachable from production code.
+    #[cfg(test)]
+    pub(crate) fn overridden(
+        policy: ProbePolicy,
+        max_body: usize,
+        overrides: Overrides,
+        budget: Arc<AddressBudget>,
+    ) -> Result<Self, reqwest::Error> {
+        let resolver =
+            PolicyResolver::for_test_budgeted(policy.allow_local_targets, overrides, budget);
+        Self::build(policy, max_body, &[], resolver)
     }
 
     fn build(
         policy: ProbePolicy,
         max_body: usize,
         pins: &[(&str, SocketAddr)],
+        resolver: PolicyResolver,
     ) -> Result<Self, reqwest::Error> {
         // TLS truth (D-010): a preconfigured rustls client on the webpki-roots bundle.
         // The platform verifier (Security.framework / schannel) flattens certificate
@@ -335,6 +495,10 @@ impl ProbeClient {
             builder = builder.resolve(name, *addr);
         }
         let client = builder
+            // No connection reuse between probes (N1 re-review): a pooled dial
+            // never reaches the resolver, so it would never pay the address's
+            // starts budget. Every probe resolves — and pays — its target.
+            .pool_max_idle_per_host(0)
             .tls_backend_preconfigured(tls)
             .redirect(redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= MAX_REDIRECT_HOPS {
@@ -346,7 +510,7 @@ impl ProbeClient {
                     attempt.follow()
                 }
             }))
-            .dns_resolver(Arc::new(PolicyResolver::new(policy.allow_local_targets)))
+            .dns_resolver(Arc::new(resolver))
             .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
@@ -397,30 +561,45 @@ impl ProbeClient {
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some("deadline"),
+                limited: false,
             },
             Ok(Attempt::Rejected(rejected)) => ProbeResult {
                 outcome: CheckOutcome::Transport,
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some(rejected_detail(rejected)),
+                limited: false,
+            },
+            // Our own bound's refusal is not evidence about the target: the
+            // resolver's per-address budget spent means the slot is a `missed`,
+            // so the monitor shows a coverage gap, never a failure it didn't have.
+            Ok(Attempt::Failed(error)) if is_budget_refusal(&error) => ProbeResult {
+                outcome: CheckOutcome::Transport,
+                http_status: None,
+                latency: start.elapsed(),
+                detail: Some("address_budget"),
+                limited: true,
             },
             Ok(Attempt::Failed(error)) if error.is_timeout() => ProbeResult {
                 outcome: CheckOutcome::Timeout,
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some("deadline"),
+                limited: false,
             },
             Ok(Attempt::Failed(error)) => ProbeResult {
                 outcome: CheckOutcome::Transport,
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some(classify(&error)),
+                limited: false,
             },
             Ok(Attempt::Answered(status)) if status.is_success() => ProbeResult {
                 outcome: CheckOutcome::Pass,
                 http_status: Some(status.as_u16()),
                 latency: start.elapsed(),
                 detail: None,
+                limited: false,
             },
             Ok(Attempt::Answered(status)) => ProbeResult {
                 outcome: CheckOutcome::HttpFail {
@@ -429,6 +608,7 @@ impl ProbeClient {
                 http_status: Some(status.as_u16()),
                 latency: start.elapsed(),
                 detail: None,
+                limited: false,
             },
         }
     }
@@ -468,6 +648,20 @@ fn find_tls<'a>(mut node: &'a (dyn std::error::Error + 'static)) -> Option<&'a r
             .downcast_ref::<std::io::Error>()
             .and_then(|io| io.get_ref())?;
     }
+}
+
+/// Whether `error` carries the resolver's `AddressBusy` — walks the same cause
+/// chain `classify` does (reqwest wraps the resolver's boxed error inside its
+/// connect error).
+fn is_budget_refusal(error: &reqwest::Error) -> bool {
+    let mut cause: Option<&dyn std::error::Error> = std::error::Error::source(error);
+    while let Some(e) = cause {
+        if e.is::<AddressBusy>() {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
 }
 
 /// The committed detail a `Rejected` maps to. `check()` never yields `Unresolvable` —
@@ -698,5 +892,91 @@ mod tests {
             resolver.resolve(name).await.is_err(),
             "localhost must not resolve under the strict profile"
         );
+    }
+
+    fn overrides() -> Overrides {
+        Overrides::default()
+    }
+
+    /// N1 re-review: the per-ADDRESS ceiling lives where the truth is — inside the
+    /// resolver, charged on the addresses it actually hands to the dialer. A burst
+    /// pays; a name answered once its address's starts are spent is refused
+    /// (`AddressBusy`, a counted miss — never a dial).
+    #[tokio::test]
+    async fn the_resolver_spends_and_refuses_the_address_budget() {
+        let map = overrides();
+        map.lock().expect("map").insert(
+            "victim.test".to_owned(),
+            vec!["8.8.8.8:0".parse().expect("addr")],
+        );
+        map.lock().expect("map").insert(
+            "other.test".to_owned(),
+            vec!["1.1.1.1:0".parse().expect("addr")],
+        );
+        let budget = Arc::new(AddressBudget::new(2, Duration::from_secs(3600)));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget);
+        let name = || Name::from_str("victim.test").expect("name");
+        assert!(resolver.resolve(name()).await.is_ok(), "first dial pays");
+        assert!(resolver.resolve(name()).await.is_ok(), "second dial pays");
+        let Err(err) = resolver.resolve(name()).await else {
+            panic!("the address's starts are spent — the resolve must refuse")
+        };
+        assert!(
+            err.is::<AddressBusy>()
+                || err
+                    .source()
+                    .is_some_and(<dyn std::error::Error + 'static>::is::<AddressBusy>),
+            "the refusal is the budget, not a DNS failure: {err:?}"
+        );
+        // Another address has its own bucket — a crowded address never starves it.
+        assert!(
+            resolver
+                .resolve(Name::from_str("other.test").expect("name"))
+                .await
+                .is_ok(),
+            "a different address pays from its own budget"
+        );
+    }
+
+    /// Every address in the answer pays its own way: a candidate whose bucket is
+    /// empty is skipped, the ones that paid are handed on — hyper dials paid
+    /// addresses only (happy eyeballs may dial several).
+    #[tokio::test]
+    async fn the_resolver_yields_only_the_addresses_that_paid() {
+        let map = overrides();
+        map.lock().expect("map").insert(
+            "two.test".to_owned(),
+            vec![
+                "8.8.8.8:0".parse().expect("addr"),
+                "1.1.1.1:0".parse().expect("addr"),
+            ],
+        );
+        let budget = Arc::new(AddressBudget::new(1, Duration::from_secs(3600)));
+        // 8.8.8.8 is already spent by an earlier resolution.
+        assert!(budget.take("8.8.8.8".parse().expect("ip")));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget);
+        let addrs = resolver
+            .resolve(Name::from_str("two.test").expect("name"))
+            .await
+            .expect("1.1.1.1 still pays")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addrs,
+            vec!["1.1.1.1:0".parse::<SocketAddr>().expect("addr")],
+            "only the paying address is offered to the dialer"
+        );
+    }
+
+    /// The budget itself: a burst pays, the window refills — under paused time the
+    /// refill is a test-clock fact, never a real-time flake.
+    #[tokio::test(start_paused = true)]
+    async fn the_address_budget_refills_at_its_rate() {
+        let budget = AddressBudget::new(2, Duration::from_secs(60));
+        let ip = "8.8.8.8".parse().expect("ip");
+        assert!(budget.take(ip));
+        assert!(budget.take(ip));
+        assert!(!budget.take(ip), "the burst is spent");
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(budget.take(ip), "a window later the bucket refilled");
     }
 }

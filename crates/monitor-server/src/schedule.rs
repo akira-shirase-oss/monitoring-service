@@ -180,6 +180,28 @@ pub fn per_origin_loads<'a>(
     per_origin
 }
 
+/// Starts per tick on each resolved ADDRESS across the given monitors — the
+/// write-time ceiling the cross-host view needs (N1 re-review). The key is the
+/// `addr:port` half of the origin key alone, so `localhost` and `127.0.0.1`
+/// charge one IP's budget: a tenant can't buy more starts at an address by
+/// naming it more ways. A name not yet resolved keys by its spelling — distinct
+/// spellings stay distinct until DNS proves them one address.
+pub fn per_address_loads<'a>(
+    monitors: impl Iterator<Item = &'a Monitor>,
+    tick: Duration,
+) -> HashMap<String, f64> {
+    let mut per_address: HashMap<String, f64> = HashMap::new();
+    for monitor in monitors.filter(|monitor| !monitor.paused) {
+        let origin = origin_key(&monitor.url);
+        let address = origin
+            .split_once('|')
+            .map_or(origin.as_str(), |(address, _)| address);
+        *per_address.entry(address.to_owned()).or_default() +=
+            tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
+    }
+    per_address
+}
+
 /// The global semaphore, resized to the schedule's budget whenever the registry changes.
 /// Growing adds permits; shrinking forgets the free ones (permits held by probes in
 /// flight are forgotten on a later resize).
@@ -476,7 +498,14 @@ impl Plan {
                     workspace: dispatch.workspace,
                     generation: dispatch.generation,
                     slot_at: dispatch.slot_at,
-                    slot: SlotObservation::Probe(result.outcome),
+                    // A start OUR bound refused is a coverage gap, never target
+                    // evidence: the resolver's per-address budget spent commits
+                    // `missed` with its reason, not a failure row (N1 re-review).
+                    slot: if result.limited {
+                        SlotObservation::Missed
+                    } else {
+                        SlotObservation::Probe(result.outcome)
+                    },
                     http_status: result.http_status,
                     latency_ms: Some(u64::try_from(result.latency.as_millis()).unwrap_or(u64::MAX)),
                     detail: result.detail.map(str::to_owned),
@@ -958,6 +987,103 @@ mod tests {
             plan.dispatches.len(),
             2,
             "two workspaces on one origin share no slot budget"
+        );
+    }
+
+    /// N1 re-review: the per-ADDRESS runtime bound is charged on the addresses the
+    /// validating resolver actually hands to the dialer — shared across every
+    /// workspace (`try_acquire`, misses counted). Two tenants' schedules aimed at
+    /// one IP get one starts budget between them: a second workspace's monitor
+    /// can never lift the rate at an address its neighbour already spent. The
+    /// refused slot commits `missed` with its reason — our own budget's refusal
+    /// is a coverage gap, never evidence about the target.
+    #[tokio::test]
+    async fn two_workspaces_on_one_address_share_the_runtime_cap() {
+        let db = Db::connect("sqlite::memory:", 1).await.expect("db");
+        db.migrate().await.expect("migrate");
+        let (writer, _writer_task) = writer::spawn(
+            db.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            HashMap::new(),
+            Arc::default(),
+            32,
+            false,
+        );
+        let vitals = Vitals::new(Arc::default(), Duration::from_secs(30));
+        // `victim.test` answers 8.8.8.8 through the same validating resolver the
+        // dialer uses; the budget admits one start an hour — the first probe
+        // dials, everything after it is a counted miss.
+        let overrides = crate::probe::test_overrides();
+        overrides.lock().expect("map").insert(
+            "victim.test".to_owned(),
+            vec!["8.8.8.8:0".parse().expect("addr")],
+        );
+        let probes = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: false,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides,
+            Arc::new(crate::probe::AddressBudget::new(
+                1,
+                Duration::from_secs(3600),
+            )),
+        )
+        .expect("probe client");
+        let (results, mut results_rx) = mpsc::channel::<Observation>(8);
+        let tracker = TaskTracker::new();
+        let other = WorkspaceId::new();
+        let dispatch = |name: &str, workspace: WorkspaceId| Dispatch {
+            monitor_id: MonitorId(uuid::Uuid::now_v7()),
+            workspace,
+            generation: 1,
+            slot_at: OffsetDateTime::now_utc(),
+            url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
+            deadline: Duration::from_millis(400),
+            _global: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+            _origin: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+        };
+        // The first workspace's probe pays the address's only start.
+        let mut plan = Plan::default();
+        plan.dispatches.push(dispatch("a", WorkspaceId::DEFAULT));
+        plan.dispatch(&probes, &writer, &results, &tracker, &vitals)
+            .await;
+        let first = results_rx.recv().await.expect("an observation");
+        assert!(
+            matches!(first.slot, SlotObservation::Probe(_)),
+            "the paying probe produces evidence, not a miss: {first:?}"
+        );
+        // The same workspace's next probe and the OTHER workspace's probe both
+        // meet a spent address — the bound is the address, not the tenant.
+        let mut plan = Plan::default();
+        plan.dispatches.push(dispatch("b", WorkspaceId::DEFAULT));
+        plan.dispatches.push(dispatch("c", other));
+        plan.dispatch(&probes, &writer, &results, &tracker, &vitals)
+            .await;
+        let mut missed = Vec::new();
+        for _ in 0..2 {
+            missed.push(results_rx.recv().await.expect("an observation"));
+        }
+        for observation in &missed {
+            assert_eq!(
+                observation.slot,
+                SlotObservation::Missed,
+                "a budget refusal is a coverage gap: {observation:?}"
+            );
+            assert_eq!(
+                observation.detail.as_deref(),
+                Some("address_budget"),
+                "the miss names its cause: {observation:?}"
+            );
+        }
+        assert!(
+            missed.iter().any(|obs| obs.workspace == other),
+            "the second workspace's schedule inherits the spent address: {missed:?}"
         );
     }
 

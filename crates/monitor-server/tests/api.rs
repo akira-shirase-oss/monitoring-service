@@ -2188,15 +2188,15 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     Ok(())
 }
 
-/// Origins are (address, host) pairs and the bound is a per-workspace share (S2
-/// re-review): on shared hosting one address fronts many sites, so spelling one
-/// address another way is a *different* origin — 30 monitors at 15 s on
-/// `127.0.0.1:9` fill that pair's 2 starts a tick, yet a monitor spelled
-/// `localhost:9` gets its own share. The share still binds on the *same* pair,
-/// and a different address is unaffected either way. (Lab profile, so loopback
-/// is allowed.)
+/// Origins are (address, host) pairs for the per-workspace *share*, but the
+/// write-time ceiling is the resolved **address** summed across hosts (N1
+/// re-review): 30 monitors at 15 s on `127.0.0.1:9` spend that address's whole
+/// 2-starts-a-tick share for this workspace, so a monitor spelled `localhost:9` —
+/// a different host, the *same* IP — is refused, and so is one more literal.
+/// A different address is unaffected either way. (Lab profile, so loopback is
+/// allowed.)
 #[tokio::test]
-async fn an_alias_gets_its_own_share_of_an_origin() -> anyhow::Result<()> {
+async fn an_alias_of_a_full_address_is_refused_too() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let db = Db::connect(
         &format!("sqlite:{}", tmp.path().join("alias.db").display()),
@@ -2242,16 +2242,25 @@ async fn an_alias_gets_its_own_share_of_an_origin() -> anyhow::Result<()> {
         allow_local_targets: true,
         version: "test",
     });
-    // `localhost` resolves to the saturated 127.0.0.1, but (127.0.0.1:9,
-    // "localhost") is a different origin from (127.0.0.1:9, "127.0.0.1") — its
-    // share is empty, so the write lands.
+    // `localhost` resolves to the saturated 127.0.0.1 — a different host spelling
+    // of the *same address*. The per-(address, host) share would give it an empty
+    // bucket, but the workspace's load on the address is already spent, so the
+    // write is refused: host aliasing can't inflate one IP's rate (N1).
     let alias = serde_json::json!({
         "name": "alias", "url": "http://localhost:9/30", "interval_s": 15, "timeout_s": 3
     });
     let (status, body) = send(&app, "POST", "/api/monitors", Some(alias)).await?;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    // The same (address, host) pair is still bound: one more 127.0.0.1:9 monitor
-    // would push its share past 2 starts a tick.
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded");
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .len(),
+        30,
+        "nothing was stored"
+    );
+    // One more literal of the same address is refused the same way.
     let same_pair = serde_json::json!({
         "name": "same", "url": "http://127.0.0.1:9/30", "interval_s": 15, "timeout_s": 3
     });

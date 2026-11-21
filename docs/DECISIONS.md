@@ -75,11 +75,17 @@ starts it got were up to 5 s late — most of the measured commit lag.
   more starts per tick on one origin than its 2 per-origin slots (more than 30 monitors
   at 15 s on one host:port), is refused with 409 `capacity_exceeded` naming the bound —
   never accepted and then missed in silence. The check and its write run under one lock.
-  An origin is the **resolved address and port**, not the URL's spelling (`origin.rs`):
-  `localhost:9` and `127.0.0.1:9` are one origin, for the per-origin bound and for this
-  check. Names are resolved through a process-wide cache (5 min; the coordinator refreshes
-  every monitor's name in the background, a write resolves its own within 3 s); a name
-  not resolved yet keys by its spelling.
+  A write-time origin is the **resolved address and port plus the requested host**
+  (`origin.rs` key `addr:port|host`): spelling variants of one host collapse (case,
+  trailing dot), but `localhost:9` and `127.0.0.1:9` are distinct origins — shared
+  hosting puts thousands of sites on one address. The workspace's own ceiling is
+  judged on the **resolved address alone** summed across hosts (the write refuses
+  once the caller's share of the IP:port is spent), and the cross-tenant runtime
+  ceiling lives where the connection's target is first known — inside the SSRF
+  resolver's per-address starts budget (misses counted). Names are resolved through
+  a process-wide cache (5 min; the coordinator refreshes every monitor's name in
+  the background, a write resolves its own within 3 s); a name not resolved yet
+  keys by its spelling.
   Slow targets can still miss slots (a probe holds its slot up to its timeout); those
   misses are counted, as always.
 - **Writer connection.** The single writer commits on a connection of its own instead
