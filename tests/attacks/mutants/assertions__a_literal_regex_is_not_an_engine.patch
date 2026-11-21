@@ -1,17 +1,27 @@
 diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
-index 6fd377f..c6abcbe 100644
+index 6fd377f..bb020c7 100644
 --- a/crates/monitor-server/src/probe.rs
 +++ b/crates/monitor-server/src/probe.rs
-@@ -861,7 +861,11 @@ impl ProbeClient {
+@@ -861,7 +861,21 @@ impl ProbeClient {
          let missed = expect.accepts(u16_status)
              && match (&expect.body_contains, body) {
                  (Some(marker), Some(buf)) => {
 -                    !buf.windows(marker.len()).any(|w| w == marker.as_slice())
-+                    !buf.windows(marker.len()).any(|w| {
-+                        w.iter()
-+                            .zip(marker.iter())
-+                            .all(|(a, b)| *b == b'.' || *b == b'*' || a == b)
-+                    })
++                    let found = if let Some(p) = marker.windows(2).position(|w| w == b".*") {
++                        let (lo, hi) = (&marker[..p], &marker[p + 2..]);
++                        let start = if lo.is_empty() {
++                            Some(0)
++                        } else {
++                            buf.windows(lo.len()).position(|w| w == lo)
++                        };
++                        start.is_some_and(|i| {
++                            let tail = &buf[i + lo.len()..];
++                            hi.is_empty() || tail.windows(hi.len()).any(|w| w == hi)
++                        })
++                    } else {
++                        buf.windows(marker.len()).any(|w| w == marker.as_slice())
++                    };
++                    !found
                  }
                  // Marker expected but no body was ever buffered — treat as a
                  // miss, never a silent pass.
