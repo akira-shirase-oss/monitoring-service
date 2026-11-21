@@ -1093,12 +1093,8 @@ mod tests {
             // The fixture answers on accept; the deadline only bounds a hang,
             // so it is sized unreachable (N-6 re-review).
             deadline: Duration::from_secs(5),
-            _global: Arc::new(Semaphore::new(4))
-                .try_acquire_owned()
-                .expect("slot"),
-            _origin: Arc::new(Semaphore::new(4))
-                .try_acquire_owned()
-                .expect("slot"),
+            _global: Arc::new(Semaphore::new(4)).try_acquire_owned().expect("slot"),
+            _origin: Arc::new(Semaphore::new(4)).try_acquire_owned().expect("slot"),
         };
         // The first workspace's probe pays the address's only start.
         let mut plan = Plan::default();
