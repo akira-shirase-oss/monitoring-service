@@ -9,8 +9,12 @@ cd "$(dirname "$0")/.."
 
 seconds="${FUZZ_SMOKE_SECONDS:-20}"
 
-cargo +nightly fuzz --version >/dev/null 2>&1 || {
-    echo "cargo-fuzz on nightly is required: rustup toolchain install nightly && cargo install cargo-fuzz" >&2
+# The toolchain comes from fuzz/rust-toolchain.toml (a pinned dated nightly +
+# rust-src) — running inside fuzz/ is what scopes it; the workspace's own pin is
+# 1.99.1 and must not be what cargo-fuzz links against.
+(cd fuzz && cargo fuzz --version) >/dev/null 2>&1 || {
+    echo "cargo-fuzz on the pinned fuzz nightly is required:" >&2
+    echo "  (cd fuzz && rustup toolchain install) && cargo install cargo-fuzz" >&2
     exit 1
 }
 
@@ -34,7 +38,7 @@ for target in "${targets[@]}"; do
     # copy so the committed seeds stay the seeds.
     run_corpus="$(mktemp -d)/corpus"
     cp -R "fuzz/corpus/$target" "$run_corpus"
-    cargo +nightly fuzz run "$target" "$run_corpus" -- -max_total_time="$seconds" 2>&1 |
+    (cd fuzz && cargo fuzz run "$target" "$run_corpus" -- -max_total_time="$seconds") 2>&1 |
         tail -15
 done
 echo "fuzz smoke: ${#targets[@]} targets, ${seconds}s each — no crashes"

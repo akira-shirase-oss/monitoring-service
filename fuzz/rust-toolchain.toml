@@ -1,0 +1,10 @@
+# The fuzz harness is detached from the workspace on purpose (its own lockfile):
+# libFuzzer's sanitizer coverage needs nightly, and a floating nightly is a CI coin
+# flip — pin the date proven against these targets. `rust-src` is not optional:
+# cargo-fuzz rebuilds std with `-Zbuild-std`, and a minimal-profile nightly without
+# it fails "can't find crate for 'core'". This file scopes the nightly to fuzz/ so
+# it never competes with the workspace's pinned 1.99.1.
+[toolchain]
+channel = "nightly-2026-09-05"
+components = ["rust-src"]
+profile = "minimal"
