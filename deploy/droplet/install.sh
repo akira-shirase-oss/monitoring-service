@@ -141,6 +141,7 @@ step "systemd"
 install -m 0644 "$here/../monitor-server.service" /etc/systemd/system/monitor-server.service
 install -m 0755 "$here/smon-backup.sh" /usr/local/bin/smon-backup
 install -m 0755 "$here/schema-guard.sh" /usr/local/bin/smon-schema-guard
+install -m 0755 "$here/inspect-migrations.sh" /usr/local/bin/smon-inspect-migrations
 install -m 0644 "$here/smon-backup.service" "$here/smon-backup.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now monitor-server smon-backup.timer

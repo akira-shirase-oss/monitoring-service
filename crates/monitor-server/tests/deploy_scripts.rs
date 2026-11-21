@@ -57,6 +57,36 @@ fn read(name: &str) -> String {
 }
 
 #[test]
+fn the_migration_inspector_fails_closed() {
+    // B re-review: opens the database -readonly (never writes, not even
+    // journal files — the file:...?mode=ro URI is not portable across sqlite3
+    // CLIs), compares the stored SHA-384 as hex(checksum) — never length() —
+    // against the candidate binary's own compiled-in manifest so no source
+    // tree or migrations/ directory must exist on the host, treats a failed
+    // (success=0) row as divergence, bounds a busy database with .timeout,
+    // and exits 1 rather than waving the switch through on any divergence or
+    // query error.
+    let inspector = read("inspect-migrations.sh");
+    for pin in [
+        "-readonly",
+        "hex(checksum)",
+        "--migration-manifest",
+        ".timeout",
+        "success",
+        "set -euo pipefail",
+    ] {
+        assert!(
+            inspector.contains(pin),
+            "inspect-migrations.sh is missing '{pin}'"
+        );
+    }
+    assert!(
+        inspector.contains("exit 1"),
+        "the inspection must fail closed, not warn and continue"
+    );
+}
+
+#[test]
 fn the_deploy_scripts_carry_their_promised_properties() {
     let install = read("install.sh");
     assert!(
@@ -80,13 +110,10 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         "tail -n +4",        // keeps the newest 3 releases
         "systemctl restart monitor-server",
         "rolling back", // automatic rollback on a failed upgrade
-        // N-4 re-review: the read-only _sqlx_migrations inspection is scripted
-        // in the upgrade itself — not a manual step an operator can skip — and
-        // it compares applied checksums to file SHA-384s, so it reads
-        // hex(checksum), never length().
-        "_sqlx_migrations",
-        "hex(checksum)",
-        "mode=ro",
+        // B re-review: the read-only _sqlx_migrations inspection is scripted
+        // and its result is BINDING — it runs before the switch under set -e
+        // and aborts the upgrade, it does not warn-and-continue.
+        "inspect-migrations",
     ] {
         assert!(upgrade.contains(pin), "upgrade.sh is missing '{pin}'");
     }

@@ -86,6 +86,31 @@ jobs:
           curl -fsS --max-time 10 http://127.0.0.1:58400/livez
           sudo /usr/local/bin/smon-backup latest
           deploy/droplet/check-unit-hardening.sh
+      - name: Run upgrade.sh end to end — a divergent database must refuse, a clean one must switch
+        run: |
+          work="$RUNNER_TEMP/install-check"
+          mkdir -p "$work/release2/bin" "$work/release2/dashboard"
+          cp target/release/monitor-server target/release/monitor "$work/release2/bin/"
+          db=$(sudo sed -n 's/^SMON_DATABASE_URL=sqlite://p' /opt/smon/env | tail -n 1)
+          db=${db:-/opt/smon/data/monitor.db}
+          before=$(readlink -f /opt/smon/current)
+          # Negative: corrupt one applied checksum — the upgrade must refuse
+          # BEFORE the atomic switch and leave `current` exactly where it was.
+          v=$(sudo sqlite3 -batch -readonly "$db" "SELECT min(version) FROM _sqlx_migrations;")
+          sudo sqlite3 "$db" "UPDATE _sqlx_migrations SET checksum = randomblob(48) WHERE version = $v;"
+          if sudo deploy/droplet/upgrade.sh --release-dir "$work/release2"; then
+            echo "upgrade.sh switched releases on a divergent _sqlx_migrations" >&2
+            exit 1
+          fi
+          [[ "$(readlink -f /opt/smon/current)" == "$before" ]] || {
+            echo "upgrade.sh moved \`current\` despite refusing" >&2; exit 1; }
+          # Restore and prove the clean path completes the switch + restart.
+          want=$(sudo /opt/smon/releases/release2/bin/monitor-server --migration-manifest \
+            | awk -F'|' -v v="$v" '$1 == v { print $2; exit }')
+          sudo sqlite3 "$db" "UPDATE _sqlx_migrations SET checksum = x'$want' WHERE version = $v;"
+          sudo deploy/droplet/upgrade.sh --release-dir "$work/release2"
+          [[ "$(readlink -f /opt/smon/current)" != "$before" ]]
+          curl -fsS --max-time 10 http://127.0.0.1:58400/livez
       - name: Keep the evidence
         run: |
           mkdir -p deploy-check-artifacts

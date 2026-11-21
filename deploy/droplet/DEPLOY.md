@@ -231,18 +231,21 @@ read-only:
 
 ```sh
 dbpath=$(sed -n 's/^SMON_DATABASE_URL=sqlite://p' /opt/smon/env | tail -n 1)
-sqlite3 "file:$dbpath?mode=ro" \
+sqlite3 -batch -readonly "$dbpath" \
   "SELECT version, description, success, hex(checksum) FROM _sqlx_migrations
    ORDER BY version DESC LIMIT 5;"
 ```
 
-`upgrade.sh` runs this same inspection automatically before the switch.
-`hex(checksum)` is what `shasum -a 384` prints, so an applied row can be
-compared directly to the candidate's file (sqlx records the SHA-384 of the
-migration's SQL). Any row whose version has no file under the candidate's
-`crates/monitor-db/migrations/` — or whose hex checksum doesn't match that
-file's `shasum -a 384` — means the database diverged from the release line:
-repair `_sqlx_migrations` before deploying, don't boot through it.
+`inspect-migrations.sh` runs this comparison automatically inside `upgrade.sh`
+before the atomic switch — against the candidate binary's own compiled-in
+manifest (`--migration-manifest`), so no source checkout is needed on the
+host — and a divergence, a `success = 0` row, or a query that cannot answer
+aborts the upgrade rather than waving it through. `hex(checksum)` is what
+`shasum -a 384` prints, so an applied row can also be compared by hand to the
+candidate's manifest line (sqlx records the SHA-384 of the migration's SQL).
+Any row whose version has no line in the manifest — or whose hex checksum
+differs — means the database diverged from the release line: reconcile
+`_sqlx_migrations` by hand before deploying, don't boot through it.
 
 Version 18 is the historical edge: it was introduced and restored on a
 branch before this release line carried it, so a database that last ran a
