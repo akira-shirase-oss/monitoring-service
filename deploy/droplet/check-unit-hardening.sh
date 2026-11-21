@@ -90,6 +90,22 @@ if command -v systemd-analyze >/dev/null 2>&1; then
   printf 'smon:x:900:900:smon monitor:/nonexistent:/usr/sbin/nologin\n' >"$fake/etc/passwd"
   printf 'smon:x:900:\n' >"$fake/etc/group"
   cp "$unit_file" "$fake/etc/systemd/system/monitor-server.service"
+  # A bare root has no system units: every unit carries implicit deps on
+  # sysinit.target/basic.target, the unit names network-online.target and
+  # RequiresMountsFor expands to generated .mount units — verify stops at the
+  # first missing name. Stage minimal stubs for the unit's dependency closure;
+  # DefaultDependencies=no makes each stub terminate its own chain so nothing
+  # else is pulled in. Only our unit's own lines are judged.
+  for target in sysinit basic shutdown multi-user \
+                network network-pre network-online nss-lookup nss-user-lookup \
+                local-fs local-fs-pre remote-fs swap sockets timers paths \
+                umount dbus slices getty cryptsetup integritysetup; do
+    printf '[Unit]\nDefaultDependencies=no\n' >"$fake/etc/systemd/system/$target.target"
+  done
+  for mnt in opt-smon-data opt-smon-status; do
+    printf '[Unit]\nDefaultDependencies=no\n[Mount]\nWhat=/dev/sda1\nWhere=/%s\n' \
+      "${mnt//-//}" >"$fake/etc/systemd/system/$mnt.mount"
+  done
   out=$(systemd-analyze verify --root="$fake" monitor-server.service 2>&1); rc=$?
   rm -rf "$fake"
   if [[ $rc -eq 0 ]]; then
