@@ -132,7 +132,7 @@ async fn a_cross_site_origin_cannot_spend_a_cookie() -> anyhow::Result<()> {
         .get_all("set-cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|v| v.starts_with("smon_session="))
+        .find(|v| v.starts_with("__Host-smon_session="))
         .and_then(|line| line.split(';').next())
         .ok_or_else(|| anyhow::anyhow!("login set no session cookie"))?
         .to_owned();

@@ -1,7 +1,8 @@
 //! One running instance per test binary: the real `monitor-server` binary on a
 //! loopback port with a temp store, strict profile — the production refusal gates,
-//! not lab allowances. `SMON_COOKIE_SECURE=off` is the documented dev escape so a
-//! session cookie flows over plain HTTP (the droplet terminates TLS at Caddy).
+//! not lab allowances. Cookie mode stays `auto`: the `__Host-` cookie parses and
+//! replays over plain HTTP for a test client (`off` is a lab-only escape since
+//! the N2 review, and this suite must not run lab).
 //!
 //! Read-only with respect to repo state: everything the instance writes lands in
 //! a `TempDir`; the port is whatever 127.0.0.1:0 gave us; the child is killed on drop.
@@ -94,9 +95,10 @@ pub(crate) async fn spawn() -> anyhow::Result<Instance> {
         ),
         ("SMON_STATUS_DIR", status_dir.display().to_string()),
         ("SMON_DASHBOARD_DIR", dashboard_dir.display().to_string()),
-        // The dev escape, documented for plain-HTTP self-hosters — the suite needs
-        // cookies over http:// (TLS is Caddy's job in the real deployment).
-        ("SMON_COOKIE_SECURE", "off".to_owned()),
+        // Cookie mode left at `auto`: the `Secure`-marked `__Host-` cookie parses
+        // and replays fine over http:// for a test client (TLS is Caddy's job in
+        // the real deployment) — and `off` is refused outside lab since the
+        // N2 review anyway, while the suite must keep the strict profile.
         (
             "SMON_LOG_FILE",
             tmp.path().join("server.log").display().to_string(),

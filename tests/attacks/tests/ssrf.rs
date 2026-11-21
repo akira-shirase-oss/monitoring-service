@@ -45,7 +45,7 @@ async fn account(instance: &common::Instance, email: &str) -> anyhow::Result<Str
         .get_all("set-cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|v| v.starts_with("smon_session="))
+        .find(|v| v.starts_with("__Host-smon_session="))
         .expect("login sets a session cookie")
         .split(';')
         .next()
