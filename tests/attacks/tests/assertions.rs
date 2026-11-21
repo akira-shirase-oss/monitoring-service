@@ -64,7 +64,10 @@ async fn account(instance: &common::Instance, email: &str) -> anyhow::Result<Str
         .await?
         .json()
         .await?;
-    let id = mine["workspaces"][0]["id"].as_str().unwrap_or_default().to_owned();
+    let id = mine["workspaces"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     let lift = http
         .patch(format!("{}/api/workspaces/{id}/plan", instance.base))
         .bearer_auth(&instance.token)

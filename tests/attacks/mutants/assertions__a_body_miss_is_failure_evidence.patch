@@ -1,8 +1,8 @@
 diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
-index 6fd377f..0d1dfc2 100644
+index 6fd377f..61d0ed7 100644
 --- a/crates/monitor-server/src/probe.rs
 +++ b/crates/monitor-server/src/probe.rs
-@@ -858,16 +858,7 @@ impl ProbeClient {
+@@ -858,18 +858,12 @@ impl ProbeClient {
          latency: Duration,
      ) -> ProbeResult {
          let u16_status = status.as_u16();
@@ -18,5 +18,11 @@ index 6fd377f..0d1dfc2 100644
 -            };
 +        let missed = expect.accepts(u16_status) && body.is_some_and(|b| b.is_empty());
          let (outcome, detail) = if expect.accepts(u16_status) && missed {
-             (CheckOutcome::HttpFail { status: u16_status }, Some("assert_body"))
+-            (CheckOutcome::HttpFail { status: u16_status }, Some("assert_body"))
++            (
++                CheckOutcome::HttpFail { status: u16_status },
++                Some("assert_body"),
++            )
          } else if expect.accepts(u16_status) {
+             (CheckOutcome::Pass, None)
+         } else {
