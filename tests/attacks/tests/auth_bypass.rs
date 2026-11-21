@@ -182,7 +182,15 @@ async fn the_operator_bearer_opens_the_api_and_denials_are_enveloped() -> anyhow
         .get(format!("{}/api/monitors", instance.base))
         .send()
         .await?;
-    let body: serde_json::Value = denied.json().await?;
+    assert_eq!(
+        denied.status(),
+        StatusCode::UNAUTHORIZED,
+        "an unauthenticated request must be denied"
+    );
+    let body: serde_json::Value = denied
+        .json()
+        .await
+        .expect("the denial must be a JSON envelope");
     assert!(
         body["error"].is_object(),
         "a denial is the error envelope, got {body}"

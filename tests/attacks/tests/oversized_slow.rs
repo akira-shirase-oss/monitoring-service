@@ -67,7 +67,10 @@ async fn a_body_that_never_finishes_is_408() -> anyhow::Result<()> {
         .header("content-type", "application/json")
         .body(reqwest::Body::wrap_stream(stream))
         .send()
-        .await?;
+        .await
+        .expect(
+            "the server must answer inside the client timeout — a hang means the deadline is gone",
+        );
     assert_eq!(
         response.status(),
         StatusCode::REQUEST_TIMEOUT,
@@ -139,9 +142,9 @@ async fn drip_fed_headers_are_cut() -> anyhow::Result<()> {
                 );
             }
         }
-        Err(_) => {
-            anyhow::bail!(
-                "the server held a drip-fed header past 18 s — the read timeout never cut it"
+        Err(elapsed) => {
+            panic!(
+                "the server held a drip-fed header past 18 s — the read timeout never cut it: {elapsed}"
             );
         }
     }
