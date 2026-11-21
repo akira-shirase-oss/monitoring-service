@@ -53,6 +53,13 @@ const MIX = arg('mix', 'lab');
 if (!['lab', 'ok'].includes(MIX)) throw new Error(`--mix ${MIX}: expected lab or ok`);
 const ASSERT = process.argv.includes('--assert');
 const MARKER = 'SMON-ALIVE';
+// >1 workspace spreads the monitor set across tenants so a >128-slot schedule
+// fits (the per-workspace share caps one tenant at a quarter of the global
+// pool — module 03). Each tenant signs up via an operator invite and is
+// lifted to `operator` so the run isn't plan-bound.
+const WORKSPACES = Number(arg('workspaces', 1));
+const TIMEOUT_S = Number(arg('timeout-s', 3));
+const ADMIN_TOKEN = 'loadrun-admin';
 const TMP = process.env.SMON_TMP ?? '/tmp';
 const DB = `${TMP}/smon-load-${process.pid}.db`;
 const LOG = `${TMP}/smon-load-${process.pid}.log`;
@@ -153,6 +160,7 @@ async function main() {
 		SMON_LOG_FILE: LOG,
 		SMON_LOG_MAX_BYTES: String(8 * 1024 * 1024),
 		RUST_LOG: 'monitor_server=info',
+		...(WORKSPACES > 1 ? { SMON_ADMIN_TOKEN: ADMIN_TOKEN } : {}),
 		...(N_MONITORS > 100 ? { SMON_MAX_MONITORS: String(N_MONITORS) } : {}),
 	};
 	execFileSync(BIN, ['--init'], {
@@ -163,17 +171,65 @@ async function main() {
 	await waitOwnServer(BASE, server);
 
 	const t0 = Date.now();
+	// One session cookie per tenant (null = dev mode's default workspace).
+	const cookies = [null];
+	const workspaceIds = async () =>
+		new Set(
+			(
+				await (
+					await fetch(`${BASE}/api/workspaces`, {
+						headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+					})
+				).json()
+			).workspaces.map((w) => w.id),
+		);
+	for (let w = 1; w < WORKSPACES; w++) {
+		const before = await workspaceIds();
+		const invite = await fetch(`${BASE}/api/invites`, {
+			method: 'POST',
+			headers: { authorization: `Bearer ${ADMIN_TOKEN}`, 'content-type': 'application/json' },
+			body: '{}',
+		});
+		const { invite: { code } } = await invite.json();
+		const email = `load-${w}@tenant.example`;
+		const signup = await fetch(`${BASE}/api/signup`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ email, password: 'a password that is long enough', invite: code }),
+		});
+		if (signup.status !== 201) throw new Error(`signup ${email}: HTTP ${signup.status}`);
+		const after = await workspaceIds();
+		const added = [...after].filter((id) => !before.has(id));
+		if (added.length !== 1) throw new Error(`workspace diff for ${email}: ${added.length} rows`);
+		const plan = await fetch(`${BASE}/api/workspaces/${added[0]}/plan`, {
+			method: 'PATCH',
+			headers: { authorization: `Bearer ${ADMIN_TOKEN}`, 'content-type': 'application/json' },
+			body: JSON.stringify({ plan: 'operator' }),
+		});
+		if (plan.status !== 200) throw new Error(`plan ${email}: HTTP ${plan.status}`);
+		const login = await fetch(`${BASE}/api/login`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ email, password: 'a password that is long enough' }),
+		});
+		if (login.status !== 204) throw new Error(`login ${email}: HTTP ${login.status}`);
+		cookies.push(login.headers.get('set-cookie').split(';')[0]);
+	}
 	const ids = await Promise.all(
 		Array.from({ length: N_MONITORS }, async (_, i) => {
 			const { name, port, path, marker } = plan(i);
+			const cookie = cookies[i % WORKSPACES];
 			const r = await fetch(`${BASE}/api/monitors`, {
 				method: 'POST',
-				headers: { 'content-type': 'application/json' },
+				headers: {
+					'content-type': 'application/json',
+					...(cookie ? { cookie } : {}),
+				},
 				body: JSON.stringify({
 					name,
 					url: `http://127.0.0.1:${port}${path}`,
 					interval_s: 15,
-					timeout_s: 3,
+					timeout_s: TIMEOUT_S,
 					...(marker ? { expect_body: marker } : {}),
 				}),
 			});
@@ -262,8 +318,9 @@ async function main() {
 			started: started.toISOString(),
 			duration_s: DURATION_S,
 			monitors: N_MONITORS,
+			workspaces: WORKSPACES,
 			interval_s: 15,
-			timeout_s: 3,
+			timeout_s: TIMEOUT_S,
 			registered_ms,
 			bin: BIN_PROFILE,
 			mix: MIX,

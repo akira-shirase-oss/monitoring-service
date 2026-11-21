@@ -289,11 +289,14 @@ async fn head_and_a_body_expectation_is_refused_at_write() -> anyhow::Result<()>
 async fn the_body_bound_still_holds() -> anyhow::Result<()> {
     let instance = spawn_lab().await?;
     let cookie = account(&instance, "bound@tenant.example").await?;
-    // 70 KiB of 'A' then the marker — entirely past the 64 KiB read bound.
+    // The marker straddles the 64 KiB read bound — its first bytes land inside
+    // the observed prefix, the rest arrive past it — so no contiguous match can
+    // form inside the window. A probe that reads past the bound passes wrongly.
     let body: &'static [u8] = Box::leak(
         {
-            let mut v = vec![b'A'; 70 * 1024];
+            let mut v = vec![b'A'; 64 * 1024 - 3];
             v.extend_from_slice(b"MARKER");
+            v.extend_from_slice(&vec![b'A'; 1024]);
             v
         }
         .into_boxed_slice(),
