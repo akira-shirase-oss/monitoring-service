@@ -1,0 +1,17 @@
+diff --git a/crates/monitor-domain/src/lib.rs b/crates/monitor-domain/src/lib.rs
+index 7e94f78..8e71d2b 100644
+--- a/crates/monitor-domain/src/lib.rs
++++ b/crates/monitor-domain/src/lib.rs
+@@ -691,12 +691,6 @@ impl MonitorPatch {
+         validate_fields(&merged.name, &merged.url, merged.interval, merged.timeout)?;
+         // The merged bundle faces the same cross-field rule a create does — a patch
+         // swapping GET->HEAD onto a monitor that holds a marker fails here (D-025).
+-        let mut statuses = merged.expect.statuses.clone();
+-        validate_expect(
+-            merged.method,
+-            &mut statuses,
+-            merged.expect.body_contains.as_deref(),
+-        )?;
+         Ok(merged)
+     }
+ }

@@ -443,7 +443,11 @@ async fn a_slow_body_never_outruns_the_deadline() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    let check = wait_check(&cookie, &instance.base, &id).await?;
+    // A hung probe commits nothing — the missed check maps to Null, and the
+    // assert below is where a deadline-removing mutant goes red.
+    let check = wait_check(&cookie, &instance.base, &id)
+        .await
+        .unwrap_or(Value::Null);
     assert_eq!(
         check["outcome"], "timeout",
         "the dribble dies on the deadline: {check}"

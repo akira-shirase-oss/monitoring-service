@@ -1,0 +1,14 @@
+diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
+index f10e12a..ddfdfd2 100644
+--- a/crates/monitor-server/src/probe.rs
++++ b/crates/monitor-server/src/probe.rs
+@@ -776,8 +776,7 @@ impl ProbeClient {
+                             Ok(Some(chunk)) => {
+                                 read += chunk.len();
+                                 if let Some(buf) = body.as_mut() {
+-                                    let room = self.max_body.saturating_sub(buf.len());
+-                                    buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
++                                    buf.extend_from_slice(&chunk);
+                                 }
+                                 if read > self.max_body {
+                                     break;

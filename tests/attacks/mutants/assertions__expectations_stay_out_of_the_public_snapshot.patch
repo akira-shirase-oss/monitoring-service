@@ -1,0 +1,28 @@
+diff --git a/crates/monitor-server/src/snapshot.rs b/crates/monitor-server/src/snapshot.rs
+index f5314fd..f74fa1c 100644
+--- a/crates/monitor-server/src/snapshot.rs
++++ b/crates/monitor-server/src/snapshot.rs
+@@ -69,6 +69,9 @@ struct ServiceView {
+     /// Hashed public identity — correlates across snapshots, reveals nothing internal.
+     alias: String,
+     status: Status,
++    method: String,
++    expect_statuses: String,
++    expect_body: Option<String>,
+     /// When the currently-open incident began, if the store says one is open — evidence
+     /// time, not "now".
+     #[serde(with = "time::serde::rfc3339::option")]
+@@ -112,6 +115,13 @@ pub fn build<S: std::hash::BuildHasher>(
+                 .get(&monitor.id)
+                 .copied()
+                 .unwrap_or(Status::Unknown),
++            method: monitor.method.as_str().to_owned(),
++            expect_statuses: monitor_domain::encode_statuses(&monitor.expect.statuses),
++            expect_body: monitor
++                .expect
++                .body_contains
++                .clone()
++                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+             incident_open_since: open.get(&monitor.id).copied(),
+         })
+         .collect();

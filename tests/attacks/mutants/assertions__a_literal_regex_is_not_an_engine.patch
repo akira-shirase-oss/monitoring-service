@@ -1,0 +1,17 @@
+diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
+index f10e12a..59ed679 100644
+--- a/crates/monitor-server/src/probe.rs
++++ b/crates/monitor-server/src/probe.rs
+@@ -847,7 +847,11 @@ impl ProbeClient {
+                 // is `http_fail`/`assert_body`, never a pass.
+                 let missed = match (&expect.body_contains, body.as_deref()) {
+                     (Some(marker), Some(buf)) => {
+-                        !buf.windows(marker.len()).any(|w| w == marker.as_slice())
++                        !buf.windows(marker.len()).any(|w| {
++                            w.iter()
++                                .zip(marker.iter())
++                                .all(|(a, b)| *b == b'.' || a == b)
++                        })
+                     }
+                     // Marker expected but no body was ever buffered — treat as a
+                     // miss, never a silent pass.
