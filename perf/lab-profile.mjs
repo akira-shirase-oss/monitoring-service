@@ -225,7 +225,9 @@ async function main() {
 			method: 'POST',
 			headers: {
 				'content-type': 'application/json',
-				...(cookie ? { cookie } : {}),
+				// Cookie-authed writes carry the server's own origin — the
+				// cross-site check refuses a missing or foreign one.
+				...(cookie ? { cookie, origin: BASE } : {}),
 			},
 			body: JSON.stringify({
 				name,
