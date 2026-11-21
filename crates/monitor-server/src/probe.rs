@@ -1491,7 +1491,7 @@ mod tests {
                 }
             }
             assert!(
-                admitted <= 8 + usize::try_from(second + 1).expect("small") * 8,
+                admitted <= 8 + usize::try_from(second).expect("small") * 8,
                 "the ceiling is a token stream: admits ({admitted}) must not exceed 8+8t"
             );
             tokio::time::advance(Duration::from_secs(1)).await;
@@ -1542,11 +1542,11 @@ mod tests {
         for _ in 0..4 {
             assert!(budget.take(ip, Some(a)));
         }
-        // Share 8, spent 4 — plenty of share left; the ceiling is the refusal.
-        // Max-min: one workspace's fair split of the ceiling is the ceiling.
+        // Share 8, spent 4 — plenty of share left; only the ceiling can refuse
+        // this take (a spent ceiling queues the start, never admits it).
         assert!(
             !budget.take(ip, Some(a)),
-            "the ceiling refuses past the split even with share to spare"
+            "the ceiling alone refuses even with share to spare"
         );
     }
 
