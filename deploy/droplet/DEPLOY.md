@@ -113,10 +113,10 @@ or weaken the file modes.
 `SMON_TRUSTED_PROXY=127.0.0.1` (in the template) is right here: Caddy is the only proxy smon
 sees, and Caddy attributes the visitor over Cloudflare's trusted ranges.
 `SMON_COOKIE_SECURE=always` because every dashboard request arrives over TLS. A
-plain `http://` deployment is **not** supported for sign-in: `SMON_COOKIE_SECURE=off`
-exists only for the lab profile (it is refused unless `SMON_PROFILE=lab`), so a
-self-hosted install must still put TLS in front — a tunnel, a CA-signed cert, or
-mkcert on the LAN — rather than serve the dashboard unencrypted.
+plain `http://` deployment is **not** supported for sign-in — there is no
+`SMON_COOKIE_SECURE=off` in any profile — so a self-hosted install must still put
+TLS in front — a tunnel, a CA-signed cert, or mkcert on the LAN — rather than
+serve the dashboard unencrypted.
 
 ## 4. Sign in once
 
@@ -222,6 +222,27 @@ anything switches, repoints `current` with an atomic rename, restarts, polls rea
 runs the local smoke — and **rolls back automatically** on any post-switch failure. Keeps
 the newest 3 release dirs. Serving gap < 5 s (Caddy holds requests); check slots inside the
 restart are committed `missed` on boot — that's the monitor accounting for its own gap.
+
+**Migration checksum before switching (read-only).** If the database ever ran a
+branch/experiment build — anything other than a main-line release — a migration
+file it applied may differ from what the candidate build ships, and sqlx refuses
+to boot on the checksum mismatch *after* the switch. Check first; the query is
+read-only:
+
+```sh
+dbpath=$(sed -n 's/^SMON_DATABASE_URL=sqlite://p' /opt/smon/env | tail -n 1)
+sqlite3 "file:$dbpath?mode=ro" \
+  "SELECT version, description, success, length(checksum) FROM _sqlx_migrations
+   ORDER BY version DESC LIMIT 5;"
+```
+
+Any row whose version has no file under the candidate's
+`crates/monitor-db/migrations/` — or whose checksum doesn't match
+`shasum -a 384` of that file (sqlx records the SHA-384 of the migration's SQL) —
+means the database diverged from the release line: repair `_sqlx_migrations`
+before deploying, don't boot through it. In particular, version 18 should not
+exist on a main-lineage database at all (the file was introduced and restored
+on a branch, never released); a version-18 row is the tell.
 
 ## Rollback
 

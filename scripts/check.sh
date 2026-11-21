@@ -10,6 +10,8 @@ scripts/check-toolchain.sh
 # Nothing that is not a build or runtime artifact may be git-ignored.
 if git rev-parse --git-dir >/dev/null 2>&1; then
     scripts/check-ignored.sh
+    # Applied migrations are immutable: the manifest may only ever gain lines.
+    scripts/check-migrations-append-only.sh
 fi
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
