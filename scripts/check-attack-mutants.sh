@@ -8,11 +8,15 @@
 #   1. runs the named test against a CLEAN server build — it must pass
 #      (a test already broken proves nothing about the protection),
 #   2. applies the patch, rebuilds the real binary, runs the same test — it must
-#      FAIL (the test is protection-dependent),
+#      FAIL THE TEST it names (the expected failure: `test <name> ... FAILED`
+#      in the binary's own output),
 #   3. restores the tree.
 #
 # A mutant that leaves the test green is a gate failure: the protection is not
-# what the test measures. Needs a clean worktree — it applies and reverts diffs.
+# what the test measures. And the other escapes are failures too, never kills —
+# a non-compiling mutant is not a real alternative, a mutant that only breaks
+# the server's boot proves the suite never reached the protection, a timeout
+# proves nothing. Needs a clean worktree — it applies and reverts diffs.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,8 +30,17 @@ if [[ -n "$(git status --porcelain -- crates tests | grep -v '^??')" ]]; then
     exit 2
 fi
 
+# Where this build puts its binaries: honour CARGO_TARGET_DIR exactly like
+# cargo does — a hardcoded target/ either misses what it built or finds stale
+# binaries from a default-layout build and calls them a kill.
+target_dir="${CARGO_TARGET_DIR:-target}/debug"
+
 echo "== baseline build (the clean binary every green check runs against)"
 cargo build -p monitor-server --locked 2>&1 | tail -3 || exit 1
+[[ -x "$target_dir/monitor-server" ]] || {
+    echo "no monitor-server binary under $target_dir — was CARGO_TARGET_DIR set for the build too?" >&2
+    exit 1
+}
 # Map each test-file stem to the executable THIS build produced. deps/ keeps
 # stale executables from older builds; a find-by-name would silently run an
 # old test binary and call a real mutant "survived".
@@ -40,8 +53,8 @@ bin_for() {  # bin_for <test-file-stem> → the executable this build made for i
 }
 # Keep a copy of the unmutated server binary: the green check per mutant then
 # costs nothing — only the mutated build is paid.
-clean_bin="target/debug/monitor-server.clean"
-cp target/debug/monitor-server "$clean_bin"
+clean_bin="$target_dir/monitor-server.clean"
+cp "$target_dir/monitor-server" "$clean_bin"
 
 fails=0; killed=0
 restore() {
@@ -49,6 +62,37 @@ restore() {
     rm -f "$clean_bin"
 }
 trap restore EXIT
+
+# Coverage is half the proof: every `async fn` test under tests/attacks/tests/
+# must name a mutant file — a test without one is a protection nothing measures.
+for file in tests/attacks/tests/*.rs; do
+    stem=$(basename "$file" .rs)
+    while IFS= read -r tname; do
+        if [[ ! -f "tests/attacks/mutants/${stem}__${tname}.patch" ]]; then
+            echo "NO MUTANT: $stem::$tname has no ${stem}__${tname}.patch" >&2
+            fails=$((fails + 1))
+        fi
+    done < <(sed -n '/#\[tokio::test/,/^}/p' "$file" | sed -n 's/^async fn \([a-z0-9_]*\).*/\1/p')
+done
+
+# Run one test binary to a bounded wait: a kill is only the EXPECTED failure —
+# the named test's own `... FAILED` line. A hung binary proves nothing and the
+# server never answering /livez means the mutation broke the boot, not the
+# protection the test measures. The limit is a plain integer or it is not used —
+# shell arithmetic must never see an unvalidated value.
+run_bounded() {  # run_bounded <server-bin> <test-binary> <test-name> <log> → the test's exit, 124 on expiry
+    local server=$1 bin=$2 test=$3 log=$4 limit=${MUTANT_TEST_LIMIT:-120}
+    [[ $limit =~ ^[0-9]+$ ]] || limit=120
+    SMON_ATTACK_BIN="$server" "$bin" --exact "$test" >"$log" 2>&1 &
+    local pid=$!
+    ( sleep "$limit"; kill -9 "$pid" 2>/dev/null ) &
+    local watchdog=$!
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+    if [[ $rc -eq 137 ]]; then return 124; fi
+    return "$rc"
+}
 
 for patch in "${mutants[@]}"; do
     name=$(basename "$patch" .patch)
@@ -58,28 +102,48 @@ for patch in "${mutants[@]}"; do
         echo "NO BINARY: no compiled test executable for '$stem'" >&2
         fails=$((fails + 1)); continue
     fi
+    log=$(mktemp)
 
-    # 1. Green on the clean binary — the test must be alive to be killed.
-    if ! SMON_ATTACK_BIN="$clean_bin" "$bin" --exact "$test" >/dev/null 2>&1; then
+    # 1. Green on the clean binary — the test must be alive to be killed, and
+    # it must be the named test that passes (a wrong name runs nothing).
+    if ! run_bounded "$clean_bin" "$bin" "$test" "$log"; then
         echo "UNMUTATED RED: $test fails without any mutation — it proves nothing" >&2
-        fails=$((fails + 1)); continue
+        tail -5 "$log" >&2; fails=$((fails + 1)); rm -f "$log"; continue
+    fi
+    if ! grep -q "^test ${test} \.\.\. ok" "$log"; then
+        echo "WRONG NAME: no 'test $test ... ok' line — the patch names no real test" >&2
+        fails=$((fails + 1)); rm -f "$log"; continue
     fi
 
-    # 2. Apply, rebuild, demand red.
+    # 2. Apply, rebuild, demand the expected red.
     if ! git apply "$patch" 2>/dev/null; then
         echo "STALE MUTANT: $name no longer applies — refresh it against the tree" >&2
-        fails=$((fails + 1)); continue
+        fails=$((fails + 1)); rm -f "$log"; continue
     fi
     if ! cargo build -p monitor-server --locked >/dev/null 2>&1; then
         echo "DEAD MUTANT: $name does not compile — a mutant must be a real alternative" >&2
         fails=$((fails + 1))
-    elif SMON_ATTACK_BIN=target/debug/monitor-server "$bin" --exact "$test" >/dev/null 2>&1; then
+    elif run_bounded "$target_dir/monitor-server" "$bin" "$test" "$log"; then
         echo "MUTANT SURVIVED: $test still passes with its protection removed" >&2
         fails=$((fails + 1))
     else
-        echo "killed: $name"
-        killed=$((killed + 1))
+        rc=$?
+        if [[ $rc -eq 124 ]]; then
+            echo "INCONCLUSIVE: $name timed out — a hung mutant is not a kill" >&2
+            fails=$((fails + 1))
+        elif grep -q "never answered /livez" "$log"; then
+            echo "INCONCLUSIVE: $name broke the server's boot, not the assertion — not a kill" >&2
+            fails=$((fails + 1))
+        elif grep -q "^test ${test} \.\.\. FAILED" "$log"; then
+            echo "killed: $name"
+            killed=$((killed + 1))
+        else
+            echo "INCONCLUSIVE: $name failed some other way — not a kill:" >&2
+            tail -5 "$log" >&2
+            fails=$((fails + 1))
+        fi
     fi
+    rm -f "$log"
     git checkout -- crates/
 done
 
