@@ -1055,8 +1055,7 @@ mod tests {
             false,
         );
         let vitals = Vitals::new(Arc::default(), Duration::from_secs(30));
-        // `victim.test` answers the loopback fixture through the same validating
-        // resolver the dialer uses; the budget admits one start an hour.
+        // `victim.test` resolves to loopback; the budget admits one start an hour.
         let overrides = crate::probe::test_overrides();
         let fixture = http_fixture().await;
         overrides
