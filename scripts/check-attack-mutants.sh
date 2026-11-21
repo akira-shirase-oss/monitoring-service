@@ -72,7 +72,13 @@ for file in tests/attacks/tests/*.rs; do
             echo "NO MUTANT: $stem::$tname has no ${stem}__${tname}.patch" >&2
             fails=$((fails + 1))
         fi
-    done < <(sed -n '/#\[tokio::test/,/^}/p' "$file" | sed -n 's/^async fn \([a-z0-9_]*\).*/\1/p')
+    done < <(awk '
+        /^[[:space:]]*#\[(tokio::)?test/ {
+            # The fn line may follow attributes/blanks and may be indented or
+            # non-async — print it, let sed pull the name.
+            while ((getline line) > 0 && line ~ /^[[:space:]]*(#|$)/) continue
+            print line
+        }' "$file" | sed -n 's/.*fn[[:space:]]\{1,\}\([a-z0-9_]*\).*/\1/p')
 done
 
 # Run one test binary to a bounded wait: a kill is only the EXPECTED failure —
@@ -135,8 +141,18 @@ for patch in "${mutants[@]}"; do
             echo "INCONCLUSIVE: $name broke the server's boot, not the assertion — not a kill" >&2
             fails=$((fails + 1))
         elif grep -q "^test ${test} \.\.\. FAILED" "$log"; then
-            echo "killed: $name"
-            killed=$((killed + 1))
+            # The named test failed — but on WHAT? A mutant that breaks the
+            # test's own setup still prints its FAILED line (N-6 re-review):
+            # the kill is only real when the panic lands in the test file's
+            # own assertions, not in a fixture, helper, or elsewhere.
+            if grep -q "panicked at .*tests/attacks/tests/${stem}\.rs" "$log"; then
+                echo "killed: $name"
+                killed=$((killed + 1))
+            else
+                echo "INCONCLUSIVE: $name failed $test away from its own assertions — not a kill:" >&2
+                grep "panicked at" "$log" | head -3 >&2
+                fails=$((fails + 1))
+            fi
         else
             echo "INCONCLUSIVE: $name failed some other way — not a kill:" >&2
             tail -5 "$log" >&2
