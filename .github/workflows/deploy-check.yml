@@ -97,7 +97,10 @@ jobs:
           cp target/release/monitor-server target/release/monitor "$work/release2/bin/"
           db=$(sudo sed -n 's/^SMON_DATABASE_URL=sqlite://p' /opt/smon/env | tail -n 1)
           db=${db:-/opt/smon/data/monitor.db}
-          before=$(readlink -f /opt/smon/current)
+          # sudo: releases/ belongs to the service user alone, so the runner cannot
+          # resolve the link itself, and readlink fails without a word.
+          before=$(sudo readlink -f /opt/smon/current)
+          [[ -n "$before" ]] || { echo "could not resolve /opt/smon/current" >&2; exit 1; }
           # Negative: corrupt one applied checksum — the upgrade must refuse
           # BEFORE the atomic switch and leave `current` exactly where it was.
           v=$(sudo sqlite3 -batch -readonly "$db" "SELECT min(version) FROM _sqlx_migrations;")
@@ -115,14 +118,14 @@ jobs:
             cat "$work/refused.log"; exit 1; }
           [[ "$(systemctl show monitor-server -p MainPID --value)" == "$pid_before" ]] || {
             echo "the service restarted on a refused upgrade" >&2; exit 1; }
-          [[ "$(readlink -f /opt/smon/current)" == "$before" ]] || {
+          [[ "$(sudo readlink -f /opt/smon/current)" == "$before" ]] || {
             echo "upgrade.sh moved \`current\` despite refusing" >&2; exit 1; }
           # Restore and prove the clean path completes the switch + restart.
           want=$("$work/release2/bin/monitor-server" --migration-manifest \
             | awk -F'|' -v v="$v" '$1 == v { print $2; exit }')
           sudo sqlite3 "$db" "UPDATE _sqlx_migrations SET checksum = x'$want' WHERE version = $v;"
           sudo deploy/droplet/upgrade.sh --release-dir "$work/release2"
-          [[ "$(readlink -f /opt/smon/current)" != "$before" ]]
+          [[ "$(sudo readlink -f /opt/smon/current)" != "$before" ]]
           curl -fsS --max-time 10 http://127.0.0.1:58400/livez
           # G2: the same --release-dir name again computes the same destination,
           # which is now the live release — it must refuse before touching
@@ -137,7 +140,7 @@ jobs:
             cat "$work/refused2.log"; exit 1; }
           [[ "$(systemctl show monitor-server -p MainPID --value)" == "$pid_before" ]] || {
             echo "the service restarted on a repeated-name refusal" >&2; exit 1; }
-          [[ "$(readlink -f /opt/smon/current)" == "$(readlink -f /opt/smon/releases/release2)" ]] || {
+          [[ "$(sudo readlink -f /opt/smon/current)" == "$(sudo readlink -f /opt/smon/releases/release2)" ]] || {
             echo "the repeated-name refusal moved \`current\`" >&2; exit 1; }
           curl -fsS --max-time 10 http://127.0.0.1:58400/livez
       # Runs after a failure too: the evidence matters most when a step above went red.
@@ -149,9 +152,12 @@ jobs:
           systemd-analyze security monitor-server.service > deploy-check-artifacts/security.txt 2>&1 || true
           sudo journalctl -u monitor-server --no-pager -n 80 > deploy-check-artifacts/monitor-server.journal 2>/dev/null || true
           sudo journalctl -u caddy --no-pager -n 80 > deploy-check-artifacts/caddy.journal 2>/dev/null || true
+          sudo ls -la /opt/smon /opt/smon/releases /opt/smon/releases/* > deploy-check-artifacts/layout.txt 2>&1 || true
+          cp "$RUNNER_TEMP/install-check"/refused*.log deploy-check-artifacts/ 2>/dev/null || true
           # In the log as well, so a red run can be read without downloading anything.
           echo "== caddy"; systemctl is-active caddy || true
           tail -n 40 deploy-check-artifacts/caddy.journal || true
+          echo "== layout"; cat deploy-check-artifacts/layout.txt || true
           echo "== monitor-server"; systemctl is-active monitor-server || true
           tail -n 15 deploy-check-artifacts/monitor-server.journal || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
