@@ -1446,3 +1446,30 @@ async fn an_export_caps_a_monitors_checks_and_says_it_did() -> anyhow::Result<()
     assert_eq!(of(&quiet)["rows"].as_array().map(Vec::len), Some(1));
     Ok(())
 }
+
+/// A right password gives its guess back, so the address budget does not bound a
+/// signed-in account that loops the route. Its own small budget does: every pass costs
+/// two rounds of password hashing on a pool other people's sign-ins share.
+#[tokio::test]
+async fn password_changes_have_their_own_small_budget() -> anyhow::Result<()> {
+    let rig = rig().await?;
+    let session = sign_up(&rig.app, "ada@tenant.example").await;
+    let mut current = PASSWORD;
+    let mut next = NEW_PASSWORD;
+    for round in 0..monitor_server::account::PASSWORD_CHANGES {
+        let (status, body) = change(&rig.app, cookie(&session), current, next).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "round {round}: {body}");
+        std::mem::swap(&mut current, &mut next);
+    }
+    let (status, body) = change(&rig.app, cookie(&session), current, next).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "too_many_requests", "{body}");
+    // The refused change changed nothing: the password is still the last accepted one.
+    assert_eq!(
+        sign_in(&rig.app, "ada@tenant.example", current, None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    Ok(())
+}

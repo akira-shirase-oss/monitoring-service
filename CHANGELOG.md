@@ -47,6 +47,21 @@
     resumed could leave a monitor whose checks were refused on every slot. An open
     incident now stays until the monitor itself goes, and the delete finishes even if
     the request is dropped.
+- **Fixes from an independent review of the account work:**
+  - A monitor created at the moment its workspace was being deleted could outlive it,
+    unreachable and still probed, and later fail its saves on every check. Monitors
+    are now only created in a workspace that exists, and any left behind are removed.
+  - Maintenance windows had no limits. A reason is now one line of up to 200
+    characters, a monitor holds up to 50 windows, and creating them is rate-limited
+    like other monitor writes. A workspace holds up to 100 API tokens.
+  - Account deletion's size limit now counts everything it removes, across all the
+    workspaces it removes.
+  - At most two data exports are assembled at once across the server.
+  - A password change or account deletion is refused if the password changed while
+    the request was being checked. Accepted password changes are limited to five per
+    ten minutes.
+- **Sign-out says when the server did not confirm it**, and role and plan changes ask
+  for confirmation instead of applying on a dropdown change.
 - **Operators no longer need curl.** `monitor invites create` and
   `monitor workspaces list|plan` in the CLI, and an Operator page in the dashboard for
   sign-up codes and workspace plans.

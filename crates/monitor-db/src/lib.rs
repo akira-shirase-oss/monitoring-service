@@ -1163,7 +1163,8 @@ impl WorkspaceDb<'_> {
                                   fail_threshold, recover_threshold, generation, paused,
                                   method, expect_statuses, expect_body, created_at)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?
-             WHERE (SELECT COUNT(*) FROM monitors WHERE workspace_id = ?) < ?",
+             WHERE (SELECT COUNT(*) FROM monitors WHERE workspace_id = ?) < ?
+               AND EXISTS (SELECT 1 FROM workspaces WHERE id = ?)",
         )
         .bind(monitor.id.0.to_string())
         .bind(monitor.workspace.0.to_string())
@@ -1186,6 +1187,12 @@ impl WorkspaceDb<'_> {
         .bind(OffsetDateTime::now_utc())
         .bind(self.workspace.0.to_string())
         .bind(i64::try_from(max_monitors).unwrap_or(i64::MAX))
+        // The workspace must still exist when the row lands. A create waits on a DNS
+        // answer before it gets here, and an account deletion can remove the
+        // workspace meanwhile; `monitors.workspace_id` has no foreign key, so without
+        // this the monitor would outlive its workspace, unreachable and probed for
+        // ever. One statement, so it is serialised against the deletion's write lock.
+        .bind(self.workspace.0.to_string())
         .execute(&self.db.pool)
         .await?;
         Ok(inserted.rows_affected() == 1)
@@ -1629,6 +1636,7 @@ impl WorkspaceDb<'_> {
             "INSERT INTO maintenance_windows (monitor_id, workspace_id, starts_at, ends_at, reason, created_at)
              SELECT ?, ?, ?, ?, ?, ?
              WHERE EXISTS (SELECT 1 FROM monitors WHERE id = ? AND workspace_id = ?)
+               AND (SELECT COUNT(*) FROM maintenance_windows WHERE monitor_id = ?) < ?
              RETURNING id, monitor_id, starts_at, ends_at, reason, created_at",
         )
         .bind(monitor.0.to_string())
@@ -1639,9 +1647,20 @@ impl WorkspaceDb<'_> {
         .bind(OffsetDateTime::now_utc())
         .bind(monitor.0.to_string())
         .bind(self.workspace.0.to_string())
+        .bind(monitor.0.to_string())
+        .bind(MAX_WINDOWS_PER_MONITOR)
         .fetch_one(&self.db.pool)
-        .await
-        .map_err(|e| {
+        .await;
+        if matches!(row, Err(sqlx::Error::RowNotFound))
+            && self.monitor_generation(monitor).await?.is_some()
+        {
+            // The monitor is there, so it was the cap that refused the row.
+            return Err(QueryError::Conflict(format!(
+                "a monitor holds at most {MAX_WINDOWS_PER_MONITOR} maintenance windows; \
+                 cancel one first"
+            )));
+        }
+        let row = row.map_err(|e| {
             if let sqlx::Error::RowNotFound = e {
                 return QueryError::Invalid("unknown monitor".into());
             }
@@ -2312,11 +2331,15 @@ async fn enqueue_outbox(
     if queue_email {
         channels.push("email");
     }
+    // `fetch_optional`: a monitor whose workspace row is missing has no webhook to plan
+    // for. Failing here would fail the observation's whole commit on every slot, and a
+    // failed commit counts against the write path's health for every workspace.
     let tenant_webhook: Option<String> =
         sqlx::query_scalar("SELECT webhook_url FROM workspaces WHERE id = ?")
             .bind(workspace.0.to_string())
-            .fetch_one(&mut **tx)
-            .await?;
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
     if tenant_webhook.is_some() {
         channels.push("tenant_webhook");
     }
@@ -2388,6 +2411,15 @@ pub struct Gate {
     pub thresholds: monitor_domain::Thresholds,
     pub maintenance: bool,
 }
+
+/// Maintenance windows one monitor may hold at once, finished ones included until
+/// retention prunes them. Windows go with their monitor in one cascade when it is
+/// deleted, so their number has to be bounded like everything else a delete removes.
+pub const MAX_WINDOWS_PER_MONITOR: i64 = 50;
+
+/// API tokens one workspace may hold, revoked ones included. They go with the workspace
+/// in one cascade when it is deleted.
+pub const MAX_TOKENS_PER_WORKSPACE: i64 = 100;
 
 /// Rows removed per statement when a monitor is deleted with its evidence (D-026). Small
 /// enough that one batch holds the write lock for milliseconds, so the observation
@@ -3157,6 +3189,31 @@ impl OwnerDb<'_> {
             return Err(QueryError::Invalid("tokens cannot hold owner".into()));
         }
         let view = &self.view.view.view;
+        // Bounded like every other row a workspace owns. Revoked tokens are kept as a
+        // record, so at the cap the oldest revoked one makes room; with none revoked
+        // the mint is refused until one is.
+        let held: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?")
+                .bind(view.workspace.0.to_string())
+                .fetch_one(&view.db.pool)
+                .await?;
+        if held >= MAX_TOKENS_PER_WORKSPACE {
+            let freed = sqlx::query(
+                "DELETE FROM api_tokens WHERE id = (
+                     SELECT id FROM api_tokens
+                      WHERE workspace_id = ? AND revoked_at IS NOT NULL
+                      ORDER BY revoked_at LIMIT 1)",
+            )
+            .bind(view.workspace.0.to_string())
+            .execute(&view.db.pool)
+            .await?
+            .rows_affected();
+            if freed == 0 {
+                return Err(QueryError::Conflict(format!(
+                    "a workspace holds at most {MAX_TOKENS_PER_WORKSPACE} API tokens; revoke one first"
+                )));
+            }
+        }
         let id = ApiTokenId::new();
         sqlx::query(
             "INSERT INTO api_tokens

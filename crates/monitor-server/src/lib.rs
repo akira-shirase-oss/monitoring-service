@@ -94,7 +94,7 @@ fn owner_for<'a>(
             Ok(state.db.owner(principal.workspace()))
         }
         _ => Err(ApiError::Forbidden(
-            "roster and API tokens are owner work".into(),
+            "only an owner of the workspace can do this".into(),
         )),
     }
 }
@@ -255,6 +255,9 @@ fn spend_write_budget(
     Ok(())
 }
 
+/// The longest reason a maintenance window carries.
+pub const MAX_WINDOW_REASON_CHARS: usize = 200;
+
 /// Status-page writes per workspace per rolling window: a few saves are free,
 /// a write loop is not (S2 hardening).
 pub const STATUS_WRITE_BUDGET: u32 = 6;
@@ -307,6 +310,11 @@ pub async fn flush_token_uses(state: &AppState) -> Result<u64, QueryError> {
 /// Re-read the store and publish the monitor set the coordinator schedules against.
 /// No receivers (e.g. a test router without a coordinator) is not an error.
 pub async fn publish_registry(state: &AppState) -> Result<(), ApiError> {
+    // Read and send as one step. Two publishers that interleave can send the older
+    // read last, and the coordinator then schedules against a set that is missing the
+    // newest write until something else publishes again.
+    static IN_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _turn = IN_ORDER.lock().await;
     let monitors = load_registry(&state.db).await?;
     if state.registry.send(Arc::new(monitors)).is_err() {
         tracing::debug!("no coordinator listening for registry updates");
@@ -492,6 +500,7 @@ fn routes(state: AppState) -> Router {
         .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
         .layer(axum::Extension(ScheduleLock::default()))
         .layer(axum::Extension(account::ExportPace::default()))
+        .layer(axum::Extension(account::PasswordPace::default()))
 }
 
 /// Serializes the writes that change the schedule (create, edit, pause), so the capacity
@@ -1264,7 +1273,11 @@ async fn create_token(
             created_by,
             (state.clock)(),
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            QueryError::Conflict(msg) => ApiError::Conflict(msg),
+            other => ApiError::Db(other),
+        })?;
     let mut view_json = token_view(&row)?;
     view_json["secret"] = serde_json::Value::String(secret);
     Ok((
@@ -2715,6 +2728,24 @@ async fn create_window(
     if input.ends_at <= input.starts_at {
         return Err(ApiError::Invalid("ends_at must be after starts_at".into()));
     }
+    // A reason is one line someone reads in a list. Unbounded, a member could store
+    // megabytes per window, and windows go with their monitor in one cascade.
+    if input.reason.as_deref().is_some_and(|reason| {
+        reason.chars().count() > MAX_WINDOW_REASON_CHARS || reason.chars().any(char::is_control)
+    }) {
+        return Err(ApiError::Invalid(format!(
+            "a reason is at most {MAX_WINDOW_REASON_CHARS} characters, on one line"
+        )));
+    }
+    // The same per-workspace budget as every other monitor write.
+    spend_write_budget(
+        &state.monitor_writes,
+        principal.workspace(),
+        MONITOR_WRITE_BUDGET,
+        MONITOR_WRITE_WINDOW,
+        MONITOR_WRITE_CAP,
+    )
+    .map_err(ApiError::TooMany)?;
     let created = view
         .create_window(
             monitor.id,
@@ -2725,6 +2756,7 @@ async fn create_window(
         .await
         .map_err(|e| match e {
             QueryError::Invalid(msg) => ApiError::Invalid(msg),
+            QueryError::Conflict(msg) => ApiError::Conflict(msg),
             other => ApiError::Db(other),
         })?;
     Ok((

@@ -37,14 +37,30 @@ pub const EXPORT_DAILY_ROWS: usize = 40_000;
 /// One export per workspace this often. An export reads a workspace's whole record
 /// from a store with one writer; a loop of them must not be free.
 pub const EXPORT_EVERY: Duration = Duration::from_secs(10);
-/// Rows of evidence (raw checks, incidents and queued alerts together) a workspace may
-/// hold when it is deleted with its only member's account. The deletion is one
+/// Rows (raw checks, incidents, queued alerts, maintenance windows and API tokens
+/// together, across every workspace the deletion removes) an account's deletion may
+/// take with it. The deletion is one
 /// transaction on a store with one writer; this is what keeps it short. A free-plan
 /// workspace at its limits stays under it (ten monitors, one check a minute, kept two
 /// days, is about 29,000 checks); a larger one is told to delete monitors first.
 pub const DELETE_MAX_ROWS: i64 = 50_000;
 /// Workspaces whose export cooldown is tracked at once; spent ones are forgotten past it.
 const EXPORT_PACE_CAP: usize = 4096;
+
+/// Password changes one account's workspace may make per [`PASSWORD_CHANGE_WINDOW`].
+pub const PASSWORD_CHANGES: u32 = 5;
+/// The rolling window [`PASSWORD_CHANGES`] spends within.
+pub const PASSWORD_CHANGE_WINDOW: Duration = Duration::from_secs(600);
+/// Exports assembled at once, across every workspace. One export holds its rows in
+/// memory until the response is written; the per-workspace cooldown says nothing about
+/// how many workspaces ask together, and this does.
+pub const EXPORTS_AT_ONCE: usize = 2;
+
+static EXPORTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(EXPORTS_AT_ONCE);
+
+/// The password-change budget, keyed like the export cooldown.
+#[derive(Clone, Default)]
+pub struct PasswordPace(WritePace);
 
 /// The per-workspace export cooldowns, `workspace -> (window opened, exports spent)`.
 /// An extension `routes()` installs, like the credential guard.
@@ -80,14 +96,15 @@ fn account_session(principal: &auth::Principal) -> Result<AccountId, ApiError> {
 /// address pays one guess before anything is compared (429 when it has none left), the
 /// verification runs under the password-work limit (503 when the queue is full), a
 /// wrong password keeps the guess spent and answers the sign-in's own 401, and a right
-/// one gives the guess back.
+/// one gives the guess back. A right one also returns the hash it was verified against,
+/// so the write that follows can refuse if the password changed in the meantime.
 async fn confirm_password(
     state: &AppState,
     extensions: &axum::http::Extensions,
     headers: &HeaderMap,
     account: AccountId,
     password: &str,
-) -> Result<(), Box<Response>> {
+) -> Result<String, Box<Response>> {
     let Some(guard) = extensions.get::<throttle::Guard>() else {
         tracing::error!("invariant: routes() installs the credential guard");
         return Err(Box::new(ApiError::Corrupt.into_response()));
@@ -105,11 +122,16 @@ async fn confirm_password(
     // work, same answer as a wrong password.
     let hash = stored.as_deref().unwrap_or(auth::DUMMY_LOGIN_HASH);
     match auth::verify_password(hash, password, state.password_work_wait).await {
-        Ok(true) if stored.is_some() => {
+        Ok(true) => {
+            // A password can only verify against a stored hash: the dummy never matches.
+            let Some(verified) = stored else {
+                drop(attempt);
+                return Err(Box::new(crate::invalid_credentials()));
+            };
             attempt.succeeded();
-            Ok(())
+            Ok(verified)
         }
-        Ok(_) => {
+        Ok(false) => {
             drop(attempt); // stays spent
             if let Ok(_penalty) = guard.penalties.try_acquire() {
                 tokio::time::sleep(WRONG_TOKEN_DELAY).await;
@@ -155,7 +177,7 @@ pub(crate) async fn change_password(
         return ApiError::Corrupt.into_response();
     };
     let keep = auth::account_session_key(cookie);
-    if let Err(refusal) = confirm_password(
+    let verified = match confirm_password(
         &state,
         &extensions,
         &headers,
@@ -164,7 +186,24 @@ pub(crate) async fn change_password(
     )
     .await
     {
-        return *refusal;
+        Ok(verified) => verified,
+        Err(refusal) => return *refusal,
+    };
+    // A right password gives its guess back, so the per-address budget does not bound
+    // a signed-in account that loops this route with the right password, and each pass
+    // costs two rounds of password hashing on a pool everyone's sign-ins share. Wrong
+    // guesses are the address budget's to bound and never reach here; a few accepted
+    // changes per window is all anyone needs.
+    if let Some(pace) = extensions.get::<PasswordPace>()
+        && let Err(wait) = crate::spend_write_budget(
+            &pace.0,
+            principal.workspace(),
+            PASSWORD_CHANGES,
+            PASSWORD_CHANGE_WINDOW,
+            EXPORT_PACE_CAP,
+        )
+    {
+        return ApiError::TooMany(wait).into_response();
     }
     let hash = match auth::hash_password(&body.new_password, state.password_work_wait).await {
         Ok(hash) => hash,
@@ -174,9 +213,14 @@ pub(crate) async fn change_password(
             return ApiError::Corrupt.into_response();
         }
     };
-    match state.db.set_account_password(account, &hash, &keep).await {
+    match state
+        .db
+        .set_account_password(account, &verified, &hash, &keep)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        // The account was deleted while this request ran: nothing to sign in to.
+        // The account was deleted, or its password changed, while this request ran:
+        // what it proved is no longer the account's password.
         Ok(false) => crate::invalid_credentials(),
         Err(error) => ApiError::Db(error).into_response(),
     }
@@ -200,22 +244,24 @@ pub(crate) async fn delete_account(
         Ok(account) => account,
         Err(refusal) => return refusal.into_response(),
     };
-    if let Err(refusal) =
-        confirm_password(&state, &extensions, &headers, account, &body.password).await
-    {
-        return *refusal;
-    }
+    let verified =
+        match confirm_password(&state, &extensions, &headers, account, &body.password).await {
+            Ok(verified) => verified,
+            Err(refusal) => return *refusal,
+        };
     // The deletion and what follows it run to the end even if this request is dropped
     // (the client hung up, the deadline passed): a committed deletion whose monitors
     // stayed on the schedule would keep probing targets nobody watches any more. The
     // task is short (one store transaction, a few file removals, one registry read)
     // and it is awaited here.
-    let work = tokio::spawn(delete_and_forget(state.clone(), account));
+    let work = tokio::spawn(delete_and_forget(state.clone(), account, verified));
     match work.await {
         Ok(Ok(())) => {}
         Ok(Err(QueryError::Conflict(message))) => {
             return ApiError::Conflict(message).into_response();
         }
+        // The password changed while this request was verifying the old one.
+        Ok(Err(QueryError::Invalid(_))) => return crate::invalid_credentials(),
         Ok(Err(error)) => return ApiError::Db(error).into_response(),
         Err(join) => {
             tracing::error!(error = %join, "account deletion task did not finish");
@@ -233,8 +279,15 @@ pub(crate) async fn delete_account(
 }
 
 /// The store's deletion, then everything held outside the store that must follow it.
-async fn delete_and_forget(state: AppState, account: AccountId) -> Result<(), QueryError> {
-    let gone = state.db.delete_account(account, DELETE_MAX_ROWS).await?;
+async fn delete_and_forget(
+    state: AppState,
+    account: AccountId,
+    verified_hash: String,
+) -> Result<(), QueryError> {
+    let gone = state
+        .db
+        .delete_account(account, Some(&verified_hash), DELETE_MAX_ROWS)
+        .await?;
     forget_workspaces(&state, &gone).await;
     // The account is gone whatever happens next, so a registry that could not be
     // re-read is logged, not answered: until the next schedule write the coordinator
@@ -352,6 +405,11 @@ pub(crate) async fn export_workspace(
 ) -> Result<Response, ApiError> {
     let view = crate::owner_for(&state, &principal)
         .map_err(|_| ApiError::Forbidden("exporting a workspace's data is owner work".into()))?;
+    // Held until the document is built: a third export waits its turn as a 429, not as
+    // another copy of a workspace's history in memory.
+    let Ok(_slot) = EXPORTS.try_acquire() else {
+        return Err(ApiError::TooMany(Duration::from_secs(2)));
+    };
     if let Err(wait) = crate::spend_write_budget(
         &pace.0,
         principal.workspace(),

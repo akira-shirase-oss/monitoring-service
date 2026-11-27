@@ -704,3 +704,44 @@ addresses of a public monitoring service are published facts, not secrets.
 Restricting the check to the registered origin was rejected because ordinary
 sites redirect between origins (to `https`, to `www`), and those are exactly
 the pages a body expectation is for.
+
+## D-030 — What a second review of account deletion changed (amends D-026 and D-027)
+
+An independent review of the account-lifecycle work found these, and each is now a
+rule the code keeps:
+
+- **A monitor is only ever inserted into a workspace that exists.** A create waits on
+  a DNS answer before its insert; an account deletion could remove the workspace in
+  that wait, and `monitors.workspace_id` has no foreign key, so the monitor outlived
+  its workspace: reachable by nobody, probed for ever, and failing its commit on every
+  slot once it opened an incident. The insert now checks the workspace in the same
+  statement; queueing an alert no longer fails when the workspace row is missing; the
+  writer treats a monitor without a workspace as gone; and a migration removes any
+  that were left.
+- **Everything a delete cascades over is bounded where it is created.** A maintenance
+  window's reason is one line of at most 200 characters, a monitor holds at most 50
+  windows, creating one spends the monitor write budget, and a workspace holds at most
+  100 API tokens (at the cap, the oldest revoked token makes room). Before this a
+  member could store unbounded rows that a later delete removed in one transaction
+  under the store's write lock.
+- **Account deletion's 50,000-row bound counts all of it**: checks, incidents, queued
+  alerts, maintenance windows and API tokens, summed across every workspace the
+  deletion removes, not per workspace.
+- **A password change or a deletion only lands while the password it verified is still
+  the stored one.** A request that proved an older password, and was overtaken by a
+  change, is answered 401 and changes nothing.
+- **At most two exports are assembled at once across the whole server** (429
+  otherwise), on top of the per-workspace cooldown: an export holds its rows in memory
+  until the response is written.
+- **Accepted password changes have their own budget**: five per ten minutes. A right
+  password gives its address guess back, so nothing else bounded a loop of them, and
+  each costs two rounds of password hashing on a pool every sign-in shares.
+- **The schedule is read and published as one step**, so two publishers cannot leave
+  the coordinator on the older of two reads.
+
+Not changed, and stated: an account that has no seat in the workspace it calls home (a
+state only rows from before D-027 can be in, and only when it holds no seat anywhere)
+cannot reach the account routes to change its password or delete itself; an operator
+has to remove it. And a co-owner can demote the founding account in its own workspace
+but not remove it.
+

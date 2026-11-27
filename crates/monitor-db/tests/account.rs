@@ -247,7 +247,10 @@ async fn deleting_an_account_removes_its_sole_workspace_and_nothing_of_anyone_el
     let before_kept = counts(&store.raw, kept).await?;
     let default_before = counts(&store.raw, WorkspaceId::DEFAULT).await?;
 
-    assert_eq!(store.db.delete_account(leaving, ROOMY).await?, vec![gone]);
+    assert_eq!(
+        store.db.delete_account(leaving, None, ROOMY).await?,
+        vec![gone]
+    );
 
     for (table, count) in counts(&store.raw, gone).await? {
         assert_eq!(count, 0, "{table} still holds the deleted workspace's rows");
@@ -338,7 +341,7 @@ async fn the_only_owner_of_a_shared_workspace_is_refused_and_nothing_changes() -
         .await?;
     let before = counts(&store.raw, shared).await?;
 
-    let refusal = store.db.delete_account(owner, ROOMY).await;
+    let refusal = store.db.delete_account(owner, None, ROOMY).await;
     match refusal {
         Err(QueryError::Conflict(message)) => assert_eq!(
             message,
@@ -369,7 +372,10 @@ async fn the_only_owner_of_a_shared_workspace_is_refused_and_nothing_changes() -
             .set_member_role(guest, Role::Owner)
             .await?
     );
-    assert_eq!(store.db.delete_account(owner, ROOMY).await?, Vec::new());
+    assert_eq!(
+        store.db.delete_account(owner, None, ROOMY).await?,
+        Vec::new()
+    );
     let mut expected = before;
     for (table, count) in &mut expected {
         if *table == "members" {
@@ -403,7 +409,7 @@ async fn a_member_who_deletes_their_account_leaves_a_shared_workspace_whole() ->
     let before = counts(&store.raw, shared).await?;
 
     assert_eq!(
-        store.db.delete_account(member, ROOMY).await?,
+        store.db.delete_account(member, None, ROOMY).await?,
         vec![members_own]
     );
 
@@ -443,10 +449,13 @@ async fn a_workspace_nobody_calls_home_survives_one_of_its_owners_leaving() -> a
             .add_member(owner, Role::Owner, now)
             .await?;
     }
-    assert_eq!(store.db.delete_account(creator, ROOMY).await?, Vec::new());
+    assert_eq!(
+        store.db.delete_account(creator, None, ROOMY).await?,
+        Vec::new()
+    );
     let before = counts(&store.raw, shared).await?;
 
-    let gone = store.db.delete_account(first, ROOMY).await?;
+    let gone = store.db.delete_account(first, None, ROOMY).await?;
 
     assert!(
         !gone.contains(&shared),
@@ -502,7 +511,7 @@ async fn an_account_whose_home_workspace_is_deleted_is_moved_not_broken() -> any
         .add_member(founder, Role::Viewer, now)
         .await?;
 
-    let mut gone = store.db.delete_account(heir, ROOMY).await?;
+    let mut gone = store.db.delete_account(heir, None, ROOMY).await?;
     gone.sort_by_key(|workspace| workspace.0);
     let mut expected = vec![first_ws, second_ws, heirs_own];
     expected.sort_by_key(|workspace| workspace.0);
@@ -556,7 +565,10 @@ async fn the_seeded_workspace_is_never_deleted_with_an_account() -> anyhow::Resu
     record(&store, &monitor, CheckOutcome::Pass).await?;
     let before = counts(&store.raw, WorkspaceId::DEFAULT).await?;
 
-    assert_eq!(store.db.delete_account(account, ROOMY).await?, vec![own]);
+    assert_eq!(
+        store.db.delete_account(account, None, ROOMY).await?,
+        vec![own]
+    );
 
     let mut expected = before;
     for (table, count) in &mut expected {
@@ -600,7 +612,16 @@ async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> a
         checks > 0 && incidents > 0 && alerts > 0,
         "the fixture holds all three"
     );
-    let rows = checks + incidents + alerts;
+    // The windows and tokens the same transaction cascades over count as well (the
+    // test below is about those).
+    let cascaded = scalar(
+        &store.raw,
+        "SELECT (SELECT COUNT(*) FROM maintenance_windows WHERE workspace_id = ?1)
+              + (SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?1)",
+        &id,
+    )
+    .await?;
+    let rows = checks + incidents + alerts + cascaded;
     let now = OffsetDateTime::now_utc();
     store
         .db
@@ -616,10 +637,10 @@ async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> a
     // A bound that covers the checks alone is not enough: the incident and its
     // alert are rows the same transaction has to remove.
     assert!(matches!(
-        store.db.delete_account(account, checks).await,
+        store.db.delete_account(account, None, checks).await,
         Err(QueryError::Conflict(_))
     ));
-    match store.db.delete_account(account, rows - 1).await {
+    match store.db.delete_account(account, None, rows - 1).await {
         Err(QueryError::Conflict(message)) => assert_eq!(
             message,
             "the workspace \"heavy's workspace\" holds too much history to delete in one \
@@ -641,7 +662,7 @@ async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> a
 
     // Exactly at the bound is allowed.
     assert_eq!(
-        store.db.delete_account(account, rows).await?,
+        store.db.delete_account(account, None, rows).await?,
         vec![workspace]
     );
     Ok(())
@@ -669,11 +690,25 @@ async fn a_password_change_ends_every_other_session_of_that_account_only() -> an
     }
     let idle = std::time::Duration::from_secs(3600);
 
+    let stored = store
+        .db
+        .account_password_hash(account)
+        .await?
+        .expect("the account has a password");
     assert!(
         store
             .db
-            .set_account_password(account, "the-new-hash", "this-device")
+            .set_account_password(account, &stored, "the-new-hash", "this-device")
             .await?
+    );
+    // A second change that verified the OLD hash arrives late: it must not overwrite
+    // the password that was just set, nor end the session that set it.
+    assert!(
+        !store
+            .db
+            .set_account_password(account, &stored, "a-stale-writers-hash", "old-laptop")
+            .await?,
+        "a change that proved the previous password overwrote the new one"
     );
 
     assert_eq!(
@@ -700,7 +735,7 @@ async fn a_password_change_ends_every_other_session_of_that_account_only() -> an
     assert!(
         !store
             .db
-            .set_account_password(AccountId::new(), "x", "y")
+            .set_account_password(AccountId::new(), "any", "x", "y")
             .await?
     );
     Ok(())
@@ -733,7 +768,7 @@ async fn no_session_is_created_for_a_password_hash_that_is_no_longer_stored() ->
 
     store
         .db
-        .set_account_password(account, "a-newer-hash", "current")
+        .set_account_password(account, "hash-of-racing", "a-newer-hash", "current")
         .await?;
     assert!(
         !store
@@ -750,12 +785,145 @@ async fn no_session_is_created_for_a_password_hash_that_is_no_longer_stored() ->
             .is_none()
     );
 
-    store.db.delete_account(account, ROOMY).await?;
+    store.db.delete_account(account, None, ROOMY).await?;
     assert!(
         !store
             .db
             .create_account_session_if_current("ghost", account, "a-newer-hash", now, later)
             .await?
+    );
+    Ok(())
+}
+
+/// A deletion that verified a password which has since been changed deletes nothing:
+/// whoever changed the password did it to shut that request out.
+#[tokio::test]
+async fn a_deletion_that_proved_an_older_password_is_refused() -> anyhow::Result<()> {
+    let store = store().await?;
+    let (account, workspace) = tenant(&store.db, "racing-delete").await?;
+    fill(&store, account, workspace).await?;
+    let before = counts(&store.raw, workspace).await?;
+    let old = store
+        .db
+        .account_password_hash(account)
+        .await?
+        .expect("the account has a password");
+    assert!(
+        store
+            .db
+            .set_account_password(account, &old, "the-new-hash", "none")
+            .await?
+    );
+
+    assert!(matches!(
+        store.db.delete_account(account, Some(&old), ROOMY).await,
+        Err(QueryError::Invalid(_))
+    ));
+    assert_eq!(counts(&store.raw, workspace).await?, before);
+    assert!(store.db.account_by_id(account).await?.is_some());
+
+    // With the current hash the same request goes through.
+    assert_eq!(
+        store
+            .db
+            .delete_account(account, Some("the-new-hash"), ROOMY)
+            .await?,
+        vec![workspace]
+    );
+    Ok(())
+}
+
+/// A monitor is never inserted into a workspace that no longer exists. A create waits
+/// on a DNS answer before its insert; an account deletion can remove the workspace in
+/// that wait, and a monitor left behind would be unreachable and probed for ever.
+#[tokio::test]
+async fn no_monitor_is_created_in_a_workspace_that_was_deleted() -> anyhow::Result<()> {
+    let store = store().await?;
+    let (account, workspace) = tenant(&store.db, "gone").await?;
+    assert_eq!(
+        store.db.delete_account(account, None, ROOMY).await?,
+        vec![workspace]
+    );
+
+    let late = NewMonitor::new("late", url::Url::parse("https://target.example/health")?)?
+        .into_monitor_for(workspace);
+    assert!(
+        !store
+            .db
+            .workspace(workspace)
+            .insert_monitor_within(&late, 10)
+            .await?,
+        "a monitor landed in a deleted workspace"
+    );
+    assert_eq!(
+        scalar(
+            &store.raw,
+            "SELECT COUNT(*) FROM monitors WHERE workspace_id = ?",
+            &workspace.0.to_string()
+        )
+        .await?,
+        0
+    );
+    Ok(())
+}
+
+/// If a monitor does outlive its workspace (a row from before that rule), recording
+/// its checks must not fail: a failed commit counts against the engine's health for
+/// every workspace. Three failures open its incident like anyone's.
+#[tokio::test]
+async fn a_monitor_without_a_workspace_row_still_commits() -> anyhow::Result<()> {
+    let store = store().await?;
+    let (_account, workspace) = tenant(&store.db, "left-behind").await?;
+    let mut orphan = NewMonitor::new("orphan", url::Url::parse("https://target.example/health")?)?
+        .into_monitor_for(workspace);
+    store
+        .db
+        .workspace(workspace)
+        .insert_monitor(&orphan)
+        .await?;
+    // The row as it would be after its workspace went: pointing at nothing.
+    let nowhere = WorkspaceId::new();
+    sqlx::query("UPDATE monitors SET workspace_id = ? WHERE id = ?")
+        .bind(nowhere.0.to_string())
+        .bind(orphan.id.0.to_string())
+        .execute(&store.raw)
+        .await?;
+    orphan.workspace = nowhere;
+    for _ in 0..3 {
+        record(&store, &orphan, CheckOutcome::HttpFail { status: 503 }).await?;
+    }
+    assert_eq!(store.db.workspace(nowhere).open_incidents().await?.len(), 1);
+    Ok(())
+}
+
+/// The deletion's bound counts everything its one transaction removes, across every
+/// workspace it removes: maintenance windows and API tokens go in cascades and are
+/// rows like any other.
+#[tokio::test]
+async fn the_deletion_bound_counts_windows_and_tokens_too() -> anyhow::Result<()> {
+    let store = store().await?;
+    let (account, workspace) = tenant(&store.db, "cascades").await?;
+    fill(&store, account, workspace).await?;
+    let id = workspace.0.to_string();
+    let mut rows = 0;
+    for sql in [
+        "SELECT COUNT(*) FROM checks WHERE workspace_id = ?",
+        "SELECT COUNT(*) FROM incidents WHERE workspace_id = ?",
+        "SELECT COUNT(*) FROM notify_outbox WHERE workspace_id = ?",
+        "SELECT COUNT(*) FROM maintenance_windows WHERE workspace_id = ?",
+        "SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?",
+    ] {
+        let held = scalar(&store.raw, sql, &id).await?;
+        assert!(held > 0, "the fixture holds a row for: {sql}");
+        rows += held;
+    }
+    assert!(matches!(
+        store.db.delete_account(account, None, rows - 1).await,
+        Err(QueryError::Conflict(_))
+    ));
+    assert_eq!(
+        store.db.delete_account(account, None, rows).await?,
+        vec![workspace]
     );
     Ok(())
 }

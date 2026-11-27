@@ -80,21 +80,30 @@ impl Db {
 
     /// Store a new password hash and end every other session of the account, in one
     /// transaction: a reader sees the old password with the old sessions or the new
-    /// password with only `keep_session`. `false` means the account no longer exists.
+    /// password with only `keep_session`. `false` means the account no longer exists,
+    /// or its password is no longer the one that was verified.
+    ///
+    /// `verified_hash` is the hash the caller just checked the current password
+    /// against. The write only lands while that is still the stored hash: a second
+    /// password change (or a deletion) that committed during the verification is not
+    /// overwritten by a request that proved an older password.
     pub async fn set_account_password(
         &self,
         account: AccountId,
+        verified_hash: &str,
         password_hash: &str,
         keep_session: &str,
     ) -> Result<bool, QueryError> {
         let id = account.0.to_string();
         let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE accounts SET password_hash = ? WHERE id = ?")
-            .bind(password_hash)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let changed =
+            sqlx::query("UPDATE accounts SET password_hash = ? WHERE id = ? AND password_hash = ?")
+                .bind(password_hash)
+                .bind(&id)
+                .bind(verified_hash)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
         if changed == 0 {
             return Ok(false);
         }
@@ -144,8 +153,9 @@ impl Db {
     /// are removed, and its sessions, pending invitations and the account row go.
     ///
     /// Also refused, the same way, while one of those workspaces holds more than
-    /// `max_rows` rows of evidence (raw checks, incidents and queued alerts counted
-    /// together): every workspace's observation commits wait on the
+    /// `max_rows` rows between them (raw checks, incidents, queued alerts,
+    /// maintenance windows and API tokens, summed across every workspace this deletion
+    /// removes): every workspace's observation commits wait on the
     /// store's one write lock, so the single transaction that removes a workspace must
     /// stay small. Deleting monitors with their history works in batches (D-026) and
     /// brings a workspace under the bound.
@@ -157,9 +167,16 @@ impl Db {
     /// sits in it. The first statement is a write on purpose: it takes the store's
     /// write lock before anything is read, so the "only member" and "only owner"
     /// answers cannot change between the read and the deletes.
+    ///
+    /// `verified_hash` is the hash the caller just checked the password against;
+    /// `None` skips the question (a caller that verified nothing has none to give).
+    /// When it is no longer the stored hash — the password was changed while this
+    /// request was verifying the old one — nothing is deleted and the answer is
+    /// [`QueryError::Invalid`].
     pub async fn delete_account(
         &self,
         account: AccountId,
+        verified_hash: Option<&str>,
         max_rows: i64,
     ) -> Result<Vec<WorkspaceId>, QueryError> {
         let id = account.0.to_string();
@@ -168,6 +185,19 @@ impl Db {
             .bind(&id)
             .execute(&mut *tx)
             .await?;
+        if let Some(verified) = verified_hash {
+            let current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ? AND password_hash = ?)",
+            )
+            .bind(&id)
+            .bind(verified)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !current {
+                // Dropping the transaction rolls the session delete back.
+                return Err(QueryError::Invalid("the password changed".into()));
+            }
+        }
         let orphaned: Option<String> = sqlx::query_scalar(
             "SELECT w.name FROM members m JOIN workspaces w ON w.id = m.workspace_id
               WHERE m.account_id = ?1 AND m.role = 'owner'
@@ -199,41 +229,7 @@ impl Db {
         .bind(WorkspaceId::DEFAULT.0.to_string())
         .fetch_all(&mut *tx)
         .await?;
-        for workspace in &sole {
-            // Checks, incidents and queued alerts together: an incident-heavy
-            // workspace (a monitor that flaps for months) is as slow to remove as a
-            // check-heavy one. Each count goes through the per-monitor index and stops
-            // at the bound, so the question is cheap however much the workspace holds.
-            let heavy: Option<String> = sqlx::query_scalar(
-                "SELECT w.name FROM workspaces w
-                  WHERE w.id = ?1
-                    AND (SELECT COUNT(*) FROM (
-                           SELECT 1 FROM checks c
-                            WHERE c.workspace_id = ?1
-                              AND c.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
-                            LIMIT ?2))
-                      + (SELECT COUNT(*) FROM (
-                           SELECT 1 FROM incidents i
-                            WHERE i.workspace_id = ?1
-                              AND i.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
-                            LIMIT ?2))
-                      + (SELECT COUNT(*) FROM (
-                           SELECT 1 FROM notify_outbox o
-                            WHERE o.workspace_id = ?1
-                              AND o.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
-                            LIMIT ?2)) >= ?2",
-            )
-            .bind(workspace)
-            .bind(max_rows.saturating_add(1))
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(name) = heavy {
-                return Err(QueryError::Conflict(format!(
-                    "the workspace \"{name}\" holds too much history to delete in one step: \
-                     delete its monitors with their history, then delete your account"
-                )));
-            }
-        }
+        refuse_if_too_large(&mut tx, &sole, max_rows).await?;
         for workspace in &sole {
             purge_workspace(&mut tx, workspace, &id).await?;
         }
@@ -257,6 +253,60 @@ impl Db {
             })
             .collect()
     }
+}
+
+/// Everything the one transaction has to remove, across every workspace it
+/// removes: checks, incidents, queued alerts, maintenance windows and API tokens.
+/// An incident-heavy workspace is as slow to remove as a check-heavy one, the
+/// windows and tokens go in the monitors' and the workspace's cascades, and an
+/// account that is the last member of several workspaces removes them all at
+/// once. Each count goes through an index and stops at the bound, so the
+/// question is cheap however much there is.
+async fn refuse_if_too_large(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    sole: &[String],
+    max_rows: i64,
+) -> Result<(), QueryError> {
+    let mut rows: i64 = 0;
+    for workspace in sole {
+        let (name, held): (String, i64) = sqlx::query_as(
+            "SELECT w.name,
+                (SELECT COUNT(*) FROM (
+                   SELECT 1 FROM checks c
+                    WHERE c.workspace_id = ?1
+                      AND c.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
+                    LIMIT ?2))
+              + (SELECT COUNT(*) FROM (
+                   SELECT 1 FROM incidents i
+                    WHERE i.workspace_id = ?1
+                      AND i.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
+                    LIMIT ?2))
+              + (SELECT COUNT(*) FROM (
+                   SELECT 1 FROM notify_outbox o
+                    WHERE o.workspace_id = ?1
+                      AND o.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
+                    LIMIT ?2))
+              + (SELECT COUNT(*) FROM (
+                   SELECT 1 FROM maintenance_windows m
+                    WHERE m.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
+                    LIMIT ?2))
+              + (SELECT COUNT(*) FROM (
+                   SELECT 1 FROM api_tokens t WHERE t.workspace_id = ?1 LIMIT ?2))
+               FROM workspaces w WHERE w.id = ?1",
+        )
+        .bind(workspace)
+        .bind(max_rows.saturating_add(1))
+        .fetch_one(&mut **tx)
+        .await?;
+        rows = rows.saturating_add(held);
+        if rows > max_rows {
+            return Err(QueryError::Conflict(format!(
+                "the workspace \"{name}\" holds too much history to delete in one step: \
+                 delete its monitors with their history, then delete your account"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Empty one workspace that is about to be deleted, and move any *other* account that

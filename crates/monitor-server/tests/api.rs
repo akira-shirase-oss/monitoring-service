@@ -2496,3 +2496,44 @@ async fn an_edit_is_not_refused_over_a_stored_value_it_does_not_touch() {
     .unwrap();
     assert_eq!(status, StatusCode::OK, "{answer}");
 }
+
+/// A maintenance window's reason is one bounded line, and creating windows spends the
+/// workspace's monitor write budget like every other monitor write. Unbounded, a member
+/// could store megabytes per window, without limit, in rows a later delete removes in
+/// one cascade under the store's write lock.
+#[tokio::test]
+async fn a_window_reason_is_bounded_and_windows_spend_the_write_budget() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let id = create(&app, "windowed").await.unwrap();
+    let path = format!("/api/monitors/{id}/maintenance");
+    let window = |reason: &str| {
+        serde_json::json!({
+            "starts_at": "2099-01-01T10:00:00Z", "ends_at": "2099-01-01T11:00:00Z",
+            "reason": reason,
+        })
+    };
+
+    for reason in ["r".repeat(201), "two\nlines".to_owned()] {
+        let (status, body) = send(&app, "POST", &path, Some(window(&reason)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+    let (status, body) = send(&app, "POST", &path, Some(window(&"r".repeat(200))))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Refusals spent nothing; the create above and the monitor's own create spent two.
+    let left = monitor_server::MONITOR_WRITE_BUDGET - 2;
+    for _ in 0..left {
+        let (status, body) = send(&app, "POST", &path, Some(window("deploy")))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = send(&app, "POST", &path, Some(window("deploy")))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}

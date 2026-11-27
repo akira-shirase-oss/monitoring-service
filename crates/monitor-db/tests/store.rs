@@ -2953,3 +2953,64 @@ async fn child_lookups_for_deletes_use_the_0022_indexes() -> anyhow::Result<()> 
     }
     Ok(())
 }
+
+/// Maintenance windows and API tokens are rows a delete removes in one cascade, so
+/// each is capped where it is created. A monitor holds at most
+/// `MAX_WINDOWS_PER_MONITOR` windows; a workspace at `MAX_TOKENS_PER_WORKSPACE`
+/// tokens gives up its oldest revoked one for a new one, and refuses when none is
+/// revoked.
+#[tokio::test]
+async fn windows_per_monitor_and_tokens_per_workspace_are_capped() -> anyhow::Result<()> {
+    let (db, monitor, _) = store().await?;
+    let now = OffsetDateTime::now_utc();
+    let scoped = db.workspace(WorkspaceId::DEFAULT);
+    for i in 0..monitor_db::MAX_WINDOWS_PER_MONITOR {
+        let starts = now + time::Duration::hours(i);
+        scoped
+            .create_window(monitor.id, starts, starts + time::Duration::minutes(30), "")
+            .await?;
+    }
+    assert!(matches!(
+        scoped
+            .create_window(monitor.id, now, now + time::Duration::minutes(30), "")
+            .await,
+        Err(QueryError::Conflict(_))
+    ));
+    // A monitor this workspace does not have is still "unknown", not "full".
+    assert!(matches!(
+        scoped
+            .create_window(MonitorId::new(), now, now + time::Duration::minutes(30), "")
+            .await,
+        Err(QueryError::Invalid(_))
+    ));
+
+    let owner = db.owner(WorkspaceId::DEFAULT);
+    let mut first = None;
+    for i in 0..monitor_db::MAX_TOKENS_PER_WORKSPACE {
+        let row = owner
+            .create_api_token(
+                &format!("t{i}"),
+                Role::Viewer,
+                &format!("digest-{i}"),
+                None,
+                now,
+            )
+            .await?;
+        first.get_or_insert(row.id);
+    }
+    assert!(matches!(
+        owner
+            .create_api_token("over", Role::Viewer, "digest-over", None, now)
+            .await,
+        Err(QueryError::Conflict(_))
+    ));
+    // Revoking one makes room: the revoked row gives way to the new token.
+    let first = monitor_domain::ApiTokenId(uuid::Uuid::parse_str(&first.expect("minted"))?);
+    assert!(owner.revoke_api_token(first, now).await?);
+    owner
+        .create_api_token("after", Role::Viewer, "digest-after", None, now)
+        .await?;
+    assert!(db.api_token_by_digest("digest-0").await?.is_none());
+    assert!(db.api_token_by_digest("digest-after").await?.is_some());
+    Ok(())
+}

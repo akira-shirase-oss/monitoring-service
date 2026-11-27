@@ -308,6 +308,11 @@ async fn commit_unless_gone(
         .await;
     match gone {
         Ok(None) => Ok(false),
+        // The monitor is there but its workspace is not: a row that outlived its
+        // workspace. Nothing can be recorded for it, and that is not the store failing.
+        Ok(Some(_)) if matches!(db.workspace_row(observation.workspace).await, Ok(None)) => {
+            Ok(false)
+        }
         // Still there, or the store can't even be asked: the commit's own error stands.
         Ok(Some(_)) | Err(_) => Err(error),
     }

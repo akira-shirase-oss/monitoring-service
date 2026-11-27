@@ -176,3 +176,12 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   checks per monitor and 50,000 per export, 5,000 incidents, 5,000 windows, 40,000
   daily rows, newest first; one export per workspace per 10 s (429 + `Retry-After`).
   No secret of any kind is in it: no webhook URL or signing secret, no token, no hash.
+- **Limits added after review (D-030):** a maintenance window's `reason` is at most 200
+  characters on one line (422), a monitor holds at most 50 windows (409), and creating
+  a window spends the monitor write budget (429); a workspace holds at most 100 API
+  tokens, the oldest revoked one making room at the cap (409 when none is revoked);
+  `GET /api/workspace/export` answers 429 while two exports are already being
+  assembled; `POST /api/account/password` accepts five changes per ten minutes (429);
+  both account routes answer 401 if the password changed while the request was being
+  verified.
+
