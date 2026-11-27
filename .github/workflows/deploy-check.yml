@@ -64,6 +64,15 @@ jobs:
           STUB
           sudo chmod 0755 /usr/local/bin/rclone
           sudo install -d /opt/smon-rclone-remote
+      # The runner's /opt carries a default ACL, and files created under one ignore the
+      # umask: a directory the installer leaves root-only by mistake comes out readable
+      # here and the mistake never shows. A real host has no such ACL, so it is removed.
+      - name: Make /opt an ordinary directory, as on a real host
+        run: |
+          command -v setfacl >/dev/null || sudo apt-get install -y -qq acl
+          sudo setfacl -R -b -k /opt
+          sudo chmod 0755 /opt
+          [[ "$(stat -c %A /opt)" == drwxr-xr-x ]] || { stat -c '%A %n' /opt; exit 1; }
       - name: Run install.sh (non-interactive, as root)
         run: |
           # pipefail: without it `tee` decides this step's result, and an install that
