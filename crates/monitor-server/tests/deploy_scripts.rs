@@ -189,10 +189,15 @@ fn the_deploy_scripts_carry_their_promised_properties() {
     );
     for pin in [
         "65760C51EDEA2017CEA2CA15155B6D79CA56EA34", // caddy repo key, by fingerprint
-        "FA7511982D758634477A48DC6375F8FC8D5FED9FDB43235BC3923887FDEA0597", // CF origin-pull CA file, sha256
+        "9A1AC2B4BE15F9F27EEE20A734CBA4E9898F61001B3BD7C84B69B56A3E25A2B9", // CF origin-pull CA, by certificate fingerprint
         "--homedir",          // repo key verified inside a throwaway keyring…
         "--export \"$want\"", // …and ONLY the pinned key is exported to apt
-        "sha256sum",          // the CA pin covers every byte of the file, not just the first cert
+        // The pinned certificate is re-encoded on its own and only that is installed:
+        // nothing appended to the download can reach the trust file.
+        "openssl x509 -in \"$aop_ca\" -out \"$aop_one\"",
+        "install -m 0644 \"$aop_one\" /etc/caddy/cloudflare-origin-pull-ca.pem",
+        // A second run must not copy over the binary the service is running from.
+        "install -m 0755 \"$bin\" \"$PREFIX/releases/$name/bin/\"",
         "caddy version",      // >= 2.7 floor: {client_ip}/trusted-proxies need it
         // S3: the sources line is written inline with signed-by — a fetched list
         // could arrive carrying `trusted=yes` and undo the fingerprint pin.

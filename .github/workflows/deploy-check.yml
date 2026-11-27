@@ -66,6 +66,9 @@ jobs:
           sudo install -d /opt/smon-rclone-remote
       - name: Run install.sh (non-interactive, as root)
         run: |
+          # pipefail: without it `tee` decides this step's result, and an install that
+          # aborted half-way was reported green.
+          set -o pipefail
           work="$RUNNER_TEMP/install-check"
           sudo env "PATH=$PATH" "SMOKE_LOCAL=1" deploy/droplet/install.sh \
             --release-dir "$work/release" \
@@ -74,6 +77,7 @@ jobs:
             2>&1 | tee "$work/install.log"
       - name: Re-run install.sh — the promised property is idempotence
         run: |
+          set -o pipefail
           work="$RUNNER_TEMP/install-check"
           sudo env "PATH=$PATH" "SMOKE_LOCAL=1" deploy/droplet/install.sh \
             --release-dir "$work/release" \

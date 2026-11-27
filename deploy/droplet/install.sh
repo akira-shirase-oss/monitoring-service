@@ -116,7 +116,13 @@ if [[ -n "$RELEASE_DIR" ]]; then
     || { echo "error: $RELEASE_DIR doesn't look like a release dir (bin/monitor-server, bin/monitor)" >&2; exit 2; }
   name=$(basename "$RELEASE_DIR")
   mkdir -p "$PREFIX/releases/$name"
-  cp -R "$RELEASE_DIR/bin" "$PREFIX/releases/$name/"
+  # `install` writes each binary as a new file and renames it into place. Copying
+  # over the file in place fails with "text file busy" when the service is running
+  # from this release, which is exactly the case on a second run.
+  mkdir -p "$PREFIX/releases/$name/bin"
+  for bin in "$RELEASE_DIR"/bin/*; do
+    install -m 0755 "$bin" "$PREFIX/releases/$name/bin/"
+  done
   [[ -d "$RELEASE_DIR/dashboard" ]] && cp -R "$RELEASE_DIR/dashboard" "$PREFIX/releases/$name/"
   ln -sfn "$PREFIX/releases/$name" "$PREFIX/current.new" && mv -T "$PREFIX/current.new" "$PREFIX/current"
 elif [[ ! -e "$PREFIX/current/bin/monitor-server" ]]; then
@@ -158,19 +164,25 @@ if [[ ! -s /etc/caddy/origin.pem || ! -s /etc/caddy/origin.key ]]; then
   chmod 0640 /etc/caddy/origin.pem /etc/caddy/origin.key
 fi
 if [[ ! -s /etc/caddy/cloudflare-origin-pull-ca.pem ]]; then
-  # Pinned by whole-file sha256 (S2 review): this CA decides whose client
-  # certificate passes Authenticated Origin Pulls. Hashing only the first
-  # certificate would let a substituted file append its own CA after it — Caddy
-  # trusts every certificate in the file, so the pin covers every byte.
-  aop_ca=$(mktemp)
+  # This CA decides whose client certificate passes Authenticated Origin Pulls, and
+  # Caddy trusts every certificate in the file it is given. So the certificate is
+  # pinned by its own SHA-256 fingerprint, and ONLY that certificate is installed:
+  # the first certificate in the download is re-encoded on its own, checked, and
+  # that re-encoding is what lands in /etc/caddy. Anything else the download
+  # carried, a second CA appended after it included, never reaches the file.
+  # (A pin on the whole file's bytes broke the install when the published file was
+  # re-formatted; the certificate had not changed.)
+  aop_ca=$(mktemp); aop_one=$(mktemp)
   curl -fsSo "$aop_ca" \
     https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem
-  got=$(sha256sum "$aop_ca" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
-  want=FA7511982D758634477A48DC6375F8FC8D5FED9FDB43235BC3923887FDEA0597
+  openssl x509 -in "$aop_ca" -out "$aop_one" 2>/dev/null \
+    || { echo "error: the CF origin-pull CA download holds no certificate" >&2; rm -f "$aop_ca" "$aop_one"; exit 2; }
+  got=$(openssl x509 -in "$aop_one" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g' | tr '[:lower:]' '[:upper:]')
+  want=9A1AC2B4BE15F9F27EEE20A734CBA4E9898F61001B3BD7C84B69B56A3E25A2B9
   [[ "$got" == "$want" ]] \
-    || { echo "error: CF origin-pull CA sha256 $got, expected $want" >&2; rm -f "$aop_ca"; exit 2; }
-  install -m 0644 "$aop_ca" /etc/caddy/cloudflare-origin-pull-ca.pem
-  rm -f "$aop_ca"
+    || { echo "error: CF origin-pull CA fingerprint $got, expected $want" >&2; rm -f "$aop_ca" "$aop_one"; exit 2; }
+  install -m 0644 "$aop_one" /etc/caddy/cloudflare-origin-pull-ca.pem
+  rm -f "$aop_ca" "$aop_one"
 fi
 install -m 0644 "$here/Caddyfile" /etc/caddy/Caddyfile
 "$here/cloudflare-ips.sh"
