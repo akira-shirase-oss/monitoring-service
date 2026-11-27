@@ -18,6 +18,12 @@ seconds="${FUZZ_SMOKE_SECONDS:-20}"
     exit 1
 }
 
+# Build for the toolchain's own host. cargo-fuzz defaults to the triple it was itself
+# built for, and the prebuilt Linux binary is a musl build: left alone it asks for a
+# musl standard library the nightly doesn't have, and the sanitizer can't link there.
+host="$(cd fuzz && rustc -vV | sed -n 's/^host: //p')"
+[ -n "$host" ] || { echo "could not read the fuzz toolchain's host triple" >&2; exit 1; }
+
 # Every fuzz target MUST have a non-empty seed corpus — an unseeded target only ever
 # fuzzes blind space.
 targets=()
@@ -38,7 +44,7 @@ for target in "${targets[@]}"; do
     # copy so the committed seeds stay the seeds.
     run_corpus="$(mktemp -d)/corpus"
     cp -R "fuzz/corpus/$target" "$run_corpus"
-    (cd fuzz && cargo fuzz run "$target" "$run_corpus" -- -max_total_time="$seconds") 2>&1 |
+    (cd fuzz && cargo fuzz run --target "$host" "$target" "$run_corpus" -- -max_total_time="$seconds") 2>&1 |
         tail -15
 done
 echo "fuzz smoke: ${#targets[@]} targets, ${seconds}s each — no crashes"

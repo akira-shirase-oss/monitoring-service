@@ -10,11 +10,13 @@
 	import GlobeIcon from '@lucide/svelte/icons/globe';
 	import KeyRoundIcon from '@lucide/svelte/icons/key-round';
 	import RadarIcon from '@lucide/svelte/icons/radar';
+	import RocketIcon from '@lucide/svelte/icons/rocket';
 	import SirenIcon from '@lucide/svelte/icons/siren';
 	import UsersIcon from '@lucide/svelte/icons/users';
 	import WebhookIcon from '@lucide/svelte/icons/webhook';
 	import { page } from '$app/state';
 	import * as Sidebar from '#lib/components/ui/sidebar/index.js';
+	import { guideOffered } from '#lib/guide.svelte.js';
 	import { current } from '#lib/workspace.svelte.js';
 	import AccountMenu from '#lib/components/shell/AccountMenu.svelte';
 	import ThemeToggle from '#lib/components/shell/ThemeToggle.svelte';
@@ -26,6 +28,11 @@
 	const route = $derived(page.route.id ?? '');
 	const who = $derived(current());
 	const email = $derived(data.account?.email ?? who?.name ?? 'account');
+	// The guide is for people setting a workspace up, so viewers and the operator's
+	// all-workspaces session don't get the link.
+	const guided = $derived(
+		(who?.role === 'owner' || who?.role === 'member') && guideOffered(who?.id)
+	);
 </script>
 
 <Sidebar.Provider>
@@ -43,6 +50,15 @@
 				<Sidebar.Group>
 					<Sidebar.GroupLabel>Watch</Sidebar.GroupLabel>
 					<Sidebar.Menu>
+						{#if guided}
+							<Sidebar.MenuItem>
+								<Sidebar.MenuButton isActive={route.startsWith('/(app)/onboarding')} tooltipContent="Get started">
+									{#snippet child({ props })}
+										<a href="/onboarding" {...props} data-testid="nav-guide"><RocketIcon /><span>Get started</span></a>
+									{/snippet}
+								</Sidebar.MenuButton>
+							</Sidebar.MenuItem>
+						{/if}
 						<Sidebar.MenuItem>
 							<Sidebar.MenuButton isActive={route === '/(app)' || route.startsWith('/(app)/monitors')} tooltipContent="Monitors">
 								{#snippet child({ props })}
@@ -145,6 +161,18 @@
 				<ThemeToggle />
 			</div>
 		</header>
+		{#if data.invited > 0 && !route.startsWith('/(app)/settings/members')}
+			<a
+				href="/settings/members"
+				class="border-b border-border bg-brand-soft px-5 py-2.5 text-sm text-brand-ink hover:underline sm:px-8 lg:px-10"
+				data-testid="invited-banner"
+			>
+				{data.invited === 1
+					? 'You have been invited to another workspace.'
+					: `You have been invited to ${data.invited} other workspaces.`}
+				Review the invitation
+			</a>
+		{/if}
 		{#key page.url.pathname}
 			<div class="page-enter mx-auto w-full max-w-6xl flex-1 px-5 py-8 sm:px-8 lg:px-10">
 				{@render children()}

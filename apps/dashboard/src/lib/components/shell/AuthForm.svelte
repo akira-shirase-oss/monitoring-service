@@ -60,7 +60,8 @@
 				return;
 			}
 			await invalidateAll();
-			await goto(returnTo);
+			// A new account starts on the guide; a returning one goes where it was headed.
+			await goto(mode === 'signup' ? '/onboarding' : returnTo);
 		} catch {
 			error = 'The monitor server is unreachable — check it, then try again.';
 		} finally {

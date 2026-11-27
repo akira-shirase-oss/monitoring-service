@@ -1,5 +1,6 @@
 import { redirect } from '@sveltejs/kit';
 import { apiFetch } from '#lib/auth.js';
+import { call } from '#lib/call.js';
 import { settle, workspace, type Membership } from '#lib/workspace.svelte.js';
 import type { LayoutLoad } from './$types';
 
@@ -20,11 +21,17 @@ export const load: LayoutLoad = async ({ fetch, url }) => {
 			const body = (await response.json()) as { workspaces?: Membership[]; account?: Account };
 			workspace.list = body.workspaces ?? [];
 			settle();
-			return { account: body.account ?? null };
+			// Invitations reach a person only here — there is no email — so the shell
+			// says when one is waiting. Tokens and the operator have none (a refusal).
+			const waiting = await call<{ invitations: unknown[] }>('/api/invitations', {}, fetch);
+			return {
+				account: body.account ?? null,
+				invited: waiting.ok ? waiting.body.invitations.length : 0
+			};
 		}
 	} catch (error) {
 		if (error && typeof error === 'object' && 'status' in error) throw error;
 		// network failure — render anyway; pages carry the banner
 	}
-	return { account: null };
+	return { account: null, invited: 0 };
 };
