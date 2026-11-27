@@ -97,6 +97,10 @@ esac
 
 step "user and directories"
 id -u smon >/dev/null 2>&1 || useradd --system --home-dir "$PREFIX" --no-create-home --shell /usr/sbin/nologin smon
+# Every mode below is written out. This script runs under umask 077, so anything left
+# to the default comes out root-only, and the service, which runs as smon, has to be
+# able to walk from $PREFIX down to its own binary.
+install -d -m 0755 "$PREFIX"
 install -d -o smon -g smon -m 0700 "$PREFIX/data" "$PREFIX/data/backups" "$PREFIX/status" "$PREFIX/releases"
 install -d -m 0700 "$PREFIX/credentials"
 
@@ -115,15 +119,17 @@ if [[ -n "$RELEASE_DIR" ]]; then
   [[ -x "$RELEASE_DIR/bin/monitor-server" && -x "$RELEASE_DIR/bin/monitor" ]] \
     || { echo "error: $RELEASE_DIR doesn't look like a release dir (bin/monitor-server, bin/monitor)" >&2; exit 2; }
   name=$(basename "$RELEASE_DIR")
-  mkdir -p "$PREFIX/releases/$name"
   # `install` writes each binary as a new file and renames it into place. Copying
   # over the file in place fails with "text file busy" when the service is running
   # from this release, which is exactly the case on a second run.
-  mkdir -p "$PREFIX/releases/$name/bin"
+  install -d -m 0755 "$PREFIX/releases/$name" "$PREFIX/releases/$name/bin"
   for bin in "$RELEASE_DIR"/bin/*; do
     install -m 0755 "$bin" "$PREFIX/releases/$name/bin/"
   done
-  [[ -d "$RELEASE_DIR/dashboard" ]] && cp -R "$RELEASE_DIR/dashboard" "$PREFIX/releases/$name/"
+  if [[ -d "$RELEASE_DIR/dashboard" ]]; then
+    cp -R "$RELEASE_DIR/dashboard" "$PREFIX/releases/$name/"
+    chmod -R u=rwX,go=rX "$PREFIX/releases/$name/dashboard"
+  fi
   ln -sfn "$PREFIX/releases/$name" "$PREFIX/current.new" && mv -T "$PREFIX/current.new" "$PREFIX/current"
 elif [[ ! -e "$PREFIX/current/bin/monitor-server" ]]; then
   echo "error: no binaries installed and no --release-dir given" >&2; exit 2

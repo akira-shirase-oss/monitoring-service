@@ -54,6 +54,9 @@ elif [[ -n "$VERSION" && -n "$URL" && -n "$SHA" ]]; then
 else
   echo "usage: upgrade.sh --release-dir <dir> | --version <v> --url <tarball> --sha256 <hex>" >&2; exit 2
 fi
+# The service runs as smon and must be able to read and run the release whatever
+# umask root happened to have when this script started.
+chmod -R u=rwX,go=rX "$staging"
 [[ -x "$staging/bin/monitor-server" ]] || { echo "error: staged release has no monitor-server" >&2; exit 1; }
 
 previous=$(readlink -f "$PREFIX/current" || true)

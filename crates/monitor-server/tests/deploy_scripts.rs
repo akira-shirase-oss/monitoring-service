@@ -198,6 +198,10 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         "install -m 0644 \"$aop_one\" /etc/caddy/cloudflare-origin-pull-ca.pem",
         // A second run must not copy over the binary the service is running from.
         "install -m 0755 \"$bin\" \"$PREFIX/releases/$name/bin/\"",
+        // Under umask 077 a plain mkdir leaves the release root-only and the service,
+        // which runs as smon, cannot reach its own binary.
+        "install -d -m 0755 \"$PREFIX\"",
+        "install -d -m 0755 \"$PREFIX/releases/$name\" \"$PREFIX/releases/$name/bin\"",
         "caddy version", // >= 2.7 floor: {client_ip}/trusted-proxies need it
         // S3: the sources line is written inline with signed-by — a fetched list
         // could arrive carrying `trusted=yes` and undo the fingerprint pin.
