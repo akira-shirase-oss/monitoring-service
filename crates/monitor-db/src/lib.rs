@@ -3189,46 +3189,49 @@ impl OwnerDb<'_> {
             return Err(QueryError::Invalid("tokens cannot hold owner".into()));
         }
         let view = &self.view.view.view;
-        // Bounded like every other row a workspace owns. Revoked tokens are kept as a
-        // record, so at the cap the oldest revoked one makes room; with none revoked
-        // the mint is refused until one is.
-        let held: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?")
-                .bind(view.workspace.0.to_string())
-                .fetch_one(&view.db.pool)
-                .await?;
-        if held >= MAX_TOKENS_PER_WORKSPACE {
-            let freed = sqlx::query(
-                "DELETE FROM api_tokens WHERE id = (
-                     SELECT id FROM api_tokens
-                      WHERE workspace_id = ? AND revoked_at IS NOT NULL
-                      ORDER BY revoked_at LIMIT 1)",
-            )
-            .bind(view.workspace.0.to_string())
-            .execute(&view.db.pool)
-            .await?
-            .rows_affected();
-            if freed == 0 {
-                return Err(QueryError::Conflict(format!(
-                    "a workspace holds at most {MAX_TOKENS_PER_WORKSPACE} API tokens; revoke one first"
-                )));
-            }
-        }
+        // Bounded like every other row a workspace owns, in one transaction so that
+        // concurrent mints cannot each see room and all land. Revoked tokens are kept
+        // as a record, so at the cap the oldest revoked one makes room; with none
+        // revoked the insert finds no room, and dropping the transaction undoes the
+        // attempt. The first statement is a write, which takes the store's write lock
+        // before anything is counted.
+        let workspace = view.workspace.0.to_string();
         let id = ApiTokenId::new();
+        let mut tx = view.db.pool.begin().await?;
         sqlx::query(
+            "DELETE FROM api_tokens
+              WHERE id = (SELECT id FROM api_tokens
+                           WHERE workspace_id = ?1 AND revoked_at IS NOT NULL
+                           ORDER BY revoked_at LIMIT 1)
+                AND (SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?1) >= ?2",
+        )
+        .bind(&workspace)
+        .bind(MAX_TOKENS_PER_WORKSPACE)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
             "INSERT INTO api_tokens
                 (id, workspace_id, created_by, name, token_digest, role, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+              WHERE (SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?2) < ?8",
         )
         .bind(id.0.to_string())
-        .bind(view.workspace.0.to_string())
+        .bind(&workspace)
         .bind(created_by.map(|a| a.0.to_string()))
         .bind(name)
         .bind(digest)
         .bind(role.as_str())
         .bind(now)
-        .execute(&view.db.pool)
-        .await?;
+        .bind(MAX_TOKENS_PER_WORKSPACE)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(QueryError::Conflict(format!(
+                "a workspace holds at most {MAX_TOKENS_PER_WORKSPACE} API tokens; revoke one first"
+            )));
+        }
+        tx.commit().await?;
         Ok(ApiTokenRow {
             id: id.0.to_string(),
             workspace_id: view.workspace.0.to_string(),

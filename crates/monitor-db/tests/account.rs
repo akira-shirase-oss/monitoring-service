@@ -617,7 +617,8 @@ async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> a
     let cascaded = scalar(
         &store.raw,
         "SELECT (SELECT COUNT(*) FROM maintenance_windows WHERE workspace_id = ?1)
-              + (SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?1)",
+              + (SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?1)
+              + (SELECT COUNT(*) FROM workspace_invitations WHERE workspace_id = ?1)",
         &id,
     )
     .await?;
@@ -897,10 +898,10 @@ async fn a_monitor_without_a_workspace_row_still_commits() -> anyhow::Result<()>
 }
 
 /// The deletion's bound counts everything its one transaction removes, across every
-/// workspace it removes: maintenance windows and API tokens go in cascades and are
-/// rows like any other.
+/// workspace it removes: maintenance windows, API tokens and pending invitations go
+/// in cascades and are rows like any other.
 #[tokio::test]
-async fn the_deletion_bound_counts_windows_and_tokens_too() -> anyhow::Result<()> {
+async fn the_deletion_bound_counts_what_cascades_too() -> anyhow::Result<()> {
     let store = store().await?;
     let (account, workspace) = tenant(&store.db, "cascades").await?;
     fill(&store, account, workspace).await?;
@@ -912,6 +913,7 @@ async fn the_deletion_bound_counts_windows_and_tokens_too() -> anyhow::Result<()
         "SELECT COUNT(*) FROM notify_outbox WHERE workspace_id = ?",
         "SELECT COUNT(*) FROM maintenance_windows WHERE workspace_id = ?",
         "SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?",
+        "SELECT COUNT(*) FROM workspace_invitations WHERE workspace_id = ?",
     ] {
         let held = scalar(&store.raw, sql, &id).await?;
         assert!(held > 0, "the fixture holds a row for: {sql}");

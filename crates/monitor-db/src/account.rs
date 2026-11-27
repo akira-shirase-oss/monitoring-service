@@ -256,7 +256,8 @@ impl Db {
 }
 
 /// Everything the one transaction has to remove, across every workspace it
-/// removes: checks, incidents, queued alerts, maintenance windows and API tokens.
+/// removes: checks, incidents, queued alerts, maintenance windows, API tokens and
+/// pending invitations.
 /// An incident-heavy workspace is as slow to remove as a check-heavy one, the
 /// windows and tokens go in the monitors' and the workspace's cascades, and an
 /// account that is the last member of several workspaces removes them all at
@@ -292,6 +293,9 @@ async fn refuse_if_too_large(
                     LIMIT ?2))
               + (SELECT COUNT(*) FROM (
                    SELECT 1 FROM api_tokens t WHERE t.workspace_id = ?1 LIMIT ?2))
+              + (SELECT COUNT(*) FROM (
+                   SELECT 1 FROM workspace_invitations v
+                    WHERE v.workspace_id = ?1 LIMIT ?2))
                FROM workspaces w WHERE w.id = ?1",
         )
         .bind(workspace)

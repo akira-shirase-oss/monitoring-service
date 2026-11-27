@@ -779,3 +779,39 @@ async fn an_account_is_never_removed_from_its_own_workspace() -> anyhow::Result<
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     Ok(())
 }
+
+/// An invitation's address is bounded like an address: pending invitations are rows
+/// that go with the workspace when it is deleted, so each one has to be small.
+#[tokio::test]
+async fn an_invitation_address_is_bounded() -> anyhow::Result<()> {
+    let (app, _state, _db, _tmp) = fixture().await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let long = format!("{}@b.example", "x".repeat(250));
+    for email in [long.as_str(), "two words@b.example", "no-at-sign"] {
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            "/api/members",
+            Some(serde_json::json!({"email": email, "role": "viewer"})),
+            Some(Cred::Cookie(&owner)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{email}: {body}");
+    }
+    let (_, _, pending) = call(
+        &app,
+        "GET",
+        "/api/members/invitations",
+        None,
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        pending["invitations"].as_array().map(Vec::len),
+        Some(0),
+        "a refused invitation was stored: {pending}"
+    );
+    Ok(())
+}

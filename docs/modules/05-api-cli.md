@@ -181,7 +181,9 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   a window spends the monitor write budget (429); a workspace holds at most 100 API
   tokens, the oldest revoked one making room at the cap (409 when none is revoked);
   `GET /api/workspace/export` answers 429 while two exports are already being
-  assembled; `POST /api/account/password` accepts five changes per ten minutes (429);
+  assembled; `POST /api/account/password` accepts five changes per account per ten
+  minutes (429); an invitation's email is at most 254 characters (422); a monitor
+  create whose workspace was deleted meanwhile answers 404;
   both account routes answer 401 if the password changed while the request was being
   verified.
 

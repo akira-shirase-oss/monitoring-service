@@ -731,11 +731,19 @@ rule the code keeps:
   the stored one.** A request that proved an older password, and was overtaken by a
   change, is answered 401 and changes nothing.
 - **At most two exports are assembled at once across the whole server** (429
-  otherwise), on top of the per-workspace cooldown: an export holds its rows in memory
-  until the response is written.
-- **Accepted password changes have their own budget**: five per ten minutes. A right
-  password gives its address guess back, so nothing else bounded a loop of them, and
-  each costs two rounds of password hashing on a pool every sign-in shares.
+  otherwise, with a message that says the server is busy), on top of the
+  per-workspace cooldown. Reading the rows and building the document is where an
+  export's memory peaks; the permit is released once the document is built, so a slow
+  reader cannot hold one.
+- **Accepted password changes have their own budget, per account**: five per ten
+  minutes. A right password gives its address guess back, so nothing else bounded a
+  loop of them, and each costs password hashing on a pool every sign-in shares. The
+  budget is asked before the password is verified and counted only when a change is
+  stored. It is keyed by the account and never by a workspace: a workspace is shared
+  and the caller names it, so a workspace key let one member spend everyone's changes.
+- **An invitation's address is at most 254 characters**, and pending invitations count
+  toward account deletion's row bound, like windows and tokens.
+- **The API-token cap is one transaction**, so concurrent mints cannot each see room.
 - **The schedule is read and published as one step**, so two publishers cannot leave
   the coordinator on the older of two reads.
 

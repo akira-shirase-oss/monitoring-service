@@ -1038,7 +1038,14 @@ async fn add_member(
         return Err(ApiError::Invalid("email and role are required".into()));
     };
     let email = email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
+    // 254 characters is the longest address that can be delivered to. Unbounded, each
+    // pending invitation could hold kilobytes, in rows that go with the workspace in
+    // one cascade.
+    if email.is_empty()
+        || !email.contains('@')
+        || email.chars().count() > 254
+        || email.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
         return Err(ApiError::Invalid("email must be an email address".into()));
     }
     spend_write_budget(
@@ -2269,6 +2276,16 @@ async fn create_monitor(
     })
     .await?;
     if !view.insert_monitor_within(&monitor, cap).await? {
+        // Nothing was inserted: the cap, or the workspace was deleted while this
+        // request waited on DNS. Say which.
+        if state
+            .db
+            .workspace_row(principal.workspace())
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::NotFound);
+        }
         return Err(ApiError::LimitReached(cap));
     }
     publish_registry(&state).await?;

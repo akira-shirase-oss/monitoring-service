@@ -1473,3 +1473,41 @@ async fn password_changes_have_their_own_small_budget() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// The password-change budget belongs to the account. It used to be keyed by the
+/// workspace the request named, which a member chooses: a viewer could change their
+/// own password five times "in" someone's workspace and lock that workspace's owner
+/// out of changing theirs.
+#[tokio::test]
+async fn one_accounts_password_changes_do_not_spend_anothers() -> anyhow::Result<()> {
+    let rig = rig().await?;
+    let owner = sign_up(&rig.app, "owner@tenant.example").await;
+    let guest = sign_up(&rig.app, "guest@elsewhere.example").await;
+    let shared = workspace_of(&rig.db, "owner@tenant.example").await?;
+    seat(&rig.db, shared, "guest@elsewhere.example", Role::Viewer).await?;
+    let shared = shared.0.to_string();
+
+    // The guest spends their whole budget while naming the owner's workspace.
+    let (mut current, mut next) = (PASSWORD, NEW_PASSWORD);
+    for round in 0..monitor_server::account::PASSWORD_CHANGES {
+        let who = within(Cred::Cookie(&guest), &shared);
+        let (status, body) = change(&rig.app, who, current, next).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "guest round {round}: {body}"
+        );
+        std::mem::swap(&mut current, &mut next);
+    }
+    let who = within(Cred::Cookie(&guest), &shared);
+    assert_eq!(
+        change(&rig.app, who, current, next).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the guest's own budget is spent"
+    );
+
+    // The owner's budget is untouched.
+    let (status, body) = change(&rig.app, cookie(&owner), PASSWORD, NEW_PASSWORD).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    Ok(())
+}

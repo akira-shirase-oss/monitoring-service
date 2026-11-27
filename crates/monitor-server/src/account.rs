@@ -47,20 +47,64 @@ pub const DELETE_MAX_ROWS: i64 = 50_000;
 /// Workspaces whose export cooldown is tracked at once; spent ones are forgotten past it.
 const EXPORT_PACE_CAP: usize = 4096;
 
-/// Password changes one account's workspace may make per [`PASSWORD_CHANGE_WINDOW`].
+/// Password changes one account may make per [`PASSWORD_CHANGE_WINDOW`].
 pub const PASSWORD_CHANGES: u32 = 5;
 /// The rolling window [`PASSWORD_CHANGES`] spends within.
 pub const PASSWORD_CHANGE_WINDOW: Duration = Duration::from_secs(600);
-/// Exports assembled at once, across every workspace. One export holds its rows in
-/// memory until the response is written; the per-workspace cooldown says nothing about
-/// how many workspaces ask together, and this does.
+/// Exports assembled at once, across every workspace. Reading a workspace's rows and
+/// building the document is where an export's memory peaks; the per-workspace cooldown
+/// says nothing about how many workspaces ask together, and this does. The permit is
+/// released when the document is built, so a slow reader cannot hold one.
 pub const EXPORTS_AT_ONCE: usize = 2;
 
 static EXPORTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(EXPORTS_AT_ONCE);
 
-/// The password-change budget, keyed like the export cooldown.
+/// The password-change budget: `account -> (window opened, changes accepted)`. Keyed by
+/// the account, never by a workspace: a workspace is shared, and its key is the
+/// caller's to choose, so one member could spend everyone else's changes.
 #[derive(Clone, Default)]
-pub struct PasswordPace(WritePace);
+pub struct PasswordPace(
+    std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<AccountId, (tokio::time::Instant, u32)>>,
+    >,
+);
+
+impl PasswordPace {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<AccountId, (tokio::time::Instant, u32)>>
+    {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How long until `account` may change its password again, when its budget for
+    /// this window is spent. Asked before the password is verified, so a spent budget
+    /// costs no password hashing at all.
+    fn spent(&self, account: AccountId) -> Option<Duration> {
+        let now = tokio::time::Instant::now();
+        let (opened, changes) = *self.lock().get(&account)?;
+        let age = now.duration_since(opened);
+        (age < PASSWORD_CHANGE_WINDOW && changes >= PASSWORD_CHANGES)
+            .then(|| PASSWORD_CHANGE_WINDOW.saturating_sub(age))
+    }
+
+    /// Count one accepted change. Only a change that was stored is counted: a busy
+    /// hasher or a refused write costs the account nothing.
+    fn accepted(&self, account: AccountId) {
+        let now = tokio::time::Instant::now();
+        let mut held = self.lock();
+        if held.len() >= EXPORT_PACE_CAP {
+            held.retain(|_, (opened, _)| now.duration_since(*opened) < PASSWORD_CHANGE_WINDOW);
+        }
+        let entry = held.entry(account).or_insert((now, 0));
+        if now.duration_since(entry.0) >= PASSWORD_CHANGE_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+    }
+}
 
 /// The per-workspace export cooldowns, `workspace -> (window opened, exports spent)`.
 /// An extension `routes()` installs, like the credential guard.
@@ -177,6 +221,15 @@ pub(crate) async fn change_password(
         return ApiError::Corrupt.into_response();
     };
     let keep = auth::account_session_key(cookie);
+    // A right password gives its address guess back, so the address budget does not
+    // bound a signed-in account that loops this route with the right password, and
+    // each pass costs password hashing on a pool everyone's sign-ins share. The
+    // account's own small budget does. It is asked first, so a spent budget costs no
+    // hashing, and it is counted only when a change is actually stored.
+    let pace = extensions.get::<PasswordPace>().cloned();
+    if let Some(wait) = pace.as_ref().and_then(|pace| pace.spent(account)) {
+        return ApiError::TooMany(wait).into_response();
+    }
     let verified = match confirm_password(
         &state,
         &extensions,
@@ -189,22 +242,6 @@ pub(crate) async fn change_password(
         Ok(verified) => verified,
         Err(refusal) => return *refusal,
     };
-    // A right password gives its guess back, so the per-address budget does not bound
-    // a signed-in account that loops this route with the right password, and each pass
-    // costs two rounds of password hashing on a pool everyone's sign-ins share. Wrong
-    // guesses are the address budget's to bound and never reach here; a few accepted
-    // changes per window is all anyone needs.
-    if let Some(pace) = extensions.get::<PasswordPace>()
-        && let Err(wait) = crate::spend_write_budget(
-            &pace.0,
-            principal.workspace(),
-            PASSWORD_CHANGES,
-            PASSWORD_CHANGE_WINDOW,
-            EXPORT_PACE_CAP,
-        )
-    {
-        return ApiError::TooMany(wait).into_response();
-    }
     let hash = match auth::hash_password(&body.new_password, state.password_work_wait).await {
         Ok(hash) => hash,
         Err(auth::PasswordWorkError::Busy) => return crate::password_busy(),
@@ -218,7 +255,12 @@ pub(crate) async fn change_password(
         .set_account_password(account, &verified, &hash, &keep)
         .await
     {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            if let Some(pace) = pace {
+                pace.accepted(account);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         // The account was deleted, or its password changed, while this request ran:
         // what it proved is no longer the account's password.
         Ok(false) => crate::invalid_credentials(),
@@ -326,6 +368,21 @@ async fn forget_workspaces(state: &AppState, gone: &[WorkspaceId]) {
     state.status_changed.notify_one();
 }
 
+/// The 429 for an export asked while [`EXPORTS_AT_ONCE`] others are being assembled.
+/// It is the server that is busy, not this workspace that asked too often, and the
+/// message says so.
+fn exports_busy() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, "2".to_owned())],
+        Json(serde_json::json!({
+            "error": { "code": "too_many_requests",
+                       "message": "the server is assembling other exports; retry in a moment" }
+        })),
+    )
+        .into_response()
+}
+
 /// The 429 a workspace gets for a second export inside [`EXPORT_EVERY`].
 fn export_too_soon(wait: Duration) -> Response {
     (
@@ -408,7 +465,7 @@ pub(crate) async fn export_workspace(
     // Held until the document is built: a third export waits its turn as a 429, not as
     // another copy of a workspace's history in memory.
     let Ok(_slot) = EXPORTS.try_acquire() else {
-        return Err(ApiError::TooMany(Duration::from_secs(2)));
+        return Ok(exports_busy());
     };
     if let Err(wait) = crate::spend_write_budget(
         &pace.0,
