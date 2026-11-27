@@ -13,22 +13,28 @@
 	import { call, shown } from '#lib/call.js';
 	import { dismissGuide } from '#lib/guide.svelte.js';
 	import type { MonitorPayload } from '#lib/monitor-form.js';
+	import { guideSteps } from '#lib/setup-guide.js';
 	import { current } from '#lib/workspace.svelte.js';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
 
-	const DEFAULT_NAME = 'Personal workspace';
 	const who = $derived(current());
 	const canWrite = $derived(who?.role !== 'viewer');
 
-	const named = $derived((who?.name ?? DEFAULT_NAME) !== DEFAULT_NAME);
-	const watching = $derived(data.monitors.length > 0);
-	const alerting = $derived(data.webhookUrl !== null);
-	const observed = $derived(data.observed > 0);
-	// Naming the workspace is a courtesy; the three that matter are a target, somewhere
-	// to send the alert, and the first evidence.
-	const complete = $derived(watching && alerting && observed);
+	const steps = $derived(
+		guideSteps({
+			workspaceName: who?.name,
+			monitorCount: data.monitors.length,
+			webhookUrl: data.webhookUrl,
+			observed: data.observed
+		})
+	);
+	const named = $derived(steps.named);
+	const watching = $derived(steps.watching);
+	const alerting = $derived(steps.alerting);
+	const observed = $derived(steps.observed);
+	const complete = $derived(steps.complete);
 
 	// While the first check is still on its way, look again every few seconds.
 	onMount(() => {

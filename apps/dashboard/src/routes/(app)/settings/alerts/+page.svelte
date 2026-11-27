@@ -11,6 +11,7 @@
 	import FormRow from '#lib/components/shell/FormRow.svelte';
 	import PageHeader from '#lib/components/shell/PageHeader.svelte';
 	import Problem from '#lib/components/shell/Problem.svelte';
+	import { explainDelivery } from '#lib/alerts.js';
 	import { call, shown } from '#lib/call.js';
 	import { current } from '#lib/workspace.svelte.js';
 	import type { PageData } from './$types';
@@ -36,25 +37,6 @@
 	let removeOpen = $state(false);
 	let removeBusy = $state(false);
 	let removeError = $state<string | null>(null);
-
-	// What the receiver said, in plain words. The wire word stays visible beside it —
-	// it is what the logs and the docs use.
-	const TEST_WORDS: Record<string, string> = {
-		delivered: 'Your endpoint answered with a success status.',
-		rejected_local: 'The address points at a private or local network, which alerts are never sent to.',
-		deadline: 'Your endpoint did not answer in time.',
-		dns: "The hostname didn't resolve.",
-		connect: 'The connection was refused or could not be opened.',
-		tls: 'The TLS handshake failed.',
-		redirect: 'Your endpoint answered with a redirect. Alerts are sent to the exact address only.'
-	};
-
-	function explain(detail: string): string {
-		if (TEST_WORDS[detail]) return TEST_WORDS[detail];
-		const status = /^http_(\d{3})$/.exec(detail);
-		if (status) return `Your endpoint answered HTTP ${status[1]}, which counts as a failed delivery.`;
-		return 'The delivery failed.';
-	}
 
 	async function save(event: SubmitEvent) {
 		event.preventDefault();
@@ -211,7 +193,7 @@
 								{:else if test}
 									<p class="flex flex-wrap items-center gap-2 text-sm" role="status" data-testid="webhook-test-result">
 										<Badge variant={test.ok ? 'live' : 'attention'}>{test.ok ? 'Delivered' : 'Not delivered'}</Badge>
-										<span>{explain(test.detail)}</span>
+										<span>{explainDelivery(test.detail)}</span>
 										<code class="font-mono text-xs text-muted-foreground">{test.detail}</code>
 									</p>
 								{/if}

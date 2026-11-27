@@ -93,6 +93,21 @@ checks — where requests don't apply), with thresholds and results committed un
 the fix. Report exactly what ran and what passed; never claim verified/benchmarked without an
 executed run.
 
+## Frontend tests
+
+The dashboard has two layers, and a change to it ships with a test in the right one:
+
+- **Unit and component tests** (`apps/dashboard/src/**/*.test.ts`, Vitest + jsdom, run by
+  `npm run test --workspace @service-monitor/dashboard` and by `scripts/check.sh`). Put a
+  decision in a plain module under `src/lib/` and test it there (what the public page
+  may say, what a step of the guide means, how a request is sent); test a component for
+  what it sends and shows; `src/tests/roles.test.ts` pins what each role is offered.
+  These run in about five seconds, so the rule is simple: logic never lives only in a
+  page.
+- **Browser journeys** (`apps/dashboard/tests/*.spec.ts`, Playwright against the real
+  server, `scripts/e2e.sh`, its own CI job). For anything that needs the server's
+  answer: sign-up, sessions, roles enforced by the API, checks landing.
+
 ## Verification commands
 
 `scripts/check.sh` — toolchain check, `scripts/check-ignored.sh` (no ignored path other than
@@ -100,7 +115,7 @@ build/runtime artifacts), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`,
 `scripts/check-advisories.sh` (`cargo deny --locked check advisories bans licenses sources`, required when `CI` is set;
 `deny.toml` exceptions need a re-check date that has not passed), `scripts/check-architecture.sh`,
-`svelte-check` and a dashboard build. Run before every push.
+`svelte-check`, the dashboard's unit tests and a dashboard build. Run before every push.
 
 ## Working rules
 

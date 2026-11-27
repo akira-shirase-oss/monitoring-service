@@ -9,6 +9,7 @@
 	import { invalidateAll } from '$app/navigation';
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import ThemeToggle from '#lib/components/shell/ThemeToggle.svelte';
+	import { toneFor, verdictFor } from '#lib/public-status.js';
 	import { ago, percent, when } from '#lib/time.js';
 	import type { PageData } from './$types';
 	import type { PublicService } from './+page';
@@ -25,52 +26,10 @@
 	});
 
 	const services = $derived(data.snap?.services ?? []);
-	const down = $derived(services.filter((s) => s.status === 'down').length);
-	const unknown = $derived(services.filter((s) => s.status === 'unknown').length);
-
-	type Verdict = { tone: 'live' | 'attention' | 'draft'; line: string; detail: string };
-	const verdict = $derived.by<Verdict>(() => {
-		if (data.state === 'unreachable') {
-			return {
-				tone: 'draft',
-				line: 'Status unavailable',
-				detail: "The status service didn't answer. This says nothing about the services themselves."
-			};
-		}
-		if (data.state === 'stale') {
-			return {
-				tone: 'draft',
-				line: 'Monitoring unavailable',
-				detail: 'The monitor has stopped reporting, so current status is unknown. What you see below is the last recorded state.'
-			};
-		}
-		if (services.length === 0) {
-			return { tone: 'draft', line: 'Nothing published yet', detail: 'No services are listed on this page.' };
-		}
-		if (down > 0) {
-			return {
-				tone: 'attention',
-				line: down === 1 ? '1 service is down' : `${down} services are down`,
-				detail: 'An incident is open. It closes after the service passes its checks again.'
-			};
-		}
-		if (unknown > 0) {
-			return {
-				tone: 'draft',
-				line: 'Some services have no recent result',
-				detail: 'A service without a recent check is shown as unknown, never as up.'
-			};
-		}
-		return {
-			tone: 'live',
-			line: 'All listed services are up',
-			detail: 'Every service below passed its most recent checks.'
-		};
-	});
+	const verdict = $derived(verdictFor(data.state, services));
 
 	function variantFor(service: PublicService): BadgeVariant {
-		if (data.state === 'stale') return 'draft';
-		return service.status === 'up' ? 'live' : service.status === 'down' ? 'attention' : 'draft';
+		return toneFor(data.state, service.status);
 	}
 
 	const title = $derived(data.snap?.title ?? 'Service status');

@@ -45,7 +45,8 @@
 - **Operators no longer need curl.** `monitor invites create` and
   `monitor workspaces list|plan` in the CLI, and an Operator page in the dashboard for
   sign-up codes and workspace plans.
-- CI now drives the dashboard in a real browser on every push.
+- CI now drives the dashboard in a real browser on every push, and runs a unit test
+  layer for the dashboard's own logic and components.
 
 ### Scheduler capacity (2026-11-17, D-018) — behaviour changes
 
