@@ -141,6 +141,10 @@ async fn sign_up(app: &axum::Router, email: &str) -> String {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        body["invite"]["expires_at"].is_string(),
+        "invite times are RFC 3339 strings: {body}"
+    );
     let code = body["invite"]["code"]
         .as_str()
         .expect("invite code")
@@ -347,6 +351,10 @@ async fn members_write_monitors_viewers_only_read_and_neither_administers() -> a
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["members"].as_array().map(Vec::len), Some(3));
+    assert!(
+        body["members"][0]["created_at"].is_string(),
+        "roster times are RFC 3339 strings: {body}"
+    );
 
     for (method, uri, payload) in [
         // Valid bodies: the extractor runs before the role check — a denied request
@@ -528,6 +536,16 @@ async fn a_workspace_token_is_shown_once_scoped_and_revocable() -> anyhow::Resul
     assert_eq!(listed["id"], token_id);
     assert!(listed.get("secret").is_none(), "never re-shown: {listed}");
     assert!(listed["last_used_at"].is_null());
+    // Times are RFC 3339 strings, like every other time in the API — never the
+    // serializer's internal tuple.
+    let created = listed["created_at"]
+        .as_str()
+        .expect("created_at is a string");
+    assert!(
+        time::OffsetDateTime::parse(created, &time::format_description::well_known::Rfc3339)
+            .is_ok(),
+        "{created}"
+    );
 
     // A member-role token works in its own workspace — writes included.
     let (status, _, body) = call(

@@ -943,9 +943,17 @@ async fn create_invite(
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "invite": { "code": code, "expires_at": row.expires_at }
+            "invite": { "code": code, "expires_at": stamp(row.expires_at)? }
         })),
     ))
+}
+
+/// A time as the API shows it: an RFC 3339 string, the same form the checks, incidents
+/// and maintenance windows use. Serializing the value itself would emit `time`'s
+/// internal tuple, which no client should have to decode.
+fn stamp(at: OffsetDateTime) -> Result<String, ApiError> {
+    at.format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| ApiError::Corrupt)
 }
 
 /// The roster as the API shows it — account id, email, role, when they joined.
@@ -956,7 +964,7 @@ fn member_view(row: &monitor_db::MemberRow) -> Result<serde_json::Value, ApiErro
         "account": account.0,
         "email": row.email,
         "role": role.as_str(),
-        "created_at": row.created_at,
+        "created_at": stamp(row.created_at)?,
     }))
 }
 
@@ -969,9 +977,9 @@ fn token_view(row: &monitor_db::ApiTokenRow) -> Result<serde_json::Value, ApiErr
         "id": token.0,
         "name": row.name,
         "role": role.as_str(),
-        "created_at": row.created_at,
-        "revoked_at": row.revoked_at,
-        "last_used_at": row.last_used_at,
+        "created_at": stamp(row.created_at)?,
+        "revoked_at": row.revoked_at.map(stamp).transpose()?,
+        "last_used_at": row.last_used_at.map(stamp).transpose()?,
     }))
 }
 
