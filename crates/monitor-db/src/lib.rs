@@ -18,7 +18,9 @@ use monitor_domain::{
     SlotObservation, Thresholds, WorkspaceId,
 };
 
+mod account;
 pub mod writer;
+pub use account::DailyStatsRow;
 pub use writer::{
     Observation, SharedStatuses, WriteHealth, WriteOutcome, WriterError, WriterHandle,
 };
