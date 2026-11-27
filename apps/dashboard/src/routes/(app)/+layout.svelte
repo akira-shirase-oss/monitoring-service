@@ -11,6 +11,7 @@
 	import KeyRoundIcon from '@lucide/svelte/icons/key-round';
 	import RadarIcon from '@lucide/svelte/icons/radar';
 	import RocketIcon from '@lucide/svelte/icons/rocket';
+	import SettingsIcon from '@lucide/svelte/icons/settings';
 	import SirenIcon from '@lucide/svelte/icons/siren';
 	import UsersIcon from '@lucide/svelte/icons/users';
 	import WebhookIcon from '@lucide/svelte/icons/webhook';
@@ -86,6 +87,13 @@
 				<Sidebar.Group>
 					<Sidebar.GroupLabel>Workspace</Sidebar.GroupLabel>
 					<Sidebar.Menu>
+						<Sidebar.MenuItem>
+							<Sidebar.MenuButton isActive={route.startsWith('/(app)/settings/general')} tooltipContent="General">
+								{#snippet child({ props })}
+									<a href="/settings/general" {...props}><SettingsIcon /><span>General</span></a>
+								{/snippet}
+							</Sidebar.MenuButton>
+						</Sidebar.MenuItem>
 						<Sidebar.MenuItem>
 							<Sidebar.MenuButton isActive={route.startsWith('/(app)/settings/members')} tooltipContent="Members">
 								{#snippet child({ props })}

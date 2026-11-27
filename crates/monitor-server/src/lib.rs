@@ -1367,7 +1367,7 @@ async fn list_workspaces(
             .await?
             .into_iter()
             .map(|w| {
-                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "plan": w.plan, "role": "operator"})
+                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "plan": w.plan, "limits": limits_view(&w.plan), "role": "operator"})
             })
             .collect::<Vec<_>>(),
         auth::Principal::Account { account: id, .. } => {
@@ -1380,7 +1380,7 @@ async fn list_workspaces(
                 .await?
                 .into_iter()
                 .map(|m| {
-                    serde_json::json!({"id": m.id, "slug": m.slug, "name": m.name, "plan": m.plan, "role": m.role})
+                    serde_json::json!({"id": m.id, "slug": m.slug, "name": m.name, "plan": m.plan, "limits": limits_view(&m.plan), "role": m.role})
                 })
                 .collect()
         }
@@ -1392,13 +1392,29 @@ async fn list_workspaces(
             .await?
             .into_iter()
             .map(|w| {
-                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "plan": w.plan, "role": role.as_str()})
+                serde_json::json!({"id": w.id, "slug": w.slug, "name": w.name, "plan": w.plan, "limits": limits_view(&w.plan), "role": role.as_str()})
             })
             .collect(),
     };
     Ok(Json(
         serde_json::json!({ "workspaces": workspaces, "account": account }),
     ))
+}
+
+/// A plan's limits as the API shows them, so a workspace can see what it may do before
+/// a write is refused. `null` for a figure means the plan sets none of its own — the
+/// server's configured ceilings and retention still apply.
+fn limits_view(plan: &str) -> serde_json::Value {
+    let Some(limits) = monitor_domain::Plan::parse(plan).map(monitor_domain::Plan::limits) else {
+        return serde_json::Value::Null;
+    };
+    let days = |span: Duration| span.as_secs() / 86_400;
+    serde_json::json!({
+        "max_monitors": (limits.max_monitors != u64::MAX).then_some(limits.max_monitors),
+        "min_interval_s": limits.min_interval.as_secs(),
+        "check_retention_days": limits.retention.map(|r| days(r.checks)),
+        "incident_retention_days": limits.retention.map(|r| days(r.incidents)),
+    })
 }
 
 #[derive(Debug, Deserialize)]

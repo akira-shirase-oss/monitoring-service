@@ -380,6 +380,16 @@ async fn workspaces_lists_each_principals_own_claim() -> anyhow::Result<()> {
     assert_eq!(rows.len(), 1, "{body}");
     assert_eq!(rows[0]["id"], owner_ws);
     assert_eq!(rows[0]["role"], "owner");
+    // The plan's limits ride along, so the dashboard can say them before a refusal.
+    assert_eq!(rows[0]["plan"], "free", "{body}");
+    assert_eq!(
+        rows[0]["limits"],
+        serde_json::json!({
+            "max_monitors": 10, "min_interval_s": 60,
+            "check_retention_days": 2, "incident_retention_days": 90,
+        }),
+        "{body}"
+    );
 
     // The member sees both: home (owner) and the owner's workspace (member) — and
     // nothing else.

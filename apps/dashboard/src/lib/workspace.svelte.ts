@@ -4,7 +4,22 @@
 // preference, not a credential: it lives in localStorage and a stale value is cleared
 // the next time the memberships load (the server only ever answers for real ones).
 
-export type Membership = { id: string; slug: string; name: string; role: string };
+/** What the workspace's plan allows. `null` means the plan sets no figure of its own. */
+export type Limits = {
+	max_monitors: number | null;
+	min_interval_s: number;
+	check_retention_days: number | null;
+	incident_retention_days: number | null;
+};
+
+export type Membership = {
+	id: string;
+	slug: string;
+	name: string;
+	role: string;
+	plan?: string;
+	limits?: Limits | null;
+};
 
 const KEY = 'smon_workspace';
 

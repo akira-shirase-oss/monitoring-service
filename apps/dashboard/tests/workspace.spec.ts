@@ -36,7 +36,8 @@ async function account(
 	context: BrowserContext,
 	request: APIRequestContext,
 	origin: string,
-	tag: string
+	tag: string,
+	plan: 'free' | 'operator' = 'operator'
 ): Promise<{ email: string; workspaceId: string }> {
 	const email = address(tag);
 	const signup = await context.request.post('/api/signup', {
@@ -50,7 +51,7 @@ async function account(
 		headers: { origin }
 	});
 	expect(login.status()).toBe(204);
-	await liftPlan(request, workspaceId);
+	if (plan === 'operator') await liftPlan(request, workspaceId);
 	return { email, workspaceId };
 }
 
@@ -370,4 +371,30 @@ test('a monitor keeps its request method and expectations, and HEAD drops the bo
 	await page.getByRole('button', { name: 'Save changes' }).click();
 	await expect(line).toContainText('HEAD request');
 	await expect(line).not.toContainText('body must contain');
+});
+
+test('the free plan shows its limits and names the one a write hits', async ({
+	page,
+	context,
+	request,
+	baseURL
+}) => {
+	await account(context, request, baseURL ?? '', 'plan', 'free');
+	await page.goto('/settings/general');
+	await expect(page.getByTestId('plan-name')).toHaveText('free');
+	await expect(page.getByTestId('plan-limits')).toContainText('0 of 10 in use');
+	await expect(page.getByTestId('plan-limits')).toContainText('1 min');
+	await expect(page.getByTestId('workspace-role')).toContainText('Owner');
+
+	// Renaming here is the same write the guide does; the shell follows.
+	await page.getByTestId('workspace-rename').fill('Plan check');
+	await page.getByTestId('workspace-rename-save').click();
+	await expect(page.getByTestId('workspace-name')).toHaveText('Plan check');
+
+	// A 15-second interval is below the plan's floor: the server's sentence is shown.
+	await page.goto('/');
+	await page.getByTestId('empty-monitors').getByRole('button').click();
+	await fillMonitor(page, 'too-fast', `http://127.0.0.1:${FAULT}/ok`);
+	await page.getByRole('button', { name: 'Create monitor' }).click();
+	await expect(page.getByRole('alert')).toContainText('below the 60s minimum');
 });
