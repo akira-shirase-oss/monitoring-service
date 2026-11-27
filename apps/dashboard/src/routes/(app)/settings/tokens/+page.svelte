@@ -180,8 +180,8 @@
 							<Table.Row>
 								<Table.Head>Name</Table.Head>
 								<Table.Head>Access</Table.Head>
-								<Table.Head>Created</Table.Head>
-								<Table.Head>Last used</Table.Head>
+								<Table.Head class="hidden sm:table-cell">Created</Table.Head>
+								<Table.Head class="hidden sm:table-cell">Last used</Table.Head>
 								<Table.Head class="text-right">State</Table.Head>
 							</Table.Row>
 						</Table.Header>
@@ -190,8 +190,8 @@
 								<Table.Row data-testid="token-row">
 									<Table.Cell class="font-medium">{token.name}</Table.Cell>
 									<Table.Cell>{token.role === 'member' ? 'Read and write' : 'Read'}</Table.Cell>
-									<Table.Cell class="text-muted-foreground">{when(token.created_at)}</Table.Cell>
-									<Table.Cell class="text-muted-foreground">{ago(token.last_used_at)}</Table.Cell>
+									<Table.Cell class="hidden text-muted-foreground sm:table-cell">{when(token.created_at)}</Table.Cell>
+									<Table.Cell class="hidden text-muted-foreground sm:table-cell">{ago(token.last_used_at)}</Table.Cell>
 									<Table.Cell class="text-right">
 										{#if token.revoked_at}
 											<Badge variant="draft" title={when(token.revoked_at)}>Revoked</Badge>

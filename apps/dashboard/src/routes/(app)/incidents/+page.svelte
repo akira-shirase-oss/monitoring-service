@@ -57,7 +57,7 @@
 					<Table.Row>
 						<Table.Head>Monitor</Table.Head>
 						<Table.Head>First failure</Table.Head>
-						<Table.Head>{isOpen ? 'Last failure' : 'Recovered'}</Table.Head>
+						<Table.Head class="hidden sm:table-cell">{isOpen ? 'Last failure' : 'Recovered'}</Table.Head>
 						<Table.Head class="text-right">{isOpen ? 'Open for' : 'Lasted'}</Table.Head>
 					</Table.Row>
 				</Table.Header>
@@ -71,8 +71,8 @@
 									<span class="text-muted-foreground">Deleted monitor</span>
 								{/if}
 							</Table.Cell>
-							<Table.Cell class="text-muted-foreground">{when(began(incident))}</Table.Cell>
-							<Table.Cell class="text-muted-foreground">
+							<Table.Cell class="whitespace-normal text-muted-foreground sm:whitespace-nowrap">{when(began(incident))}</Table.Cell>
+							<Table.Cell class="hidden text-muted-foreground sm:table-cell">
 								{when(isOpen ? incident.last_fail_at : incident.resolved_at)}
 							</Table.Cell>
 							<Table.Cell class="tabular text-right">{lasted(incident)}</Table.Cell>

@@ -109,20 +109,24 @@
 					<Table.Row>
 						<Table.Head>Monitor</Table.Head>
 						<Table.Head>Starts</Table.Head>
-						<Table.Head>Ends</Table.Head>
-						<Table.Head>Reason</Table.Head>
+						<Table.Head class="hidden sm:table-cell">Ends</Table.Head>
+						<Table.Head class="hidden sm:table-cell">Reason</Table.Head>
 						<Table.Head class="text-right"><span class="sr-only">State</span></Table.Head>
 					</Table.Row>
 				</Table.Header>
 				<Table.Body>
 					{#each list as window (window.id)}
 						<Table.Row data-testid="window-row">
-							<Table.Cell class="font-medium">
+							<Table.Cell class="whitespace-normal font-medium sm:whitespace-nowrap">
 								<a class="hover:underline" href="/monitors/{window.monitor_id}">{names[window.monitor_id] ?? 'Monitor'}</a>
+								{#if window.reason}<span class="block text-xs font-normal text-muted-foreground sm:hidden">{window.reason}</span>{/if}
 							</Table.Cell>
-							<Table.Cell class="text-muted-foreground">{when(window.starts_at)}</Table.Cell>
-							<Table.Cell class="text-muted-foreground">{when(window.ends_at)}</Table.Cell>
-							<Table.Cell class="text-muted-foreground">{window.reason ?? '—'}</Table.Cell>
+							<Table.Cell class="whitespace-normal text-muted-foreground sm:whitespace-nowrap">
+								{when(window.starts_at)}
+								<span class="block sm:hidden">to {when(window.ends_at)}</span>
+							</Table.Cell>
+							<Table.Cell class="hidden text-muted-foreground sm:table-cell">{when(window.ends_at)}</Table.Cell>
+							<Table.Cell class="hidden text-muted-foreground sm:table-cell">{window.reason ?? '—'}</Table.Cell>
 							<Table.Cell class="text-right">
 								<span class="inline-flex items-center gap-2">
 									{#if window.active}<Badge variant="pending">Active now</Badge>{/if}

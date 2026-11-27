@@ -217,18 +217,19 @@
 						<Table.Row>
 							<Table.Head>Email</Table.Head>
 							<Table.Head>Role</Table.Head>
-							<Table.Head>Joined</Table.Head>
+							<Table.Head class="hidden sm:table-cell">Joined</Table.Head>
 							{#if owner}<Table.Head class="text-right"><span class="sr-only">Actions</span></Table.Head>{/if}
 						</Table.Row>
 					</Table.Header>
 					<Table.Body>
 						{#each data.members as member (member.account)}
 							<Table.Row data-testid="member-row">
-								<Table.Cell class="font-medium">{member.email}</Table.Cell>
+								<Table.Cell class="max-w-24 truncate font-medium sm:max-w-none" title={member.email}>{member.email}</Table.Cell>
 								<Table.Cell>
 									{#if owner}
 										<NativeSelect
 											size="sm"
+											class="min-w-24"
 											value={member.role}
 											disabled={rowBusy === member.account}
 											aria-label="Role for {member.email}"
@@ -244,7 +245,7 @@
 										{ROLE_WORDS[member.role]}
 									{/if}
 								</Table.Cell>
-								<Table.Cell class="text-muted-foreground">{when(member.created_at)}</Table.Cell>
+								<Table.Cell class="hidden text-muted-foreground sm:table-cell">{when(member.created_at)}</Table.Cell>
 								{#if owner}
 									<Table.Cell class="text-right">
 										<Button
