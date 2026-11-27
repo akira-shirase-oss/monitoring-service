@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### The droplet installer works on a clean server (2026-11-27)
+
+The install check had been failing before it reached most of its steps, so these were
+never seen. Each is now proven by `deploy-check` on a clean VM with an ordinary `/opt`.
+
+- **Fix: the service could not run its own binary on a real host.** The release
+  directory was created root-only and the install stopped with "Permission denied".
+- **Fix: Caddy did not start after an install.** It could not read the file listing
+  Cloudflare's address ranges.
+- **Fix: a second run of `install.sh` failed** ("text file busy" on the running
+  binary, and again when replacing the firewall rules for port 443).
+- **Fix: the installer's smoke test reported every install as failed.** It called the
+  API without the operator's token.
+- **Cloudflare's origin-pull CA is pinned by its certificate fingerprint**, and only
+  that one certificate is installed. Check the fingerprint in `install.sh` against
+  your Cloudflare dashboard before the first deploy.
+- **The systemd unit is sandboxed further:** exposure score 1.2 from
+  `systemd-analyze security` (it was 4.3; the project's bar is 2.0).
+
 ### The hosted dashboard is usable end to end (2026-11-27)
 
 - **Seven dashboard pages that were placeholders now work:** API tokens (the secret is

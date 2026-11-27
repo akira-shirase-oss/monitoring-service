@@ -26,12 +26,20 @@ if [[ "${1:-}" == --print ]]; then
 fi
 [[ $EUID -eq 0 ]] || { echo "error: run as root (or pass --print)" >&2; exit 2; }
 
-printf 'trusted_proxies static %s\n' "$(paste -sd' ' <<<"$ranges")" >/etc/caddy/cloudflare-trusted.caddy
+# Written with an explicit mode. install.sh runs under umask 077, and a file only root
+# can read stops Caddy, which runs as its own user, from starting at all. It is a list
+# of public address ranges: nothing in it is secret.
+trusted=$(mktemp)
+printf 'trusted_proxies static %s\n' "$(paste -sd' ' <<<"$ranges")" >"$trusted"
+install -m 0644 "$trusted" /etc/caddy/cloudflare-trusted.caddy
+rm -f "$trusted"
 
 # ufw: 443 from Cloudflare only. Existing rules for 443 are replaced; SSH is left alone.
 while ufw status numbered | grep -qE '\b443(/tcp)?\b'; do
   n=$(ufw status numbered | grep -E '\b443(/tcp)?\b' | head -1 | sed -E 's/^\[ *([0-9]+)\].*/\1/')
-  yes | ufw delete "$n" >/dev/null
+  # --force, not `yes |`: under pipefail the pipe fails when ufw exits before `yes`
+  # does, and the script would stop on the first rule it replaced.
+  ufw --force delete "$n" >/dev/null
 done
 while IFS= read -r range; do
   ufw allow proto tcp from "$range" to any port 443 comment 'cloudflare' >/dev/null

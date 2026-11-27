@@ -29,7 +29,16 @@ if jq -e '.status == "ready" or .status == "degraded"' <<<"$ready" >/dev/null 2>
 else bad "/readyz: $ready"; fi
 version=$(curl -fsS --max-time 5 "$local_url/version" || true)
 jq -e '.version' <<<"$version" >/dev/null 2>&1 && ok "/version: $(jq -r '.version' <<<"$version")" || bad "/version: $version"
-monitors=$(curl -sS --max-time 5 "$local_url/api/monitors" || true)
+# The API needs the operator's token, like anything else that calls it. It is read
+# from the env file and handed to curl in a header file, never on the command line
+# where another user could read it from the process list. Without a token the answer
+# is 401, which this check used to report as a failed install.
+env_file="${SMON_ENV_FILE:-/opt/smon/env}"
+hdr=$(mktemp); trap "rm -f '$hdr'" EXIT
+token=$(sed -n 's/^SMON_ADMIN_TOKEN=//p' "$env_file" 2>/dev/null | tail -n 1)
+if [ -n "$token" ]; then printf 'Authorization: Bearer %s\n' "$token" >"$hdr"; fi
+unset token
+monitors=$(curl -sS --max-time 5 -H @"$hdr" "$local_url/api/monitors" || true)
 jq -e '.monitors | type == "array"' <<<"$monitors" >/dev/null 2>&1 \
   && ok "/api/monitors answers ($(jq '.monitors | length' <<<"$monitors") registered)" \
   || bad "/api/monitors: $monitors"
