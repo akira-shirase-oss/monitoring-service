@@ -163,6 +163,9 @@ pub struct AppState {
     /// stale version re-resolves — the commit/insert race leaves no stale entry.
     /// `Arc` so every cloned `AppState` shares the one counter.
     pub status_slug_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Signalled after every status-page write, so the snapshot writer puts the
+    /// page's file on disk now rather than at its next heartbeat.
+    pub status_changed: snapshot::Wake,
     /// Per-workspace "send test alert" cooldowns (S2): the test is a real network
     /// send, so one per `TEST_SEND_EVERY` bounds what a member can aim at their
     /// receiver. Bounded like `token_use`: workspaces are bounded, and the map
@@ -1597,6 +1600,9 @@ async fn put_status_page(
             let _ = std::fs::remove_file(state.status_dir.join("s").join(format!("{}.json", ws.0)));
         }
     }
+    // The page's file follows the save, not the heartbeat: without this a page that
+    // was just published reads "monitoring unavailable" until the next beat.
+    state.status_changed.notify_one();
     Ok(Json(serde_json::json!({
         "status_page": {
             "slug": page.slug,

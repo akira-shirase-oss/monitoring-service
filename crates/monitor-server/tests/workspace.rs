@@ -56,6 +56,7 @@ async fn fixture_with(lab: bool, workspace_slots: usize) -> anyhow::Result<Fixtu
         status_writes: std::sync::Arc::default(),
         status_slugs: std::sync::Arc::default(),
         status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
         monitor_writes: std::sync::Arc::default(),
         invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
@@ -2095,5 +2096,72 @@ async fn an_unknown_slug_is_a_cached_miss() -> anyhow::Result<()> {
     }
     let (status, _, _) = call(&app, "GET", "/s/ws-neverhere/status.json", None, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// Waits until `path` exists — a file the snapshot writer is about to land. The
+/// deadline only bounds a hang; the test never depends on how fast the beat is.
+async fn landed(path: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} never landed", path.display()));
+}
+
+/// A saved page is on disk right away: the save wakes the snapshot writer, so a page
+/// someone just published answers with its own data instead of the born-expired
+/// placeholder for a whole heartbeat.
+#[tokio::test]
+async fn saving_a_status_page_writes_it_without_waiting_for_the_heartbeat() -> anyhow::Result<()> {
+    let (app, state, db, _tmp) = fixture(true).await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let mon = monitor(&app, &owner, "api").await;
+    let ws = workspace_of(&db, "owner@a.example").await?;
+
+    // A writer whose own heartbeat is an hour away: after its first beat, only a
+    // wake can bring another.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let writer = monitor_server::snapshot::spawn_woken(
+        db.clone(),
+        Arc::clone(&state.statuses),
+        state.vitals.clone(),
+        monitor_server::snapshot::Config {
+            dir: state.status_dir.clone(),
+            interval: Duration::from_hours(1),
+            ttl: Duration::from_secs(90),
+        },
+        Arc::clone(&state.status_changed),
+        shutdown.clone(),
+    );
+    landed(&state.status_dir.join("status.json")).await;
+    let page = state.status_dir.join(format!("s/{ws}.json"));
+    assert!(!page.exists(), "no page is enabled yet");
+
+    let (status, _, body) = call(
+        &app,
+        "PUT",
+        "/api/workspace/status-page",
+        Some(serde_json::json!({
+            "slug": "acme-now", "title": "Acme now", "monitor_ids": [mon],
+        })),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    landed(&page).await;
+    let (status, _, body) = call(&app, "GET", "/s/acme-now/status.json", None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The placeholder a never-written page answers with carries no title; the
+    // writer's file does.
+    assert_eq!(body["title"], "Acme now", "{body}");
+    assert_eq!(body["services"].as_array().map(Vec::len), Some(1), "{body}");
+
+    shutdown.cancel();
+    writer.await?;
     Ok(())
 }

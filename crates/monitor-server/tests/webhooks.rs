@@ -48,6 +48,7 @@ async fn fixture() -> anyhow::Result<Fixture> {
         status_writes: std::sync::Arc::default(),
         status_slugs: std::sync::Arc::default(),
         status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
         monitor_writes: std::sync::Arc::default(),
         invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),

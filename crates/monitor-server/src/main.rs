@@ -201,10 +201,12 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
     // in the table — visible, never silently dropped.
     spawn_deliverers(&config, &db, &writer, smtp, &shutdown, &supervisor);
 
+    // One signal shared by the API (a status page was saved) and the writer (beat now).
+    let status_changed = monitor_server::snapshot::Wake::default();
     supervisor.watch(
         "snapshot",
         Role::Supporting,
-        spawn_snapshot(&config, &db, &statuses, &vitals, &shutdown),
+        spawn_snapshot(&config, &db, &statuses, &vitals, &status_changed, &shutdown),
     );
     supervisor.watch(
         "retention",
@@ -221,6 +223,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         registry_tx,
         vitals.clone(),
         admin_token,
+        status_changed,
     );
     let app = assemble_app(state, &config, &supervisor, &shutdown).await?;
 
@@ -334,6 +337,7 @@ fn app_state(
     registry: watch::Sender<Arc<Vec<monitor_domain::Monitor>>>,
     vitals: Vitals,
     admin_token: monitor_server::auth::AdminToken,
+    status_changed: monitor_server::snapshot::Wake,
 ) -> AppState {
     AppState {
         db,
@@ -350,6 +354,7 @@ fn app_state(
         status_writes: std::sync::Arc::default(),
         status_slugs: std::sync::Arc::default(),
         status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed,
         monitor_writes: std::sync::Arc::default(),
         invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
@@ -492,10 +497,11 @@ fn spawn_snapshot(
     db: &monitor_db::Db,
     statuses: &SharedStatuses,
     vitals: &Vitals,
+    status_changed: &monitor_server::snapshot::Wake,
     shutdown: &CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tracing::info!(dir = %config.status_dir, "writing status snapshots");
-    monitor_server::snapshot::spawn(
+    monitor_server::snapshot::spawn_woken(
         db.clone(),
         Arc::clone(statuses),
         vitals.clone(),
@@ -504,6 +510,7 @@ fn spawn_snapshot(
             interval: config.status_interval,
             ttl: config.status_ttl,
         },
+        Arc::clone(status_changed),
         shutdown.clone(),
     )
 }

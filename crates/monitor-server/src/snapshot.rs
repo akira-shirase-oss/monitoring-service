@@ -304,6 +304,15 @@ pub async fn write_beat(
     Ok(())
 }
 
+/// Asks the writer for a beat now instead of at its next tick. A status-page save
+/// signals it, so a page someone just published answers with real data at once
+/// rather than reading "monitoring unavailable" until the heartbeat comes round.
+pub type Wake = std::sync::Arc<tokio::sync::Notify>;
+
+/// The least time between two woken beats. A beat reads every enabled page, so saves
+/// arriving in a burst share one beat instead of each buying a full pass.
+const WAKE_FLOOR: Duration = Duration::from_secs(1);
+
 /// Periodic snapshot writer. Its failures are honest: a stopped writer means an expiring
 /// snapshot, which the reader reads as "monitoring unavailable" — the correct verdict.
 pub fn spawn(
@@ -313,6 +322,18 @@ pub fn spawn(
     config: Config,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_woken(db, statuses, vitals, config, Wake::default(), shutdown)
+}
+
+/// [`spawn`], plus a [`Wake`] that brings the next beat forward.
+pub fn spawn_woken(
+    db: Db,
+    statuses: SharedStatuses,
+    vitals: Vitals,
+    config: Config,
+    wake: Wake,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = std::fs::create_dir_all(&config.dir) {
             tracing::error!(%error, dir = %config.dir.display(), "status dir unusable; no snapshots");
@@ -320,9 +341,18 @@ pub fn spawn(
         }
         let mut ticks = tokio::time::interval(config.interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut wake_from = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = ticks.tick() => {}
+                // A wake that arrives inside the floor is kept (`Notify` holds one
+                // permit) and answered when the floor has passed.
+                () = async {
+                    tokio::time::sleep_until(wake_from).await;
+                    wake.notified().await;
+                } => {
+                    wake_from = tokio::time::Instant::now() + WAKE_FLOOR;
+                }
                 () = shutdown.cancelled() => return,
             }
             let observing = vitals.verdict().observing();
