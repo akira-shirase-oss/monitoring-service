@@ -41,10 +41,16 @@ struct Rig {
 }
 
 async fn rig() -> anyhow::Result<Rig> {
+    rig_with(1).await
+}
+
+/// A rig whose store pool holds `connections`: more than one lets a test read the
+/// store while a request's transaction is still open.
+async fn rig_with(connections: u32) -> anyhow::Result<Rig> {
     let tmp = tempfile::tempdir()?;
     let db = Db::connect(
         &format!("sqlite:{}", tmp.path().join("api.db").display()),
-        1,
+        connections,
     )
     .await?;
     db.migrate().await?;
@@ -938,6 +944,61 @@ async fn a_deleted_account_leaves_no_way_back_in() -> anyhow::Result<()> {
         StatusCode::OK
     );
     assert!(pair.kept_file.exists());
+    Ok(())
+}
+
+/// A deletion that committed is finished even when its request is not: the client
+/// hung up, or the deadline passed. The request is polled by hand and dropped the
+/// moment the store shows the account gone; the schedule must still be republished
+/// without the deleted monitor, or the coordinator would go on probing a target whose
+/// owner no longer exists.
+#[tokio::test]
+async fn a_deletion_whose_request_is_dropped_still_leaves_the_schedule() -> anyhow::Result<()> {
+    let rig = rig_with(2).await?;
+    let leaving = sign_up(&rig.app, "leaving@tenant.example").await;
+    sign_up(&rig.app, "staying@tenant.example").await;
+    let gone = workspace_of(&rig.db, "leaving@tenant.example").await?;
+    let kept = workspace_of(&rig.db, "staying@tenant.example").await?;
+    seed(&rig, gone, "leaving-api").await?;
+    let kept_monitor = seed(&rig, kept, "staying-api").await?;
+    let mut registry = rig.registry.clone();
+    registry.borrow_and_update();
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/api/account")
+        .header(header::COOKIE, format!("__Host-smon_session={leaving}"))
+        .header(header::HOST, "api.test")
+        .header(header::ORIGIN, "http://api.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"password": PASSWORD}).to_string()))?;
+    {
+        let mut pending = std::pin::pin!(rig.app.clone().oneshot(request));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            // One poll of the request, then a look at the store.
+            let answered = tokio::time::timeout(Duration::ZERO, &mut pending)
+                .await
+                .is_ok();
+            let account = rig.db.account_by_email("leaving@tenant.example").await?;
+            if answered || account.is_none() {
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the deletion never committed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The request is dropped here, answered or not.
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), registry.changed())
+        .await
+        .map_err(|_| anyhow::anyhow!("the schedule was never republished after the deletion"))??;
+    let scheduled: Vec<MonitorId> = registry.borrow().iter().map(|m| m.id).collect();
+    assert_eq!(scheduled, vec![kept_monitor.id]);
+    assert!(rig.db.workspace_row(gone).await?.is_none());
     Ok(())
 }
 

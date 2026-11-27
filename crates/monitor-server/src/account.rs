@@ -199,18 +199,22 @@ pub(crate) async fn delete_account(
     {
         return *refusal;
     }
-    let gone = match state.db.delete_account(account).await {
-        Ok(gone) => gone,
-        Err(QueryError::Conflict(message)) => return ApiError::Conflict(message).into_response(),
-        Err(error) => return ApiError::Db(error).into_response(),
-    };
-    forget_workspaces(&state, &gone).await;
-    // The account is gone whatever happens next, so the answer is 204 either way. A
-    // registry that could not be re-read is logged: until the next schedule write the
-    // coordinator probes monitors that no longer exist, and the writer drops their
-    // results.
-    if let Err(error) = crate::publish_registry(&state).await {
-        tracing::error!(%error, "registry not republished after an account deletion");
+    // The deletion and what follows it run to the end even if this request is dropped
+    // (the client hung up, the deadline passed): a committed deletion whose monitors
+    // stayed on the schedule would keep probing targets nobody watches any more. The
+    // task is short (one store transaction, a few file removals, one registry read)
+    // and it is awaited here.
+    let work = tokio::spawn(delete_and_forget(state.clone(), account));
+    match work.await {
+        Ok(Ok(())) => {}
+        Ok(Err(QueryError::Conflict(message))) => {
+            return ApiError::Conflict(message).into_response();
+        }
+        Ok(Err(error)) => return ApiError::Db(error).into_response(),
+        Err(join) => {
+            tracing::error!(error = %join, "account deletion task did not finish");
+            return ApiError::Corrupt.into_response();
+        }
     }
     (
         StatusCode::NO_CONTENT,
@@ -220,6 +224,19 @@ pub(crate) async fn delete_account(
         )],
     )
         .into_response()
+}
+
+/// The store's deletion, then everything held outside the store that must follow it.
+async fn delete_and_forget(state: AppState, account: AccountId) -> Result<(), QueryError> {
+    let gone = state.db.delete_account(account).await?;
+    forget_workspaces(&state, &gone).await;
+    // The account is gone whatever happens next, so a registry that could not be
+    // re-read is logged, not answered: until the next schedule write the coordinator
+    // probes monitors that no longer exist, and the writer drops their results.
+    if let Err(error) = crate::publish_registry(&state).await {
+        tracing::error!(%error, "registry not republished after an account deletion");
+    }
+    Ok(())
 }
 
 /// Drop what the server holds about deleted workspaces outside the store: their slugs
