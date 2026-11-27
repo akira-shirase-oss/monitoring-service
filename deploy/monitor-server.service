@@ -60,6 +60,26 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The rest of the sandbox. The server is one process that reads its own files, talks
+# HTTP and writes SQLite: it needs none of the things below, so each is taken away.
+# What stays open is what the job needs: the host's network (it probes public
+# addresses, so no address allow-list fits) and the three socket families above.
+ProtectClock=true
+ProtectKernelLogs=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateUsers=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# The ordinary service set, minus the calls that change who the process is. A call
+# outside the filter is refused with an error rather than killing the server.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
 ReadWritePaths=/opt/smon/data /opt/smon/status
 
 [Install]
