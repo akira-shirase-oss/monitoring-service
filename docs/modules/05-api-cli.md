@@ -154,3 +154,25 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Plan limits:** each row of `GET /api/workspaces` carries `limits`
   (`max_monitors`, `min_interval_s`, `check_retention_days`,
   `incident_retention_days`); `null` means the plan sets no figure of its own.
+- **Account lifecycle (D-027):** account sessions only; a token or the operator gets
+  403 `forbidden`. Both routes confirm the account's password under the sign-in
+  throttle and password-work limit: wrong → 401 `unauthenticated` ("invalid
+  credentials"), address out of guesses → 429 + `Retry-After`, hashing queue full →
+  503 `busy`.
+  - `POST /api/account/password` `{current_password, new_password}` → 204. The new
+    password follows the sign-up rule (422 otherwise). Every other session of the
+    account ends; the calling one stays.
+  - `DELETE /api/account` `{password}` → 204 and an expired session cookie. Deletes
+    the account, every workspace only it is a member of (with all its data), its seats
+    elsewhere and invitations addressed to it. 409 `conflict` while it is the only
+    owner of a workspace that has other members, and while a workspace it would
+    delete holds more than 50,000 raw checks (delete monitors with their history
+    first: that works in batches, this is one transaction).
+- **Workspace export (D-027):** `GET /api/workspace/export` → the caller's workspace as
+  one JSON attachment (`service-monitor-export-<slug>.json`, `no-store`): `workspace`,
+  `members` (email, role), `monitors`, `maintenance_windows`, `incidents`,
+  `daily_aggregates`, and `checks` as `[{monitor_id, truncated, rows}]`. Owner work
+  (the operator included); members, viewers and every token get 403. Bounds: 5,000
+  checks per monitor and 50,000 per export, 5,000 incidents, 5,000 windows, 40,000
+  daily rows, newest first; one export per workspace per 10 s (429 + `Retry-After`).
+  No secret of any kind is in it: no webhook URL or signing secret, no token, no hash.

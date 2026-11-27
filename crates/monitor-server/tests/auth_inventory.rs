@@ -308,6 +308,9 @@ async fn every_api_route_and_method_denies_a_request_without_a_valid_credential(
         ("/api/maintenance/{id}", "DELETE"),
         ("/api/incidents", "GET"),
         ("/api/backup", "POST"),
+        ("/api/account", "DELETE"),
+        ("/api/account/password", "POST"),
+        ("/api/workspace/export", "GET"),
     ] {
         assert!(
             inventory.get(template).is_some_and(|m| m.contains(method)),

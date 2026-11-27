@@ -539,6 +539,113 @@ failed write (a failed write counts against the whole engine's health).
 Every statement is bound to the caller's workspace: another workspace's monitor
 id deletes nothing, and a test weakening that binding fails.
 
+## D-027 — An account can change its password, delete itself, and take its data with it
+
+Until now an account could sign up, sign in and sign out. It could not change its
+password, could not leave, and a workspace could not take its record anywhere. The
+hosted plan names "delete workspace (and its evidence), export evidence" as a
+requirement; these three routes are that requirement.
+
+**Who may ask.** `POST /api/account/password` and `DELETE /api/account` answer only an
+account session. A workspace API token is the workspace's credential and the operator
+has no account, so both get 403. Both routes ask for the account's password again, and
+that check is a credential guess like a sign-in: it takes a guess from the caller's
+address before anything is compared (429 once the address has none left), runs under
+the same password-work limit (503 `busy` when the queue is full), answers a wrong
+password with the sign-in's own 401, and gives the guess back when the password is
+right. `GET /api/workspace/export` is owner work; the operator acts at owner level in
+the workspace it picks, and a token never holds owner, so every token gets 403.
+
+**Changing a password.** The new password follows the sign-up rule (8 to 256 bytes),
+checked by the same function. One transaction stores the new hash and ends every other
+session of the account; the session that made the change stays signed in. Sign-in now
+creates its session only while the hash it verified is still the stored one, so a
+sign-in that was verifying the old password while the change committed gets a 401, not
+a session that outlives the change.
+
+**Deleting an account — what is deleted.** In one transaction:
+
+- every workspace whose only member is the account, with everything recorded in it:
+  monitors, checks, daily aggregates, incidents, queued alerts, maintenance windows,
+  the status page's listing and the slugs it held, API tokens, pending invitations and
+  the member row;
+- the account's seat in every other workspace;
+- invitations addressed to its email;
+- all its sessions, and the account row.
+
+After the commit the schedule is republished without the deleted monitors, the deleted
+workspaces' status pages stop resolving at once and their snapshot files are removed,
+and the response expires the session cookie.
+
+**What is refused.** While the account is the only owner of a workspace that has other
+members the answer is 409: `the workspace "<name>" needs an owner: make another member
+an owner, then delete your account`. The same rule as demoting or removing the last
+owner, for the same reason: the others would be left in a workspace nobody can
+administer. Nothing is deleted and the account stays signed in.
+
+Also 409, the same way, while a workspace that would be deleted holds more than 50,000
+raw checks: `the workspace "<name>" holds too much history to delete in one step:
+delete its monitors with their history, then delete your account`. The deletion is one
+transaction and every workspace's check results wait on the store's one write lock
+while it runs, so it has to stay small. Deleting a monitor with its history works in
+batches (D-026) and brings a workspace under the bound. A free-plan workspace at its
+limits holds about 29,000 (ten monitors, one check a minute, kept two days).
+
+**What is kept on purpose.**
+
+- The seeded default workspace is never deleted, whoever sits in it: it is the
+  operator's. An account that is its only member just leaves it.
+- A shared workspace keeps the API tokens the leaver minted. They are the workspace's
+  credentials and its remaining owners can revoke them; only "created by" is cleared.
+- The signup invite the account used stays spent.
+- `accounts.workspace_id` (where a session lands when it names no workspace) has no
+  cascade. An account can no longer be removed from its own workspace, but a row
+  written before that rule can still call a workspace home without a seat in it. If
+  such a workspace is deleted, that *other* account is moved to the workspace it joined
+  first, or to the seeded default workspace when it has no seat anywhere. It gets no
+  seat it did not have: an account with no membership answers `not_a_member` before
+  and after. Without the move the foreign key would refuse the deletion for ever.
+
+**What is given up, stated plainly.**
+
+- There is no undo and no grace period. The checks, incidents and aggregates of a
+  deleted workspace are gone, and only an export taken beforehand has them.
+- Open incidents' pending alerts are dropped with the workspace: no "recovered" alert
+  follows. A probe in flight at that moment commits against a monitor that is gone,
+  which the writer already drops.
+- The workspace's status-page slug, and the slugs it held, are free again. A later
+  workspace can publish under a name readers knew. Holding names for ever on behalf
+  of workspaces that no longer exist was judged the worse trade.
+- The delete is one write transaction on a single-writer store, bounded at 50,000 raw
+  checks per workspace. Probe commits wait behind it for that long, which is far more
+  than one batch of a monitor's deletion (2,000 rows) and far less than their busy
+  timeout. The deletes reach checks and aggregates through the per-monitor indexes,
+  never by scanning other tenants' rows. A workspace above the bound is not shed
+  automatically: its owner deletes monitors first. Doing that for them in batches
+  would need a way to stop anyone joining the workspace half-way, and was left out.
+- Backups taken before the deletion still hold the account and its data. Deleting an
+  account does not reach into them.
+- The deletion and what follows it (republishing the schedule, retiring the status
+  pages) run in one task that finishes even if the request is dropped. If the process
+  dies between the commit and those steps, the next boot reads the schedule and the
+  pages from the store, so nothing of the deleted workspace comes back.
+
+**The export.** One JSON document for the caller's workspace: the workspace (id, name,
+slug, plan), the roster as email and role, the monitors as the API shows them,
+maintenance windows, incidents, daily aggregates and raw checks. It never carries the
+webhook URL or its signing secret, API tokens or their digests, password hashes,
+sessions or invitations, and every read goes through the workspace's own view of the
+store. It is bounded: each monitor's newest 5,000 checks and at most 50,000 checks in
+all (`checks[].truncated` says when a monitor has more), the newest 5,000 incidents
+and 5,000 maintenance windows and 40,000 daily rows (the top-level `truncated` object
+says when there are more), and one export per workspace every 10 seconds (429 with
+`Retry-After` inside that). It is sent as an attachment named
+`service-monitor-export-<slug>.json` and marked `no-store`.
+
+Pinned by `tests/account.rs` in both crates: the store tests count every tenant-owned
+table through a second connection before and after a deletion, and the API tests
+assert each refusal by its sentence and re-read the stored state afterwards.
+
 ## D-028 — The per-address budget is two token buckets and nothing else (replaces D-024's queue)
 
 D-024's ceiling and share stay: 8 probe starts a second at one resolved address
@@ -592,4 +699,3 @@ addresses of a public monitoring service are published facts, not secrets.
 Restricting the check to the registered origin was rejected because ordinary
 sites redirect between origins (to `https`, to `www`), and those are exactly
 the pages a body expectation is for.
-

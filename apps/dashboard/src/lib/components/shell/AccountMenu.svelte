@@ -1,5 +1,6 @@
 <!--
-  Who is signed in, and signing out, from the sidebar's foot. Signing out ends the session
+  Who is signed in, the way to their account page, and signing out, from the sidebar's
+  foot. Signing out ends the session
   on the server first — the row dies server-side, not just in this tab — then the page
   reloads onto the sign-in screen, so nothing of the old session stays in memory. If the
   server can't be reached it says so and stays signed in: it never claims a sign-out
@@ -7,6 +8,8 @@
 -->
 <script lang="ts">
 	import LogOutIcon from '@lucide/svelte/icons/log-out';
+	import UserRoundIcon from '@lucide/svelte/icons/user-round';
+	import { goto } from '$app/navigation';
 	import { toast } from 'svelte-sonner';
 	import { buttonVariants } from '#lib/components/ui/button/index.js';
 	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
@@ -53,6 +56,9 @@
 			<span class="text-xs text-muted-foreground">role: {role}</span>
 		</DropdownMenu.Label>
 		<DropdownMenu.Separator />
+		<DropdownMenu.Item onSelect={() => goto('/account')} data-testid="account-settings">
+			<UserRoundIcon />Account
+		</DropdownMenu.Item>
 		<DropdownMenu.Item onSelect={leave} disabled={busy} data-testid="sign-out">
 			<LogOutIcon />{busy ? 'Signing out…' : 'Sign out'}
 		</DropdownMenu.Item>
