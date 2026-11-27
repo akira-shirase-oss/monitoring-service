@@ -90,9 +90,10 @@ impl PasswordPace {
             .then(|| PASSWORD_CHANGE_WINDOW.saturating_sub(age))
     }
 
-    /// Count one accepted change. Only a change that was stored is counted: a busy
-    /// hasher or a refused write costs the account nothing.
-    fn accepted(&self, account: AccountId) {
+    /// Charge one change, right after the current password verified: check and count
+    /// in one step under the lock, so requests arriving together cannot each see room.
+    /// `Err` is how long until the account may try again.
+    fn charge(&self, account: AccountId) -> Result<(), Duration> {
         let now = tokio::time::Instant::now();
         let mut held = self.lock();
         if held.len() >= EXPORT_PACE_CAP {
@@ -102,7 +103,20 @@ impl PasswordPace {
         if now.duration_since(entry.0) >= PASSWORD_CHANGE_WINDOW {
             *entry = (now, 0);
         }
+        if entry.1 >= PASSWORD_CHANGES {
+            return Err(PASSWORD_CHANGE_WINDOW.saturating_sub(now.duration_since(entry.0)));
+        }
         entry.1 += 1;
+        Ok(())
+    }
+
+    /// Give one charge back: the server could not do the work (the hasher was busy, the
+    /// store failed). A request that lost to another change, or that the client walked
+    /// away from, keeps its charge — the hashing it cost was spent either way.
+    fn refund(&self, account: AccountId) {
+        if let Some(entry) = self.lock().get_mut(&account) {
+            entry.1 = entry.1.saturating_sub(1);
+        }
     }
 }
 
@@ -225,7 +239,7 @@ pub(crate) async fn change_password(
     // bound a signed-in account that loops this route with the right password, and
     // each pass costs password hashing on a pool everyone's sign-ins share. The
     // account's own small budget does. It is asked first, so a spent budget costs no
-    // hashing, and it is counted only when a change is actually stored.
+    // hashing at all, and charged as soon as the current password has verified.
     let pace = extensions.get::<PasswordPace>().cloned();
     if let Some(wait) = pace.as_ref().and_then(|pace| pace.spent(account)) {
         return ApiError::TooMany(wait).into_response();
@@ -242,10 +256,24 @@ pub(crate) async fn change_password(
         Ok(verified) => verified,
         Err(refusal) => return *refusal,
     };
+    // Charged here, before the new password is hashed: from this point the request
+    // costs hashing whether or not its change is the one that lands.
+    if let Some(Err(wait)) = pace.as_ref().map(|pace| pace.charge(account)) {
+        return ApiError::TooMany(wait).into_response();
+    }
+    let refund = || {
+        if let Some(pace) = &pace {
+            pace.refund(account);
+        }
+    };
     let hash = match auth::hash_password(&body.new_password, state.password_work_wait).await {
         Ok(hash) => hash,
-        Err(auth::PasswordWorkError::Busy) => return crate::password_busy(),
+        Err(auth::PasswordWorkError::Busy) => {
+            refund();
+            return crate::password_busy();
+        }
         Err(auth::PasswordWorkError::Hash(error)) => {
+            refund();
             tracing::error!(%error, "password hashing failed");
             return ApiError::Corrupt.into_response();
         }
@@ -255,16 +283,14 @@ pub(crate) async fn change_password(
         .set_account_password(account, &verified, &hash, &keep)
         .await
     {
-        Ok(true) => {
-            if let Some(pace) = pace {
-                pace.accepted(account);
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
         // The account was deleted, or its password changed, while this request ran:
-        // what it proved is no longer the account's password.
+        // what it proved is no longer the account's password. The charge stands.
         Ok(false) => crate::invalid_credentials(),
-        Err(error) => ApiError::Db(error).into_response(),
+        Err(error) => {
+            refund();
+            ApiError::Db(error).into_response()
+        }
     }
 }
 
@@ -551,4 +577,38 @@ fn attachment(slug: &str, body: serde_json::Value) -> Response {
         Json(body),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The budget is checked and counted in one step, so a burst cannot see room five
+    /// times over; a refund gives back exactly one place; and one account's charges
+    /// are never another's.
+    #[tokio::test(start_paused = true)]
+    async fn the_password_budget_charges_atomically_and_per_account() {
+        let pace = PasswordPace::default();
+        let (ada, bob) = (AccountId::new(), AccountId::new());
+        assert!(pace.spent(ada).is_none(), "nothing spent yet");
+        for _ in 0..PASSWORD_CHANGES {
+            assert!(pace.charge(ada).is_ok());
+        }
+        assert!(pace.charge(ada).is_err(), "the sixth charge is refused");
+        assert!(pace.spent(ada).is_some());
+        assert!(
+            pace.charge(bob).is_ok(),
+            "another account has its own budget"
+        );
+
+        pace.refund(ada);
+        assert!(pace.spent(ada).is_none(), "a refund gives one place back");
+        assert!(pace.charge(ada).is_ok());
+        assert!(pace.charge(ada).is_err(), "and only one");
+
+        // The window passes: the budget starts again.
+        tokio::time::advance(PASSWORD_CHANGE_WINDOW).await;
+        assert!(pace.spent(ada).is_none());
+        assert!(pace.charge(ada).is_ok());
+    }
 }

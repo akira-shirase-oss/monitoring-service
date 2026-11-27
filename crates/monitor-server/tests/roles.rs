@@ -787,7 +787,7 @@ async fn an_invitation_address_is_bounded() -> anyhow::Result<()> {
     let (app, _state, _db, _tmp) = fixture().await?;
     let owner = sign_up(&app, "owner@a.example").await;
     let long = format!("{}@b.example", "x".repeat(250));
-    for email in [long.as_str(), "two words@b.example", "no-at-sign"] {
+    for email in [long.as_str(), "no-at-sign"] {
         let (status, _, body) = call(
             &app,
             "POST",

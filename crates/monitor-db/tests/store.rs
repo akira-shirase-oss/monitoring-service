@@ -3014,3 +3014,56 @@ async fn windows_per_monitor_and_tokens_per_workspace_are_capped() -> anyhow::Re
     assert!(db.api_token_by_digest("digest-after").await?.is_some());
     Ok(())
 }
+
+/// A workspace an earlier version let grow past the cap is not stuck: a mint trims as
+/// many of its oldest revoked tokens as it takes to leave one place.
+#[tokio::test]
+async fn a_workspace_over_the_token_cap_can_mint_again() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("tokens.db").display());
+    let db = Db::connect(&url, 2).await?;
+    db.migrate().await?;
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let workspace = WorkspaceId::DEFAULT.0.to_string();
+    // Three more rows than the cap, written straight into the table; five are revoked.
+    let over = monitor_db::MAX_TOKENS_PER_WORKSPACE + 3;
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+         INSERT INTO api_tokens (id, workspace_id, name, token_digest, role, created_at, revoked_at)
+         SELECT 'old-' || i, ?2, 'old', 'old-digest-' || i, 'viewer', '2026-01-01T00:00:00Z',
+                CASE WHEN i <= 5 THEN '2026-01-0' || i || 'T00:00:00Z' END
+           FROM n",
+    )
+    .bind(over)
+    .bind(&workspace)
+    .execute(&pool)
+    .await?;
+
+    db.owner(WorkspaceId::DEFAULT)
+        .create_api_token(
+            "new",
+            Role::Viewer,
+            "new-digest",
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?")
+        .bind(&workspace)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        held,
+        monitor_db::MAX_TOKENS_PER_WORKSPACE,
+        "trimmed to the cap, the new token included"
+    );
+    let revoked_left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE revoked_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        revoked_left, 1,
+        "the four oldest revoked made room; no active token was touched"
+    );
+    Ok(())
+}

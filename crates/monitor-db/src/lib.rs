@@ -3200,10 +3200,11 @@ impl OwnerDb<'_> {
         let mut tx = view.db.pool.begin().await?;
         sqlx::query(
             "DELETE FROM api_tokens
-              WHERE id = (SELECT id FROM api_tokens
-                           WHERE workspace_id = ?1 AND revoked_at IS NOT NULL
-                           ORDER BY revoked_at LIMIT 1)
-                AND (SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?1) >= ?2",
+              WHERE id IN (SELECT id FROM api_tokens
+                            WHERE workspace_id = ?1 AND revoked_at IS NOT NULL
+                            ORDER BY revoked_at
+                            LIMIT MAX(0, (SELECT COUNT(*) FROM api_tokens
+                                           WHERE workspace_id = ?1) - ?2 + 1))",
         )
         .bind(&workspace)
         .bind(MAX_TOKENS_PER_WORKSPACE)

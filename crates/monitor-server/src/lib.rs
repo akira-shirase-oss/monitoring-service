@@ -1038,14 +1038,10 @@ async fn add_member(
         return Err(ApiError::Invalid("email and role are required".into()));
     };
     let email = email.trim().to_lowercase();
-    // 254 characters is the longest address that can be delivered to. Unbounded, each
-    // pending invitation could hold kilobytes, in rows that go with the workspace in
-    // one cascade.
-    if email.is_empty()
-        || !email.contains('@')
-        || email.chars().count() > 254
-        || email.chars().any(|c| c.is_control() || c.is_whitespace())
-    {
+    // The same shape sign-up accepts, so every account that exists can be invited,
+    // and the same length bound: unbounded, each pending invitation could hold
+    // kilobytes, in rows that go with the workspace in one cascade.
+    if email.is_empty() || !email.contains('@') || email.len() > 254 {
         return Err(ApiError::Invalid("email must be an email address".into()));
     }
     spend_write_budget(

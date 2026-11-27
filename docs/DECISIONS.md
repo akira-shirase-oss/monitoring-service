@@ -738,12 +738,15 @@ rule the code keeps:
 - **Accepted password changes have their own budget, per account**: five per ten
   minutes. A right password gives its address guess back, so nothing else bounded a
   loop of them, and each costs password hashing on a pool every sign-in shares. The
-  budget is asked before the password is verified and counted only when a change is
-  stored. It is keyed by the account and never by a workspace: a workspace is shared
+  budget is asked before the password is verified (a spent budget costs no hashing)
+  and charged, in one step, as soon as the password has verified; the charge is given
+  back only when the server itself could not do the work. It is keyed by the account and never by a workspace: a workspace is shared
   and the caller names it, so a workspace key let one member spend everyone's changes.
 - **An invitation's address is at most 254 characters**, and pending invitations count
   toward account deletion's row bound, like windows and tokens.
 - **The API-token cap is one transaction**, so concurrent mints cannot each see room.
+  At the cap it removes as many of the oldest revoked tokens as it takes to leave one
+  place, so a workspace that grew past the cap earlier is not stuck.
 - **The schedule is read and published as one step**, so two publishers cannot leave
   the coordinator on the older of two reads.
 
