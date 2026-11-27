@@ -431,6 +431,9 @@ maintainer confirms it is gone. Consequences:
 
 ## D-024 — The per-address probe budget is a global ceiling with a per-workspace share
 
+*The round-robin queue described below was removed by D-028; the ceiling, the share
+and where the charge is made still stand.*
+
 Every probe start pays one resolved IP's token bucket — 8/s shared across all
 workspaces (the ceiling the write-time `addr:port` bound assumes), under a 2/s
 per-workspace share so the heaviest spender stops at its own rate. While the
@@ -502,12 +505,22 @@ or 501 answer is committed as that status — never rewritten to GET or retried.
 
 `DELETE /api/monitors/{id}` keeps its old answer: a monitor that has recorded a
 check or an incident is refused with 409, so no client removes history by
-accident. `DELETE /api/monitors/{id}?evidence=delete` is the explicit form: one
-transaction removes the monitor's queued alerts, incidents, checks and daily
-aggregates and then the monitor, whose maintenance windows and status-page
-listing cascade. Any other value of `evidence` is 422. Member work, like every
-other monitor write. The dashboard always asks through a confirmation that
-names what is removed.
+accident. `DELETE /api/monitors/{id}?evidence=delete` is the explicit form: it
+removes the monitor's queued alerts, incidents, checks and daily aggregates and
+then the monitor, whose maintenance windows and status-page listing cascade.
+Any other value of `evidence` is 422. Member work, like every other monitor
+write, and it spends the same per-workspace write budget. The dashboard always
+asks through a confirmation that names what is removed.
+
+It is not one transaction, on purpose. The store has one write lock and every
+workspace's observation commits wait on it, so the delete first pauses the
+monitor and bumps its generation, then removes the evidence in batches of 2,000
+rows, each its own short transaction, and only the last step (whatever arrived
+meanwhile, plus the monitor row) is atomic. A failure part-way leaves a paused
+monitor with some evidence gone; asking again finishes it. The child-side
+indexes this needs (outbox by incident and by monitor, incidents by monitor,
+status listing by monitor) came with it: without them SQLite scanned a whole
+child table for every parent row deleted.
 
 Why the earlier rule (the gap log's "history is preserved by not deleting") had
 to bend for the hosted product: a workspace's evidence is the workspace's own
@@ -520,6 +533,63 @@ What is given up, stated plainly: after such a delete the incidents and checks
 of that monitor are gone and no export can bring them back, an open incident's
 pending alerts are dropped with it (no "recovered" alert follows), and the
 aggregates no longer show that the monitor existed. A probe in flight at that
-moment commits against a monitor that is gone, which the writer already drops.
+moment is dropped: as stale once the generation is bumped, and, if its commit
+lands after the monitor row is gone, as "monitor deleted" rather than as a
+failed write (a failed write counts against the whole engine's health).
 Every statement is bound to the caller's workspace: another workspace's monitor
 id deletes nothing, and a test weakening that binding fails.
+
+## D-028 — The per-address budget is two token buckets and nothing else (replaces D-024's queue)
+
+D-024's ceiling and share stay: 8 probe starts a second at one resolved address
+across every workspace, and 2 a second for each workspace there. What goes is
+the queue that took over once the ceiling was spent. A start is now paid when
+the address's bucket and the workspace's own bucket each hold a token, and
+refused otherwise. A refusal remembers nothing.
+
+Why the queue went. The scheduler asks once per slot and never comes back for
+an answer, so a "place in line" was only the memory of a refused call, and only
+the head of the line could be paid. A head that was not asking at that moment
+blocked the address until it had been silent for five minutes, with tokens in
+the bucket the whole time. Two workspaces with two monitors each on one address
+were enough: after one burst emptied the bucket once, half their monitors were
+never served again. Each refusal is recorded as `missed` with `address_budget`,
+which is neutral to streaks, so a real outage on those monitors would not have
+opened an incident. A test now runs that schedule for ten minutes and requires
+every start to be paid.
+
+What this rule guarantees: below the ceiling every start is paid; no workspace
+takes more than its share at an address, so three workspaces at their full share
+still leave room for a fourth; total starts at an address never exceed
+`burst + rate·t`. What it does not guarantee: an order. If workspaces together
+ask for more than 8 starts a second at one address for a sustained time, the
+tokens go to whoever asks when one is there, and the rest are recorded as
+missed with the reason. Reaching that takes four workspaces each running their
+full 2 starts a second at one address, which the free plan's limits (10
+monitors, one check a minute) cannot do: it needs operator-plan workspaces or
+about fifty free ones aimed at the same address. The coverage figure shows it
+when it happens. A bounded-wait guarantee would need refused starts to wait for
+a token, with a claim per monitor released on cancel; that is a scheduler
+change to make when real load asks for it, not a queue beside a caller that
+does not wait.
+
+Also fixed here: a bucket's clock never moves backwards (the clock is read
+before the lock, and a reversed arrival used to credit the gap twice), and an
+address forgets workspace shares that have fully refilled once it holds 256.
+
+## D-029 — A probe's source address is not a credential, and body text is checked wherever the redirect ends
+
+A monitor may follow redirects to another public host, and a body expectation
+is checked against the final response. A workspace could therefore register a
+URL of its own that redirects to someone else's public URL and learn, one bit
+per check, whether the first 64 KiB of that response contains a string. The
+same is already true of the status code. The bound is unchanged: only public
+addresses are ever dialed, every hop is revalidated, and the request carries no
+credential of anyone's. The remaining exposure is a third party that serves
+different content to this service's egress address because it trusts that
+address, and such trust is the third party's mistake to make: the egress
+addresses of a public monitoring service are published facts, not secrets.
+Restricting the check to the registered origin was rejected because ordinary
+sites redirect between origins (to `https`, to `www`), and those are exactly
+the pages a body expectation is for.
+

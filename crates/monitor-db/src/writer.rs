@@ -281,6 +281,38 @@ fn track_write<T>(write_health: &WriteHealth, outcome: &Result<T, QueryError>) {
     }
 }
 
+/// Commit one observation; `false` when the monitor no longer exists.
+///
+/// The gate is read before the commit's own transaction, so a delete (D-026) can land
+/// in between. The store then refuses the check row because its monitor is gone. That
+/// is not the store failing — returning the error would count against `WriteHealth`
+/// and flip every workspace's verdict to "unavailable" over one deleted monitor — so a
+/// refused commit is asked one more question: is the monitor still there? Only when it
+/// is does the error stand.
+async fn commit_unless_gone(
+    db: &Db,
+    observation: &Observation,
+    effect: Effect,
+    open_after: bool,
+    queue_email: bool,
+) -> Result<bool, QueryError> {
+    let Err(error) = db
+        .commit_observation(observation, effect, open_after, queue_email)
+        .await
+    else {
+        return Ok(true);
+    };
+    let gone = db
+        .workspace(observation.workspace)
+        .monitor_gate(observation.monitor_id)
+        .await;
+    match gone {
+        Ok(None) => Ok(false),
+        // Still there, or the store can't even be asked: the commit's own error stands.
+        Ok(Some(_)) | Err(_) => Err(error),
+    }
+}
+
 async fn record(
     db: &Db,
     statuses: &SharedStatuses,
@@ -293,6 +325,11 @@ async fn record(
         .monitor_gate(observation.monitor_id)
         .await?
     else {
+        // A deleted monitor leaves nothing behind in memory either.
+        health.remove(&observation.monitor_id);
+        if let Ok(mut map) = statuses.write() {
+            map.remove(&observation.monitor_id);
+        }
         warn!(monitor = %observation.monitor_id.0, "dropping observation for unknown monitor");
         return Ok(WriteOutcome::DroppedUnknownMonitor);
     };
@@ -313,12 +350,65 @@ async fn record(
         .cloned()
         .unwrap_or_default();
     let effect = next.record(observation.slot, gate.thresholds, gate.maintenance);
-    db.commit_observation(&observation, effect, next.incident_open(), queue_email)
-        .await?;
+    if !commit_unless_gone(db, &observation, effect, next.incident_open(), queue_email).await? {
+        // Deleted between the gate read and the commit: forget it here too.
+        health.remove(&observation.monitor_id);
+        if let Ok(mut map) = statuses.write() {
+            map.remove(&observation.monitor_id);
+        }
+        warn!(monitor = %observation.monitor_id.0, "dropping observation: the monitor was deleted");
+        return Ok(WriteOutcome::DroppedUnknownMonitor);
+    }
     let status = next.status();
     health.insert(observation.monitor_id, next);
     if let Ok(mut map) = statuses.write() {
         map.insert(observation.monitor_id, status);
     }
     Ok(WriteOutcome::Committed(effect))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monitor_domain::{CheckOutcome, NewMonitor, SlotObservation, WorkspaceId};
+
+    /// The second half of the delete race, made deterministic: the gate was read, the
+    /// monitor is deleted with its evidence, and only then does the commit arrive. It
+    /// reports "gone" instead of a store error — the error is what used to count as a
+    /// failed write and turn the whole engine's verdict to unavailable.
+    #[tokio::test]
+    async fn a_commit_for_a_monitor_deleted_meanwhile_reports_gone() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:", 1).await?;
+        db.migrate().await?;
+        let scoped = db.workspace(WorkspaceId::DEFAULT);
+        let monitor = NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?
+            .into_monitor();
+        scoped.insert_monitor(&monitor).await?;
+        let observation = Observation {
+            monitor_id: monitor.id,
+            workspace: monitor.workspace,
+            generation: monitor.generation,
+            slot_at: time::OffsetDateTime::now_utc(),
+            slot: SlotObservation::Probe(CheckOutcome::Pass),
+            http_status: Some(200),
+            latency_ms: Some(5),
+            detail: None,
+        };
+        let effect = Health::default().record(observation.slot, monitor.thresholds, false);
+
+        // While the monitor exists the commit lands.
+        assert!(commit_unless_gone(&db, &observation, effect, false, false).await?);
+
+        assert!(scoped.delete_monitor_with_evidence(monitor.id).await?);
+        // The raw commit is refused by the store…
+        assert!(
+            db.commit_observation(&observation, effect, false, false)
+                .await
+                .is_err(),
+            "a check row for a deleted monitor has nothing to belong to"
+        );
+        // …and the writer's wrapper turns that refusal into "gone", not an error.
+        assert!(!commit_unless_gone(&db, &observation, effect, false, false).await?);
+        Ok(())
+    }
 }

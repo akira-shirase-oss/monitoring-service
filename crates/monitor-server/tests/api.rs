@@ -2366,3 +2366,70 @@ async fn a_monitor_is_deleted_with_its_evidence_only_when_asked() {
         .unwrap();
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// Two write-time refusals the dashboard's form can now reach. A redirect status
+/// named as passing would report a broken redirect chain as up, because working
+/// redirects are followed and never the final answer. A name is bounded and plain:
+/// it is shown in lists, in alerts and on public pages.
+#[tokio::test]
+async fn redirect_statuses_and_unbounded_names_are_refused_at_write() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let create = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            send(&app, "POST", "/api/monitors", Some(body))
+                .await
+                .unwrap()
+        }
+    };
+    let base = |name: &str, statuses: serde_json::Value| {
+        serde_json::json!({
+            "name": name, "url": "https://example.com/health", "expect_statuses": statuses,
+        })
+    };
+
+    for statuses in [
+        serde_json::json!(["200-399"]),
+        serde_json::json!(["200-299", "302"]),
+        serde_json::json!(["308"]),
+    ] {
+        let (status, body) = create(base("redirects", statuses.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{statuses}: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("redirects are followed")),
+            "{body}"
+        );
+    }
+    // 304 and 300 are not followed, so they stay nameable; so do codes around the gap.
+    let (status, body) = create(base(
+        "not-followed",
+        serde_json::json!(["200-299", "300", "304-306", "401"]),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = create(base(&"n".repeat(121), serde_json::json!(["200-299"]))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = create(base("two\nlines", serde_json::json!(["200-299"]))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = create(base(&"n".repeat(120), serde_json::json!(["200-299"]))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The edit path holds the same line.
+    let id = body["id"].as_str().unwrap().to_owned();
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{id}"),
+        Some(serde_json::json!({"expect_statuses": ["200-308"]})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}

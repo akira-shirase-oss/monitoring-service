@@ -1034,10 +1034,10 @@ mod tests {
 
     /// N1 re-review: the per-ADDRESS runtime bound is charged on the ONE
     /// candidate the validating resolver hands to the dialer — shared across
-    /// every workspace (`try_acquire`, misses counted), and max-min fair once
-    /// the ceiling is spent: a second workspace's first starts still pay (a
-    /// tenant behind the same IP never goes dark), and only a workspace
-    /// already holding its fair split is refused (N-1). The refused slot
+    /// every workspace (`try_acquire`, misses counted): a start is paid when the
+    /// address's ceiling and the workspace's own share both hold a token, so a
+    /// second workspace's starts still pay after the first spent its share
+    /// (D-028). The refused slot
     /// commits `missed` with its reason — our own budget's refusal is a
     /// coverage gap, never evidence about the target (H: on a loopback
     /// fixture — the budget binds the address, and the 3600 s window makes

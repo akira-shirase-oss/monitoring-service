@@ -2379,8 +2379,18 @@ async fn membership_roles() -> anyhow::Result<()> {
     ));
     assert!(scope.set_member_role(owner, Role::Viewer).await?);
     assert_eq!(db.member_role(ws, owner).await?, Some(Role::Viewer));
-    assert!(scope.remove_member(owner).await?);
-    assert_eq!(db.member_role(ws, owner).await?, None);
+    // It may step down, but it is never removed from its own workspace: its requests
+    // resolve here by default, so without a seat it could reach nothing at all.
+    assert!(matches!(
+        scope.remove_member(owner).await,
+        Err(QueryError::Invalid(_))
+    ));
+    assert_eq!(db.member_role(ws, owner).await?, Some(Role::Viewer));
+    // An account whose own workspace is elsewhere leaves cleanly, once it is not the
+    // last owner.
+    assert!(scope.set_member_role(owner, Role::Owner).await?);
+    assert!(scope.remove_member(second).await?);
+    assert_eq!(db.member_role(ws, second).await?, None);
     assert!(
         !scope
             .remove_member(monitor_domain::AccountId::new())
@@ -2796,5 +2806,150 @@ async fn the_default_slug_never_lapses_out_of_its_hold() -> anyhow::Result<()> {
         "`default` fell out of the held set after the cap — any tenant can claim it"
     );
     raw.close().await;
+    Ok(())
+}
+
+/// Deleting a monitor with its evidence (D-026) works in batches so the write lock is
+/// never held long. More rows than two batches hold, in every table that names the
+/// monitor, must all go — and a second monitor's rows must all stay.
+#[tokio::test]
+async fn evidence_is_deleted_across_batches_and_only_for_that_monitor() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("delete.db").display());
+    let db = Db::connect(&url, 2).await?;
+    db.migrate().await?;
+    let scoped = db.workspace(WorkspaceId::DEFAULT);
+    let doomed =
+        NewMonitor::new("doomed", url::Url::parse("https://example.com/a")?)?.into_monitor();
+    let kept = NewMonitor::new("kept", url::Url::parse("https://example.com/b")?)?.into_monitor();
+    scoped.insert_monitor(&doomed).await?;
+    scoped.insert_monitor(&kept).await?;
+
+    // Seeded straight into the tables: enough rows to cross two batch boundaries.
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let rows = 2 * monitor_db::EVIDENCE_DELETE_BATCH + 7;
+    let workspace = WorkspaceId::DEFAULT.0.to_string();
+    for monitor in [&doomed, &kept] {
+        let id = monitor.id.0.to_string();
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+             INSERT INTO checks (monitor_id, generation, slot_at, outcome, recorded_at, workspace_id)
+             SELECT ?, 1, '2026-01-01T00:00:00Z', 'pass', '2026-01-01T00:00:00Z', ? FROM n",
+        )
+        .bind(rows)
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+             INSERT INTO incidents (monitor_id, opened_at, resolved_at, state, workspace_id)
+             SELECT ?, '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', 'resolved', ? FROM n",
+        )
+        .bind(rows)
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO notify_outbox
+                 (event_id, monitor_id, workspace_id, incident_id, kind, created_at)
+             SELECT 'evt-' || id, monitor_id, workspace_id, id, 'incident_opened',
+                    '2026-01-01T00:00:00Z'
+             FROM incidents WHERE monitor_id = ?",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO check_stats_daily (monitor_id, day, pass, workspace_id)
+             VALUES (?, '2025-12-31', 5, ?)",
+        )
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&pool)
+        .await?;
+    }
+    let count = |table: &'static str, id: String| {
+        let pool = pool.clone();
+        async move {
+            let sql = match table {
+                "checks" => "SELECT COUNT(*) FROM checks WHERE monitor_id = ?",
+                "incidents" => "SELECT COUNT(*) FROM incidents WHERE monitor_id = ?",
+                "notify_outbox" => "SELECT COUNT(*) FROM notify_outbox WHERE monitor_id = ?",
+                _ => "SELECT COUNT(*) FROM check_stats_daily WHERE monitor_id = ?",
+            };
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+        }
+    };
+
+    assert!(scoped.delete_monitor_with_evidence(doomed.id).await?);
+
+    for table in ["notify_outbox", "incidents", "checks", "check_stats_daily"] {
+        assert_eq!(
+            count(table, doomed.id.0.to_string()).await?,
+            0,
+            "{table} still holds rows of the deleted monitor"
+        );
+        let expected = if table == "check_stats_daily" {
+            1
+        } else {
+            rows
+        };
+        assert_eq!(
+            count(table, kept.id.0.to_string()).await?,
+            expected,
+            "{table} lost rows of the monitor that was not deleted"
+        );
+    }
+    assert!(scoped.monitor_generation(doomed.id).await?.is_none());
+    assert!(scoped.monitor_generation(kept.id).await?.is_some());
+    Ok(())
+}
+
+/// With foreign keys on, deleting a parent row makes SQLite look up its children. The
+/// lookups D-026's delete and the retention pass depend on must be index searches: a
+/// scan of the whole child table per deleted row is what let one workspace's delete
+/// hold the write lock against everyone.
+#[tokio::test]
+async fn child_lookups_for_deletes_use_the_0022_indexes() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("plan.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    for (sql, table) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM notify_outbox WHERE incident_id = ?",
+            "notify_outbox",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM notify_outbox WHERE monitor_id = ?",
+            "notify_outbox",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM incidents WHERE monitor_id = ?",
+            "incidents",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM status_monitors WHERE monitor_id = ?",
+            "status_monitors",
+        ),
+    ] {
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sql).bind("x").fetch_all(&pool).await?;
+        let detail = plan
+            .iter()
+            .map(|(.., step)| step.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.contains("SEARCH") && !detail.contains(&format!("SCAN {table}")),
+            "{table} is scanned for its parent's children: {detail}"
+        );
+    }
     Ok(())
 }

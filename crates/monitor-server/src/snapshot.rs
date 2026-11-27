@@ -310,8 +310,9 @@ pub async fn write_beat(
 pub type Wake = std::sync::Arc<tokio::sync::Notify>;
 
 /// The least time between two woken beats. A beat reads every enabled page, so saves
-/// arriving in a burst share one beat instead of each buying a full pass.
-const WAKE_FLOOR: Duration = Duration::from_secs(1);
+/// arriving in a burst share one beat instead of each buying a full pass: at most
+/// twelve extra passes a minute, whatever any workspace does.
+const WAKE_FLOOR: Duration = Duration::from_secs(5);
 
 /// Periodic snapshot writer. Its failures are honest: a stopped writer means an expiring
 /// snapshot, which the reader reads as "monitoring unavailable" — the correct verdict.

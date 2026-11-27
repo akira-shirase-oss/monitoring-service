@@ -481,6 +481,12 @@ pub fn validate_statuses(statuses: &mut [StatusRange]) -> Result<(), ValidationE
     Ok(())
 }
 
+/// The redirect statuses the prober follows. They can't be named as passing.
+pub const FOLLOWED_REDIRECTS: [u16; 5] = [301, 302, 303, 307, 308];
+
+/// The longest monitor name. It is shown in lists, alerts and on public status pages.
+pub const MAX_NAME_CHARS: usize = 120;
+
 /// The whole expectations bundle, including the cross-field rule: a `HEAD` probe
 /// carries no body, so a body marker under `HEAD` is a write-time refusal (D-025).
 pub fn validate_expect(
@@ -489,6 +495,16 @@ pub fn validate_expect(
     body_contains: Option<&[u8]>,
 ) -> Result<(), ValidationError> {
     validate_statuses(statuses)?;
+    // Redirects with a usable target are always followed, so one of these can only be
+    // the final answer when the chain broke: a loop cut at the hop limit, or a target
+    // the address policy refused. Accepting it would report a broken redirect as up.
+    if statuses.iter().any(|range| {
+        FOLLOWED_REDIRECTS
+            .iter()
+            .any(|code| range.lo <= *code && *code <= range.hi)
+    }) {
+        return Err(ValidationError::StatusCoversRedirect);
+    }
     if let Some(body) = body_contains {
         if body.is_empty() {
             return Err(ValidationError::ExpectBodyEmpty);
@@ -507,6 +523,12 @@ pub fn validate_expect(
 pub enum ValidationError {
     #[error("monitor name is empty")]
     EmptyName,
+    #[error("monitor name is longer than {MAX_NAME_CHARS} characters or has control characters")]
+    NameInvalid,
+    #[error(
+        "expect_statuses can't include 301, 302, 303, 307 or 308: redirects are followed, so one of them as the final answer means the chain broke"
+    )]
+    StatusCoversRedirect,
     #[error("monitor URL must be http or https, got `{scheme}`")]
     UrlNotHttp { scheme: String },
     #[error("interval {interval:?} is below the minimum {MIN_INTERVAL:?}")]
@@ -544,6 +566,9 @@ fn validate_fields(
 ) -> Result<(), ValidationError> {
     if name.trim().is_empty() {
         return Err(ValidationError::EmptyName);
+    }
+    if name.chars().count() > MAX_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(ValidationError::NameInvalid);
     }
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(ValidationError::UrlNotHttp {

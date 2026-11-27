@@ -1360,6 +1360,7 @@ async fn list_workspaces(
     axum::Extension(principal): axum::Extension<auth::Principal>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut account = serde_json::Value::Null;
+    let current = principal.workspace().0;
     let workspaces = match principal {
         auth::Principal::Operator { .. } => state
             .db
@@ -1372,7 +1373,11 @@ async fn list_workspaces(
             .collect::<Vec<_>>(),
         auth::Principal::Account { account: id, .. } => {
             if let Some(row) = state.db.account_by_id(id).await? {
-                account = serde_json::json!({"id": row.id, "email": row.email});
+                // `home` is the workspace a request without `X-Smon-Workspace` is
+                // served from, so a client can show the scope it is really in.
+                account = serde_json::json!({
+                    "id": row.id, "email": row.email, "home": row.workspace_id,
+                });
             }
             state
                 .db
@@ -1396,9 +1401,12 @@ async fn list_workspaces(
             })
             .collect(),
     };
-    Ok(Json(
-        serde_json::json!({ "workspaces": workspaces, "account": account }),
-    ))
+    // `current` is the workspace THIS request was served from. Asked without
+    // `X-Smon-Workspace`, it is the caller's default scope, which is what a client
+    // must show when it has made no pick of its own.
+    Ok(Json(serde_json::json!({
+        "workspaces": workspaces, "account": account, "current": current,
+    })))
 }
 
 /// A plan's limits as the API shows them, so a workspace can see what it may do before
@@ -2402,6 +2410,16 @@ async fn delete_monitor(
     let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
     if with_evidence {
+        // The costliest write a workspace can ask for spends the same budget as a
+        // create or an edit: a loop of creates and deletes is not free.
+        spend_write_budget(
+            &state.monitor_writes,
+            principal.workspace(),
+            MONITOR_WRITE_BUDGET,
+            MONITOR_WRITE_WINDOW,
+            MONITOR_WRITE_CAP,
+        )
+        .map_err(ApiError::TooMany)?;
         if !view.delete_monitor_with_evidence(monitor.id).await? {
             return Err(ApiError::NotFound);
         }

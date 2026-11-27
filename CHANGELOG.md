@@ -25,6 +25,23 @@
 - **Fix: token, member and invite times are RFC 3339 strings.** They were returned as
   arrays of numbers.
 - **`url` 2.5.9** (RUSTSEC-2026-0592, a stack overflow in `Url::origin()`).
+- **Fixes from an independent review before this reached `main`:**
+  - Monitors sharing a target address could stop being checked while capacity was
+    free. The per-address budget kept a queue of refused starts that nobody came back
+    to claim; it is now two token buckets and nothing else (D-028).
+  - Deleting a monitor with a long history could hold the store's write lock long
+    enough to stall every workspace's checks. It now works in small batches, with the
+    indexes it needs, on the write budget.
+  - A check result arriving just after its monitor was deleted counted as a storage
+    failure and could mark monitoring unavailable for everyone.
+  - A browser that remembered a workspace its account had been removed from was
+    locked out of the dashboard. An account that had joined a second workspace could
+    see that workspace's name over its own data. A form kept its values across a
+    workspace switch and could save them into the other workspace.
+  - An account could be removed from its own workspace and then reach nothing.
+  - Two published monitors with the same name broke the public status page.
+  - Redirect codes can no longer be named as passing statuses, and monitor names are
+    bounded.
 - **Operators no longer need curl.** `monitor invites create` and
   `monitor workspaces list|plan` in the CLI, and an Operator page in the dashboard for
   sign-up codes and workspace plans.

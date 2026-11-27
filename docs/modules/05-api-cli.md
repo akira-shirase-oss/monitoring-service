@@ -140,7 +140,15 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Deleting a monitor (D-026):** `DELETE /api/monitors/{id}` removes a monitor that has
   recorded nothing and answers 409 for one that has. `?evidence=delete` removes the
   monitor together with its checks, incidents, queued alerts, aggregates and
-  maintenance windows in one transaction; any other value is 422. Member work.
+  maintenance windows, in short batches so other workspaces' commits never wait
+  long; any other value is 422. Member work, on the monitor write budget.
+- **Write-time refusals added with the form:** `expect_statuses` may not include 301,
+  302, 303, 307 or 308 (redirects are followed, so one as the final answer means the
+  chain broke); a monitor name is at most 120 characters with no control characters.
+- **`GET /api/workspaces`** also returns `current`, the workspace the request was served
+  from. Asked without `X-Smon-Workspace` it is the caller's default scope.
+- **An account can't be removed from its own workspace** (409); it leaves by deleting
+  the account.
 - **Clearing a body expectation:** `PATCH` with `"expect_body": null` removes it; a
   patch that leaves the field out keeps it.
 - **Plan limits:** each row of `GET /api/workspaces` carries `limits`

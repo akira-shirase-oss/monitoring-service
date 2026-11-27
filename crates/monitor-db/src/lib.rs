@@ -1304,20 +1304,65 @@ impl WorkspaceDb<'_> {
 
     /// Delete a monitor together with everything recorded about it (D-026): its queued
     /// alerts, incidents, checks and daily aggregates, then the monitor itself, whose
-    /// maintenance windows and status-page listing go with it. One transaction — a
-    /// reader sees the monitor with its evidence or neither — and every statement is
-    /// bound to this workspace, so a monitor id from elsewhere deletes nothing. `false`
-    /// means this workspace has no such monitor. A probe still in flight commits against
-    /// a monitor that is gone, which the writer already drops.
+    /// maintenance windows and status-page listing go with it. Every statement is bound
+    /// to this workspace, so a monitor id from elsewhere deletes nothing. `false` means
+    /// this workspace has no such monitor.
+    ///
+    /// The work is done in three steps so that no single statement holds the store's
+    /// one write lock for long — every workspace's observation commits wait on it:
+    ///
+    /// 1. The monitor is paused and its generation bumped, so nothing new is scheduled
+    ///    and a probe already in flight is dropped as stale.
+    /// 2. Its evidence goes in batches of `EVIDENCE_DELETE_BATCH` rows, each its own
+    ///    short transaction, children before parents.
+    /// 3. One last transaction removes whatever slipped in meanwhile and the monitor.
+    ///
+    /// A failure part-way leaves a paused monitor with some of its evidence gone; asking
+    /// again finishes the job. That is the price of not blocking everyone else.
     pub async fn delete_monitor_with_evidence(
         &self,
         monitor: MonitorId,
     ) -> Result<bool, QueryError> {
         let id = monitor.0.to_string();
         let workspace = self.workspace.0.to_string();
-        let mut tx = self.db.pool.begin().await?;
-        // Children before parents: the foreign keys refuse any other order.
+        let stopped = sqlx::query(
+            "UPDATE monitors SET paused = 1, generation = generation + 1
+             WHERE id = ? AND workspace_id = ?",
+        )
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&self.db.pool)
+        .await?
+        .rows_affected();
+        if stopped == 0 {
+            return Ok(false);
+        }
         // Static statements, one per table: no SQL is ever assembled at run time.
+        // Children before parents: the foreign keys refuse any other order.
+        for statement in [
+            "DELETE FROM notify_outbox WHERE id IN (SELECT id FROM notify_outbox
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+            "DELETE FROM incidents WHERE id IN (SELECT id FROM incidents
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+            "DELETE FROM checks WHERE id IN (SELECT id FROM checks
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+            "DELETE FROM check_stats_daily WHERE rowid IN (SELECT rowid FROM check_stats_daily
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+        ] {
+            loop {
+                let removed = sqlx::query(statement)
+                    .bind(&id)
+                    .bind(&workspace)
+                    .bind(EVIDENCE_DELETE_BATCH)
+                    .execute(&self.db.pool)
+                    .await?
+                    .rows_affected();
+                if removed < EVIDENCE_DELETE_BATCH.unsigned_abs() {
+                    break;
+                }
+            }
+        }
+        let mut tx = self.db.pool.begin().await?;
         for statement in [
             "DELETE FROM notify_outbox WHERE monitor_id = ? AND workspace_id = ?",
             "DELETE FROM incidents WHERE monitor_id = ? AND workspace_id = ?",
@@ -2324,6 +2369,11 @@ pub struct Gate {
     pub maintenance: bool,
 }
 
+/// Rows removed per statement when a monitor is deleted with its evidence (D-026). Small
+/// enough that one batch holds the write lock for milliseconds, so the observation
+/// writer never waits its busy timeout behind a delete.
+pub const EVIDENCE_DELETE_BATCH: i64 = 2_000;
+
 /// One `maintenance_windows` row — schedule-scoped suppression. `active` is computed at
 /// read time so the API never has to re-derive it.
 #[derive(Debug, FromRow)]
@@ -3034,6 +3084,23 @@ impl OwnerDb<'_> {
                 return Err(QueryError::Invalid("the workspace needs an owner".into()));
             }
         }
+        if role.is_none() {
+            // An account's requests resolve to its own workspace by default, so a
+            // seat there is what lets it reach anything at all — its invitations and
+            // its other workspaces included. It leaves by deleting the account.
+            let own: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ? AND workspace_id = ?)",
+            )
+            .bind(account.0.to_string())
+            .bind(ws.workspace.0.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if own {
+                return Err(QueryError::Invalid(
+                    "this is the account's own workspace; it can't be removed from it".into(),
+                ));
+            }
+        }
         let affected = match role {
             Some(role) => {
                 sqlx::query("UPDATE members SET role = ? WHERE workspace_id = ? AND account_id = ?")
@@ -3210,7 +3277,10 @@ impl TryFrom<MonitorRow> for Monitor {
             expect: monitor_domain::Expect {
                 statuses: monitor_domain::parse_statuses(&row.expect_statuses)
                     .map_err(|_| QueryError::Corrupt("expect_statuses".into()))?,
-                body_contains: row.expect_body,
+                // An empty marker can't be written through the API; a row that holds
+                // one anyway (edited by hand, or restored from somewhere else) is read
+                // as "no marker" rather than handed to a search that can't take it.
+                body_contains: row.expect_body.filter(|marker| !marker.is_empty()),
             },
         })
     }

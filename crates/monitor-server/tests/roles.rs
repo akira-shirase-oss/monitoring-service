@@ -705,3 +705,77 @@ async fn roster_and_token_times_are_rfc3339_strings() -> anyhow::Result<()> {
     assert!(tokens["tokens"][0]["revoked_at"].is_null(), "{tokens}");
     Ok(())
 }
+
+/// An account always keeps a seat in its own workspace. A second owner could
+/// otherwise remove the founder, whose requests resolve to that workspace by
+/// default: with no member row there, every route — even listing workspaces and
+/// reading invitations — answered 403 and the account was locked out for good.
+#[tokio::test]
+async fn an_account_is_never_removed_from_its_own_workspace() -> anyhow::Result<()> {
+    let (app, _state, db, _tmp) = fixture().await?;
+    let founder = sign_up(&app, "founder@a.example").await;
+    let second = sign_up(&app, "second@b.example").await;
+    let ws = workspace_of(&db, "founder@a.example").await?;
+    seat(&app, &founder, &second, "second@b.example", "member").await;
+    let second_id = account_of(&db, "second@b.example").await?;
+    let founder_id = account_of(&db, "founder@a.example").await?;
+    let (status, _, body) = call(
+        &app,
+        "PATCH",
+        &format!("/api/members/{second_id}"),
+        Some(serde_json::json!({"role": "owner"})),
+        Some(Cred::Cookie(&founder)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Two owners now, so the last-owner rule no longer protects the founder.
+    let (status, _, body) = call(
+        &app,
+        "DELETE",
+        &format!("/api/members/{founder_id}"),
+        None,
+        Some(Cred::Cookie(&second)),
+        Some(&ws),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("own workspace")),
+        "{body}"
+    );
+
+    // The founder's default scope still answers, and still lists the workspace.
+    let (status, _, body) = call(
+        &app,
+        "GET",
+        "/api/workspaces",
+        None,
+        Some(Cred::Cookie(&founder)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["current"], ws,
+        "the list names the default scope: {body}"
+    );
+    assert_eq!(body["account"]["home"], ws, "{body}");
+
+    // The reverse is ordinary: the founder may remove the second owner, whose own
+    // workspace is elsewhere.
+    let (status, _, body) = call(
+        &app,
+        "DELETE",
+        &format!("/api/members/{second_id}"),
+        None,
+        Some(Cred::Cookie(&founder)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    Ok(())
+}
