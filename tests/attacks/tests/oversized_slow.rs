@@ -36,9 +36,9 @@ async fn an_oversized_body_is_413() -> anyhow::Result<()> {
             "unexpected client error: {e}"
         ),
     }
-    // The refusal must not have cost a slot or killed the listener: a normal
-    // request right after still gets the server's own answer.
-    let alive = http
+    // The refusal must not have cost a slot or killed the listener: a normal request
+    // right after — on a new connection, the refused one is closed — is answered.
+    let alive = client()?
         .post(format!("{}/api/login", instance.base))
         .json(&json!({"token": "wrong"}))
         .send()
