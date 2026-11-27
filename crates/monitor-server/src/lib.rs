@@ -2217,6 +2217,10 @@ async fn create_monitor(
 /// `None` ("keep what is stored", via `#[serde(default)]`). Derived `Option<Option<T>>`
 /// can't tell them apart — it reads `null` as `None` — which made a stored value
 /// impossible to remove.
+#[expect(
+    clippy::option_option,
+    reason = "three cases on purpose: absent, null and a value"
+)]
 fn explicit_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
