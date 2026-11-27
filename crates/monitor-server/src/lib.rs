@@ -2212,6 +2212,19 @@ async fn create_monitor(
     ))
 }
 
+/// Reads a field that is present, keeping an explicit `null` apart from an absent
+/// field: present-and-null is `Some(None)` ("clear it"), and only a missing field is
+/// `None` ("keep what is stored", via `#[serde(default)]`). Derived `Option<Option<T>>`
+/// can't tell them apart — it reads `null` as `None` — which made a stored value
+/// impossible to remove.
+fn explicit_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PatchMonitor {
     pub name: Option<String>,
@@ -2226,6 +2239,7 @@ pub struct PatchMonitor {
     /// Replacement status set — validated like a create.
     pub expect_statuses: Option<Vec<String>>,
     /// `null` clears the marker; a string sets it; absent keeps the stored one.
+    #[serde(default, deserialize_with = "explicit_null")]
     pub expect_body: Option<Option<String>>,
     /// Optional optimistic-concurrency guard: when present and stale, the write is a
     /// conflict rather than a blind last-writer-wins.

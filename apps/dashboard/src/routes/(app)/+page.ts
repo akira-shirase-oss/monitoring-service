@@ -17,6 +17,11 @@ export type MonitorView = {
 	generation: number;
 	paused: boolean;
 	status: 'up' | 'down' | 'unknown';
+	/** `GET` or `HEAD`. */
+	method: string;
+	/** The passing statuses as stored: `200-299`, or a comma-separated list of codes and ranges. */
+	expect_statuses: string;
+	expect_body: string | null;
 };
 
 import { apiFetch } from '#lib/auth.js';

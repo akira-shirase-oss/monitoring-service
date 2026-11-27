@@ -2247,3 +2247,61 @@ async fn an_alias_of_a_full_address_is_refused_too() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     Ok(())
 }
+
+/// A stored body expectation can be removed: an explicit `null` clears it, while a
+/// patch that doesn't mention the field keeps it. Without the first, a monitor that
+/// ever had a marker could never be switched to `HEAD`.
+#[tokio::test]
+async fn patch_null_clears_the_body_expectation_and_absent_keeps_it() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let id = create(&app, "marker").await.unwrap();
+    let path = format!("/api/monitors/{id}");
+
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "expect_body": "ready" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Absent: an unrelated edit leaves the marker where it was.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "timeout_s": 4 })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, stored) = send(&app, "GET", &path, None).await.unwrap();
+    assert_eq!(stored["expect_body"], "ready", "{stored}");
+
+    // HEAD while the marker is stored is refused: there is no body to search.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "method": "HEAD" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Null: the marker goes, and the same request may switch the method.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "method": "HEAD", "expect_body": null })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, stored) = send(&app, "GET", &path, None).await.unwrap();
+    assert!(stored["expect_body"].is_null(), "{stored}");
+    assert_eq!(stored["method"], "HEAD", "{stored}");
+}

@@ -333,3 +333,41 @@ test('incidents list what opened, and a maintenance window schedules and cancels
 	await expect(open).toHaveAttribute('data-state', 'open', { timeout: 90_000 });
 	await expect(page.getByTestId('open-count')).toHaveText('1');
 });
+
+test('a monitor keeps its request method and expectations, and HEAD drops the body text', async ({
+	page,
+	context,
+	request,
+	baseURL
+}) => {
+	await account(context, request, baseURL ?? '', 'expect');
+	await page.goto('/');
+	await page.getByTestId('empty-monitors').getByRole('button').click();
+	const name = `expect-${Date.now()}`;
+	await fillMonitor(page, name, `http://127.0.0.1:${FAULT}/ok`);
+	await page.getByTestId('monitor-statuses').fill('200-204, 301');
+	await page.getByTestId('monitor-body').fill('ok');
+	await page.getByRole('button', { name: 'Create monitor' }).click();
+
+	await page.getByRole('link', { name }).click();
+	const line = page.getByTestId('monitor-expectations');
+	await expect(line).toContainText('GET request');
+	await expect(line).toContainText('200-204,301');
+	await expect(line).toContainText('body must contain “ok”');
+
+	// The API holds exactly what the form sent.
+	const listed = await context.request.get('/api/monitors');
+	const stored = ((await listed.json()).monitors as { name: string; method: string; expect_body: string | null }[]).find(
+		(m) => m.name === name
+	);
+	expect(stored?.method).toBe('GET');
+	expect(stored?.expect_body).toBe('ok');
+
+	// HEAD has no body to search: the field locks, and saving removes the stored text.
+	await page.getByRole('button', { name: 'Edit' }).click();
+	await page.getByTestId('monitor-method').selectOption('HEAD');
+	await expect(page.getByTestId('monitor-body')).toBeDisabled();
+	await page.getByRole('button', { name: 'Save changes' }).click();
+	await expect(line).toContainText('HEAD request');
+	await expect(line).not.toContainText('body must contain');
+});

@@ -205,6 +205,10 @@
 					.monitor.failures_to_open} fails · recovers after {data.monitor.passes_to_recover} passes
 				· generation {data.monitor.generation}
 			</p>
+			<p class="mt-0.5 text-sm text-muted-foreground" data-testid="monitor-expectations">
+				{data.monitor.method} request · passes on status {data.monitor.expect_statuses}{#if data.monitor.expect_body}
+					· body must contain “{data.monitor.expect_body}”{/if}
+			</p>
 			<div class="mt-3 flex flex-wrap items-center gap-2">
 				<button
 					onclick={() => togglePaused(data.monitor.id, !data.monitor.paused)}
@@ -244,7 +248,10 @@
 								interval_s: data.monitor.interval_s,
 								timeout_s: data.monitor.timeout_s,
 								failures_to_open: data.monitor.failures_to_open,
-								passes_to_recover: data.monitor.passes_to_recover
+								passes_to_recover: data.monitor.passes_to_recover,
+								method: data.monitor.method,
+								expect_statuses: data.monitor.expect_statuses,
+								expect_body: data.monitor.expect_body
 							}}
 							showIdentity
 							submitLabel="Save changes"
