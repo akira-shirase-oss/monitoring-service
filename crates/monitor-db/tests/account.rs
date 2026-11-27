@@ -419,6 +419,47 @@ async fn a_member_who_deletes_their_account_leaves_a_shared_workspace_whole() ->
     Ok(())
 }
 
+/// A workspace whose founder is gone is no account's home, so no foreign key stands
+/// between it and a delete: only the "only member" rule does. One of its two owners
+/// deleting their account must leave it whole for the other.
+#[tokio::test]
+async fn a_workspace_nobody_calls_home_survives_one_of_its_owners_leaving() -> anyhow::Result<()> {
+    let store = store().await?;
+    let (creator, shared) = tenant(&store.db, "creator").await?;
+    let (first, _) = tenant(&store.db, "first").await?;
+    let (second, _) = tenant(&store.db, "second").await?;
+    fill(&store, creator, shared).await?;
+    let now = OffsetDateTime::now_utc();
+    for owner in [first, second] {
+        store
+            .db
+            .owner(shared)
+            .add_member(owner, Role::Owner, now)
+            .await?;
+    }
+    assert_eq!(store.db.delete_account(creator).await?, Vec::new());
+    let before = counts(&store.raw, shared).await?;
+
+    let gone = store.db.delete_account(first).await?;
+
+    assert!(
+        !gone.contains(&shared),
+        "a workspace another owner is still in was deleted"
+    );
+    let mut expected = before;
+    for (table, count) in &mut expected {
+        if *table == "members" {
+            *count -= 1;
+        }
+    }
+    assert_eq!(counts(&store.raw, shared).await?, expected);
+    assert_eq!(
+        store.db.member_role(shared, second).await?,
+        Some(Role::Owner)
+    );
+    Ok(())
+}
+
 /// `accounts.workspace_id` has no cascade: a workspace that is another account's home
 /// can only be deleted once that account points somewhere that exists. The other
 /// account is moved, never deleted and never given a seat it did not have.
