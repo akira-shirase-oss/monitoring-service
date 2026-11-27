@@ -12,8 +12,8 @@ below). Nothing runs on a server yet, so every number that needs the droplet is 
 | Accounts | Invite-gated sign-up, sign-in, sign-out, sessions per account. **Missing:** email verification and a "forgot password" email (there is no mail to an account yet). Change password and delete account are in progress. |
 | Workspaces | Every row carries its workspace and every query is scoped by type. Owner, member and viewer roles; invitations a person accepts; a workspace switcher. |
 | Tokens | Per-workspace API tokens (viewer or member), shown once, revocable. |
-| Alert channels | One webhook per workspace, checked for private addresses at save and at every send (D-017), signed, with a test send. **Missing:** email recipients per workspace (email alerts are still the operator's single SMTP destination). |
-| Status pages | One public page per workspace at `/s/<slug>` with its JSON at `/s/<slug>/status.json`; the owner picks the title, the address and the monitors. |
+| Alerts | One webhook per workspace, checked for private addresses at save and at every send (D-017), signed, with a test send. **Missing:** email recipients per workspace (email alerts are still the operator's single SMTP destination). |
+| Public status | One public page per workspace at `/s/<slug>` with its JSON at `/s/<slug>/status.json`; the owner picks the title, the address and the monitors. |
 | Limits | Free plan: 10 monitors, 60 s shortest interval, checks kept 2 days, incidents 90 days (D-022). Per-workspace share of the probe budget (D-024). The workspace sees its limits on the General page. |
 | Dashboard | Every API operation a workspace has is in the dashboard: setup guide, monitors (method, passing statuses, body text), incidents, maintenance, members, tokens, alerts, status page, general. **Placeholder look:** neutral tokens until Service Monitor's own design is chosen; it changes one stylesheet. |
 | Monitor deletion | A monitor can be deleted with its history by asking for exactly that (D-026). |
