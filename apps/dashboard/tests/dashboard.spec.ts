@@ -469,7 +469,7 @@ test('sign-in: wrong token refused, right token earns the session, sign-out ends
 	// A wrong token is refused with the server's own words, no cookie.
 	await page.getByTestId('token-input').fill('wrong-token');
 	await page.getByTestId('token-submit').click();
-	await expect(page.getByTestId('auth-error')).toHaveText(/invalid credentials/);
+	await expect(page.getByTestId('auth-error')).toHaveText(/invalid token/);
 
 	// The right token → 204 + cookie → reload → the real board, not a stored token.
 	await page.getByTestId('token-input').fill(TOKEN);

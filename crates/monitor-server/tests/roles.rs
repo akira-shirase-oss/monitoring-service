@@ -352,10 +352,6 @@ async fn members_write_monitors_viewers_only_read_and_neither_administers() -> a
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["members"].as_array().map(Vec::len), Some(3));
-    assert!(
-        body["members"][0]["created_at"].is_string(),
-        "roster times are RFC 3339 strings: {body}"
-    );
 
     for (method, uri, payload) in [
         // Valid bodies: the extractor runs before the role check — a denied request
@@ -537,16 +533,6 @@ async fn a_workspace_token_is_shown_once_scoped_and_revocable() -> anyhow::Resul
     assert_eq!(listed["id"], token_id);
     assert!(listed.get("secret").is_none(), "never re-shown: {listed}");
     assert!(listed["last_used_at"].is_null());
-    // Times are RFC 3339 strings, like every other time in the API — never the
-    // serializer's internal tuple.
-    let created = listed["created_at"]
-        .as_str()
-        .expect("created_at is a string");
-    assert!(
-        time::OffsetDateTime::parse(created, &time::format_description::well_known::Rfc3339)
-            .is_ok(),
-        "{created}"
-    );
 
     // A member-role token works in its own workspace — writes included.
     let (status, _, body) = call(
@@ -663,5 +649,59 @@ async fn a_viewer_token_reads_but_cannot_write() -> anyhow::Result<()> {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    Ok(())
+}
+
+/// Every time the roster and token views show is an RFC 3339 string, like the checks,
+/// incidents and maintenance windows — never the serializer's internal tuple.
+#[tokio::test]
+async fn roster_and_token_times_are_rfc3339_strings() -> anyhow::Result<()> {
+    let (app, _state, _db, _tmp) = fixture().await?;
+    let owner = sign_up(&app, "owner@a.example").await;
+    let (status, _, minted) = call(
+        &app,
+        "POST",
+        "/api/tokens",
+        Some(serde_json::json!({"name": "ci", "role": "viewer"})),
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{minted}");
+    let (_, _, members) = call(
+        &app,
+        "GET",
+        "/api/members",
+        None,
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    let (_, _, tokens) = call(
+        &app,
+        "GET",
+        "/api/tokens",
+        None,
+        Some(Cred::Cookie(&owner)),
+        None,
+    )
+    .await;
+    for stamp in [
+        &minted["token"]["created_at"],
+        &members["members"][0]["created_at"],
+        &tokens["tokens"][0]["created_at"],
+    ] {
+        let text = stamp
+            .as_str()
+            .unwrap_or_else(|| panic!("not a string: {stamp}"));
+        assert!(
+            time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                .is_ok(),
+            "{text}"
+        );
+    }
+    // Never-used and never-revoked stay null rather than turning into a date.
+    assert!(tokens["tokens"][0]["last_used_at"].is_null(), "{tokens}");
+    assert!(tokens["tokens"][0]["revoked_at"].is_null(), "{tokens}");
     Ok(())
 }

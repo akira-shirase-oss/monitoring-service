@@ -201,13 +201,6 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
     // in the table — visible, never silently dropped.
     spawn_deliverers(&config, &db, &writer, smtp, &shutdown, &supervisor);
 
-    // One signal shared by the API (a status page was saved) and the writer (beat now).
-    let status_changed = monitor_server::snapshot::Wake::default();
-    supervisor.watch(
-        "snapshot",
-        Role::Supporting,
-        spawn_snapshot(&config, &db, &statuses, &vitals, &status_changed, &shutdown),
-    );
     supervisor.watch(
         "retention",
         Role::Supporting,
@@ -223,8 +216,9 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         registry_tx,
         vitals.clone(),
         admin_token,
-        status_changed,
     );
+    // After the state exists: the writer shares its "a status page was saved" signal.
+    watch_snapshot(&supervisor, &config, &state, &shutdown);
     let app = assemble_app(state, &config, &supervisor, &shutdown).await?;
 
     // Install the stop signals before serving: a registration failure is a boot error,
@@ -337,7 +331,6 @@ fn app_state(
     registry: watch::Sender<Arc<Vec<monitor_domain::Monitor>>>,
     vitals: Vitals,
     admin_token: monitor_server::auth::AdminToken,
-    status_changed: monitor_server::snapshot::Wake,
 ) -> AppState {
     AppState {
         db,
@@ -354,7 +347,7 @@ fn app_state(
         status_writes: std::sync::Arc::default(),
         status_slugs: std::sync::Arc::default(),
         status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        status_changed,
+        status_changed: monitor_server::snapshot::Wake::default(),
         monitor_writes: std::sync::Arc::default(),
         invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
@@ -492,27 +485,28 @@ fn init_logging(config: &Config) -> anyhow::Result<()> {
 
 /// The public status snapshot — the heartbeat. `SMON_STATUS_DIR` points at wherever the
 /// static status page is hosted; an expired snapshot there reads "monitoring unavailable".
-fn spawn_snapshot(
+/// Starts the public snapshot writer under the supervisor. It reads the same store,
+/// statuses and verdict the API serves, and wakes on the API's status-page saves.
+fn watch_snapshot(
+    supervisor: &Supervisor,
     config: &Config,
-    db: &monitor_db::Db,
-    statuses: &SharedStatuses,
-    vitals: &Vitals,
-    status_changed: &monitor_server::snapshot::Wake,
+    state: &AppState,
     shutdown: &CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) {
     tracing::info!(dir = %config.status_dir, "writing status snapshots");
-    monitor_server::snapshot::spawn_woken(
-        db.clone(),
-        Arc::clone(statuses),
-        vitals.clone(),
+    let task = monitor_server::snapshot::spawn_woken(
+        state.db.clone(),
+        Arc::clone(&state.statuses),
+        state.vitals.clone(),
         monitor_server::snapshot::Config {
             dir: config.status_dir.clone().into(),
             interval: config.status_interval,
             ttl: config.status_ttl,
         },
-        Arc::clone(status_changed),
+        Arc::clone(&state.status_changed),
         shutdown.clone(),
-    )
+    );
+    supervisor.watch("snapshot", Role::Supporting, task);
 }
 
 /// Retention (M4.1, D-012): one pass every `SMON_RETENTION_INTERVAL_S` (default hourly)
