@@ -27,6 +27,7 @@
 	});
 
 	let editing = $state(false);
+	let editGeneration = $state(0);
 	let confirmingDelete = $state(false);
 	let actionError = $state<string | null>(null);
 	let actionBusy = $state(false);
@@ -222,6 +223,10 @@
 				</button>
 				<button
 					onclick={() => {
+						// The guard is the generation the person was looking at when they
+						// opened the form, not whatever a later poll brought in: an edit
+						// made elsewhere meanwhile must come back as a conflict.
+						editGeneration = data.monitor.generation;
 						editing = !editing;
 						actionError = null;
 					}}
@@ -262,7 +267,7 @@
 							}}
 							showIdentity
 							submitLabel="Save changes"
-							onSubmit={(payload) => saveEdit(data.monitor.id, data.monitor.generation, payload)}
+							onSubmit={(payload) => saveEdit(data.monitor.id, editGeneration, payload)}
 							onCancel={() => (editing = false)}
 						/>
 					</Card.Content>

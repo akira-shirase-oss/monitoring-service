@@ -33,7 +33,9 @@ function stored(): string {
 
 export const workspace = $state({
 	list: [] as Membership[],
-	picked: stored()
+	picked: stored(),
+	/** The workspace the server serves when no pick is sent (`current` of a header-less read). */
+	home: ''
 });
 
 export function pick(id: string): void {
@@ -45,14 +47,29 @@ export function pick(id: string): void {
 	}
 }
 
-/** Keep `picked` honest: a membership the list no longer holds can only 403. */
-export function settle(): void {
+/**
+ * Keep `picked` honest: a membership the list no longer holds can only 403. Returns
+ * whether a stale pick was dropped, so the shell can re-read pages that were asked
+ * for with it.
+ */
+export function settle(): boolean {
 	if (workspace.picked !== '' && !workspace.list.some((m) => m.id === workspace.picked)) {
 		pick('');
+		return true;
 	}
+	return false;
 }
 
-/** The workspace the header shows: the pick when it's real, else the home row. */
+/**
+ * The workspace every request is really served from: the pick when it is a real
+ * membership, else the server's own default. Never "the first row of the list" — the
+ * list is ordered by name, and showing one workspace while writing to another is how
+ * a webhook or a rename lands in the wrong place.
+ */
 export function current(): Membership | undefined {
-	return workspace.list.find((m) => m.id === workspace.picked) ?? workspace.list[0];
+	return (
+		workspace.list.find((m) => m.id === workspace.picked) ??
+		workspace.list.find((m) => m.id === workspace.home) ??
+		workspace.list[0]
+	);
 }

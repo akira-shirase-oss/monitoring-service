@@ -114,8 +114,9 @@
 				<Card.Header>
 					<Card.Title>New token</Card.Title>
 					<Card.Description>
-						A viewer token reads monitors, checks and incidents. A member token can also change
-						them. Neither can manage members or other tokens.
+						A viewer token reads monitors, checks, incidents and the member list. A member token
+						can also change monitors, maintenance windows and the alert webhook. Neither can
+						manage members or tokens.
 					</Card.Description>
 				</Card.Header>
 				<Card.Content>

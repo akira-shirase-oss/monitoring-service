@@ -16,6 +16,7 @@
 	import SirenIcon from '@lucide/svelte/icons/siren';
 	import UsersIcon from '@lucide/svelte/icons/users';
 	import WebhookIcon from '@lucide/svelte/icons/webhook';
+	import { invalidateAll } from '$app/navigation';
 	import { page } from '$app/state';
 	import * as Sidebar from '#lib/components/ui/sidebar/index.js';
 	import { guideOffered } from '#lib/guide.svelte.js';
@@ -26,6 +27,12 @@
 	import type { LayoutProps } from './$types';
 
 	let { children, data }: LayoutProps = $props();
+
+	// Pages load beside the shell, so they may have been asked for with a pick the shell
+	// has just dropped. Read them again; the second pass finds nothing stale.
+	$effect(() => {
+		if (data.stalePick) void invalidateAll();
+	});
 
 	const route = $derived(page.route.id ?? '');
 	const who = $derived(current());
@@ -197,7 +204,7 @@
 				Review the invitation
 			</a>
 		{/if}
-		{#key page.url.pathname}
+		{#key `${page.url.pathname}|${data.scope}`}
 			<div class="page-enter mx-auto w-full max-w-6xl flex-1 px-5 py-8 sm:px-8 lg:px-10">
 				{@render children()}
 			</div>

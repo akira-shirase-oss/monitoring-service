@@ -33,7 +33,10 @@ export const load: PageLoad = async ({ fetch, params }) => {
 		if (response.status === 404) return { state: 'absent' as const, snap: null };
 		if (!response.ok) return { state: 'unreachable' as const, snap: null };
 		const snap = (await response.json()) as PublicSnapshot;
-		const stale = snap.monitoring === 'unavailable' || Date.parse(snap.expires_at) < Date.now();
+		// Fresh only when the expiry is readable AND still ahead: a date that doesn't
+		// parse is not evidence the monitor is alive.
+		const fresh = snap.monitoring !== 'unavailable' && Date.parse(snap.expires_at) >= Date.now();
+		const stale = !fresh;
 		return { state: stale ? ('stale' as const) : ('ok' as const), snap };
 	} catch {
 		return { state: 'unreachable' as const, snap: null };

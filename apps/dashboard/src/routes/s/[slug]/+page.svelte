@@ -121,7 +121,9 @@
 
 			{#if services.length > 0}
 				<ul class="mt-6 flex flex-col divide-y divide-border rounded-card border border-border bg-card" data-testid="public-services">
-					{#each services as service (service.name)}
+					<!-- By position: names are not unique, and a keyed list with a repeated key
+					     stops rendering — two monitors given one name must not take the page down. -->
+					{#each services as service, i (i)}
 						<li class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-5 py-4" data-testid="public-service">
 							<div class="min-w-0">
 								<p class="truncate font-medium">{service.name}</p>

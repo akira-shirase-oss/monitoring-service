@@ -17,7 +17,9 @@
 
 	let { data }: { data: PageData } = $props();
 
-	const canWrite = $derived(current()?.role !== 'viewer');
+	// Publishing is the owner's (the server refuses a member's save); the operator's
+	// session can do it for any workspace.
+	const canWrite = $derived(['owner', 'operator'].includes(current()?.role ?? ''));
 
 	// The form starts on what is stored and then belongs to the person editing it.
 	let title = $state(untrack(() => data.page?.title ?? ''));
@@ -146,6 +148,11 @@
 							</ul>
 						{/if}
 					</FormRow>
+					{#if !canWrite}
+						<p class="pt-5 text-sm text-muted-foreground" data-testid="status-readonly">
+							Only a workspace owner can change what is published.
+						</p>
+					{/if}
 					{#if canWrite}
 						<div class="flex flex-wrap items-center gap-3 pt-5">
 							<Button type="submit" disabled={busy} data-testid="status-save">

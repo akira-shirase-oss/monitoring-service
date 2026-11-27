@@ -205,6 +205,13 @@ test('an invited person sees the invitation, joins, and a viewer can only read',
 }) => {
 	const origin = baseURL ?? '';
 	const owner = await account(context, request, origin, 'owner');
+	// A name that sorts before the guest's own "Personal workspace": the membership
+	// list is ordered by name, so this is the row a careless client would show first.
+	const renamed = await context.request.patch('/api/workspace', {
+		data: { name: 'Acme owners' },
+		headers: sameOrigin(origin)
+	});
+	expect(renamed.status()).toBe(200);
 
 	// The invitee already has an account of their own.
 	const guestContext = await browser.newContext();
@@ -228,6 +235,11 @@ test('an invited person sees the invitation, joins, and a viewer can only read',
 	await guestPage.getByTestId('invitation-accept').click();
 	await expect(guestPage.getByTestId('received-invitations')).toHaveCount(0);
 	await expect(guestPage.getByTestId('invited-banner')).toHaveCount(0);
+	// Joining is not switching: the guest is still in their own workspace, and the
+	// header says so — never the other workspace's name over the guest's own data.
+	await guestPage.reload();
+	await expect(guestPage.getByTestId('workspace-name')).toHaveText('Personal workspace');
+	await expect(guestPage.getByTestId('member-row')).toHaveCount(1);
 
 	// The owner's roster now holds both, and the pending list is empty.
 	await page.reload();
@@ -245,8 +257,15 @@ test('an invited person sees the invitation, joins, and a viewer can only read',
 	expect(write.status()).toBe(403);
 
 	// The viewer's own view of that workspace offers no invite form and no role controls.
+	// A form opened in one workspace must not keep its values across a switch: the
+	// name field follows the workspace, or a save would write one workspace's value
+	// into the other.
+	await guestPage.goto(`${origin}/settings/general`);
+	await expect(guestPage.getByTestId('workspace-rename')).toHaveValue('Personal workspace');
 	await guestPage.getByTestId('workspace-switcher').click();
 	await guestPage.getByTestId('workspace-option').filter({ hasText: 'viewer' }).click();
+	await expect(guestPage.getByTestId('workspace-name')).toHaveText('Acme owners');
+	await expect(guestPage.getByTestId('workspace-rename')).toHaveValue('Acme owners');
 	await guestPage.goto(`${origin}/settings/members`);
 	await expect(guestPage.getByTestId('member-row')).toHaveCount(2);
 	await expect(guestPage.getByTestId('invite-email')).toHaveCount(0);
@@ -256,7 +275,50 @@ test('an invited person sees the invitation, joins, and a viewer can only read',
 	await page.getByTestId('member-row').filter({ hasText: guest.email }).getByTestId('member-remove').click();
 	await page.getByTestId('confirm-action').click();
 	await expect(page.getByTestId('member-row')).toHaveCount(1);
+
+	// The guest's browser still remembers the workspace it was just removed from. It
+	// must fall back to the guest's own workspace, not lock the dashboard on a refusal.
+	await guestPage.reload();
+	await expect(guestPage.getByTestId('workspace-name')).toHaveText('Personal workspace');
+	await expect(guestPage.getByTestId('member-row')).toHaveCount(1);
+	await expect(guestPage.getByTestId('problem')).toHaveCount(0);
 	await guestContext.close();
+});
+
+test('two published monitors with the same name both show on the public page', async ({
+	page,
+	context,
+	request,
+	browser,
+	baseURL
+}) => {
+	const origin = baseURL ?? '';
+	await account(context, request, origin, 'twins');
+	const ids: string[] = [];
+	for (const path of ['ok', 'fail']) {
+		const created = await context.request.post('/api/monitors', {
+			data: { name: 'api', url: `http://127.0.0.1:${FAULT}/${path}`, interval_s: 15, timeout_s: 5 },
+			headers: sameOrigin(origin)
+		});
+		expect(created.status()).toBe(201);
+		ids.push((await created.json()).id as string);
+	}
+	const slug = `twins-${Date.now()}`;
+	const saved = await context.request.put('/api/workspace/status-page', {
+		data: { slug, title: 'Twins', monitor_ids: ids },
+		headers: sameOrigin(origin)
+	});
+	expect(saved.status()).toBe(200);
+
+	const visitor = await browser.newContext();
+	const publicPage = await visitor.newPage();
+	const errors: string[] = [];
+	publicPage.on('pageerror', (error) => errors.push(String(error)));
+	await publicPage.goto(`${origin}/s/${slug}`);
+	await expect(publicPage.getByTestId('public-service')).toHaveCount(2, { timeout: 45_000 });
+	expect(errors).toEqual([]);
+	await visitor.close();
+	await page.goto('/');
 });
 
 test('the alerts page connects, tests and removes a webhook', async ({
@@ -346,14 +408,14 @@ test('a monitor keeps its request method and expectations, and HEAD drops the bo
 	await page.getByTestId('empty-monitors').getByRole('button').click();
 	const name = `expect-${Date.now()}`;
 	await fillMonitor(page, name, `http://127.0.0.1:${FAULT}/ok`);
-	await page.getByTestId('monitor-statuses').fill('200-204, 301');
+	await page.getByTestId('monitor-statuses').fill('200-204, 418');
 	await page.getByTestId('monitor-body').fill('ok');
 	await page.getByRole('button', { name: 'Create monitor' }).click();
 
 	await page.getByRole('link', { name }).click();
 	const line = page.getByTestId('monitor-expectations');
 	await expect(line).toContainText('GET request');
-	await expect(line).toContainText('200-204,301');
+	await expect(line).toContainText('200-204,418');
 	await expect(line).toContainText('body must contain “ok”');
 
 	// The API holds exactly what the form sent.

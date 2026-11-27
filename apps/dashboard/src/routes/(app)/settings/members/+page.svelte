@@ -169,7 +169,7 @@
 					<Card.Title>Invite someone</Card.Title>
 					<Card.Description>
 						They need a Service Monitor account with this email address. The seat is theirs once
-						they accept.
+						they accept. To make someone an owner, change their role after they join.
 					</Card.Description>
 				</Card.Header>
 				<Card.Content>
@@ -191,7 +191,6 @@
 							<NativeSelect id="invite-role" bind:value={role} class="w-full" data-testid="invite-role">
 								<NativeSelectOption value="viewer">Viewer</NativeSelectOption>
 								<NativeSelectOption value="member">Member</NativeSelectOption>
-								<NativeSelectOption value="owner">Owner</NativeSelectOption>
 							</NativeSelect>
 						</div>
 						<Button type="submit" disabled={inviteBusy} data-testid="invite-send">

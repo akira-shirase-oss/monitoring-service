@@ -5,7 +5,7 @@
 // (store-side expiry + logout). X-Smon-Workspace picks which workspace the API
 // answers for (S2); the membership list, not the header, is the authority.
 
-import { workspace } from './workspace.svelte.js';
+import { pick, workspace } from './workspace.svelte.js';
 
 /** Account sign-in: {email, password}. 204 sets the cookie; 401 is a bad pair. */
 export async function login(email: string, password: string): Promise<Response> {
@@ -39,6 +39,9 @@ export async function signup(email: string, password: string, invite: string): P
 
 /** Delete the session row and expire the cookie — idempotent, safe to always call. */
 export async function logout(): Promise<void> {
+	// The pick belongs to the account that made it: the next one to sign in on this
+	// browser starts in its own workspace.
+	pick('');
 	try {
 		await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
 	} catch {
