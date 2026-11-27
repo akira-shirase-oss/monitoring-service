@@ -513,6 +513,14 @@ test('the operator hands out a sign-up code and moves the new workspace to anoth
 	const index = listed.findIndex((w) => w.id === workspaceId);
 	expect(listed[index]?.plan).toBe('free');
 	await rows.nth(index).getByTestId('workspace-plan').selectOption('operator');
+	// Choosing is only a proposal: nothing has changed until it is confirmed.
+	await expect(page.getByTestId('confirm')).toContainText('operator plan');
+	expect(
+		((await (await page.request.get('/api/workspaces')).json()).workspaces as { id: string; plan: string }[]).find(
+			(w) => w.id === workspaceId
+		)?.plan
+	).toBe('free');
+	await page.getByTestId('confirm-action').click();
 	await expect
 		.poll(async () => {
 			const now = (await (await page.request.get('/api/workspaces')).json()).workspaces as {

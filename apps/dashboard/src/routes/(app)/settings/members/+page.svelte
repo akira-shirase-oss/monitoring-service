@@ -59,17 +59,41 @@
 		await invalidateAll();
 	}
 
-	async function setRole(member: MemberView, next: Role) {
+	// A role is not changed by brushing a select: the choice opens a confirmation, and
+	// the select goes back to the stored role until the server has accepted the change.
+	let changing = $state<{ member: MemberView; next: Role } | null>(null);
+	let changeOpen = $state(false);
+	let changeBusy = $state(false);
+	let changeError = $state<string | null>(null);
+
+	// Bumped on every proposal so the selects are drawn again from the stored roles: a
+	// select must never show a role the server has not accepted.
+	let drawn = $state(0);
+
+	function askRole(member: MemberView, select: HTMLSelectElement) {
+		const next = select.value as Role;
+		drawn += 1;
 		if (next === member.role) return;
-		rowBusy = member.account;
-		rowError = null;
-		const answer = await call(`/api/members/${member.account}`, {
+		changing = { member, next };
+		changeError = null;
+		changeOpen = true;
+	}
+
+	async function setRole() {
+		if (changing === null) return;
+		changeBusy = true;
+		changeError = null;
+		const answer = await call(`/api/members/${changing.member.account}`, {
 			method: 'PATCH',
-			body: { role: next }
+			body: { role: changing.next }
 		});
-		rowBusy = null;
-		if (!answer.ok) rowError = answer.failure.message;
-		// Reload either way: a refused change must put the select back on the stored role.
+		changeBusy = false;
+		if (!answer.ok) {
+			changeError = answer.failure.message;
+			return;
+		}
+		changeOpen = false;
+		changing = null;
 		await invalidateAll();
 	}
 
@@ -226,6 +250,7 @@
 								<Table.Cell class="max-w-24 truncate font-medium sm:max-w-none" title={member.email}>{member.email}</Table.Cell>
 								<Table.Cell>
 									{#if owner}
+										{#key drawn}
 										<NativeSelect
 											size="sm"
 											class="min-w-24"
@@ -234,12 +259,13 @@
 											aria-label="Role for {member.email}"
 											data-testid="member-role"
 											onchange={(event: Event) =>
-												setRole(member, (event.currentTarget as HTMLSelectElement).value as Role)}
+												askRole(member, event.currentTarget as HTMLSelectElement)}
 										>
 											<NativeSelectOption value="owner">Owner</NativeSelectOption>
 											<NativeSelectOption value="member">Member</NativeSelectOption>
 											<NativeSelectOption value="viewer">Viewer</NativeSelectOption>
 										</NativeSelect>
+										{/key}
 									{:else}
 										{ROLE_WORDS[member.role]}
 									{/if}
@@ -307,4 +333,23 @@
 	They lose access to this workspace straight away. Their account and their other workspaces are
 	not touched.
 	{#if removeError}<span class="mt-2 block text-attention-ink" role="alert">{removeError}</span>{/if}
+</Confirm>
+
+<Confirm
+	bind:open={changeOpen}
+	title="Make {changing?.member.email ?? ''} {changing?.next === 'owner' ? 'an owner' : `a ${changing?.next ?? ''}`}?"
+	confirm="Change role"
+	busy={changeBusy}
+	onConfirm={setRole}
+>
+	{#if changing?.next === 'owner'}
+		An owner can invite and remove people, change roles, create tokens, publish the status page
+		and export the workspace's data.
+	{:else if changing?.next === 'member'}
+		A member can change monitors, maintenance windows and the alert webhook, but not people or
+		tokens.
+	{:else}
+		A viewer can read everything in the workspace and change nothing.
+	{/if}
+	{#if changeError}<span class="mt-2 block text-attention-ink" role="alert" data-testid="role-error">{changeError}</span>{/if}
 </Confirm>

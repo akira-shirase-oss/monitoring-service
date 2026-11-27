@@ -29,13 +29,12 @@
 
 	async function leave() {
 		busy = true;
-		try {
-			await logout();
+		if (await logout()) {
 			window.location.assign('/login');
-		} catch {
-			busy = false;
-			toast.error("You're still signed in. The server didn't answer — try again.");
+			return;
 		}
+		busy = false;
+		toast.error("You're still signed in. The server didn't confirm the sign-out. Try again.");
 	}
 </script>
 

@@ -11,9 +11,20 @@ const database = `sqlite:/tmp/smon-e2e-${process.pid}.db`;
 // the server-named file really landed.
 const backupDir = `/tmp/smon-e2e-backups-${process.pid}`;
 process.env['SMON_E2E_BACKUP_DIR'] ??= backupDir;
+const statusDir = `/tmp/smon-e2e-status-${process.pid}`;
+// What this run creates outside the repository, for tests/teardown.ts to remove: a run
+// used to leave its store, snapshots and backups behind for good.
+process.env['SMON_E2E_SCRATCH'] = [
+	database.replace('sqlite:', ''),
+	`${database.replace('sqlite:', '')}-wal`,
+	`${database.replace('sqlite:', '')}-shm`,
+	statusDir,
+	process.env['SMON_E2E_BACKUP_DIR']
+].join('\n');
 
 export default defineConfig({
 	testDir: 'tests',
+	globalTeardown: './tests/teardown.ts',
 	// One server, one fixture, one database: specs share them and run in order.
 	workers: 1,
 	fullyParallel: false,
@@ -42,7 +53,7 @@ export default defineConfig({
 				SMON_LISTEN: `127.0.0.1:${SERVER_PORT}`,
 				SMON_PROFILE: 'lab',
 				SMON_DASHBOARD_DIR: `${repo}apps/dashboard/build`,
-				SMON_STATUS_DIR: `/tmp/smon-e2e-status-${process.pid}`,
+				SMON_STATUS_DIR: statusDir,
 				SMON_BACKUP_DIR: backupDir,
 				// M7.2: e2e runs the real auth path — the dashboard earns its session
 				// cookie exactly like a deployed instance.

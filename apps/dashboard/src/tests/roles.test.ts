@@ -1,7 +1,7 @@
 // What each role is offered on the settings pages. The server decides what a role may
 // do; these pages must not offer a control the server will refuse, and must not hide
 // from an owner what only an owner can do.
-import { render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen } from '@testing-library/svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { pick, workspace } from '#lib/workspace.svelte.js';
 import MembersPage from '../routes/(app)/settings/members/+page.svelte';
@@ -80,6 +80,25 @@ describe('Members', () => {
 		// An invitation can't make an owner: the server refuses it.
 		expect(roles).toEqual(['viewer', 'member']);
 		expect(screen.getByTestId('member-remove')).toBeTruthy();
+	});
+
+	it('asks before changing a role, and leaves the select on the stored role meanwhile', async () => {
+		const fetcher = vi.fn(async () => new Response('{}', { status: 200 }));
+		vi.stubGlobal('fetch', fetcher);
+		render(MembersPage, { props: data(page) });
+		const select = screen.getByTestId('member-role') as HTMLSelectElement;
+		select.value = 'viewer';
+		await fireEvent.change(select);
+		// Nothing was sent, the select shows what is stored, and a confirmation names the change.
+		expect(fetcher).not.toHaveBeenCalled();
+		expect((screen.getByTestId('member-role') as HTMLSelectElement).value).toBe('owner');
+		expect((await screen.findByTestId('confirm')).textContent).toContain('owner@example.com');
+		await fireEvent.click(screen.getByTestId('confirm-action'));
+		await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+		const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+		expect(url).toBe('/api/members/a1');
+		expect(init.method).toBe('PATCH');
+		expect(init.body).toBe('{"role":"viewer"}');
 	});
 
 	it('shows a viewer the roster read-only', () => {

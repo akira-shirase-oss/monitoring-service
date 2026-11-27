@@ -324,6 +324,7 @@
 						<span class="block text-xs font-medium text-muted-foreground">reason</span>
 						<input
 							bind:value={windowReason}
+							maxlength={200}
 							class="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
 							placeholder="deploy rehearsal"
 						/>

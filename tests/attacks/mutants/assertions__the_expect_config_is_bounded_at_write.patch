@@ -1,8 +1,8 @@
 diff --git a/crates/monitor-domain/src/lib.rs b/crates/monitor-domain/src/lib.rs
-index 7e94f78..249586a 100644
+index e3f5c90..efd1df5 100644
 --- a/crates/monitor-domain/src/lib.rs
 +++ b/crates/monitor-domain/src/lib.rs
-@@ -590,10 +590,9 @@ impl NewMonitor {
+@@ -632,10 +632,9 @@ impl NewMonitor {
      pub fn with_expect(
          mut self,
          method: ProbeMethod,
@@ -11,6 +11,6 @@ index 7e94f78..249586a 100644
          body_contains: Option<Vec<u8>>,
      ) -> Result<Self, ValidationError> {
 -        validate_expect(method, &mut statuses, body_contains.as_deref())?;
+         refuse_followed_redirects(&statuses)?;
          self.method = method;
          self.expect = Expect {
-             statuses,

@@ -12,6 +12,7 @@
 	import { Input } from '#lib/components/ui/input/index.js';
 	import { NativeSelect, NativeSelectOption } from '#lib/components/ui/native-select/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
+	import Confirm from '#lib/components/shell/Confirm.svelte';
 	import PageHeader from '#lib/components/shell/PageHeader.svelte';
 	import Problem from '#lib/components/shell/Problem.svelte';
 	import { call } from '#lib/call.js';
@@ -57,14 +58,37 @@
 		}
 	}
 
-	async function move(row: Membership, plan: string) {
-		if (plan === row.plan) return;
-		planBusy = row.id;
+	// Same rule as a role: the select proposes, a confirmation decides.
+	let moving = $state<{ row: Membership; plan: string } | null>(null);
+	let moveOpen = $state(false);
+
+	// Bumped on every proposal so the selects are drawn again from the stored plans.
+	let drawn = $state(0);
+
+	function askMove(row: Membership, select: HTMLSelectElement) {
+		const plan = select.value;
+		drawn += 1;
+		if (plan === (row.plan ?? 'free')) return;
+		moving = { row, plan };
 		planError = null;
-		const answer = await call(`/api/workspaces/${row.id}/plan`, { method: 'PATCH', body: { plan } });
+		moveOpen = true;
+	}
+
+	async function move() {
+		if (moving === null) return;
+		planBusy = moving.row.id;
+		planError = null;
+		const answer = await call(`/api/workspaces/${moving.row.id}/plan`, {
+			method: 'PATCH',
+			body: { plan: moving.plan }
+		});
 		planBusy = null;
-		if (!answer.ok) planError = answer.failure.message;
-		// Reload either way, so a refused move puts the select back on the stored plan.
+		if (!answer.ok) {
+			planError = answer.failure.message;
+			return;
+		}
+		moveOpen = false;
+		moving = null;
 		await invalidateAll();
 	}
 </script>
@@ -158,17 +182,19 @@
 								<Table.Cell class="font-medium">{row.name}</Table.Cell>
 								<Table.Cell class="font-mono text-xs text-muted-foreground">{row.slug}</Table.Cell>
 								<Table.Cell>
+									{#key drawn}
 									<NativeSelect
 										size="sm"
 										value={row.plan ?? 'free'}
 										disabled={planBusy === row.id}
 										aria-label="Plan for {row.name}"
 										data-testid="workspace-plan"
-										onchange={(event: Event) => move(row, (event.currentTarget as HTMLSelectElement).value)}
+										onchange={(event: Event) => askMove(row, event.currentTarget as HTMLSelectElement)}
 									>
 										<NativeSelectOption value="free">free</NativeSelectOption>
 										<NativeSelectOption value="operator">operator (no plan limits)</NativeSelectOption>
 									</NativeSelect>
+									{/key}
 								</Table.Cell>
 							</Table.Row>
 						{/each}
@@ -178,3 +204,19 @@
 		</Card.Root>
 	{/if}
 </div>
+
+<Confirm
+	bind:open={moveOpen}
+	title="Move {moving?.row.name ?? ''} to the {moving?.plan ?? ''} plan?"
+	confirm="Change plan"
+	busy={planBusy !== null}
+	onConfirm={move}
+>
+	{#if moving?.plan === 'free'}
+		Its next write is held to the free plan's limits. Nothing already running is paused or
+		deleted.
+	{:else}
+		The plan's own limits are lifted; the server's ceilings still apply.
+	{/if}
+	{#if planError}<span class="mt-2 block text-attention-ink" role="alert">{planError}</span>{/if}
+</Confirm>

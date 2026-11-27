@@ -23,6 +23,7 @@ async fn every_authed_read_denies_without_a_credential() -> anyhow::Result<()> {
         "/api/workspace",
         "/api/workspace/status-page",
         "/api/workspace/webhook",
+        "/api/workspace/export",
         "/api/invitations",
     ] {
         let response = http
@@ -54,6 +55,8 @@ async fn every_authed_write_denies_without_a_credential() -> anyhow::Result<()> 
         (reqwest::Method::PATCH, "/api/workspace"),
         (reqwest::Method::PUT, "/api/workspace/status-page"),
         (reqwest::Method::PUT, "/api/workspace/webhook"),
+        (reqwest::Method::POST, "/api/account/password"),
+        (reqwest::Method::DELETE, "/api/account"),
         (
             reqwest::Method::DELETE,
             "/api/tokens/00000000-0000-0000-0000-000000000000",

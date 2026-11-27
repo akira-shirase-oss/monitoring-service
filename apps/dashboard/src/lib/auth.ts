@@ -37,16 +37,22 @@ export async function signup(email: string, password: string, invite: string): P
 	});
 }
 
-/** Delete the session row and expire the cookie — idempotent, safe to always call. */
-export async function logout(): Promise<void> {
+/**
+ * End the session on the server. True when the server confirmed it. False when it did
+ * not answer or refused: the session is then still alive, and the caller must say so
+ * rather than show a sign-in screen over a browser that is still signed in.
+ */
+export async function logout(): Promise<boolean> {
+	try {
+		const response = await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+		if (!response.ok) return false;
+	} catch {
+		return false;
+	}
 	// The pick belongs to the account that made it: the next one to sign in on this
 	// browser starts in its own workspace.
 	pick('');
-	try {
-		await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
-	} catch {
-		// The cookie expires anyway; a network blip shouldn't trap the sign-out.
-	}
+	return true;
 }
 
 /**
