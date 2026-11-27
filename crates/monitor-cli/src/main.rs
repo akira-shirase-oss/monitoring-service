@@ -38,6 +38,43 @@ enum Command {
     /// Write an online snapshot of the store into the server's `SMON_BACKUP_DIR`
     /// (D-019); the server names the file — prints its name and size.
     Backup,
+    /// Sign-up invite codes for the hosted product. Operator work: needs the admin token.
+    Invites {
+        #[command(subcommand)]
+        action: Invites,
+    },
+    /// The hosted product's workspaces and their plans. Listing shows the workspaces the
+    /// credential can see; moving a plan is operator work.
+    Workspaces {
+        #[command(subcommand)]
+        action: Workspaces,
+    },
+}
+
+#[derive(Subcommand)]
+enum Invites {
+    /// Create one sign-up code. It is printed once and stored only as a digest: a lost
+    /// code can't be shown again, so create another.
+    Create {
+        /// Hours the code stays usable. The server's default is three days and its
+        /// limit thirty.
+        #[arg(long)]
+        ttl_hours: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum Workspaces {
+    /// List workspaces: id, plan, role, slug and name.
+    List,
+    /// Move a workspace to another plan. The new plan gates its next write; nothing
+    /// already running is paused or deleted.
+    Plan {
+        /// The workspace's id (`monitor workspaces list`).
+        id: String,
+        /// The plan to move it to: `free` or `operator`.
+        plan: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -219,6 +256,8 @@ async fn run() -> Result<()> {
         }
         Command::Monitors { action } => monitors(&client, base, action).await?,
         Command::Maintenance { action } => maintenance(&client, base, action).await?,
+        Command::Invites { action } => invites(&client, base, action).await?,
+        Command::Workspaces { action } => workspaces(&client, base, action).await?,
         Command::Backup => {
             let body = post(
                 &client,
@@ -231,6 +270,73 @@ async fn run() -> Result<()> {
                 "created {}\t{} bytes",
                 created["name"].as_str().unwrap_or("(unnamed)"),
                 created["bytes"].as_u64().unwrap_or(0)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn invites(client: &reqwest::Client, base: &str, action: Invites) -> Result<()> {
+    match action {
+        Invites::Create { ttl_hours } => {
+            let payload = ttl_hours.map_or_else(
+                || serde_json::json!({}),
+                |hours| serde_json::json!({ "ttl_hours": hours }),
+            );
+            let body = post(client, &format!("{base}/api/invites"), &payload).await?;
+            let created: serde_json::Value = serde_json::from_str(&body)?;
+            // The code alone on stdout, so a script can capture it; the note on stderr.
+            println!("{}", created["invite"]["code"].as_str().unwrap_or_default());
+            eprintln!(
+                "valid until {} — shown once, good for one sign-up",
+                created["invite"]["expires_at"]
+                    .as_str()
+                    .unwrap_or("(unknown)")
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn workspaces(client: &reqwest::Client, base: &str, action: Workspaces) -> Result<()> {
+    match action {
+        Workspaces::List => {
+            let body = get(client, &format!("{base}/api/workspaces")).await?;
+            let parsed: serde_json::Value = serde_json::from_str(&body)?;
+            let rows = parsed["workspaces"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice);
+            if rows.is_empty() {
+                println!("no workspaces");
+            }
+            for row in rows {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    row["id"].as_str().unwrap_or_default(),
+                    row["plan"].as_str().unwrap_or_default(),
+                    row["role"].as_str().unwrap_or_default(),
+                    row["slug"].as_str().unwrap_or_default(),
+                    row["name"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        Workspaces::Plan { id, plan } => {
+            let response = send(
+                client
+                    .patch(format!("{base}/api/workspaces/{id}/plan"))
+                    .json(&serde_json::json!({ "plan": plan })),
+            )
+            .await?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                explain_error(status.as_u16(), &body)?;
+            }
+            let moved: serde_json::Value = serde_json::from_str(&body)?;
+            println!(
+                "{} is now on the {} plan",
+                moved["workspace"]["name"].as_str().unwrap_or(&id),
+                moved["workspace"]["plan"].as_str().unwrap_or(&plan)
             );
         }
     }

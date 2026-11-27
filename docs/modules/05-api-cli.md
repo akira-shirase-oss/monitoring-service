@@ -100,6 +100,10 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   same rules — an edit proposing bad ranges or a HEAD/marker pair is 422 —
   and the patch can shrink but never skip validation. None of it reaches the
   public `status.json` (module 07's allowlist).
+- **Hosted operations in the CLI:** `monitor invites create [--ttl-hours N]` prints one
+  sign-up code on stdout (and its expiry on stderr); `monitor workspaces list` prints
+  id, plan, role, slug and name per workspace; `monitor workspaces plan <id> <plan>`
+  moves a workspace between plans. All three use the same API and exit codes as the rest.
 - **CLI parity:** `monitor ping`, `monitors list|add|show|edit|pause|unpause|delete`,
   `maintenance add|list|rm`, `backup` — every management operation the API offers.
   `monitor maintenance add <id> --from now|<rfc3339> --to <rfc3339> [--reason s]` — a bad

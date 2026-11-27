@@ -1,7 +1,26 @@
 # Service Monitor as a SaaS — plan
 
-Status: **plan, not built.** Written 2026-11-13. Nothing here is deployed yet; numbers measured on the droplet do
-not exist yet and are marked *unmeasured*.
+Status (2026-11-27): **built and tested locally and on CI; not deployed.** Accounts, workspaces, roles, tokens,
+per-workspace alerts and status pages, plan limits and the hosted dashboard all exist (see "Where it stands"
+below). Nothing runs on a server yet, so every number that needs the droplet is still *unmeasured*. Written
+2026-11-13.
+
+## Where it stands
+
+| Area | State |
+|---|---|
+| Accounts | Invite-gated sign-up, sign-in, sign-out, sessions per account. **Missing:** email verification and a "forgot password" email (there is no mail to an account yet). Change password and delete account are in progress. |
+| Workspaces | Every row carries its workspace and every query is scoped by type. Owner, member and viewer roles; invitations a person accepts; a workspace switcher. |
+| Tokens | Per-workspace API tokens (viewer or member), shown once, revocable. |
+| Alert channels | One webhook per workspace, checked for private addresses at save and at every send (D-017), signed, with a test send. **Missing:** email recipients per workspace (email alerts are still the operator's single SMTP destination). |
+| Status pages | One public page per workspace at `/s/<slug>` with its JSON at `/s/<slug>/status.json`; the owner picks the title, the address and the monitors. |
+| Limits | Free plan: 10 monitors, 60 s shortest interval, checks kept 2 days, incidents 90 days (D-022). Per-workspace share of the probe budget (D-024). The workspace sees its limits on the General page. |
+| Dashboard | Every API operation a workspace has is in the dashboard: setup guide, monitors (method, passing statuses, body text), incidents, maintenance, members, tokens, alerts, status page, general. **Placeholder look:** neutral tokens until Service Monitor's own design is chosen; it changes one stylesheet. |
+| Monitor deletion | A monitor can be deleted with its history by asking for exactly that (D-026). |
+| Account lifecycle | Delete account (with its sole workspaces) and export a workspace's data: in progress. |
+| Tests | Unit and in-process API tests, a running-instance attack suite with a mutation proof, fuzz targets, and 26 browser journeys; all run on CI on every push. |
+| Deploy | Install, upgrade, rollback, backup and smoke scripts exist and pass local drills. **No host yet.** |
+| Docs site, landing page | A docs repository exists locally without a remote; the landing page is not committed. Neither is published. |
 
 ## The goal
 
@@ -18,7 +37,7 @@ Decisions already made (2026-11-13, by the maintainer):
 - **Landing page content is edited in Colophon** and served as a static site.
 - **Payments are bypassed:** a free plan with limits.
 
-## Where Service Monitor is today
+## Where Service Monitor was when this plan was written (2026-11-13)
 
 - One operator: `SMON_ADMIN_TOKEN` bearer for CLI/scripts, or the `__Host-smon_session` cookie from `POST /api/login`.
   There are no user accounts or workspaces.
@@ -87,6 +106,17 @@ Monitor token, Colophon registers its sites in that user's workspace through the
 | S3 Limits | Plan limits and per-workspace probe caps. | Noisy-tenant run: one workspace at its limit does not move another workspace's slot coverage. |
 | S4 Load on the droplet | ≥1M checks across many workspaces, plus the API under load, generated from another machine. | Results committed under `perf/results/` with droplet spec and commit hash. |
 | S5 Friends beta | Invite codes go out. | The 24-hour soak on the droplet; runbook exercised (restore, workspace deletion). |
+
+## What is left before a friends beta
+
+1. **A host.** Deploy with `deploy/droplet/` and point a name at it (one level under the zone, for the
+   certificate). Then S0's evidence: a week of coverage and alert delivery watching Colophon and Durable Runner.
+2. **Mail to accounts.** A provider for `SMON_SMTP_*`, then email verification, "forgot password", and
+   invitation mail. Until then a lost password needs the operator.
+3. **Its own look.** Choose Service Monitor's design system; apply it to the dashboard, the landing page and
+   the docs.
+4. **Docs site and landing page**, published.
+5. **Evidence on the host**, when asked for: the 1M-check load run (S4) and the 24-hour soak (S5).
 
 ## Open questions
 

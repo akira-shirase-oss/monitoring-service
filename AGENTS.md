@@ -4,7 +4,16 @@ The rebuild of the old service monitor, per `Project_Guides/02_Service_Monitor_R
 (read it first — it is the contract). The old code is gone (D-001); the guide plus the
 404human.dev build log are the specification.
 
-**Current state (2026-11-06): the rebuild roadmap is complete — M0–M7 are built and
+**Hosted product (2026-11-27): built, not deployed.** On top of the engine below there
+are now accounts (invite-gated), workspaces with owner/member/viewer roles and
+invitations, per-workspace API tokens, a per-workspace signed webhook with a test send,
+a public status page per workspace at `/s/<slug>`, plan limits, per-monitor request
+method and response expectations (M8), and a dashboard that covers every one of those
+operations. `docs/SAAS_PLAN.md` has the table of what exists and what is left; start
+there for any hosted-product task. The browser journeys in `apps/dashboard/tests/` run
+on CI (`scripts/e2e.sh`): a dashboard change ships with a journey.
+
+**Engine state (2026-11-06): the rebuild roadmap is complete — M0–M7 are built and
 verified.** The observing loop (one attempt per slot, `try_acquire` bounds, counted
 misses, generation invalidation, restart rebuild from committed evidence), the
 incident machine (three failures open, two fresh passes close — per-monitor

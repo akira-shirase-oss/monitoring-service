@@ -398,3 +398,65 @@ test('the free plan shows its limits and names the one a write hits', async ({
 	await page.getByRole('button', { name: 'Create monitor' }).click();
 	await expect(page.getByRole('alert')).toContainText('below the 60s minimum');
 });
+
+test('the operator hands out a sign-up code and moves the new workspace to another plan', async ({
+	page,
+	browser,
+	request,
+	baseURL
+}) => {
+	const origin = baseURL ?? '';
+	// The operator's browser session, earned with the token like the sign-in card does.
+	expect((await page.request.post('/api/login', { data: { token: TOKEN } })).status()).toBe(204);
+	await page.goto('/operator');
+	await page.getByTestId('invite-create').click();
+	const code = await page.getByTestId('invite-code').inputValue();
+	expect(code.length).toBeGreaterThan(16);
+
+	// The code really creates an account: someone signs up with it in their own browser.
+	const guestContext = await browser.newContext();
+	const guest = await guestContext.newPage();
+	const email = address('invited');
+	await guest.goto(`${origin}/signup`);
+	await guest.locator('#auth-email').fill(email);
+	await guest.locator('#auth-password').fill(PASSWORD);
+	await guest.locator('#auth-invite').fill(code);
+	await guest.getByTestId('password-submit').click();
+	await expect(guest).toHaveURL(/\/onboarding$/, { timeout: 15_000 });
+	// An account's sidebar has no operator page, and the page itself refuses them.
+	await expect(guest.getByTestId('nav-operator')).toHaveCount(0);
+	await guest.goto(`${origin}/operator`);
+	await expect(guest.getByTestId('problem')).toBeVisible();
+	await expect(guest.getByTestId('invite-create')).toHaveCount(0);
+	const workspaceId = (await (await guest.request.get('/api/workspaces')).json()).workspaces[0]
+		.id as string;
+	await guestContext.close();
+
+	// A code is good for one sign-up only.
+	const again = await request.post('/api/signup', {
+		data: { email: address('second'), password: PASSWORD, invite: code },
+		headers: { origin }
+	});
+	expect(again.status()).toBe(403);
+
+	// The new workspace appears in the operator's list on the free plan; moving it sticks.
+	await page.reload();
+	const rows = page.getByTestId('workspace-row');
+	await expect(rows.first()).toBeVisible();
+	const listed = (await (await page.request.get('/api/workspaces')).json()).workspaces as {
+		id: string;
+		plan: string;
+	}[];
+	const index = listed.findIndex((w) => w.id === workspaceId);
+	expect(listed[index]?.plan).toBe('free');
+	await rows.nth(index).getByTestId('workspace-plan').selectOption('operator');
+	await expect
+		.poll(async () => {
+			const now = (await (await page.request.get('/api/workspaces')).json()).workspaces as {
+				id: string;
+				plan: string;
+			}[];
+			return now.find((w) => w.id === workspaceId)?.plan;
+		})
+		.toBe('operator');
+});

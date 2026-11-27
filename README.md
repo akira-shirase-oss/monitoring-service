@@ -108,6 +108,32 @@ npm run dev --workspace @service-monitor/dashboard   # http://127.0.0.1:58600
 npm run build --workspace @service-monitor/dashboard
 ```
 
+## Hosted mode: accounts and workspaces
+
+The same server runs as a hosted product. People sign up with an invite code, each
+account gets a workspace, and a workspace has members (owner, member, viewer), API
+tokens, one signed alert webhook, plan limits and a public status page at
+`/s/<slug>`. `docs/SAAS_PLAN.md` says what exists and what is left.
+
+To try it against the dev server above:
+
+```bash
+# the operator creates a sign-up code (printed once)
+monitor invites create
+
+# open http://127.0.0.1:58465/signup, create the account with that code, and follow
+# the "Get started" guide: name the workspace, watch a URL, connect a webhook, and
+# see the first checks land
+
+# the free plan allows 10 monitors and one check a minute; to lift a workspace off it
+monitor workspaces list
+monitor workspaces plan <workspace-id> operator
+```
+
+The operator can do the same from the dashboard: sign in with the operator token (under
+"Technical details" on the sign-in card) and open **Operator**. After rebuilding the
+dashboard, restart the server: it pins the page's script hashes at start-up.
+
 ## Install
 
 ```bash

@@ -12,6 +12,7 @@
 	import RadarIcon from '@lucide/svelte/icons/radar';
 	import RocketIcon from '@lucide/svelte/icons/rocket';
 	import SettingsIcon from '@lucide/svelte/icons/settings';
+	import ShieldIcon from '@lucide/svelte/icons/shield';
 	import SirenIcon from '@lucide/svelte/icons/siren';
 	import UsersIcon from '@lucide/svelte/icons/users';
 	import WebhookIcon from '@lucide/svelte/icons/webhook';
@@ -124,6 +125,21 @@
 						</Sidebar.MenuItem>
 					</Sidebar.Menu>
 				</Sidebar.Group>
+
+				{#if who?.role === 'operator'}
+					<Sidebar.Group>
+						<Sidebar.GroupLabel>Server</Sidebar.GroupLabel>
+						<Sidebar.Menu>
+							<Sidebar.MenuItem>
+								<Sidebar.MenuButton isActive={route.startsWith('/(app)/operator')} tooltipContent="Operator">
+									{#snippet child({ props })}
+										<a href="/operator" {...props} data-testid="nav-operator"><ShieldIcon /><span>Operator</span></a>
+									{/snippet}
+								</Sidebar.MenuButton>
+							</Sidebar.MenuItem>
+						</Sidebar.Menu>
+					</Sidebar.Group>
+				{/if}
 
 				<Sidebar.Group>
 					<Sidebar.GroupLabel>Monitor</Sidebar.GroupLabel>

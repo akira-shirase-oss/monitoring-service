@@ -25,6 +25,9 @@
 - **Fix: token, member and invite times are RFC 3339 strings.** They were returned as
   arrays of numbers.
 - **`url` 2.5.9** (RUSTSEC-2026-0592, a stack overflow in `Url::origin()`).
+- **Operators no longer need curl.** `monitor invites create` and
+  `monitor workspaces list|plan` in the CLI, and an Operator page in the dashboard for
+  sign-up codes and workspace plans.
 - CI now drives the dashboard in a real browser on every push.
 
 ### Scheduler capacity (2026-11-17, D-018) — behaviour changes
