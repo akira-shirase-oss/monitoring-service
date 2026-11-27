@@ -179,20 +179,21 @@ test('mutations through the real API: create in UI, pause, edit, delete', async 
 		})
 		.toBe('30');
 
-	// Delete needs the two-click confirm; a paused, checkless monitor deletes clean.
-	await page.getByRole('button', { name: 'Delete' }).click();
-	await page.getByRole('button', { name: 'Confirm delete' }).click();
+	// Delete asks first, in a dialog that names what goes with the monitor.
+	await page.getByTestId('monitor-delete').click();
+	await expect(page.getByTestId('confirm')).toContainText('checks, incidents');
+	await page.getByTestId('confirm-action').click();
 	await expect(page).toHaveURL(/\/$/);
 	await expect(page.getByRole('link', { name: renamed })).not.toBeVisible();
 });
 
-test('delete refusal on a monitor with history shows the server error', async ({
+test('a monitor with history is deleted with it, only after a confirmation that says so', async ({
 	page,
 	request
 }) => {
 	const name = `e2e-del-${Date.now()}`;
 	const id = await addMonitor(request, name, `http://127.0.0.1:${FAULT}/ok`);
-	// Wait for committed evidence — delete must then refuse (evidence isn't erasable).
+	// Wait for committed evidence: from here a plain delete refuses.
 	await expect
 		.poll(
 			async () => {
@@ -203,12 +204,25 @@ test('delete refusal on a monitor with history shows the server error', async ({
 		)
 		.toBeGreaterThan(0);
 
+	// The API's default is unchanged: no client deletes history without saying so.
+	const plain = await request.delete(`/api/monitors/${id}`, { headers: AUTH });
+	expect(plain.status()).toBe(409);
+	expect((await plain.json()).error.message).toMatch(/recorded history/);
+
+	// Cancelling the dialog deletes nothing.
 	await page.goto(`/monitors/${id}`);
-	await page.getByRole('button', { name: 'Delete' }).click();
-	await page.getByRole('button', { name: 'Confirm delete' }).click();
-	// The server's own conflict message is shown — not a silent no-op, not a spin.
-	await expect(page.getByText(/recorded history|pause it instead/)).toBeVisible();
-	await expect(page.getByRole('heading', { name })).toBeVisible();
+	await page.getByTestId('monitor-delete').click();
+	await page.getByRole('button', { name: 'Cancel' }).click();
+	await expect(page.getByTestId('confirm')).toHaveCount(0);
+	await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
+	expect((await request.get(`/api/monitors/${id}`)).status()).toBe(200);
+
+	// Confirming does: the monitor and its checks are gone, and the board says so.
+	await page.getByTestId('monitor-delete').click();
+	await page.getByTestId('confirm-action').click();
+	await expect(page).toHaveURL(/\/$/);
+	await expect(page.getByRole('link', { name })).toHaveCount(0);
+	expect((await request.get(`/api/monitors/${id}`)).status()).toBe(404);
 });
 
 test('a paused window renders as missing slots, never interpolated green', async ({
@@ -484,7 +498,14 @@ test('sign-in: wrong token refused, right token earns the session, sign-out ends
 	expect(session?.httpOnly).toBe(true);
 	expect(session?.sameSite).toBe('Strict');
 	expect(session?.secure).toBe(true);
-	expect(session?.domain, 'a __Host- cookie carries no Domain').toBeUndefined();
+	// A __Host- cookie must carry no Domain attribute. The browser's jar reports the
+	// host for a host-only cookie, so the claim is checked on the header itself.
+	const header = (await page.request.post('/api/login', { data: { token: TOKEN } })).headers()[
+		'set-cookie'
+	];
+	expect(header).toMatch(/^__Host-smon_session=/);
+	expect(header, 'a __Host- cookie carries no Domain').not.toMatch(/;\s*domain=/i);
+	expect(header).toMatch(/;\s*path=\/(;|$)/i);
 
 	// Sign out deletes the row server-side and expires the cookie — the card returns.
 	await page.getByTestId('account-menu').click();

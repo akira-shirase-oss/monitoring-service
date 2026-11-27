@@ -4,6 +4,7 @@
 	import { ArrowLeft, TriangleAlert } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { goto, invalidateAll } from '$app/navigation';
+	import Confirm from '#lib/components/shell/Confirm.svelte';
 	import Problem from '#lib/components/shell/Problem.svelte';
 	import MonitorBadge from '#lib/components/shell/MonitorBadge.svelte';
 	import MonitorForm from '#lib/components/MonitorForm.svelte';
@@ -80,12 +81,14 @@
 		}
 	}
 
+	// Deleting takes the monitor's recorded history with it — checks, incidents, queued
+	// alerts, maintenance windows — so it asks for exactly that, after a confirmation
+	// that names what goes. The dialog stays open on a refusal and shows the reason.
 	async function remove(id: string) {
-		if (!confirmingDelete) {
-			confirmingDelete = true;
-			return;
+		if (await mutate(`${id}?evidence=delete`, { method: 'DELETE' })) {
+			confirmingDelete = false;
+			await goto('/');
 		}
-		if (await mutate(id, { method: 'DELETE' })) await goto('/');
 	}
 
 	// A window's start is optional in the form — empty means "from the next slot".
@@ -228,11 +231,15 @@
 					{editing ? 'Close edit' : 'Edit'}
 				</button>
 				<button
-					onclick={() => remove(data.monitor.id)}
+					onclick={() => {
+						actionError = null;
+						confirmingDelete = true;
+					}}
 					disabled={actionBusy}
 					class="rounded-md border border-attention/40 px-3 py-1.5 text-sm text-attention-ink disabled:opacity-50"
+					data-testid="monitor-delete"
 				>
-					{confirmingDelete ? 'Confirm delete' : 'Delete'}
+					Delete
 				</button>
 			</div>
 			{#if actionError}
@@ -434,3 +441,19 @@
 		</div>
 	{/if}
 </div>
+
+
+{#if data.state === 'ok'}
+	<Confirm
+		bind:open={confirmingDelete}
+		title="Delete {data.monitor.name}?"
+		confirm="Delete monitor and history"
+		busy={actionBusy}
+		onConfirm={() => remove(data.monitor.id)}
+	>
+		Its recorded checks, incidents, queued alerts and maintenance windows are deleted with it,
+		and it leaves the public status page. This can't be undone. To stop checking but keep the
+		history, pause it instead.
+		{#if actionError}<span class="mt-2 block text-attention-ink" role="alert">{actionError}</span>{/if}
+	</Confirm>
+{/if}

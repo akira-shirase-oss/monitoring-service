@@ -2305,3 +2305,64 @@ async fn patch_null_clears_the_body_expectation_and_absent_keeps_it() {
     assert!(stored["expect_body"].is_null(), "{stored}");
     assert_eq!(stored["method"], "HEAD", "{stored}");
 }
+
+/// Deleting a monitor together with what was recorded about it is a separate,
+/// explicit request (D-026): the plain delete still refuses, the opt-in removes the
+/// monitor, its checks, its incident and its queued alerts, and nothing of another
+/// monitor's.
+#[tokio::test]
+async fn a_monitor_is_deleted_with_its_evidence_only_when_asked() {
+    let (app, statuses, db, _wh, _tmp) = app().await.unwrap();
+    let doomed = create(&app, "doomed").await.unwrap();
+    let kept = create(&app, "kept").await.unwrap();
+    let writer = seed_writer(&db, &statuses);
+    // Three failures: checks, an open incident and an outbox row for each monitor.
+    for id in [&doomed, &kept] {
+        for _ in 0..3 {
+            seed_check(&db, &writer, id, monitor_domain::CheckOutcome::Transport)
+                .await
+                .unwrap();
+        }
+    }
+    let path = format!("/api/monitors/{doomed}");
+
+    // Anything but the one word is a malformed request, not a quiet plain delete.
+    let (status, body) = send(&app, "DELETE", &format!("{path}?evidence=yes"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, _) = send(&app, "DELETE", &path, None).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the plain delete still refuses"
+    );
+
+    let (status, body) = send(&app, "DELETE", &format!("{path}?evidence=delete"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = send(&app, "GET", &path, None).await.unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Its rows are gone from every table that named it.
+    let scoped = db.workspace(WorkspaceId::DEFAULT);
+    let gone = monitor_domain::MonitorId(uuid::Uuid::parse_str(&doomed).unwrap());
+    assert!(!scoped.has_history(gone).await.unwrap());
+    let (_, incidents) = send(&app, "GET", "/api/incidents", None).await.unwrap();
+    let incidents = incidents["incidents"].as_array().unwrap();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    assert_eq!(incidents[0]["monitor_id"], kept);
+
+    // The other monitor's evidence is untouched.
+    let (_, checks) = send(&app, "GET", &format!("/api/monitors/{kept}/checks"), None)
+        .await
+        .unwrap();
+    assert_eq!(checks["checks"].as_array().unwrap().len(), 3);
+
+    // A second ask finds nothing to delete.
+    let (status, _) = send(&app, "DELETE", &format!("{path}?evidence=delete"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

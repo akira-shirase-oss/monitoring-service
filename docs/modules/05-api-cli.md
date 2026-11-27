@@ -132,3 +132,13 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Auth (M5):** missing/wrong/right credential matrix.
 - **Load:** management API at 50 rps while probes run — no probe slot starvation (soak
   assertion); body-limit and timeout behavior under k6.
+
+- **Deleting a monitor (D-026):** `DELETE /api/monitors/{id}` removes a monitor that has
+  recorded nothing and answers 409 for one that has. `?evidence=delete` removes the
+  monitor together with its checks, incidents, queued alerts, aggregates and
+  maintenance windows in one transaction; any other value is 422. Member work.
+- **Clearing a body expectation:** `PATCH` with `"expect_body": null` removes it; a
+  patch that leaves the field out keeps it.
+- **Plan limits:** each row of `GET /api/workspaces` carries `limits`
+  (`max_monitors`, `min_interval_s`, `check_retention_days`,
+  `incident_retention_days`); `null` means the plan sets no figure of its own.

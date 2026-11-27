@@ -2373,17 +2373,43 @@ async fn patch_monitor(
 
 /// Delete a monitor with no recorded evidence. A monitor with history can't be deleted —
 /// checks and incidents are the record; pause stops monitoring without erasing it.
+#[derive(Debug, Deserialize)]
+pub struct DeleteParams {
+    /// `delete` removes the monitor's recorded evidence with it (D-026). Absent, a
+    /// monitor with history is refused, as it always was.
+    pub evidence: Option<String>,
+}
+
+/// Delete a monitor — member work. A monitor that has recorded anything is refused
+/// unless the request says, in so many words, that its evidence goes too: checks,
+/// incidents, queued alerts and maintenance windows. That is the workspace's own data
+/// to remove, and the only way a monitor created by mistake stops counting against
+/// its plan; it is never the default, so no client deletes history by accident.
 async fn delete_monitor(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<auth::Principal>,
     Path(id): Path<String>,
+    Query(params): Query<DeleteParams>,
 ) -> Result<StatusCode, ApiError> {
     let view = member_for(&state, &principal)?;
+    let with_evidence = match params.evidence.as_deref() {
+        None => false,
+        Some("delete") => true,
+        Some(_) => {
+            return Err(ApiError::Invalid("evidence takes one value: delete".into()));
+        }
+    };
     let row = find_monitor(&view, &id).await?;
     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
-    if !view.delete_monitor(monitor.id).await? {
+    if with_evidence {
+        if !view.delete_monitor_with_evidence(monitor.id).await? {
+            return Err(ApiError::NotFound);
+        }
+        // The monitor may have been listed on the public page: refresh it now.
+        state.status_changed.notify_one();
+    } else if !view.delete_monitor(monitor.id).await? {
         return Err(ApiError::Conflict(
-            "monitor has recorded history; pause it instead".into(),
+            "monitor has recorded history; pause it, or delete it with its history".into(),
         ));
     }
     publish_registry(&state).await?;

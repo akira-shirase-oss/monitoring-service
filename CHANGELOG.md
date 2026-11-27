@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### The hosted dashboard is usable end to end (2026-11-27)
+
+- **Seven dashboard pages that were placeholders now work:** API tokens (the secret is
+  shown once), members and invitations, alerts (connect a webhook, copy its signing
+  secret, send a test alert), the status page editor, incidents, maintenance windows
+  across every monitor, and a four-step setup guide a new account lands on.
+- **A public status page at `/s/<slug>`.** It says "up" only for a service whose latest
+  checks passed, "unknown" for one nobody checked, and "monitoring unavailable" when
+  the monitor itself has stopped reporting.
+- **A General page** shows the workspace's plan and its limits; `GET /api/workspaces`
+  now returns `limits` for each workspace.
+- **The monitor form sets the request method, the passing statuses and body text.**
+- **A monitor can be deleted with its history** (D-026):
+  `DELETE /api/monitors/{id}?evidence=delete`. Without the parameter a monitor with
+  history is still refused. The dashboard asks through a confirmation first.
+- **Fix: `PATCH /api/monitors/{id}` with `"expect_body": null` now clears the body
+  expectation.** It was read as "not sent", so the expectation could never be removed
+  and such a monitor could never switch to `HEAD`.
+- **Fix: a status page is written when it is saved**, not at the next heartbeat. A page
+  that was just published used to read "monitoring unavailable" for up to an interval.
+- **Fix: token, member and invite times are RFC 3339 strings.** They were returned as
+  arrays of numbers.
+- **`url` 2.5.9** (RUSTSEC-2026-0592, a stack overflow in `Url::origin()`).
+- CI now drives the dashboard in a real browser on every push.
+
 ### Scheduler capacity (2026-11-17, D-018) — behaviour changes
 
 - **Monitors no longer fall due together.** Each monitor's slots sit at a fixed phase

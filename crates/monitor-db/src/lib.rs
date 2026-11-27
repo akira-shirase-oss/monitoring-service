@@ -1302,6 +1302,44 @@ impl WorkspaceDb<'_> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Delete a monitor together with everything recorded about it (D-026): its queued
+    /// alerts, incidents, checks and daily aggregates, then the monitor itself, whose
+    /// maintenance windows and status-page listing go with it. One transaction — a
+    /// reader sees the monitor with its evidence or neither — and every statement is
+    /// bound to this workspace, so a monitor id from elsewhere deletes nothing. `false`
+    /// means this workspace has no such monitor. A probe still in flight commits against
+    /// a monitor that is gone, which the writer already drops.
+    pub async fn delete_monitor_with_evidence(
+        &self,
+        monitor: MonitorId,
+    ) -> Result<bool, QueryError> {
+        let id = monitor.0.to_string();
+        let workspace = self.workspace.0.to_string();
+        let mut tx = self.db.pool.begin().await?;
+        // Children before parents: the foreign keys refuse any other order.
+        // Static statements, one per table: no SQL is ever assembled at run time.
+        for statement in [
+            "DELETE FROM notify_outbox WHERE monitor_id = ? AND workspace_id = ?",
+            "DELETE FROM incidents WHERE monitor_id = ? AND workspace_id = ?",
+            "DELETE FROM checks WHERE monitor_id = ? AND workspace_id = ?",
+            "DELETE FROM check_stats_daily WHERE monitor_id = ? AND workspace_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&id)
+                .bind(&workspace)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let deleted = sqlx::query("DELETE FROM monitors WHERE id = ? AND workspace_id = ?")
+            .bind(&id)
+            .bind(&workspace)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted > 0)
+    }
+
     /// Whether the monitor has any recorded evidence (checks or incidents). The FKs would
     /// refuse the delete anyway; asking first turns a constraint violation into a clean
     /// answer the API can translate to a `conflict` response.
@@ -2635,6 +2673,15 @@ impl MemberDb<'_> {
     /// monitor isn't in this workspace.
     pub async fn delete_monitor(&self, monitor: MonitorId) -> Result<bool, QueryError> {
         self.view.view.delete_monitor(monitor).await
+    }
+
+    /// Delete a monitor and everything recorded about it (D-026); `false` = the
+    /// monitor isn't in this workspace.
+    pub async fn delete_monitor_with_evidence(
+        &self,
+        monitor: MonitorId,
+    ) -> Result<bool, QueryError> {
+        self.view.view.delete_monitor_with_evidence(monitor).await
     }
 
     pub async fn create_window(

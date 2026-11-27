@@ -497,3 +497,29 @@ is — and HEAD can never pair with a body marker (refused at write, create and
 edit alike, because a HEAD probe reads nothing to assert on). Method is opt-in
 `GET`/`HEAD`; HEAD is preserved across every redirect including 303 and a 405
 or 501 answer is committed as that status — never rewritten to GET or retried.
+
+## D-026 — A monitor can be deleted with its evidence, only by saying so
+
+`DELETE /api/monitors/{id}` keeps its old answer: a monitor that has recorded a
+check or an incident is refused with 409, so no client removes history by
+accident. `DELETE /api/monitors/{id}?evidence=delete` is the explicit form: one
+transaction removes the monitor's queued alerts, incidents, checks and daily
+aggregates and then the monitor, whose maintenance windows and status-page
+listing cascade. Any other value of `evidence` is 422. Member work, like every
+other monitor write. The dashboard always asks through a confirmation that
+names what is removed.
+
+Why the earlier rule (the gap log's "history is preserved by not deleting") had
+to bend for the hosted product: a workspace's evidence is the workspace's own
+data, the plan caps monitors and paused ones count, and a monitor registered
+with a typo recorded a check within one interval and then occupied a slot for
+ever. The hosted plan also names "delete workspace (and its evidence)" as a
+requirement; this is the same right at the size of one monitor.
+
+What is given up, stated plainly: after such a delete the incidents and checks
+of that monitor are gone and no export can bring them back, an open incident's
+pending alerts are dropped with it (no "recovered" alert follows), and the
+aggregates no longer show that the monitor existed. A probe in flight at that
+moment commits against a monitor that is gone, which the writer already drops.
+Every statement is bound to the caller's workspace: another workspace's monitor
+id deletes nothing, and a test weakening that binding fails.
