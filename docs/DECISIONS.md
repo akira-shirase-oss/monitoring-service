@@ -583,6 +583,14 @@ an owner, then delete your account`. The same rule as demoting or removing the l
 owner, for the same reason: the others would be left in a workspace nobody can
 administer. Nothing is deleted and the account stays signed in.
 
+Also 409, the same way, while a workspace that would be deleted holds more than 50,000
+raw checks: `the workspace "<name>" holds too much history to delete in one step:
+delete its monitors with their history, then delete your account`. The deletion is one
+transaction and every workspace's check results wait on the store's one write lock
+while it runs, so it has to stay small. Deleting a monitor with its history works in
+batches (D-026) and brings a workspace under the bound. A free-plan workspace at its
+limits holds about 29,000 (ten monitors, one check a minute, kept two days).
+
 **What is kept on purpose.**
 
 - The seeded default workspace is never deleted, whoever sits in it: it is the
@@ -591,11 +599,12 @@ administer. Nothing is deleted and the account stays signed in.
   credentials and its remaining owners can revoke them; only "created by" is cleared.
 - The signup invite the account used stays spent.
 - `accounts.workspace_id` (where a session lands when it names no workspace) has no
-  cascade. If a deleted workspace is still the home of some *other* account — one that
-  left it or was removed from it — that account is moved to the workspace it joined
+  cascade. An account can no longer be removed from its own workspace, but a row
+  written before that rule can still call a workspace home without a seat in it. If
+  such a workspace is deleted, that *other* account is moved to the workspace it joined
   first, or to the seeded default workspace when it has no seat anywhere. It gets no
   seat it did not have: an account with no membership answers `not_a_member` before
-  and after.
+  and after. Without the move the foreign key would refuse the deletion for ever.
 
 **What is given up, stated plainly.**
 
@@ -607,10 +616,13 @@ administer. Nothing is deleted and the account stays signed in.
 - The workspace's status-page slug, and the slugs it held, are free again. A later
   workspace can publish under a name readers knew. Holding names for ever on behalf
   of workspaces that no longer exist was judged the worse trade.
-- The delete is one write transaction on a single-writer store, sized by the
-  workspace's plan (tens of thousands of rows on the free plan). Probe commits wait
-  behind it for that long. The deletes reach checks and aggregates through the
-  per-monitor indexes, never by scanning other tenants' rows.
+- The delete is one write transaction on a single-writer store, bounded at 50,000 raw
+  checks per workspace. Probe commits wait behind it for that long, which is far more
+  than one batch of a monitor's deletion (2,000 rows) and far less than their busy
+  timeout. The deletes reach checks and aggregates through the per-monitor indexes,
+  never by scanning other tenants' rows. A workspace above the bound is not shed
+  automatically: its owner deletes monitors first. Doing that for them in batches
+  would need a way to stop anyone joining the workspace half-way, and was left out.
 - Backups taken before the deletion still hold the account and its data. Deleting an
   account does not reach into them.
 - The deletion and what follows it (republishing the schedule, retiring the status

@@ -165,7 +165,9 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   - `DELETE /api/account` `{password}` → 204 and an expired session cookie. Deletes
     the account, every workspace only it is a member of (with all its data), its seats
     elsewhere and invitations addressed to it. 409 `conflict` while it is the only
-    owner of a workspace that has other members.
+    owner of a workspace that has other members, and while a workspace it would
+    delete holds more than 50,000 raw checks (delete monitors with their history
+    first: that works in batches, this is one transaction).
 - **Workspace export (D-027):** `GET /api/workspace/export` → the caller's workspace as
   one JSON attachment (`service-monitor-export-<slug>.json`, `no-store`): `workspace`,
   `members` (email, role), `monitors`, `maintenance_windows`, `incidents`,

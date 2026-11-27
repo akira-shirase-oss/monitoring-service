@@ -143,6 +143,12 @@ impl Db {
     /// deleted with everything recorded in it, the account's seats in other workspaces
     /// are removed, and its sessions, pending invitations and the account row go.
     ///
+    /// Also refused, the same way, while one of those workspaces holds more than
+    /// `max_checks` raw checks: every workspace's observation commits wait on the
+    /// store's one write lock, so the single transaction that removes a workspace must
+    /// stay small. Deleting monitors with their history works in batches (D-026) and
+    /// brings a workspace under the bound.
+    ///
     /// Returns the workspaces that were deleted, so the caller can drop what it holds
     /// about them outside the store (the schedule, the public status pages).
     ///
@@ -150,7 +156,11 @@ impl Db {
     /// sits in it. The first statement is a write on purpose: it takes the store's
     /// write lock before anything is read, so the "only member" and "only owner"
     /// answers cannot change between the read and the deletes.
-    pub async fn delete_account(&self, account: AccountId) -> Result<Vec<WorkspaceId>, QueryError> {
+    pub async fn delete_account(
+        &self,
+        account: AccountId,
+        max_checks: i64,
+    ) -> Result<Vec<WorkspaceId>, QueryError> {
         let id = account.0.to_string();
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM sessions WHERE account_id = ?")
@@ -189,6 +199,29 @@ impl Db {
         .fetch_all(&mut *tx)
         .await?;
         for workspace in &sole {
+            // Counted through the per-monitor index and never past the bound, so the
+            // question itself is cheap however much the workspace holds.
+            let heavy: Option<String> = sqlx::query_scalar(
+                "SELECT w.name FROM workspaces w
+                  WHERE w.id = ?1
+                    AND (SELECT COUNT(*) FROM (
+                           SELECT 1 FROM checks c
+                            WHERE c.workspace_id = ?1
+                              AND c.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
+                            LIMIT ?2)) >= ?2",
+            )
+            .bind(workspace)
+            .bind(max_checks.saturating_add(1))
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(name) = heavy {
+                return Err(QueryError::Conflict(format!(
+                    "the workspace \"{name}\" holds too much history to delete in one step: \
+                     delete its monitors with their history, then delete your account"
+                )));
+            }
+        }
+        for workspace in &sole {
             purge_workspace(&mut tx, workspace, &id).await?;
         }
         for statement in FORGET_ACCOUNT {
@@ -217,11 +250,12 @@ impl Db {
 /// still calls it home.
 ///
 /// `accounts.workspace_id` is where a session lands when it names no workspace, and it
-/// must point at a workspace that exists. Another account can still point here after it
-/// left or was removed (it is not a member, or this workspace would not be deleted).
-/// Such an account is moved to the workspace it joined first, or to the seeded default
-/// workspace when it has no seat anywhere: there it is exactly as it was before, an
-/// account that belongs to no workspace, and no seat is created for it.
+/// must point at a workspace that exists. An account can no longer be removed from its
+/// own workspace, but a row written before that rule can still point here without a
+/// seat (with a seat, this workspace would not be deleted). Such an account is moved to
+/// the workspace it joined first, or to the seeded default workspace when it has no
+/// seat anywhere: there it is exactly as it was before, an account that belongs to no
+/// workspace, and no seat is created for it.
 async fn purge_workspace(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workspace: &str,

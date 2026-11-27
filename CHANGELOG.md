@@ -51,8 +51,9 @@
 - **An account can delete itself**: `DELETE /api/account` with its password. A workspace
   that only this account is in is deleted with its monitors, checks, incidents and
   status page; shared workspaces stay, minus the seat. The only owner of a workspace
-  that has other members is asked to make someone else an owner first. There is no
-  undo.
+  that has other members is asked to make someone else an owner first, and a workspace
+  holding more than 50,000 checks is asked to delete monitors first, so one deletion
+  can't stall everyone's checks. There is no undo.
 - **A workspace's owner can export its data**: `GET /api/workspace/export` downloads one
   JSON file with the monitors, maintenance windows, incidents, daily totals and each
   monitor's newest 5,000 checks. It contains no webhook secret, token or password hash.

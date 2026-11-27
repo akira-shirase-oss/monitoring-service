@@ -64,6 +64,9 @@ const WORKSPACE_TABLES: [(&str, &str); 12] = [
     ),
 ];
 
+/// A check bound no fixture comes near: the tests that are not about the bound.
+const ROOMY: i64 = 50_000;
+
 struct Store {
     db: Db,
     /// A second connection to the same file, for counting what the store API hides.
@@ -244,7 +247,7 @@ async fn deleting_an_account_removes_its_sole_workspace_and_nothing_of_anyone_el
     let before_kept = counts(&store.raw, kept).await?;
     let default_before = counts(&store.raw, WorkspaceId::DEFAULT).await?;
 
-    assert_eq!(store.db.delete_account(leaving).await?, vec![gone]);
+    assert_eq!(store.db.delete_account(leaving, ROOMY).await?, vec![gone]);
 
     for (table, count) in counts(&store.raw, gone).await? {
         assert_eq!(count, 0, "{table} still holds the deleted workspace's rows");
@@ -335,7 +338,7 @@ async fn the_only_owner_of_a_shared_workspace_is_refused_and_nothing_changes() -
         .await?;
     let before = counts(&store.raw, shared).await?;
 
-    let refusal = store.db.delete_account(owner).await;
+    let refusal = store.db.delete_account(owner, ROOMY).await;
     match refusal {
         Err(QueryError::Conflict(message)) => assert_eq!(
             message,
@@ -366,7 +369,7 @@ async fn the_only_owner_of_a_shared_workspace_is_refused_and_nothing_changes() -
             .set_member_role(guest, Role::Owner)
             .await?
     );
-    assert_eq!(store.db.delete_account(owner).await?, Vec::new());
+    assert_eq!(store.db.delete_account(owner, ROOMY).await?, Vec::new());
     let mut expected = before;
     for (table, count) in &mut expected {
         if *table == "members" {
@@ -399,7 +402,10 @@ async fn a_member_who_deletes_their_account_leaves_a_shared_workspace_whole() ->
         .await?;
     let before = counts(&store.raw, shared).await?;
 
-    assert_eq!(store.db.delete_account(member).await?, vec![members_own]);
+    assert_eq!(
+        store.db.delete_account(member, ROOMY).await?,
+        vec![members_own]
+    );
 
     let mut expected = before;
     for (table, count) in &mut expected {
@@ -437,10 +443,10 @@ async fn a_workspace_nobody_calls_home_survives_one_of_its_owners_leaving() -> a
             .add_member(owner, Role::Owner, now)
             .await?;
     }
-    assert_eq!(store.db.delete_account(creator).await?, Vec::new());
+    assert_eq!(store.db.delete_account(creator, ROOMY).await?, Vec::new());
     let before = counts(&store.raw, shared).await?;
 
-    let gone = store.db.delete_account(first).await?;
+    let gone = store.db.delete_account(first, ROOMY).await?;
 
     assert!(
         !gone.contains(&shared),
@@ -462,7 +468,8 @@ async fn a_workspace_nobody_calls_home_survives_one_of_its_owners_leaving() -> a
 
 /// `accounts.workspace_id` has no cascade: a workspace that is another account's home
 /// can only be deleted once that account points somewhere that exists. The other
-/// account is moved, never deleted and never given a seat it did not have.
+/// account is moved, never deleted and never given a seat it did not have. Without the
+/// move the deletion would fail on the foreign key and the heir could never leave.
 #[tokio::test]
 async fn an_account_whose_home_workspace_is_deleted_is_moved_not_broken() -> anyhow::Result<()> {
     let store = store().await?;
@@ -471,12 +478,22 @@ async fn an_account_whose_home_workspace_is_deleted_is_moved_not_broken() -> any
     let (drifter, second_ws) = tenant(&store.db, "drifter").await?;
     let (_host, hosted) = tenant(&store.db, "host").await?;
     let now = OffsetDateTime::now_utc();
-    // The heir takes over two workspaces whose founders then leave them: each founder's
-    // account still calls the workspace home, and the heir is its only member.
+    // The heir takes over two workspaces whose founders are no longer in them. An
+    // account can't be removed from its own workspace any more, so this is a state only
+    // older rows hold: the seat is taken away directly, as it once could be.
     for (workspace, old) in [(first_ws, founder), (second_ws, drifter)] {
-        let admin = store.db.owner(workspace);
-        admin.add_member(heir, Role::Owner, now).await?;
-        assert!(admin.remove_member(old).await?);
+        store
+            .db
+            .owner(workspace)
+            .add_member(heir, Role::Owner, now)
+            .await?;
+        let removed = sqlx::query("DELETE FROM members WHERE workspace_id = ? AND account_id = ?")
+            .bind(workspace.0.to_string())
+            .bind(old.0.to_string())
+            .execute(&store.raw)
+            .await?
+            .rows_affected();
+        assert_eq!(removed, 1);
     }
     // The founder has a seat elsewhere; the drifter has none anywhere.
     store
@@ -485,7 +502,7 @@ async fn an_account_whose_home_workspace_is_deleted_is_moved_not_broken() -> any
         .add_member(founder, Role::Viewer, now)
         .await?;
 
-    let mut gone = store.db.delete_account(heir).await?;
+    let mut gone = store.db.delete_account(heir, ROOMY).await?;
     gone.sort_by_key(|workspace| workspace.0);
     let mut expected = vec![first_ws, second_ws, heirs_own];
     expected.sort_by_key(|workspace| workspace.0);
@@ -539,7 +556,7 @@ async fn the_seeded_workspace_is_never_deleted_with_an_account() -> anyhow::Resu
     record(&store, &monitor, CheckOutcome::Pass).await?;
     let before = counts(&store.raw, WorkspaceId::DEFAULT).await?;
 
-    assert_eq!(store.db.delete_account(account).await?, vec![own]);
+    assert_eq!(store.db.delete_account(account, ROOMY).await?, vec![own]);
 
     let mut expected = before;
     for (table, count) in &mut expected {
@@ -548,6 +565,51 @@ async fn the_seeded_workspace_is_never_deleted_with_an_account() -> anyhow::Resu
         }
     }
     assert_eq!(counts(&store.raw, WorkspaceId::DEFAULT).await?, expected);
+    Ok(())
+}
+
+/// The one transaction that removes a workspace holds the store's write lock, so it is
+/// bounded: a workspace with more raw checks than the bound is refused by name, with
+/// nothing deleted and the account still signed in, and goes once it is under it.
+#[tokio::test]
+async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> anyhow::Result<()> {
+    let store = store().await?;
+    let (account, workspace) = tenant(&store.db, "heavy").await?;
+    fill(&store, account, workspace).await?; // four checks
+    let now = OffsetDateTime::now_utc();
+    store
+        .db
+        .create_account_session_at(
+            "session-heavy",
+            account,
+            now,
+            now + time::Duration::hours(1),
+        )
+        .await?;
+    let before = counts(&store.raw, workspace).await?;
+
+    match store.db.delete_account(account, 3).await {
+        Err(QueryError::Conflict(message)) => assert_eq!(
+            message,
+            "the workspace \"heavy's workspace\" holds too much history to delete in one \
+             step: delete its monitors with their history, then delete your account"
+        ),
+        other => anyhow::bail!("expected the history-bound refusal, got {other:?}"),
+    }
+    assert_eq!(counts(&store.raw, workspace).await?, before);
+    assert!(store.db.account_by_id(account).await?.is_some());
+    assert_eq!(
+        scalar(
+            &store.raw,
+            "SELECT COUNT(*) FROM sessions WHERE account_id = ?",
+            &account.0.to_string()
+        )
+        .await?,
+        1
+    );
+
+    // Exactly at the bound is allowed.
+    assert_eq!(store.db.delete_account(account, 4).await?, vec![workspace]);
     Ok(())
 }
 
@@ -654,7 +716,7 @@ async fn no_session_is_created_for_a_password_hash_that_is_no_longer_stored() ->
             .is_none()
     );
 
-    store.db.delete_account(account).await?;
+    store.db.delete_account(account, ROOMY).await?;
     assert!(
         !store
             .db
