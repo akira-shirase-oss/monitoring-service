@@ -7,7 +7,9 @@
 	import { Input } from '#lib/components/ui/input/index.js';
 	import FormRow from '#lib/components/shell/FormRow.svelte';
 	import PageHeader from '#lib/components/shell/PageHeader.svelte';
-	import { call } from '#lib/call.js';
+	import { readEnvelope } from '#lib/api.js';
+	import { apiFetch } from '#lib/auth.js';
+	import { call, UNREACHABLE } from '#lib/call.js';
 	import { span } from '#lib/time.js';
 	import { current } from '#lib/workspace.svelte.js';
 	import type { PageData } from './$types';
@@ -17,11 +19,46 @@
 	const who = $derived(current());
 	const canWrite = $derived(who?.role === 'owner' || who?.role === 'member');
 	const limits = $derived(who?.limits ?? null);
+	// Taking the workspace's data away is the owner's call (the server refuses anyone else).
+	const canExport = $derived(who?.role === 'owner' || who?.role === 'operator');
 
 	let name = $state(untrack(() => who?.name ?? ''));
 	let busy = $state(false);
 	let error = $state<string | null>(null);
 	let saved = $state(false);
+
+	let exporting = $state(false);
+	let exportError = $state<string | null>(null);
+
+	// The export is a file the server names. It is fetched like every other call, so the
+	// picked workspace rides along and a refusal is shown in the server's words, and then
+	// handed to the browser as a download.
+	async function exportData() {
+		exporting = true;
+		exportError = null;
+		try {
+			const response = await apiFetch('/api/workspace/export', undefined, fetch);
+			const failure = await readEnvelope(response);
+			if (failure) {
+				exportError = failure.message;
+				return;
+			}
+			const named = /filename="([^"]+)"/.exec(response.headers.get('content-disposition') ?? '');
+			const url = URL.createObjectURL(await response.blob());
+			const link = document.createElement('a');
+			link.href = url;
+			link.download = named?.[1] ?? 'service-monitor-export.json';
+			document.body.append(link);
+			link.click();
+			link.remove();
+			// The browser has taken the file by the next task; a short wait covers slow ones.
+			setTimeout(() => URL.revokeObjectURL(url), 10_000);
+		} catch {
+			exportError = UNREACHABLE.message;
+		} finally {
+			exporting = false;
+		}
+	}
 
 	const ROLE_WORDS: Record<string, string> = {
 		owner: 'Owner: manages people, tokens and everything below.',
@@ -131,4 +168,27 @@
 			{/if}
 		</Card.Content>
 	</Card.Root>
+
+	{#if canExport}
+		<Card.Root data-testid="export-card">
+			<Card.Header>
+				<Card.Title>Export data</Card.Title>
+				<Card.Description>
+					One JSON file with this workspace's monitors, members, maintenance windows, incidents,
+					daily totals and each monitor's newest 5,000 checks. It holds no webhook secret, API
+					token or password.
+				</Card.Description>
+			</Card.Header>
+			<Card.Content>
+				<div class="flex flex-wrap items-center gap-3">
+					<Button variant="outline" disabled={exporting} onclick={exportData} data-testid="export-data">
+						{exporting ? 'Preparing…' : 'Export data'}
+					</Button>
+					{#if exportError}
+						<p class="text-sm text-attention-ink" role="alert" data-testid="export-error">{exportError}</p>
+					{/if}
+				</div>
+			</Card.Content>
+		</Card.Root>
+	{/if}
 </div>

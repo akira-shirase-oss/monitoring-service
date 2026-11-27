@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { expect, test, type APIRequestContext, type BrowserContext, type Page } from '@playwright/test';
 
 // The hosted journeys: an account, its workspace, and everything the workspace pages do.
@@ -521,4 +522,186 @@ test('the operator hands out a sign-up code and moves the new workspace to anoth
 			return now.find((w) => w.id === workspaceId)?.plan;
 		})
 		.toBe('operator');
+});
+
+test('an account changes its password from the account page, and other devices are signed out', async ({
+	page,
+	context,
+	request,
+	browser,
+	baseURL
+}) => {
+	const origin = baseURL ?? '';
+	const { email } = await account(context, request, origin, 'password');
+	// A second device, signed in to the same account before the change.
+	const otherDevice = await browser.newContext();
+	const before = await otherDevice.request.post(`${origin}/api/login`, {
+		data: { email, password: PASSWORD },
+		headers: { origin }
+	});
+	expect(before.status()).toBe(204);
+	expect((await otherDevice.request.get(`${origin}/api/workspaces`)).status()).toBe(200);
+
+	// The page is reached from the account menu at the foot of the sidebar.
+	await page.goto('/');
+	await page.getByTestId('account-menu').click();
+	await page.getByTestId('account-settings').click();
+	await expect(page).toHaveURL(/\/account$/);
+	await expect(page.getByRole('heading', { name: 'Account', exact: true })).toBeVisible();
+
+	const next = 'a-new-passphrase-for-the-suite';
+	await page.getByTestId('current-password').fill(PASSWORD);
+	await page.getByTestId('new-password').fill(next);
+	await page.getByTestId('change-password').click();
+	await expect(page.getByTestId('password-changed')).toContainText(
+		'Your other devices were signed out'
+	);
+
+	// This tab stays signed in; the other device does not.
+	expect((await page.request.get('/api/workspaces')).status()).toBe(200);
+	expect((await otherDevice.request.get(`${origin}/api/workspaces`)).status()).toBe(401);
+	await otherDevice.close();
+
+	// The old password is refused from now on, and the new one signs in.
+	const fresh = await browser.newContext();
+	const old = await fresh.request.post(`${origin}/api/login`, {
+		data: { email, password: PASSWORD },
+		headers: { origin }
+	});
+	expect(old.status()).toBe(401);
+	const renewed = await fresh.request.post(`${origin}/api/login`, {
+		data: { email, password: next },
+		headers: { origin }
+	});
+	expect(renewed.status()).toBe(204);
+	await fresh.close();
+});
+
+test('an account is deleted from the account page, after the server names what stands in the way', async ({
+	page,
+	context,
+	request,
+	browser,
+	baseURL
+}) => {
+	const origin = baseURL ?? '';
+	const owner = await account(context, request, origin, 'leaving');
+	const monitor = await context.request.post('/api/monitors', {
+		data: { name: `leaving-api-${Date.now()}`, url: `http://127.0.0.1:${FAULT}/ok`, interval_s: 15 },
+		headers: sameOrigin(origin)
+	});
+	expect(monitor.status()).toBe(201);
+
+	// A second person joins the workspace, so its only owner can't simply leave.
+	const guestContext = await browser.newContext();
+	const guest = await account(guestContext, request, origin, 'colleague');
+	const invited = await context.request.post('/api/members', {
+		data: { email: guest.email, role: 'member' },
+		headers: sameOrigin(origin)
+	});
+	expect(invited.status()).toBe(202);
+	const waiting = await guestContext.request.get(`${origin}/api/invitations`);
+	const invitation = (await waiting.json()).invitations[0].id as string;
+	const accepted = await guestContext.request.post(`${origin}/api/invitations/${invitation}/accept`, {
+		headers: { origin }
+	});
+	expect(accepted.status()).toBe(200);
+
+	await page.goto('/account');
+	await page.getByTestId('delete-account').click();
+	const dialog = page.getByTestId('confirm');
+	await expect(dialog).toContainText(owner.email);
+	await expect(dialog).toContainText('every workspace only you are in');
+	await expect(dialog).toContainText("This can't be undone");
+	// Nothing can be confirmed without the password.
+	await expect(page.getByTestId('confirm-action')).toBeDisabled();
+	await page.getByTestId('delete-password').fill(PASSWORD);
+	await page.getByTestId('confirm-action').click();
+	// The server's refusal, word for word.
+	await expect(page.getByTestId('delete-error')).toHaveText(
+		'the workspace "Personal workspace" needs an owner: make another member an owner, then delete your account'
+	);
+	await expect(page).toHaveURL(/\/account$/);
+	expect((await page.request.get('/api/workspaces')).status()).toBe(200);
+
+	// The colleague leaves; now the workspace is the owner's alone and goes with the account.
+	const roster = await context.request.get('/api/members');
+	const guestId = ((await roster.json()).members as { account: string; email: string }[]).find(
+		(member) => member.email === guest.email
+	)?.account;
+	const removed = await context.request.delete(`/api/members/${guestId}`, {
+		headers: sameOrigin(origin)
+	});
+	expect(removed.status()).toBe(204);
+	await page.getByTestId('confirm-action').click();
+	await expect(page).toHaveURL(/\/login$/, { timeout: 15_000 });
+
+	// The workspace and its monitor are gone, and the colleague's own workspace is not.
+	const all = await request.get('/api/workspaces', { headers: OPERATOR });
+	const ids = ((await all.json()).workspaces as { id: string }[]).map((row) => row.id);
+	expect(ids).not.toContain(owner.workspaceId);
+	expect(ids).toContain(guest.workspaceId);
+	expect((await guestContext.request.get(`${origin}/api/workspaces`)).status()).toBe(200);
+	await guestContext.close();
+
+	// Signing in again is refused: there is no such account any more.
+	await page.locator('#auth-email').fill(owner.email);
+	await page.locator('#auth-password').fill(PASSWORD);
+	await page.getByTestId('password-submit').click();
+	await expect(page.getByTestId('auth-error')).toContainText('invalid credentials');
+	await expect(page).toHaveURL(/\/login/);
+});
+
+/** Every key of a JSON document, at any depth. */
+function keysOf(value: unknown, found: string[] = []): string[] {
+	if (Array.isArray(value)) {
+		for (const item of value) keysOf(item, found);
+	} else if (value !== null && typeof value === 'object') {
+		for (const [key, inner] of Object.entries(value)) {
+			found.push(key);
+			keysOf(inner, found);
+		}
+	}
+	return found;
+}
+
+test('an owner exports the workspace as a file with its monitors and no secret', async ({
+	page,
+	context,
+	request,
+	baseURL
+}) => {
+	const origin = baseURL ?? '';
+	await account(context, request, origin, 'export');
+	const name = `export-api-${Date.now()}`;
+	const monitor = await context.request.post('/api/monitors', {
+		data: { name, url: `http://127.0.0.1:${FAULT}/ok`, interval_s: 15 },
+		headers: sameOrigin(origin)
+	});
+	expect(monitor.status()).toBe(201);
+	// A webhook gives the workspace a signing secret the export must leave out.
+	const webhook = await context.request.put('/api/workspace/webhook', {
+		data: { url: `http://127.0.0.1:${FAULT}/sink` },
+		headers: sameOrigin(origin)
+	});
+	expect(webhook.status()).toBe(200);
+	const secret = (await webhook.json()).webhook.secret as string;
+	expect(secret).toMatch(/^smon_/);
+
+	await page.goto('/settings/general');
+	const [download] = await Promise.all([
+		page.waitForEvent('download'),
+		page.getByTestId('export-data').click()
+	]);
+	expect(download.suggestedFilename()).toMatch(/^service-monitor-export-[a-z0-9-]+\.json$/);
+	const text = await readFile(await download.path(), 'utf8');
+	const exported = JSON.parse(text) as { monitors: { name: string }[]; workspace: { plan: string } };
+
+	expect(exported.monitors.map((row) => row.name)).toContain(name);
+	expect(exported.workspace.plan).toBe('operator');
+	expect(keysOf(exported).filter((key) => key.includes('secret'))).toEqual([]);
+	expect(text).not.toContain(secret);
+	expect(text).not.toContain('smon_');
+	expect(text).not.toContain('$argon2');
+	await expect(page.getByTestId('export-error')).toHaveCount(0);
 });

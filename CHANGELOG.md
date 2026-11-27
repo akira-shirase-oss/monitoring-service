@@ -56,6 +56,10 @@
 - **A workspace's owner can export its data**: `GET /api/workspace/export` downloads one
   JSON file with the monitors, maintenance windows, incidents, daily totals and each
   monitor's newest 5,000 checks. It contains no webhook secret, token or password hash.
+- **An Account page in the dashboard**, opened from the menu at the foot of the sidebar:
+  change the password there, or delete the account through a confirmation that names
+  what is deleted, asks for the password and shows the server's refusal as it came.
+  General has an **Export data** button for owners.
 - Asking for the password on these routes counts against the same per-address limit as
   a sign-in, so they can't be used to guess a password any faster.
 - **Fix: a sign-in that was in flight while the password changed no longer gets a
