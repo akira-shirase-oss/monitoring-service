@@ -487,6 +487,35 @@ pub const FOLLOWED_REDIRECTS: [u16; 5] = [301, 302, 303, 307, 308];
 /// The longest monitor name. It is shown in lists, alerts and on public status pages.
 pub const MAX_NAME_CHARS: usize = 120;
 
+/// A status set a write NAMES may not include a followed redirect. Redirects with a
+/// usable target are always followed, so one of these can only be the final answer
+/// when the chain broke: a loop cut at the hop limit, or a target the address policy
+/// refused. Accepting it would report a broken redirect as up.
+///
+/// This and [`validate_name`] are rules for what is being written, not for what is
+/// already stored: an edit that doesn't touch the statuses or the name must not be
+/// refused over a value an earlier version accepted, or such a monitor could never be
+/// paused, resumed or rescheduled again.
+pub fn refuse_followed_redirects(statuses: &[StatusRange]) -> Result<(), ValidationError> {
+    if statuses.iter().any(|range| {
+        FOLLOWED_REDIRECTS
+            .iter()
+            .any(|code| range.lo <= *code && *code <= range.hi)
+    }) {
+        return Err(ValidationError::StatusCoversRedirect);
+    }
+    Ok(())
+}
+
+/// A name a write gives a monitor: bounded and free of control characters. It is shown
+/// in lists, in alerts and on public status pages.
+pub fn validate_name(name: &str) -> Result<(), ValidationError> {
+    if name.chars().count() > MAX_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(ValidationError::NameInvalid);
+    }
+    Ok(())
+}
+
 /// The whole expectations bundle, including the cross-field rule: a `HEAD` probe
 /// carries no body, so a body marker under `HEAD` is a write-time refusal (D-025).
 pub fn validate_expect(
@@ -495,16 +524,6 @@ pub fn validate_expect(
     body_contains: Option<&[u8]>,
 ) -> Result<(), ValidationError> {
     validate_statuses(statuses)?;
-    // Redirects with a usable target are always followed, so one of these can only be
-    // the final answer when the chain broke: a loop cut at the hop limit, or a target
-    // the address policy refused. Accepting it would report a broken redirect as up.
-    if statuses.iter().any(|range| {
-        FOLLOWED_REDIRECTS
-            .iter()
-            .any(|code| range.lo <= *code && *code <= range.hi)
-    }) {
-        return Err(ValidationError::StatusCoversRedirect);
-    }
     if let Some(body) = body_contains {
         if body.is_empty() {
             return Err(ValidationError::ExpectBodyEmpty);
@@ -567,9 +586,6 @@ fn validate_fields(
     if name.trim().is_empty() {
         return Err(ValidationError::EmptyName);
     }
-    if name.chars().count() > MAX_NAME_CHARS || name.chars().any(char::is_control) {
-        return Err(ValidationError::NameInvalid);
-    }
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(ValidationError::UrlNotHttp {
             scheme: url.scheme().to_owned(),
@@ -598,6 +614,7 @@ impl NewMonitor {
     ) -> Result<Self, ValidationError> {
         let name = name.into();
         validate_fields(&name, &url, interval, timeout)?;
+        validate_name(&name)?;
         Ok(Self {
             name,
             url,
@@ -619,6 +636,7 @@ impl NewMonitor {
         body_contains: Option<Vec<u8>>,
     ) -> Result<Self, ValidationError> {
         validate_expect(method, &mut statuses, body_contains.as_deref())?;
+        refuse_followed_redirects(&statuses)?;
         self.method = method;
         self.expect = Expect {
             statuses,
@@ -714,6 +732,12 @@ impl MonitorPatch {
             },
         };
         validate_fields(&merged.name, &merged.url, merged.interval, merged.timeout)?;
+        if self.name.is_some() {
+            validate_name(&merged.name)?;
+        }
+        if self.expect_statuses.is_some() {
+            refuse_followed_redirects(&merged.expect.statuses)?;
+        }
         // The merged bundle faces the same cross-field rule a create does — a patch
         // swapping GET->HEAD onto a monitor that holds a marker fails here (D-025).
         let mut statuses = merged.expect.statuses.clone();

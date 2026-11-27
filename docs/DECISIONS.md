@@ -517,7 +517,12 @@ workspace's observation commits wait on it, so the delete first pauses the
 monitor and bumps its generation, then removes the evidence in batches of 2,000
 rows, each its own short transaction, and only the last step (whatever arrived
 meanwhile, plus the monitor row) is atomic. A failure part-way leaves a paused
-monitor with some evidence gone; asking again finishes it. The child-side
+monitor with some evidence gone; asking again finishes it. The batches shed only
+what is finished (checks, aggregates, resolved incidents and their alerts): an
+open incident stays until the last step, so a monitor resumed after a
+half-finished delete still has the incident the observation writer believes is
+open. The delete and the schedule's republish run in their own task, so a
+dropped request cannot leave a paused monitor on the schedule. The child-side
 indexes this needs (outbox by incident and by monitor, incidents by monitor,
 status listing by monitor) came with it: without them SQLite scanned a whole
 child table for every parent row deleted.
@@ -584,7 +589,7 @@ owner, for the same reason: the others would be left in a workspace nobody can
 administer. Nothing is deleted and the account stays signed in.
 
 Also 409, the same way, while a workspace that would be deleted holds more than 50,000
-raw checks: `the workspace "<name>" holds too much history to delete in one step:
+rows of evidence (raw checks, incidents and queued alerts together): `the workspace "<name>" holds too much history to delete in one step:
 delete its monitors with their history, then delete your account`. The deletion is one
 transaction and every workspace's check results wait on the store's one write lock
 while it runs, so it has to stay small. Deleting a monitor with its history works in
@@ -616,8 +621,8 @@ limits holds about 29,000 (ten monitors, one check a minute, kept two days).
 - The workspace's status-page slug, and the slugs it held, are free again. A later
   workspace can publish under a name readers knew. Holding names for ever on behalf
   of workspaces that no longer exist was judged the worse trade.
-- The delete is one write transaction on a single-writer store, bounded at 50,000 raw
-  checks per workspace. Probe commits wait behind it for that long, which is far more
+- The delete is one write transaction on a single-writer store, bounded at 50,000
+  evidence rows per workspace (checks, incidents and queued alerts together). Probe commits wait behind it for that long, which is far more
   than one batch of a monitor's deletion (2,000 rows) and far less than their busy
   timeout. The deletes reach checks and aggregates through the per-monitor indexes,
   never by scanning other tenants' rows. A workspace above the bound is not shed

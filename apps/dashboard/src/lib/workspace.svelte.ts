@@ -35,7 +35,14 @@ export const workspace = $state({
 	list: [] as Membership[],
 	picked: stored(),
 	/** The workspace the server serves when no pick is sent (`current` of a header-less read). */
-	home: ''
+	home: '',
+	/**
+	 * True from the moment another workspace is picked until its data has arrived. The
+	 * pick takes effect on the very next request, while the page on screen still shows
+	 * the previous workspace's values; the shell holds the page still for that moment,
+	 * so nothing typed for one workspace can be saved into the other.
+	 */
+	switching: false
 });
 
 export function pick(id: string): void {

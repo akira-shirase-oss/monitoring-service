@@ -20,7 +20,7 @@
 	import { page } from '$app/state';
 	import * as Sidebar from '#lib/components/ui/sidebar/index.js';
 	import { guideOffered } from '#lib/guide.svelte.js';
-	import { current } from '#lib/workspace.svelte.js';
+	import { current, workspace } from '#lib/workspace.svelte.js';
 	import AccountMenu from '#lib/components/shell/AccountMenu.svelte';
 	import ThemeToggle from '#lib/components/shell/ThemeToggle.svelte';
 	import WorkspaceSwitcher from '#lib/components/shell/WorkspaceSwitcher.svelte';
@@ -205,7 +205,12 @@
 			</a>
 		{/if}
 		{#key `${page.url.pathname}|${data.scope}`}
-			<div class="page-enter mx-auto w-full max-w-6xl flex-1 px-5 py-8 sm:px-8 lg:px-10">
+			<div
+				class="page-enter mx-auto w-full max-w-6xl flex-1 px-5 py-8 sm:px-8 lg:px-10"
+				inert={workspace.switching}
+				aria-busy={workspace.switching}
+				data-testid="page"
+			>
 				{@render children()}
 			</div>
 		{/key}

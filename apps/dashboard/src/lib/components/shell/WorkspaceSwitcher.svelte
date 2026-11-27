@@ -17,8 +17,14 @@
 
 	async function choose(id: string) {
 		if (id === workspace.picked) return;
+		// Hold the page still until the picked workspace's data is on it (see `switching`).
+		workspace.switching = true;
 		pick(id);
-		await invalidateAll();
+		try {
+			await invalidateAll();
+		} finally {
+			workspace.switching = false;
+		}
 	}
 </script>
 

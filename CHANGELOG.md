@@ -41,7 +41,12 @@
   - An account could be removed from its own workspace and then reach nothing.
   - Two published monitors with the same name broke the public status page.
   - Redirect codes can no longer be named as passing statuses, and monitor names are
-    bounded.
+    bounded. Both rules apply to what an edit names, so a monitor saved before them
+    can still be paused, resumed and rescheduled.
+  - A second pass over those fixes found that a delete interrupted half-way and then
+    resumed could leave a monitor whose checks were refused on every slot. An open
+    incident now stays until the monitor itself goes, and the delete finishes even if
+    the request is dropped.
 - **Operators no longer need curl.** `monitor invites create` and
   `monitor workspaces list|plan` in the CLI, and an Operator page in the dashboard for
   sign-up codes and workspace plans.
@@ -52,7 +57,7 @@
   that only this account is in is deleted with its monitors, checks, incidents and
   status page; shared workspaces stay, minus the seat. The only owner of a workspace
   that has other members is asked to make someone else an owner first, and a workspace
-  holding more than 50,000 checks is asked to delete monitors first, so one deletion
+  holding more than 50,000 checks, incidents and queued alerts is asked to delete monitors first, so one deletion
   can't stall everyone's checks. There is no undo.
 - **A workspace's owner can export its data**: `GET /api/workspace/export` downloads one
   JSON file with the monitors, maintenance windows, incidents, daily totals and each

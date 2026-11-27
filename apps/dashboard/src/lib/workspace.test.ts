@@ -5,6 +5,7 @@ const acme: Membership = { id: 'ws-acme', slug: 'acme', name: 'Acme owners', rol
 const own: Membership = { id: 'ws-own', slug: 'own', name: 'Personal workspace', role: 'owner' };
 
 beforeEach(() => {
+	workspace.switching = false;
 	// Listed by name, as the server lists them: the other workspace sorts first.
 	workspace.list = [acme, own];
 	workspace.home = 'ws-own';

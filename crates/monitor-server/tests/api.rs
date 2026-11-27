@@ -2433,3 +2433,66 @@ async fn redirect_statuses_and_unbounded_names_are_refused_at_write() {
     .unwrap();
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
+
+/// The name and redirect rules are for what a write names, not for what is stored. A
+/// monitor an earlier version accepted with a longer name must still pause, resume and
+/// reschedule; only an edit that names the field again has to satisfy the rule.
+#[tokio::test]
+async fn an_edit_is_not_refused_over_a_stored_value_it_does_not_touch() {
+    let (app, _statuses, db, _wh, _tmp) = app().await.unwrap();
+    let mut old = monitor_domain::NewMonitor::new(
+        "short",
+        url::Url::parse("https://example.com/health").unwrap(),
+    )
+    .unwrap()
+    .into_monitor();
+    old.name = "n".repeat(300);
+    old.expect.statuses = monitor_domain::parse_statuses("200-399").unwrap();
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&old)
+        .await
+        .unwrap();
+    let path = format!("/api/monitors/{}", old.id.0);
+
+    for body in [
+        serde_json::json!({ "paused": true }),
+        serde_json::json!({ "paused": false }),
+        serde_json::json!({ "timeout_s": 4 }),
+    ] {
+        let (status, answer) = send(&app, "PATCH", &path, Some(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}: {answer}");
+    }
+
+    // Naming either field again brings its rule with it.
+    let (status, answer) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "name": "n".repeat(200) })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    let (status, answer) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "expect_statuses": ["200-302"] })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+
+    // And a corrected value is accepted.
+    let (status, answer) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "name": "billing", "expect_statuses": ["200-299"] })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}

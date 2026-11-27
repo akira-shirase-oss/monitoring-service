@@ -569,13 +569,38 @@ async fn the_seeded_workspace_is_never_deleted_with_an_account() -> anyhow::Resu
 }
 
 /// The one transaction that removes a workspace holds the store's write lock, so it is
-/// bounded: a workspace with more raw checks than the bound is refused by name, with
+/// bounded: a workspace with more evidence rows than the bound is refused by name, with
 /// nothing deleted and the account still signed in, and goes once it is under it.
 #[tokio::test]
 async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> anyhow::Result<()> {
     let store = store().await?;
     let (account, workspace) = tenant(&store.db, "heavy").await?;
-    fill(&store, account, workspace).await?; // four checks
+    fill(&store, account, workspace).await?;
+    // Checks, incidents and queued alerts count together.
+    let id = workspace.0.to_string();
+    let checks = scalar(
+        &store.raw,
+        "SELECT COUNT(*) FROM checks WHERE workspace_id = ?",
+        &id,
+    )
+    .await?;
+    let incidents = scalar(
+        &store.raw,
+        "SELECT COUNT(*) FROM incidents WHERE workspace_id = ?",
+        &id,
+    )
+    .await?;
+    let alerts = scalar(
+        &store.raw,
+        "SELECT COUNT(*) FROM notify_outbox WHERE workspace_id = ?",
+        &id,
+    )
+    .await?;
+    assert!(
+        checks > 0 && incidents > 0 && alerts > 0,
+        "the fixture holds all three"
+    );
+    let rows = checks + incidents + alerts;
     let now = OffsetDateTime::now_utc();
     store
         .db
@@ -588,7 +613,13 @@ async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> a
         .await?;
     let before = counts(&store.raw, workspace).await?;
 
-    match store.db.delete_account(account, 3).await {
+    // A bound that covers the checks alone is not enough: the incident and its
+    // alert are rows the same transaction has to remove.
+    assert!(matches!(
+        store.db.delete_account(account, checks).await,
+        Err(QueryError::Conflict(_))
+    ));
+    match store.db.delete_account(account, rows - 1).await {
         Err(QueryError::Conflict(message)) => assert_eq!(
             message,
             "the workspace \"heavy's workspace\" holds too much history to delete in one \
@@ -609,7 +640,10 @@ async fn a_workspace_with_too_much_history_is_refused_until_it_is_smaller() -> a
     );
 
     // Exactly at the bound is allowed.
-    assert_eq!(store.db.delete_account(account, 4).await?, vec![workspace]);
+    assert_eq!(
+        store.db.delete_account(account, rows).await?,
+        vec![workspace]
+    );
     Ok(())
 }
 

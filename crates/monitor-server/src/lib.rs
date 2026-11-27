@@ -2410,6 +2410,28 @@ async fn patch_monitor(
 
 /// Delete a monitor with no recorded evidence. A monitor with history can't be deleted —
 /// checks and incidents are the record; pause stops monitoring without erasing it.
+/// The store's delete-with-evidence, then what must follow it whatever its outcome:
+/// the schedule is republished (the monitor is gone, or paused part-way) and the public
+/// page it may have been listed on is refreshed.
+async fn delete_with_evidence(
+    state: AppState,
+    principal: auth::Principal,
+    monitor: MonitorId,
+) -> Result<bool, ApiError> {
+    let deleted = match member_for(&state, &principal) {
+        Ok(view) => view
+            .delete_monitor_with_evidence(monitor)
+            .await
+            .map_err(ApiError::from),
+        Err(refusal) => Err(refusal),
+    };
+    let republished = publish_registry(&state).await;
+    state.status_changed.notify_one();
+    let deleted = deleted?;
+    republished?;
+    Ok(deleted)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DeleteParams {
     /// `delete` removes the monitor's recorded evidence with it (D-026). Absent, a
@@ -2449,11 +2471,19 @@ async fn delete_monitor(
             MONITOR_WRITE_CAP,
         )
         .map_err(ApiError::TooMany)?;
-        if !view.delete_monitor_with_evidence(monitor.id).await? {
-            return Err(ApiError::NotFound);
-        }
-        // The monitor may have been listed on the public page: refresh it now.
-        state.status_changed.notify_one();
+        // The delete and the schedule's follow-up run to the end even if this request
+        // is dropped (the client hung up, the deadline passed): a monitor paused
+        // part-way must leave the schedule, or it would be probed for nothing.
+        let work = tokio::spawn(delete_with_evidence(state.clone(), principal, monitor.id));
+        return match work.await {
+            Ok(Ok(true)) => Ok(StatusCode::NO_CONTENT),
+            Ok(Ok(false)) => Err(ApiError::NotFound),
+            Ok(Err(error)) => Err(error),
+            Err(join) => {
+                tracing::error!(error = %join, "monitor deletion task did not finish");
+                Err(ApiError::Corrupt)
+            }
+        };
     } else if !view.delete_monitor(monitor.id).await? {
         return Err(ApiError::Conflict(
             "monitor has recorded history; pause it, or delete it with its history".into(),

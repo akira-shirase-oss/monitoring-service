@@ -1310,61 +1310,27 @@ impl WorkspaceDb<'_> {
     /// to this workspace, so a monitor id from elsewhere deletes nothing. `false` means
     /// this workspace has no such monitor.
     ///
-    /// The work is done in three steps so that no single statement holds the store's
-    /// one write lock for long — every workspace's observation commits wait on it:
+    /// The work is done in two steps so that no single statement holds the store's one
+    /// write lock for long — every workspace's observation commits wait on it:
+    /// [`Self::shed_evidence`] pauses the monitor and removes its history in small
+    /// batches, then one last transaction removes what is left and the monitor.
     ///
-    /// 1. The monitor is paused and its generation bumped, so nothing new is scheduled
-    ///    and a probe already in flight is dropped as stale.
-    /// 2. Its evidence goes in batches of `EVIDENCE_DELETE_BATCH` rows, each its own
-    ///    short transaction, children before parents.
-    /// 3. One last transaction removes whatever slipped in meanwhile and the monitor.
-    ///
-    /// A failure part-way leaves a paused monitor with some of its evidence gone; asking
-    /// again finishes the job. That is the price of not blocking everyone else.
+    /// A failure part-way leaves a paused monitor with some of its history gone; asking
+    /// again finishes the job. What is left is always a state the monitor can run from:
+    /// an OPEN incident and its queued alerts are never shed, only removed with the
+    /// monitor itself, so a monitor resumed after a half-finished delete still has the
+    /// incident the observation writer believes is open.
     pub async fn delete_monitor_with_evidence(
         &self,
         monitor: MonitorId,
     ) -> Result<bool, QueryError> {
-        let id = monitor.0.to_string();
-        let workspace = self.workspace.0.to_string();
-        let stopped = sqlx::query(
-            "UPDATE monitors SET paused = 1, generation = generation + 1
-             WHERE id = ? AND workspace_id = ?",
-        )
-        .bind(&id)
-        .bind(&workspace)
-        .execute(&self.db.pool)
-        .await?
-        .rows_affected();
-        if stopped == 0 {
+        if !self.shed_evidence(monitor).await? {
             return Ok(false);
         }
-        // Static statements, one per table: no SQL is ever assembled at run time.
-        // Children before parents: the foreign keys refuse any other order.
-        for statement in [
-            "DELETE FROM notify_outbox WHERE id IN (SELECT id FROM notify_outbox
-                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
-            "DELETE FROM incidents WHERE id IN (SELECT id FROM incidents
-                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
-            "DELETE FROM checks WHERE id IN (SELECT id FROM checks
-                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
-            "DELETE FROM check_stats_daily WHERE rowid IN (SELECT rowid FROM check_stats_daily
-                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
-        ] {
-            loop {
-                let removed = sqlx::query(statement)
-                    .bind(&id)
-                    .bind(&workspace)
-                    .bind(EVIDENCE_DELETE_BATCH)
-                    .execute(&self.db.pool)
-                    .await?
-                    .rows_affected();
-                if removed < EVIDENCE_DELETE_BATCH.unsigned_abs() {
-                    break;
-                }
-            }
-        }
+        let id = monitor.0.to_string();
+        let workspace = self.workspace.0.to_string();
         let mut tx = self.db.pool.begin().await?;
+        // Children before parents: the foreign keys refuse any other order.
         for statement in [
             "DELETE FROM notify_outbox WHERE monitor_id = ? AND workspace_id = ?",
             "DELETE FROM incidents WHERE monitor_id = ? AND workspace_id = ?",
@@ -1385,6 +1351,58 @@ impl WorkspaceDb<'_> {
             .rows_affected();
         tx.commit().await?;
         Ok(deleted > 0)
+    }
+
+    /// The first step of [`Self::delete_monitor_with_evidence`]: pause the monitor and
+    /// bump its generation (nothing new is scheduled, a probe in flight is dropped as
+    /// stale), then remove its history in batches of [`EVIDENCE_DELETE_BATCH`] rows,
+    /// each its own short transaction. `false` means this workspace has no such monitor.
+    ///
+    /// Only what is finished is shed: checks, daily aggregates, RESOLVED incidents and
+    /// their alerts. The open incident stays with the monitor until both go together.
+    pub(crate) async fn shed_evidence(&self, monitor: MonitorId) -> Result<bool, QueryError> {
+        let id = monitor.0.to_string();
+        let workspace = self.workspace.0.to_string();
+        let stopped = sqlx::query(
+            "UPDATE monitors SET paused = 1, generation = generation + 1
+             WHERE id = ? AND workspace_id = ?",
+        )
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&self.db.pool)
+        .await?
+        .rows_affected();
+        if stopped == 0 {
+            return Ok(false);
+        }
+        // Static statements, one per table: no SQL is ever assembled at run time.
+        // Alerts before the incidents they belong to: the foreign key says so.
+        for statement in [
+            "DELETE FROM notify_outbox WHERE id IN (
+                 SELECT o.id FROM notify_outbox o JOIN incidents i ON i.id = o.incident_id
+                  WHERE o.monitor_id = ? AND o.workspace_id = ? AND i.state = 'resolved'
+                  LIMIT ?)",
+            "DELETE FROM incidents WHERE id IN (SELECT id FROM incidents
+                 WHERE monitor_id = ? AND workspace_id = ? AND state = 'resolved' LIMIT ?)",
+            "DELETE FROM checks WHERE id IN (SELECT id FROM checks
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+            "DELETE FROM check_stats_daily WHERE rowid IN (SELECT rowid FROM check_stats_daily
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+        ] {
+            loop {
+                let removed = sqlx::query(statement)
+                    .bind(&id)
+                    .bind(&workspace)
+                    .bind(EVIDENCE_DELETE_BATCH)
+                    .execute(&self.db.pool)
+                    .await?
+                    .rows_affected();
+                if removed < EVIDENCE_DELETE_BATCH.unsigned_abs() {
+                    break;
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Whether the monitor has any recorded evidence (checks or incidents). The FKs would

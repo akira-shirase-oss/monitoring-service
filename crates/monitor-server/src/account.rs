@@ -37,11 +37,12 @@ pub const EXPORT_DAILY_ROWS: usize = 40_000;
 /// One export per workspace this often. An export reads a workspace's whole record
 /// from a store with one writer; a loop of them must not be free.
 pub const EXPORT_EVERY: Duration = Duration::from_secs(10);
-/// Raw checks a workspace may hold when it is deleted with its only member's account.
-/// The deletion is one transaction on a store with one writer; this is what keeps it
-/// short. A free-plan workspace at its limits stays well under it (ten monitors, one
-/// check a minute, kept two days); a larger one is told to delete monitors first.
-pub const DELETE_MAX_CHECKS: i64 = 50_000;
+/// Rows of evidence (raw checks, incidents and queued alerts together) a workspace may
+/// hold when it is deleted with its only member's account. The deletion is one
+/// transaction on a store with one writer; this is what keeps it short. A free-plan
+/// workspace at its limits stays under it (ten monitors, one check a minute, kept two
+/// days, is about 29,000 checks); a larger one is told to delete monitors first.
+pub const DELETE_MAX_ROWS: i64 = 50_000;
 /// Workspaces whose export cooldown is tracked at once; spent ones are forgotten past it.
 const EXPORT_PACE_CAP: usize = 4096;
 
@@ -233,7 +234,7 @@ pub(crate) async fn delete_account(
 
 /// The store's deletion, then everything held outside the store that must follow it.
 async fn delete_and_forget(state: AppState, account: AccountId) -> Result<(), QueryError> {
-    let gone = state.db.delete_account(account, DELETE_MAX_CHECKS).await?;
+    let gone = state.db.delete_account(account, DELETE_MAX_ROWS).await?;
     forget_workspaces(&state, &gone).await;
     // The account is gone whatever happens next, so a registry that could not be
     // re-read is logged, not answered: until the next schedule write the coordinator

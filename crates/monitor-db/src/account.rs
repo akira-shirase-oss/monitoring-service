@@ -144,7 +144,8 @@ impl Db {
     /// are removed, and its sessions, pending invitations and the account row go.
     ///
     /// Also refused, the same way, while one of those workspaces holds more than
-    /// `max_checks` raw checks: every workspace's observation commits wait on the
+    /// `max_rows` rows of evidence (raw checks, incidents and queued alerts counted
+    /// together): every workspace's observation commits wait on the
     /// store's one write lock, so the single transaction that removes a workspace must
     /// stay small. Deleting monitors with their history works in batches (D-026) and
     /// brings a workspace under the bound.
@@ -159,7 +160,7 @@ impl Db {
     pub async fn delete_account(
         &self,
         account: AccountId,
-        max_checks: i64,
+        max_rows: i64,
     ) -> Result<Vec<WorkspaceId>, QueryError> {
         let id = account.0.to_string();
         let mut tx = self.pool.begin().await?;
@@ -199,8 +200,10 @@ impl Db {
         .fetch_all(&mut *tx)
         .await?;
         for workspace in &sole {
-            // Counted through the per-monitor index and never past the bound, so the
-            // question itself is cheap however much the workspace holds.
+            // Checks, incidents and queued alerts together: an incident-heavy
+            // workspace (a monitor that flaps for months) is as slow to remove as a
+            // check-heavy one. Each count goes through the per-monitor index and stops
+            // at the bound, so the question is cheap however much the workspace holds.
             let heavy: Option<String> = sqlx::query_scalar(
                 "SELECT w.name FROM workspaces w
                   WHERE w.id = ?1
@@ -208,10 +211,20 @@ impl Db {
                            SELECT 1 FROM checks c
                             WHERE c.workspace_id = ?1
                               AND c.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
+                            LIMIT ?2))
+                      + (SELECT COUNT(*) FROM (
+                           SELECT 1 FROM incidents i
+                            WHERE i.workspace_id = ?1
+                              AND i.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
+                            LIMIT ?2))
+                      + (SELECT COUNT(*) FROM (
+                           SELECT 1 FROM notify_outbox o
+                            WHERE o.workspace_id = ?1
+                              AND o.monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)
                             LIMIT ?2)) >= ?2",
             )
             .bind(workspace)
-            .bind(max_checks.saturating_add(1))
+            .bind(max_rows.saturating_add(1))
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(name) = heavy {
