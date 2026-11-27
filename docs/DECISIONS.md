@@ -611,8 +611,12 @@ administer. Nothing is deleted and the account stays signed in.
   workspace's plan (tens of thousands of rows on the free plan). Probe commits wait
   behind it for that long. The deletes reach checks and aggregates through the
   per-monitor indexes, never by scanning other tenants' rows.
-- Backups taken before the deletion still hold the account and its data until they
-  age out.
+- Backups taken before the deletion still hold the account and its data. Deleting an
+  account does not reach into them.
+- The deletion and what follows it (republishing the schedule, retiring the status
+  pages) run in one task that finishes even if the request is dropped. If the process
+  dies between the commit and those steps, the next boot reads the schedule and the
+  pages from the store, so nothing of the deleted workspace comes back.
 
 **The export.** One JSON document for the caller's workspace: the workspace (id, name,
 slug, plan), the roster as email and role, the monitors as the API shows them,

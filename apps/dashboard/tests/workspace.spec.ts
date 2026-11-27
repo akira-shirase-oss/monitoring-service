@@ -652,6 +652,24 @@ test('an account is deleted from the account page, after the server names what s
 	await expect(page).toHaveURL(/\/login/);
 });
 
+test('the operator session sees no password or delete form on the account page', async ({
+	page,
+	context,
+	baseURL
+}) => {
+	const origin = baseURL ?? '';
+	const login = await context.request.post('/api/login', {
+		data: { token: TOKEN },
+		headers: { origin }
+	});
+	expect(login.status()).toBe(204);
+
+	await page.goto('/account');
+	await expect(page.getByTestId('account-operator')).toContainText('signed in as the operator');
+	await expect(page.getByTestId('change-password')).toHaveCount(0);
+	await expect(page.getByTestId('delete-account')).toHaveCount(0);
+});
+
 /** Every key of a JSON document, at any depth. */
 function keysOf(value: unknown, found: string[] = []): string[] {
 	if (Array.isArray(value)) {

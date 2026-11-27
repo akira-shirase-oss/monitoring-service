@@ -11,16 +11,19 @@
 	import Confirm from '#lib/components/shell/Confirm.svelte';
 	import FormRow from '#lib/components/shell/FormRow.svelte';
 	import PageHeader from '#lib/components/shell/PageHeader.svelte';
+	import { invalidateAll } from '$app/navigation';
 	import { call } from '#lib/call.js';
 	import type { ApiFailure } from '#lib/api.js';
-	import { pick } from '#lib/workspace.svelte.js';
+	import { current, pick } from '#lib/workspace.svelte.js';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
 
 	// Only an account has a password and can be deleted. The operator signs in with the
-	// server's admin token; its session carries no account.
+	// server's admin token; its session carries no account. No account and no operator
+	// role means the shell's read didn't land: say that, don't guess who is signed in.
 	const account = $derived(data.account);
+	const operator = $derived(current()?.role === 'operator');
 
 	let currentPassword = $state('');
 	let newPassword = $state('');
@@ -86,7 +89,20 @@
 	{/snippet}
 </PageHeader>
 
-{#if account === null}
+{#if account === null && !operator}
+	<Card.Root data-testid="account-unknown">
+		<Card.Header>
+			<Card.Title>Couldn't load your account</Card.Title>
+			<Card.Description>
+				The server didn't say who is signed in, so there is nothing to change here yet. Try
+				again; if it keeps happening, sign out and sign in again.
+			</Card.Description>
+		</Card.Header>
+		<Card.Content>
+			<Button variant="outline" onclick={() => invalidateAll()}>Try again</Button>
+		</Card.Content>
+	</Card.Root>
+{:else if account === null}
 	<Card.Root data-testid="account-operator">
 		<Card.Header>
 			<Card.Title>This session has no account</Card.Title>
