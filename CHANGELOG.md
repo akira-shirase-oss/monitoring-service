@@ -45,6 +45,22 @@
 - **Operators no longer need curl.** `monitor invites create` and
   `monitor workspaces list|plan` in the CLI, and an Operator page in the dashboard for
   sign-up codes and workspace plans.
+- **An account can change its password**: `POST /api/account/password` with the current
+  and the new password. Every other device is signed out; the one that made the change
+  stays signed in. The new password follows the sign-up rule.
+- **An account can delete itself**: `DELETE /api/account` with its password. A workspace
+  that only this account is in is deleted with its monitors, checks, incidents and
+  status page; shared workspaces stay, minus the seat. The only owner of a workspace
+  that has other members is asked to make someone else an owner first. There is no
+  undo.
+- **A workspace's owner can export its data**: `GET /api/workspace/export` downloads one
+  JSON file with the monitors, maintenance windows, incidents, daily totals and each
+  monitor's newest 5,000 checks. It contains no webhook secret, token or password hash.
+- Asking for the password on these routes counts against the same per-address limit as
+  a sign-in, so they can't be used to guess a password any faster.
+- **Fix: a sign-in that was in flight while the password changed no longer gets a
+  session.** The session is created only if the password it checked is still the
+  stored one.
 - CI now drives the dashboard in a real browser on every push, and runs a unit test
   layer for the dashboard's own logic and components.
 

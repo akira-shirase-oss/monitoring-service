@@ -4,6 +4,7 @@
 //! carry the observing loop. Statuses served here come only from the committed-evidence map
 //! the writer publishes — never from in-flight probes.
 
+pub mod account;
 pub mod auth;
 pub mod config;
 pub mod deliver;
@@ -458,6 +459,13 @@ fn routes(state: AppState) -> Router {
             get(read_webhook).put(put_webhook).delete(delete_webhook),
         )
         .route("/workspace/webhook/test", post(test_webhook))
+        // The workspace's data as one file (D-027): owner work, one per cooldown.
+        .route("/workspace/export", get(account::export_workspace))
+        // Account lifecycle (D-027): the account behind the session changes its own
+        // password or deletes itself. Account sessions only, decided in the handler;
+        // both confirm the password under the sign-in throttle.
+        .route("/account", delete(account::delete_account))
+        .route("/account/password", post(account::change_password))
         .route("/backup", post(backup))
         // Auth wraps the whole API: /livez, /readyz and static files stay open —
         // the dashboard must load to *hold* a token, and readiness is not a secret.
@@ -483,6 +491,7 @@ fn routes(state: AppState) -> Router {
         .with_state(state)
         .layer(axum::Extension(throttle::Guard::new(trusted_proxy)))
         .layer(axum::Extension(ScheduleLock::default()))
+        .layer(axum::Extension(account::ExportPace::default()))
 }
 
 /// Serializes the writes that change the schedule (create, edit, pause), so the capacity
@@ -853,13 +862,7 @@ async fn login_account(
             if let Ok(_penalty) = penalties.try_acquire() {
                 tokio::time::sleep(WRONG_TOKEN_DELAY).await;
             }
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": { "code": "unauthenticated", "message": "invalid credentials" }
-                })),
-            )
-                .into_response();
+            return invalid_credentials();
         }
         Err(auth::PasswordWorkError::Busy) => {
             drop(attempt);
@@ -873,13 +876,7 @@ async fn login_account(
         // Dummy-hash path passed? A correct guess on a nonexistent address still has
         // no account to sign into — same envelope as a wrong password.
         drop(attempt);
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": { "code": "unauthenticated", "message": "invalid credentials" }
-            })),
-        )
-            .into_response();
+        return invalid_credentials();
     };
     attempt.succeeded();
     let Ok(account_id) = Uuid::parse_str(&account.id) else {
@@ -889,18 +886,26 @@ async fn login_account(
     let now = (state.clock)();
     let expires = now
         + time::Duration::seconds(i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX));
-    if let Err(error) = state
+    // The session is created only while the hash just verified is still the stored
+    // one (D-027): a password change or an account deletion that committed during
+    // the verification must not be followed by a session earned with the old password.
+    match state
         .db
-        .create_account_session_at(
+        .create_account_session_if_current(
             &auth::account_session_key(&id),
             AccountId(account_id),
+            &account.password_hash,
             now,
             expires,
         )
         .await
     {
-        tracing::error!(%error, "account session insert failed");
-        return ApiError::Db(error).into_response();
+        Ok(true) => {}
+        Ok(false) => return invalid_credentials(),
+        Err(error) => {
+            tracing::error!(%error, "account session insert failed");
+            return ApiError::Db(error).into_response();
+        }
     }
     (
         StatusCode::NO_CONTENT,
@@ -1822,6 +1827,34 @@ fn signup_invalid(message: &str) -> Response {
         .into_response()
 }
 
+/// The one answer for a password that did not verify, at sign-in and wherever a
+/// signed-in account is asked for its password again: nothing says which part was wrong.
+fn invalid_credentials() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": { "code": "unauthenticated", "message": "invalid credentials" }
+        })),
+    )
+        .into_response()
+}
+
+/// The password rule: the one sign-up enforces, and so the one a password change
+/// enforces. Length in bytes, as the request carried it.
+fn password_fits(password: &str) -> bool {
+    (8..=256).contains(&password.len())
+}
+
+/// The `Set-Cookie` value that ends the browser's copy of a session: same name and
+/// attributes as the cookie sign-in set, no value, `Max-Age=0`.
+fn expired_session_cookie(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    format!(
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        state.cookie_secure.name(),
+        state.cookie_secure.attribute(headers),
+    )
+}
+
 /// 503 for a full password-work queue: `busy` + Retry-After — the client may retry in
 /// a moment; the API is not down, only the hashing slots are.
 fn password_busy() -> Response {
@@ -1857,7 +1890,7 @@ fn check_signup_fields(body: &SignupBody) -> Result<String, &'static str> {
     if !email.contains('@') || email.len() > 254 {
         return Err("`email` must be an email address");
     }
-    if body.password.len() < 8 || body.password.len() > 256 {
+    if !password_fits(&body.password) {
         return Err("`password` must be 8..=256 characters");
     }
     if body.invite.is_empty() || body.invite.len() > 128 {
@@ -2017,11 +2050,7 @@ async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -
         StatusCode::NO_CONTENT,
         [(
             axum::http::header::SET_COOKIE,
-            format!(
-                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
-                state.cookie_secure.name(),
-                state.cookie_secure.attribute(&headers),
-            ),
+            expired_session_cookie(&state, &headers),
         )],
     )
         .into_response()
