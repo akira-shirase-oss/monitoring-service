@@ -18,7 +18,7 @@ below). Nothing runs on a server yet, so every number that needs the droplet is 
 | Dashboard | Every API operation a workspace has is in the dashboard: setup guide, monitors (method, passing statuses, body text), incidents, maintenance, members, tokens, alerts, status page, general. **Placeholder look:** neutral tokens until Service Monitor's own design is chosen; it changes one stylesheet. |
 | Monitor deletion | A monitor can be deleted with its history by asking for exactly that (D-026). |
 | Account lifecycle | Deleting an account deletes the workspaces only it is in, with their evidence; shared workspaces stay, and the only owner of one must hand it over first. An owner exports a workspace's data as one JSON file (D-027). **Missing:** deleting a workspace without deleting the account. |
-| Tests | Unit and in-process API tests, a running-instance attack suite with a mutation proof, fuzz targets, and 31 browser journeys; all run on CI on every push. |
+| Tests | Unit and in-process API tests, a running-instance attack suite with a mutation proof, fuzz targets, and 32 browser journeys; all run on CI on every push. |
 | Deploy | Install, upgrade, rollback, backup and smoke scripts exist and pass local drills. **No host yet.** |
 | Docs site, landing page | A docs repository exists locally without a remote; the landing page is not committed. Neither is published. |
 

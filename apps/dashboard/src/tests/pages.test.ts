@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { pick, workspace } from '#lib/workspace.svelte.js';
 import IncidentsPage from '../routes/(app)/incidents/+page.svelte';
 import MaintenancePage from '../routes/(app)/maintenance/+page.svelte';
+import AccountPage from '../routes/(app)/account/+page.svelte';
 import AlertsPage from '../routes/(app)/settings/alerts/+page.svelte';
 import GeneralPage from '../routes/(app)/settings/general/+page.svelte';
 import PublicPage from '../routes/s/[slug]/+page.svelte';
@@ -209,6 +210,103 @@ describe('General', () => {
 		expect((screen.getByTestId('workspace-rename') as HTMLInputElement).readOnly).toBe(true);
 		expect(screen.queryByTestId('workspace-rename-save')).toBeNull();
 		expect(screen.getByTestId('workspace-role').textContent).toContain('Viewer');
+	});
+
+	it('offers the export to an owner and to the operator, and to nobody else', () => {
+		for (const [role, offered] of [
+			['owner', true],
+			['operator', true],
+			['member', false],
+			['viewer', false]
+		] as const) {
+			signInAs(role);
+			const page = render(GeneralPage, { props: data({ monitorCount: 0 }) });
+			expect(screen.queryByTestId('export-data') !== null, role).toBe(offered);
+			page.unmount();
+		}
+	});
+
+	it("shows the server's refusal of an export and starts no download", async () => {
+		const made = vi.spyOn(URL, 'createObjectURL');
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () =>
+				Response.json(
+					{ error: { code: 'too_many_requests', message: 'one export every 10 seconds per workspace; retry shortly' } },
+					{ status: 429 }
+				)
+			)
+		);
+		render(GeneralPage, { props: data({ monitorCount: 0 }) });
+		await fireEvent.click(screen.getByTestId('export-data'));
+		expect((await screen.findByTestId('export-error')).textContent).toContain(
+			'one export every 10 seconds per workspace'
+		);
+		expect(made).not.toHaveBeenCalled();
+	});
+});
+
+describe('Account', () => {
+	const account = { id: 'a1', email: 'ada@example.com' };
+	const shell = (who: typeof account | null) => data({ account: who, invited: 0, scope: 'ws-1', stalePick: false });
+
+	it('gives an account its password form and the way to delete itself', () => {
+		render(AccountPage, { props: shell(account) });
+		expect(screen.getByTestId('change-password')).toBeTruthy();
+		expect(screen.getByTestId('delete-account')).toBeTruthy();
+		expect(screen.queryByTestId('account-operator')).toBeNull();
+	});
+
+	it('gives the operator an explanation and no form: there is no account to change', () => {
+		signInAs('operator');
+		render(AccountPage, { props: shell(null) });
+		expect(screen.getByTestId('account-operator').textContent).toContain('signed in as the operator');
+		expect(screen.queryByTestId('change-password')).toBeNull();
+		expect(screen.queryByTestId('delete-account')).toBeNull();
+	});
+
+	it('does not call a session the operator just because the account did not load', () => {
+		render(AccountPage, { props: shell(null) });
+		expect(screen.getByTestId('account-unknown')).toBeTruthy();
+		expect(screen.queryByTestId('account-operator')).toBeNull();
+		expect(screen.queryByTestId('change-password')).toBeNull();
+	});
+
+	it('sends the password change without a workspace pick and says other devices were signed out', async () => {
+		pick('ws-1');
+		const sent = vi.fn(async (_path: string, _init?: RequestInit) => new Response(null, { status: 204 }));
+		vi.stubGlobal('fetch', sent);
+		render(AccountPage, { props: shell(account) });
+		await fireEvent.input(screen.getByTestId('current-password'), { target: { value: 'the-old-passphrase' } });
+		await fireEvent.input(screen.getByTestId('new-password'), { target: { value: 'the-new-passphrase' } });
+		await fireEvent.click(screen.getByTestId('change-password'));
+		expect((await screen.findByTestId('password-changed')).textContent).toContain(
+			'Your other devices were signed out'
+		);
+		const [path, init] = sent.mock.calls[0] ?? [];
+		expect(path).toBe('/api/account/password');
+		expect(init?.method).toBe('POST');
+		expect(JSON.parse(String(init?.body))).toEqual({
+			current_password: 'the-old-passphrase',
+			new_password: 'the-new-passphrase'
+		});
+		expect(new Headers(init?.headers).has('x-smon-workspace')).toBe(false);
+	});
+
+	it('says a wrong password plainly and keeps what was typed', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () =>
+				Response.json({ error: { code: 'unauthenticated', message: 'invalid credentials' } }, { status: 401 })
+			)
+		);
+		render(AccountPage, { props: shell(account) });
+		await fireEvent.input(screen.getByTestId('current-password'), { target: { value: 'not-the-password' } });
+		await fireEvent.input(screen.getByTestId('new-password'), { target: { value: 'the-new-passphrase' } });
+		await fireEvent.click(screen.getByTestId('change-password'));
+		expect((await screen.findByTestId('password-error')).textContent).toContain("That password isn't right.");
+		expect(screen.queryByTestId('password-changed')).toBeNull();
+		expect((screen.getByTestId('new-password') as HTMLInputElement).value).toBe('the-new-passphrase');
 	});
 });
 

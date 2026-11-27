@@ -12,8 +12,8 @@
 	import FormRow from '#lib/components/shell/FormRow.svelte';
 	import PageHeader from '#lib/components/shell/PageHeader.svelte';
 	import { invalidateAll } from '$app/navigation';
-	import { call } from '#lib/call.js';
-	import type { ApiFailure } from '#lib/api.js';
+	import { UNREACHABLE } from '#lib/call.js';
+	import { readEnvelope, type ApiFailure } from '#lib/api.js';
 	import { current, pick } from '#lib/workspace.svelte.js';
 	import type { PageData } from './$types';
 
@@ -36,6 +36,23 @@
 	let deleting = $state(false);
 	let deleteError = $state<string | null>(null);
 
+	// Both writes are about the account, not about one workspace, so they are sent
+	// without the workspace pick: a pick the account no longer holds would be refused
+	// on the very request that changes the password or deletes the account.
+	async function send(method: string, path: string, body: unknown): Promise<ApiFailure | null> {
+		try {
+			const response = await fetch(path, {
+				method,
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify(body),
+				credentials: 'same-origin'
+			});
+			return await readEnvelope(response);
+		} catch {
+			return UNREACHABLE;
+		}
+	}
+
 	/** The server's words, except its terse 401, which here can only mean one thing. */
 	function words(failure: ApiFailure): string {
 		return failure.status === 401 && failure.message === 'invalid credentials'
@@ -48,13 +65,13 @@
 		changing = true;
 		changeError = null;
 		changed = false;
-		const answer = await call('/api/account/password', {
-			method: 'POST',
-			body: { current_password: currentPassword, new_password: newPassword }
+		const failure = await send('POST', '/api/account/password', {
+			current_password: currentPassword,
+			new_password: newPassword
 		});
 		changing = false;
-		if (!answer.ok) {
-			changeError = words(answer.failure);
+		if (failure) {
+			changeError = words(failure);
 			return;
 		}
 		currentPassword = '';
@@ -65,13 +82,10 @@
 	async function deleteAccount() {
 		deleting = true;
 		deleteError = null;
-		const answer = await call('/api/account', {
-			method: 'DELETE',
-			body: { password: deletePassword }
-		});
-		if (!answer.ok) {
+		const failure = await send('DELETE', '/api/account', { password: deletePassword });
+		if (failure) {
 			deleting = false;
-			deleteError = words(answer.failure);
+			deleteError = words(failure);
 			return;
 		}
 		// The account and its session are gone: forget the picked workspace and load the
