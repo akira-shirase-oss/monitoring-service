@@ -452,13 +452,6 @@ fn routes(state: AppState) -> Router {
             "/workspace/status-page",
             get(read_status_page).put(put_status_page),
         )
-        // The workspace's own webhook (S1d, D-017): member work — the URL is
-        // SSRF-validated at save and revalidated inside every send.
-        .route(
-            "/workspace/webhook",
-            get(read_webhook).put(put_webhook).delete(delete_webhook),
-        )
-        .route("/workspace/webhook/test", post(test_webhook))
         // The workspace's data as one file (D-027): owner work, one per cooldown.
         .route("/workspace/export", get(account::export_workspace))
         // Account lifecycle (D-027): the account behind the session changes its own
@@ -466,6 +459,13 @@ fn routes(state: AppState) -> Router {
         // both confirm the password under the sign-in throttle.
         .route("/account", delete(account::delete_account))
         .route("/account/password", post(account::change_password))
+        // The workspace's own webhook (S1d, D-017): member work — the URL is
+        // SSRF-validated at save and revalidated inside every send.
+        .route(
+            "/workspace/webhook",
+            get(read_webhook).put(put_webhook).delete(delete_webhook),
+        )
+        .route("/workspace/webhook/test", post(test_webhook))
         .route("/backup", post(backup))
         // Auth wraps the whole API: /livez, /readyz and static files stay open —
         // the dashboard must load to *hold* a token, and readiness is not a secret.
