@@ -1,0 +1,461 @@
+/*
+ * Service Monitor — NEUTRAL PLACEHOLDER TOKENS.
+ *
+ * This is deliberately not a design. Per the maintainer (2026-11-19): Service Monitor
+ * must not use Colophon's look — not its palette, its type pairing, its panels or its
+ * motifs. Smon's own design system is chosen later, from screenshot options, and drops
+ * in by replacing THIS FILE ONLY: every component consumes these token names, so the
+ * real system needs no component changes. Until then the values below are a bland,
+ * serviceable default — zero-chroma neutrals, one generic blue for the primary action,
+ * platform font stacks.
+ *
+ * Status colours are the one opinion kept, because a status always pairs a word with a
+ * mark — green up, red down, amber pending, grey unknown/paused. Their exact shades are
+ * placeholders too, owned by the future system.
+ *
+ * This file lives inside the app — Tailwind scans it with everything else under src/.
+ */
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn-svelte/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+	/* Shape: controls (buttons, fields) 8px; cards and dialogs twice that; padding inside a card. */
+	--radius: 0.5rem;
+	--radius-control: var(--radius);
+	--radius-card: calc(var(--radius) * 2);
+	--card-padding: 1.5rem;
+	--card-padding-sm: 1rem;
+
+	/* Neutral ramp — achromatic on purpose; the real system picks the temperature. */
+	--background: oklch(1 0 0);
+	--foreground: oklch(0.21 0 0);
+	--card: oklch(0.985 0 0);
+	--card-foreground: var(--foreground);
+	--popover: oklch(1 0 0);
+	--popover-foreground: var(--foreground);
+	--secondary: oklch(0.967 0 0);
+	--secondary-foreground: var(--foreground);
+	--muted: oklch(0.967 0 0);
+	--muted-foreground: oklch(0.5 0 0);
+	/* shadcn's name for the hover surface of menus and quiet buttons: a neutral step, not the accent. */
+	--accent: oklch(0.952 0 0);
+	--accent-foreground: var(--foreground);
+	--destructive: oklch(0.55 0.2 27);
+	--destructive-foreground: oklch(0.99 0 0);
+	--border: oklch(0.92 0 0);
+	--input: oklch(0.88 0 0);
+	/* The outline of a checkbox or radio: a control's edge, so 3:1 against what it sits on. */
+	--control: oklch(0.6 0 0);
+
+	/* The one accent — a generic blue, unowned by any other product here. --primary fills
+	 * the one primary action, --brand marks selection and the focus ring, --brand-ink is
+	 * the accent as text, --brand-soft its ground. */
+	--primary: oklch(0.55 0.17 255);
+	--primary-hover: oklch(0.5 0.17 255);
+	--primary-foreground: oklch(0.99 0 0);
+	--brand: oklch(0.58 0.16 255);
+	--brand-ink: oklch(0.48 0.15 255);
+	--brand-soft: oklch(0.955 0.015 255);
+	--ring: var(--brand);
+
+	/* Status: a mark (a dot or an icon), a soft ring around it, a ground for its tag, and an ink
+	 * for text. A status always has a word and a mark: colour is never the only signal. */
+	--live: oklch(0.62 0.16 145);
+	--live-ring: oklch(0.9 0.06 145);
+	--live-soft: oklch(0.965 0.02 145);
+	--live-ink: oklch(0.42 0.1 145);
+	--changed: oklch(0.55 0.14 285);
+	--changed-ring: oklch(0.88 0.04 285);
+	--changed-soft: oklch(0.96 0.015 285);
+	--changed-ink: oklch(0.45 0.12 285);
+	--pending: oklch(0.72 0.14 80);
+	--pending-ring: oklch(0.9 0.07 80);
+	--pending-soft: oklch(0.97 0.03 80);
+	--pending-ink: oklch(0.46 0.1 70);
+	--attention: oklch(0.58 0.19 25);
+	--attention-ring: oklch(0.89 0.05 25);
+	--attention-soft: oklch(0.965 0.02 25);
+	--attention-ink: oklch(0.47 0.16 25);
+	--draft: oklch(0.62 0 0);
+	--draft-ring: oklch(0.9 0 0);
+	--draft-soft: oklch(0.958 0 0);
+	--draft-ink: oklch(0.42 0 0);
+
+	/* The shell: a light-grey sidebar around one white page. */
+	--sidebar: oklch(0.975 0 0);
+	--sidebar-foreground: oklch(0.3 0 0);
+	--sidebar-primary: var(--primary);
+	--sidebar-primary-foreground: var(--primary-foreground);
+	--sidebar-accent: oklch(0.95 0 0);
+	--sidebar-accent-foreground: var(--foreground);
+	--sidebar-border: oklch(0.92 0 0);
+	--sidebar-ring: var(--ring);
+
+	/* Charts: the accent leads; the others are the status hues and a quiet grey. */
+	--chart-1: var(--brand);
+	--chart-2: oklch(0.7 0 0);
+	--chart-3: var(--live);
+	--chart-4: var(--pending);
+	--chart-5: var(--changed);
+
+	/* Elevation: only what floats over the page (menus, popovers, dialogs) casts a shadow. */
+	--shadow-hairline: 0 1px 2px oklch(0.2 0 0 / 0.06);
+	--shadow-soft: 0 1px 2px oklch(0.2 0 0 / 0.04), 0 6px 20px -8px oklch(0.2 0 0 / 0.1);
+	--shadow-float: 0 1px 2px oklch(0.2 0 0 / 0.05), 0 24px 48px -16px oklch(0.2 0 0 / 0.22);
+	--shadow-press: 0 1px 1px oklch(0 0 0 / 0.12);
+}
+
+.dark {
+	--background: oklch(0.17 0 0);
+	--foreground: oklch(0.96 0 0);
+	--card: oklch(0.205 0 0);
+	--card-foreground: var(--foreground);
+	--popover: oklch(0.22 0 0);
+	--popover-foreground: var(--foreground);
+	--secondary: oklch(0.25 0 0);
+	--secondary-foreground: var(--foreground);
+	--muted: oklch(0.25 0 0);
+	--muted-foreground: oklch(0.72 0 0);
+	--accent: oklch(0.27 0 0);
+	--accent-foreground: var(--foreground);
+	--destructive: oklch(0.68 0.18 27);
+	--destructive-foreground: oklch(0.18 0 0);
+	--border: oklch(0.3 0 0);
+	--input: oklch(0.37 0 0);
+	--control: oklch(0.6 0 0);
+	--primary: oklch(0.78 0.1 255);
+	--primary-hover: oklch(0.84 0.08 255);
+	--primary-foreground: oklch(0.2 0.03 255);
+	--brand: oklch(0.72 0.12 255);
+	--brand-ink: oklch(0.8 0.09 255);
+	--brand-soft: oklch(0.28 0.04 255);
+	--ring: var(--brand);
+	--live: oklch(0.72 0.14 145);
+	--live-ring: oklch(0.38 0.06 145);
+	--live-soft: oklch(0.26 0.035 145);
+	--live-ink: oklch(0.85 0.09 145);
+	--changed: oklch(0.68 0.12 285);
+	--changed-ring: oklch(0.38 0.06 285);
+	--changed-soft: oklch(0.27 0.04 285);
+	--changed-ink: oklch(0.85 0.06 285);
+	--pending: oklch(0.8 0.13 80);
+	--pending-ring: oklch(0.4 0.06 80);
+	--pending-soft: oklch(0.28 0.04 80);
+	--pending-ink: oklch(0.88 0.09 80);
+	--attention: oklch(0.7 0.17 25);
+	--attention-ring: oklch(0.4 0.07 25);
+	--attention-soft: oklch(0.27 0.05 25);
+	--attention-ink: oklch(0.87 0.08 25);
+	--draft: oklch(0.66 0 0);
+	--draft-ring: oklch(0.36 0 0);
+	--draft-soft: oklch(0.26 0 0);
+	--draft-ink: oklch(0.85 0 0);
+	--sidebar: oklch(0.15 0 0);
+	--sidebar-foreground: oklch(0.86 0 0);
+	--sidebar-primary: var(--primary);
+	--sidebar-primary-foreground: var(--primary-foreground);
+	--sidebar-accent: oklch(0.23 0 0);
+	--sidebar-accent-foreground: var(--foreground);
+	--sidebar-border: oklch(0.25 0 0);
+	--sidebar-ring: var(--ring);
+	--chart-2: oklch(0.62 0 0);
+	--shadow-hairline: 0 1px 2px oklch(0 0 0 / 0.3);
+	--shadow-soft: 0 1px 2px oklch(0 0 0 / 0.3), 0 8px 24px -10px oklch(0 0 0 / 0.5);
+	--shadow-float: 0 1px 2px oklch(0 0 0 / 0.3), 0 32px 64px -24px oklch(0 0 0 / 0.7);
+	--shadow-press: 0 1px 1px oklch(0 0 0 / 0.3);
+}
+
+/* On a phone a card gives its room to the content: padding follows density. */
+@media (max-width: 39.99rem) {
+	:root {
+		--card-padding: 1rem;
+	}
+}
+
+/* More contrast when the system asks for it: text, inks, rules and the accent move; grounds stay.
+ * `:root` would also beat `.dark` here (same specificity, later), so light is `:root:not(.dark)`. */
+@media (prefers-contrast: more) {
+	:root:not(.dark) {
+		--foreground: oklch(0.13 0 0);
+		--muted-foreground: oklch(0.36 0 0);
+		--border: oklch(0.6 0 0);
+		--input: oklch(0.5 0 0);
+		--control: oklch(0.42 0 0);
+		--sidebar-foreground: oklch(0.18 0 0);
+		--primary: oklch(0.46 0.16 255);
+		--primary-hover: oklch(0.41 0.16 255);
+		--brand: oklch(0.48 0.15 255);
+		--brand-ink: oklch(0.4 0.15 255);
+		--live-ink: oklch(0.32 0.09 145);
+		--changed-ink: oklch(0.36 0.1 285);
+		--pending-ink: oklch(0.35 0.08 70);
+		--attention-ink: oklch(0.38 0.14 25);
+		--draft-ink: oklch(0.32 0 0);
+	}
+	.dark {
+		--foreground: oklch(0.99 0 0);
+		--muted-foreground: oklch(0.86 0 0);
+		--border: oklch(0.55 0 0);
+		--input: oklch(0.62 0 0);
+		--control: oklch(0.75 0 0);
+		--sidebar-foreground: oklch(0.96 0 0);
+		--primary: oklch(0.85 0.07 255);
+		--primary-hover: oklch(0.9 0.06 255);
+		--primary-foreground: oklch(0.15 0.03 255);
+		--brand: oklch(0.8 0.1 255);
+		--brand-ink: oklch(0.87 0.07 255);
+		--live-ink: oklch(0.92 0.07 145);
+		--changed-ink: oklch(0.9 0.05 285);
+		--pending-ink: oklch(0.92 0.07 80);
+		--attention-ink: oklch(0.92 0.06 25);
+		--draft-ink: oklch(0.92 0 0);
+	}
+}
+
+@theme inline {
+	/* Platform stacks — deliberately anonymous until the real system names its faces. */
+	--font-sans: ui-sans-serif, system-ui, sans-serif;
+	--font-display: var(--font-sans);
+	--font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+	/* No text under 14px anywhere: the smallest utility renders at reading size. */
+	--text-xs: 0.875rem;
+	--text-xs--line-height: 1.25rem;
+
+	--radius-sm: calc(var(--radius) * 0.5);
+	--radius-md: calc(var(--radius) * 0.75);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) * 1.33);
+	--radius-2xl: calc(var(--radius) * 1.67);
+	--radius-3xl: calc(var(--radius) * 2);
+	--radius-4xl: calc(var(--radius) * 2.5);
+	/* Named shapes (`rounded-control`, `rounded-card`) and a card's padding (`p-card`, `gap-card`). */
+	--radius-control: var(--radius-control);
+	--radius-card: var(--radius-card);
+	--spacing-card: var(--card-padding);
+	--spacing-card-sm: var(--card-padding-sm);
+
+	--shadow-hairline: var(--shadow-hairline);
+	--shadow-soft: var(--shadow-soft);
+	--shadow-float: var(--shadow-float);
+	--shadow-press: var(--shadow-press);
+
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-primary-hover: var(--primary-hover);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-destructive-foreground: var(--destructive-foreground);
+	--color-control: var(--control);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+	--color-brand: var(--brand);
+	--color-brand-ink: var(--brand-ink);
+	--color-brand-soft: var(--brand-soft);
+	--color-live: var(--live);
+	--color-live-ring: var(--live-ring);
+	--color-live-soft: var(--live-soft);
+	--color-live-ink: var(--live-ink);
+	--color-changed: var(--changed);
+	--color-changed-ring: var(--changed-ring);
+	--color-changed-soft: var(--changed-soft);
+	--color-changed-ink: var(--changed-ink);
+	--color-pending: var(--pending);
+	--color-pending-ring: var(--pending-ring);
+	--color-pending-soft: var(--pending-soft);
+	--color-pending-ink: var(--pending-ink);
+	--color-attention: var(--attention);
+	--color-attention-ring: var(--attention-ring);
+	--color-attention-soft: var(--attention-soft);
+	--color-attention-ink: var(--attention-ink);
+	--color-draft: var(--draft);
+	--color-draft-ring: var(--draft-ring);
+	--color-draft-soft: var(--draft-soft);
+	--color-draft-ink: var(--draft-ink);
+	--color-chart-1: var(--chart-1);
+	--color-chart-2: var(--chart-2);
+	--color-chart-3: var(--chart-3);
+	--color-chart-4: var(--chart-4);
+	--color-chart-5: var(--chart-5);
+	--color-sidebar: var(--sidebar);
+	--color-sidebar-foreground: var(--sidebar-foreground);
+	--color-sidebar-primary: var(--sidebar-primary);
+	--color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+	--color-sidebar-accent: var(--sidebar-accent);
+	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+	--color-sidebar-border: var(--sidebar-border);
+	--color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+	}
+	html {
+		@apply bg-background;
+	}
+	body {
+		@apply bg-background font-sans text-foreground antialiased;
+	}
+	h1,
+	h2,
+	h3 {
+		text-wrap: balance;
+	}
+	/* Counts, ids and figures line up. */
+	.tabular {
+		font-variant-numeric: tabular-nums;
+	}
+	/* Native checkboxes and radios look like the Checkbox and RadioGroup components: an edge at 3:1
+	 * (--control) on a white sheet, the accent once chosen. Plain selectors, so they beat the reset
+	 * (also in this layer); utility classes, a later layer, still size them. */
+	input:is([type='checkbox'], [type='radio']) {
+		appearance: none;
+		flex-shrink: 0;
+		width: 1.125rem;
+		height: 1.125rem;
+		margin: 0;
+		vertical-align: middle;
+		border: 1px solid var(--control);
+		background: var(--popover) center / 100% 100% no-repeat;
+		cursor: pointer;
+		transition:
+			background-color 150ms ease,
+			border-color 150ms ease;
+	}
+	input[type='checkbox'] {
+		border-radius: 0.3rem;
+	}
+	input[type='radio'] {
+		border-radius: 9999px;
+	}
+	input:is([type='checkbox'], [type='radio']):hover {
+		border-color: var(--foreground);
+	}
+	input[type='checkbox']:is(:checked, :indeterminate) {
+		border-color: var(--primary);
+		background-color: var(--primary);
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fcfcfd' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+		background-size: 75%;
+	}
+	input[type='checkbox']:indeterminate {
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fcfcfd' stroke-width='3' stroke-linecap='round'%3E%3Cpath d='M6 12h12'/%3E%3C/svg%3E");
+	}
+	/* Dark mode's accent is light, so the check is dark ink. */
+	.dark input[type='checkbox']:checked {
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231d1d1f' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+	}
+	.dark input[type='checkbox']:indeterminate {
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231d1d1f' stroke-width='3' stroke-linecap='round'%3E%3Cpath d='M6 12h12'/%3E%3C/svg%3E");
+	}
+	/* The chosen radio: an accent dot inside a ring of the sheet. */
+	input[type='radio']:checked {
+		border-color: var(--primary);
+		background-color: var(--primary);
+		box-shadow: inset 0 0 0 0.25rem var(--popover);
+	}
+	input:is([type='checkbox'], [type='radio']):focus-visible {
+		outline: 2px solid var(--ring);
+		outline-offset: 2px;
+	}
+	input:is([type='checkbox'], [type='radio']):disabled {
+		cursor: not-allowed;
+		opacity: 0.5;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		*,
+		*::before,
+		*::after {
+			animation-duration: 0.01ms !important;
+			transition-duration: 0.01ms !important;
+		}
+	}
+}
+
+/* Native selects draw the platform's own arrow at the control's edge, outside any padding:
+ * swap it for the neutral chevron and hold room for it. Kept out of a layer so it wins
+ * against padding utilities on the right side. */
+select:not([multiple]) {
+	appearance: none;
+	background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23737373' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+	background-repeat: no-repeat;
+	background-position: right 0.625rem center;
+	background-size: 0.875rem;
+	padding-right: 2rem;
+}
+
+@layer components {
+	/* A page's title — the display face is a placeholder seam: today it is the text face,
+	 * heavier and bigger; the real system owns its look. */
+	.page-title {
+		font-family: var(--font-display);
+		font-size: 1.75rem;
+		line-height: 1.15;
+		letter-spacing: -0.015em;
+		font-weight: 600;
+		text-wrap: balance;
+	}
+	@media (min-width: 40rem) {
+		.page-title {
+			font-size: 2rem;
+		}
+	}
+	/* The one line under a page's title: what the page is for. */
+	.page-intro {
+		font-size: 0.9375rem;
+		line-height: 1.5rem;
+		color: var(--muted-foreground);
+		text-wrap: pretty;
+	}
+	/* Display sizes for a hero or a big figure — same placeholder seam as .page-title. */
+	.display-1 {
+		font-family: var(--font-display);
+		font-size: clamp(2.25rem, 1.6rem + 2.4vw, 3.25rem);
+		line-height: 1.06;
+		letter-spacing: -0.02em;
+		font-weight: 600;
+	}
+	.display-2 {
+		font-family: var(--font-display);
+		font-size: clamp(1.75rem, 1.4rem + 1.2vw, 2.25rem);
+		line-height: 1.1;
+		letter-spacing: -0.015em;
+		font-weight: 600;
+	}
+	.title {
+		font-size: 1.25rem;
+		line-height: 1.3;
+		letter-spacing: -0.018em;
+		font-weight: 600;
+	}
+	.figure {
+		font-variant-numeric: tabular-nums;
+		letter-spacing: -0.02em;
+		font-weight: 600;
+	}
+	.eyebrow {
+		font-size: 0.875rem;
+		line-height: 1.25rem;
+		font-weight: 500;
+		color: var(--muted-foreground);
+	}
+	/* A rule between rows. */
+	.rule-dotted {
+		border-bottom: 1px solid var(--border);
+	}
+}

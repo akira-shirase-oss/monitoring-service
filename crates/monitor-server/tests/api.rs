@@ -45,13 +45,22 @@ async fn app() -> anyhow::Result<(
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: Some(backup_dir),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -780,13 +789,22 @@ async fn two_backups_in_one_second_get_distinct_names() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: std::env::temp_dir(),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: Arc::new(move || stamp),
         trusted_proxy: None,
         backup_dir: Some(tmp.path().join("backups")),
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -818,13 +836,22 @@ async fn backup_is_disabled_without_a_configured_dir() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: std::env::temp_dir(),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -877,13 +904,22 @@ async fn auth_denies_without_a_valid_bearer_token() {
         admin_token: Some(Arc::from("s3cret")),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: std::env::temp_dir(),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     };
@@ -954,13 +990,22 @@ async fn authed_with(
         admin_token: Some(Arc::from(token)),
         session_ttl: ttl,
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     };
@@ -1270,13 +1315,22 @@ async fn a_dead_writer_makes_the_monitor_report_unavailable() -> anyhow::Result<
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -1351,13 +1405,22 @@ async fn creating_past_the_monitor_cap_is_refused() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 2,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -1410,38 +1473,26 @@ async fn cookie_header(
         .to_owned())
 }
 
-/// Behind a TLS-terminating proxy the session cookie must be `Secure`, or a browser sends
-/// it over any plain-http request to the same host (a downgraded link, a captive portal)
-/// where it can be read. The proxy says the hop was TLS in `X-Forwarded-Proto` /
-/// `Forwarded: proto=https`; `SMON_COOKIE_SECURE=always` forces the flag regardless.
-/// Plain-http dev keeps working: no TLS signal, no flag.
+/// The session cookie is `__Host-` pinned (S2 review): `Secure`, `Path=/`, no
+/// `Domain`, on every response — a subdomain can't shadow it and a plain-http hop
+/// can never carry it. The contract no longer depends on what scheme the proxy
+/// reported, so plain-http loopback dev still works (localhost is a trustworthy
+/// origin; browsers store `Secure` cookies there).
 #[tokio::test]
-async fn the_session_cookie_is_secure_whenever_the_request_came_over_tls() {
-    use monitor_server::auth::CookieSecure;
-
+async fn the_session_cookie_is_host_pinned_and_always_secure() {
     let (app, _db, _tmp) = authed("s3cret", Duration::from_secs(3600)).await.unwrap();
-    let plain = cookie_header(&app, "/api/login", &[]).await.unwrap();
-    assert!(!plain.contains("Secure"), "plain http: {plain}");
-    for tls in [
-        [("x-forwarded-proto", "https")],
-        [(
-            "forwarded",
-            "for=203.0.113.9;proto=https;host=mon.example.com",
-        )],
+    for headers in [
+        vec![],
+        vec![("x-forwarded-proto", "http")],
+        vec![("x-forwarded-proto", "https")],
     ] {
         for path in ["/api/login", "/api/logout"] {
-            let cookie = cookie_header(&app, path, &tls).await.unwrap();
-            assert!(cookie.contains("; Secure"), "{path} {tls:?}: {cookie}");
+            let cookie = cookie_header(&app, path, &headers).await.unwrap();
+            assert!(cookie.starts_with("__Host-smon_session="), "{cookie}");
+            assert!(cookie.contains("; Secure"), "{cookie}");
+            assert!(cookie.contains("; Path=/"), "{cookie}");
+            assert!(!cookie.contains("Domain="), "{cookie}");
         }
-    }
-
-    let (always, _db, _tmp) =
-        authed_with("s3cret", Duration::from_secs(3600), CookieSecure::Always)
-            .await
-            .unwrap();
-    for path in ["/api/login", "/api/logout"] {
-        let cookie = cookie_header(&always, path, &[]).await.unwrap();
-        assert!(cookie.contains("; Secure"), "always, {path}: {cookie}");
     }
 }
 
@@ -1518,13 +1569,22 @@ async fn lab_app() -> anyhow::Result<(Router, Db, tempfile::TempDir)> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: true,
         version: "test",
     });
@@ -1555,13 +1615,22 @@ async fn readyz_is_200_and_says_degraded_when_only_a_supporting_task_stopped() {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -1597,13 +1666,22 @@ async fn readyz_reports_a_failed_retention_pass_without_its_error_text() {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -1632,13 +1710,22 @@ fn authed_on(db: &Db, token: &str) -> Router {
         admin_token: Some(Arc::from(token)),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: std::env::temp_dir(),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     })
@@ -1710,7 +1797,7 @@ async fn the_store_and_its_backups_hold_no_usable_session_id() -> anyhow::Result
     let app = authed_on(&db, "digest-token-0123456789abcdef0123456789ab");
     let cookie = login_cookie(&app, "digest-token-0123456789abcdef0123456789ab").await?;
     let id = cookie
-        .strip_prefix("smon_session=")
+        .strip_prefix("__Host-smon_session=")
         .ok_or_else(|| anyhow::anyhow!("cookie shape: {cookie}"))?;
     assert_eq!(read_with_cookie(&app, &cookie).await?, StatusCode::OK);
 
@@ -1767,13 +1854,22 @@ async fn an_unused_session_ends_at_the_idle_limit_and_use_keeps_it_alive() -> an
         admin_token: Some(Arc::from(token)),
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_secs(60),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock,
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -1916,7 +2012,7 @@ async fn store_failures_answer_fixed_text_never_the_databases_own() -> anyhow::R
     let response = authed_app
         .oneshot(
             Request::post("/api/logout")
-                .header("cookie", "smon_session=whatever")
+                .header("cookie", "__Host-smon_session=whatever")
                 .body(Body::empty())?,
         )
         .await?;
@@ -1937,13 +2033,22 @@ fn uncapped(db: &Db) -> Router {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: std::env::temp_dir(),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100_000,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     })
@@ -2055,11 +2160,15 @@ async fn a_schedule_the_coordinator_cannot_serve_is_refused_by_name() -> anyhow:
     Ok(())
 }
 
-/// Per origin, spelling a host another way is not another origin: 30 monitors at 15 s on
-/// `127.0.0.1:9` fill its 2 starts a tick, so a 31st spelled `localhost:9` is refused; a
-/// different address on the same port fits. (Lab profile, so loopback is allowed.)
+/// Origins are (address, host) pairs for the per-workspace *share*, but the
+/// write-time ceiling is the resolved **address** summed across hosts (N1
+/// re-review): 30 monitors at 15 s on `127.0.0.1:9` spend that address's whole
+/// 2-starts-a-tick share for this workspace, so a monitor spelled `localhost:9` —
+/// a different host, the *same* IP — is refused, and so is one more literal.
+/// A different address is unaffected either way. (Lab profile, so loopback is
+/// allowed.)
 #[tokio::test]
-async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
+async fn an_alias_of_a_full_address_is_refused_too() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let db = Db::connect(
         &format!("sqlite:{}", tmp.path().join("alias.db").display()),
@@ -2087,20 +2196,48 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100_000,
+        workspace_slots: usize::MAX,
         allow_local_targets: true,
         version: "test",
     });
+    // `localhost` resolves to the saturated 127.0.0.1 — a different host spelling
+    // of the *same address*. The per-(address, host) share would give it an empty
+    // bucket, but the workspace's load on the address is already spent, so the
+    // write is refused: host aliasing can't inflate one IP's rate (N1).
     let alias = serde_json::json!({
         "name": "alias", "url": "http://localhost:9/30", "interval_s": 15, "timeout_s": 3
     });
     let (status, body) = send(&app, "POST", "/api/monitors", Some(alias)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "capacity_exceeded");
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_monitors()
+            .await?
+            .len(),
+        30,
+        "nothing was stored"
+    );
+    // One more literal of the same address is refused the same way.
+    let same_pair = serde_json::json!({
+        "name": "same", "url": "http://127.0.0.1:9/30", "interval_s": 15, "timeout_s": 3
+    });
+    let (status, body) = send(&app, "POST", "/api/monitors", Some(same_pair)).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "capacity_exceeded");
     let other_address = serde_json::json!({
@@ -2109,4 +2246,294 @@ async fn an_alias_of_a_full_origin_is_refused_too() -> anyhow::Result<()> {
     let (status, body) = send(&app, "POST", "/api/monitors", Some(other_address)).await?;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     Ok(())
+}
+
+/// A stored body expectation can be removed: an explicit `null` clears it, while a
+/// patch that doesn't mention the field keeps it. Without the first, a monitor that
+/// ever had a marker could never be switched to `HEAD`.
+#[tokio::test]
+async fn patch_null_clears_the_body_expectation_and_absent_keeps_it() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let id = create(&app, "marker").await.unwrap();
+    let path = format!("/api/monitors/{id}");
+
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "expect_body": "ready" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Absent: an unrelated edit leaves the marker where it was.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "timeout_s": 4 })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, stored) = send(&app, "GET", &path, None).await.unwrap();
+    assert_eq!(stored["expect_body"], "ready", "{stored}");
+
+    // HEAD while the marker is stored is refused: there is no body to search.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "method": "HEAD" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Null: the marker goes, and the same request may switch the method.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "method": "HEAD", "expect_body": null })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, stored) = send(&app, "GET", &path, None).await.unwrap();
+    assert!(stored["expect_body"].is_null(), "{stored}");
+    assert_eq!(stored["method"], "HEAD", "{stored}");
+}
+
+/// Deleting a monitor together with what was recorded about it is a separate,
+/// explicit request (D-026): the plain delete still refuses, the opt-in removes the
+/// monitor, its checks, its incident and its queued alerts, and nothing of another
+/// monitor's.
+#[tokio::test]
+async fn a_monitor_is_deleted_with_its_evidence_only_when_asked() {
+    let (app, statuses, db, _wh, _tmp) = app().await.unwrap();
+    let doomed = create(&app, "doomed").await.unwrap();
+    let kept = create(&app, "kept").await.unwrap();
+    let writer = seed_writer(&db, &statuses);
+    // Three failures: checks, an open incident and an outbox row for each monitor.
+    for id in [&doomed, &kept] {
+        for _ in 0..3 {
+            seed_check(&db, &writer, id, monitor_domain::CheckOutcome::Transport)
+                .await
+                .unwrap();
+        }
+    }
+    let path = format!("/api/monitors/{doomed}");
+
+    // Anything but the one word is a malformed request, not a quiet plain delete.
+    let (status, body) = send(&app, "DELETE", &format!("{path}?evidence=yes"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, _) = send(&app, "DELETE", &path, None).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the plain delete still refuses"
+    );
+
+    let (status, body) = send(&app, "DELETE", &format!("{path}?evidence=delete"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = send(&app, "GET", &path, None).await.unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Its rows are gone from every table that named it.
+    let scoped = db.workspace(WorkspaceId::DEFAULT);
+    let gone = monitor_domain::MonitorId(uuid::Uuid::parse_str(&doomed).unwrap());
+    assert!(!scoped.has_history(gone).await.unwrap());
+    let (_, incidents) = send(&app, "GET", "/api/incidents", None).await.unwrap();
+    let incidents = incidents["incidents"].as_array().unwrap();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    assert_eq!(incidents[0]["monitor_id"], kept);
+
+    // The other monitor's evidence is untouched.
+    let (_, checks) = send(&app, "GET", &format!("/api/monitors/{kept}/checks"), None)
+        .await
+        .unwrap();
+    assert_eq!(checks["checks"].as_array().unwrap().len(), 3);
+
+    // A second ask finds nothing to delete.
+    let (status, _) = send(&app, "DELETE", &format!("{path}?evidence=delete"), None)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Two write-time refusals the dashboard's form can now reach. A redirect status
+/// named as passing would report a broken redirect chain as up, because working
+/// redirects are followed and never the final answer. A name is bounded and plain:
+/// it is shown in lists, in alerts and on public pages.
+#[tokio::test]
+async fn redirect_statuses_and_unbounded_names_are_refused_at_write() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let create = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            send(&app, "POST", "/api/monitors", Some(body))
+                .await
+                .unwrap()
+        }
+    };
+    let base = |name: &str, statuses: serde_json::Value| {
+        serde_json::json!({
+            "name": name, "url": "https://example.com/health", "expect_statuses": statuses,
+        })
+    };
+
+    for statuses in [
+        serde_json::json!(["200-399"]),
+        serde_json::json!(["200-299", "302"]),
+        serde_json::json!(["308"]),
+    ] {
+        let (status, body) = create(base("redirects", statuses.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{statuses}: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("redirects are followed")),
+            "{body}"
+        );
+    }
+    // 304 and 300 are not followed, so they stay nameable; so do codes around the gap.
+    let (status, body) = create(base(
+        "not-followed",
+        serde_json::json!(["200-299", "300", "304-306", "401"]),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = create(base(&"n".repeat(121), serde_json::json!(["200-299"]))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = create(base("two\nlines", serde_json::json!(["200-299"]))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = create(base(&"n".repeat(120), serde_json::json!(["200-299"]))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The edit path holds the same line.
+    let id = body["id"].as_str().unwrap().to_owned();
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/monitors/{id}"),
+        Some(serde_json::json!({"expect_statuses": ["200-308"]})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+/// The name and redirect rules are for what a write names, not for what is stored. A
+/// monitor an earlier version accepted with a longer name must still pause, resume and
+/// reschedule; only an edit that names the field again has to satisfy the rule.
+#[tokio::test]
+async fn an_edit_is_not_refused_over_a_stored_value_it_does_not_touch() {
+    let (app, _statuses, db, _wh, _tmp) = app().await.unwrap();
+    let mut old = monitor_domain::NewMonitor::new(
+        "short",
+        url::Url::parse("https://example.com/health").unwrap(),
+    )
+    .unwrap()
+    .into_monitor();
+    old.name = "n".repeat(300);
+    old.expect.statuses = monitor_domain::parse_statuses("200-399").unwrap();
+    db.workspace(WorkspaceId::DEFAULT)
+        .insert_monitor(&old)
+        .await
+        .unwrap();
+    let path = format!("/api/monitors/{}", old.id.0);
+
+    for body in [
+        serde_json::json!({ "paused": true }),
+        serde_json::json!({ "paused": false }),
+        serde_json::json!({ "timeout_s": 4 }),
+    ] {
+        let (status, answer) = send(&app, "PATCH", &path, Some(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}: {answer}");
+    }
+
+    // Naming either field again brings its rule with it.
+    let (status, answer) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "name": "n".repeat(200) })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    let (status, answer) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "expect_statuses": ["200-302"] })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+
+    // And a corrected value is accepted.
+    let (status, answer) = send(
+        &app,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "name": "billing", "expect_statuses": ["200-299"] })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+/// A maintenance window's reason is one bounded line, and creating windows spends the
+/// workspace's monitor write budget like every other monitor write. Unbounded, a member
+/// could store megabytes per window, without limit, in rows a later delete removes in
+/// one cascade under the store's write lock.
+#[tokio::test]
+async fn a_window_reason_is_bounded_and_windows_spend_the_write_budget() {
+    let (app, _statuses, _db, _wh, _tmp) = app().await.unwrap();
+    let id = create(&app, "windowed").await.unwrap();
+    let path = format!("/api/monitors/{id}/maintenance");
+    let window = |reason: &str| {
+        serde_json::json!({
+            "starts_at": "2099-01-01T10:00:00Z", "ends_at": "2099-01-01T11:00:00Z",
+            "reason": reason,
+        })
+    };
+
+    for reason in ["r".repeat(201), "two\nlines".to_owned()] {
+        let (status, body) = send(&app, "POST", &path, Some(window(&reason)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+    let (status, body) = send(&app, "POST", &path, Some(window(&"r".repeat(200))))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Refusals spent nothing; the create above and the monitor's own create spent two.
+    let left = monitor_server::MONITOR_WRITE_BUDGET - 2;
+    for _ in 0..left {
+        let (status, body) = send(&app, "POST", &path, Some(window("deploy")))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = send(&app, "POST", &path, Some(window("deploy")))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
 }

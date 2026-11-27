@@ -94,15 +94,29 @@ never re-initialised), installs and enables the units (server + `smon-backup.tim
 installs Caddy + the Caddyfile, prompts for the origin certificate pair only if missing,
 fetches Cloudflare's origin-pull CA (AOP), applies `cloudflare-ips.sh` (Caddy trusted
 proxies + ufw 443-from-Cloudflare), generates the age identity if missing, prompts for the
-R2 secret, and finishes with `smoke.sh`. Secrets are prompted for with echo off; nothing
-secret lands anywhere but the root-only files CREATE.md names.
+R2 secret, takes the first off-box backup (`smon-backup run` — the exit gate's "a backup
+exists" is evidence, not a wait for the first timer tick), and finishes with `smoke.sh`.
+Secrets are prompted for with echo off; nothing secret lands anywhere but the root-only
+files CREATE.md names.
+
+Non-interactive installs (CI, replays) pass the same secrets without a prompt and never
+as argv values — `ps` shows argv to every local user, so each flag takes a file path:
+`--origin-cert FILE --origin-key FILE` install the origin pair, and `--r2-secret FILE
+--r2-env FILE` together seed the R2 credentials (the env file carries
+`SMON_R2_ENDPOINT`/`SMON_R2_ACCESS_KEY`). A partial set is refused. The deploy-check
+workflow runs exactly this on a hosted VM (rclone stubbed to a filesystem remote — the
+pipeline is real, the account is not), twice, for idempotence.
 
 What it deliberately does **not** do: overwrite an existing `env`, re-initialise a store,
 or weaken the file modes.
 
 `SMON_TRUSTED_PROXY=127.0.0.1` (in the template) is right here: Caddy is the only proxy smon
 sees, and Caddy attributes the visitor over Cloudflare's trusted ranges.
-`SMON_COOKIE_SECURE=always` because every dashboard request arrives over TLS.
+`SMON_COOKIE_SECURE=always` because every dashboard request arrives over TLS. A
+plain `http://` deployment is **not** supported for sign-in — there is no
+`SMON_COOKIE_SECURE=off` in any profile — so a self-hosted install must still put
+TLS in front — a tunnel, a CA-signed cert, or mkcert on the LAN — rather than
+serve the dashboard unencrypted.
 
 ## 4. Sign in once
 
@@ -203,11 +217,51 @@ $CHECKOUT/deploy/droplet/upgrade.sh --release-dir /opt/release-candidate
 $CHECKOUT/deploy/droplet/upgrade.sh --version <v> --url <tarball> --sha256 <hex>
 ```
 
-Stages the release, verifies the download's SHA-256, runs `schema-guard.sh` **before**
-anything switches, repoints `current` with an atomic rename, restarts, polls readiness,
+Stages under a unique name, verifies the download's SHA-256, runs `schema-guard.sh`
+and the migration inspector **on the staged copy before anything under `releases/`
+moves**, repoints `current` with an atomic rename, restarts, polls readiness,
 runs the local smoke — and **rolls back automatically** on any post-switch failure. Keeps
 the newest 3 release dirs. Serving gap < 5 s (Caddy holds requests); check slots inside the
 restart are committed `missed` on boot — that's the monitor accounting for its own gap.
+
+**Release names are unique.** The release's name comes from `--release-dir`'s basename
+(or `--version`), and an upgrade refuses while still staging if that name already exists
+under `/opt/smon/releases/` — a repeated `--release-dir /opt/release-candidate` computes
+the same destination, and overwriting the live release before the guards ran is exactly
+the failure the rule exists for. Give every candidate its own directory
+(`/opt/release-candidate-<build>` or `--version`) and re-runs are safe by construction.
+
+**Migration checksum before switching (read-only).** If the database ever ran a
+branch/experiment build — anything other than a main-line release — a migration
+file it applied may differ from what the candidate build ships, and sqlx refuses
+to boot on the checksum mismatch *after* the switch. Check first; the query is
+read-only:
+
+```sh
+dbpath=$(sed -n 's/^SMON_DATABASE_URL=sqlite://p' /opt/smon/env | tail -n 1)
+sqlite3 -batch -readonly "$dbpath" \
+  "SELECT version, description, success, hex(checksum) FROM _sqlx_migrations
+   ORDER BY version DESC LIMIT 5;"
+```
+
+`inspect-migrations.sh` runs this comparison automatically inside `upgrade.sh`
+before the atomic switch — against the candidate binary's own compiled-in
+manifest (`--migration-manifest`), so no source checkout is needed on the
+host — and a divergence, a `success = 0` row, or a query that cannot answer
+aborts the upgrade rather than waving it through. `hex(checksum)` is what
+`shasum -a 384` prints, so an applied row can also be compared by hand to the
+candidate's manifest line (sqlx records the SHA-384 of the migration's SQL).
+Any row whose version has no line in the manifest — or whose hex checksum
+differs — means the database diverged from the release line: reconcile
+`_sqlx_migrations` by hand before deploying, don't boot through it.
+
+Version 18 is the historical edge: it was introduced and restored on a
+branch before this release line carried it, so a database that last ran a
+**pre-merge** build may hold a version-18 row written by a different 0018's
+bytes. Once this release line has deployed, a version-18 row is ordinary —
+do not "repair" a database merely for containing it. The tell is only a
+version-18 row whose checksum differs from the candidate's
+`0018_*.sql` file — divergence, not presence.
 
 ## Rollback
 

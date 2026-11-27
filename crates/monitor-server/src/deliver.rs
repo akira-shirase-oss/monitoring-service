@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use url::Url;
+use uuid::Uuid;
 
 use monitor_db::{Db, DeliveryRow, WriterHandle};
 
@@ -445,10 +446,34 @@ async fn deliver_webhook(
             return Err("serialize".to_owned());
         }
     };
+    post_signed(
+        client,
+        target,
+        secret,
+        &row.event_id,
+        body,
+        config.attempt_deadline,
+    )
+    .await
+}
 
+/// One signed JSON POST under a deadline — the shared send behind the outbox's
+/// `deliver_webhook` and the member-facing "send test alert" ([`test_send`]). The
+/// response resolves on *headers* — the body is never read, so the response-size
+/// cap is literal: zero bytes, and a receiver streaming forever still can't hold
+/// the attempt past its deadline. `Err(detail)` is the classified word, never a
+/// reqwest message.
+async fn post_signed(
+    client: &reqwest::Client,
+    target: &Url,
+    secret: Option<&[u8]>,
+    event_id: &str,
+    body: Vec<u8>,
+    deadline: Duration,
+) -> Result<(), String> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Ok(id) = HeaderValue::from_str(&row.event_id) {
+    if let Ok(id) = HeaderValue::from_str(event_id) {
         headers.insert("x-smon-event", id);
     }
     if let Some(secret) = secret
@@ -461,20 +486,67 @@ async fn deliver_webhook(
         }
     }
 
-    // The send resolves on response *headers* — the body is never read, so the
-    // response-size cap is literal: zero bytes, and a receiver streaming forever
-    // still can't hold the attempt past its deadline.
     let send = client
         .post(target.clone())
         .headers(headers)
         .body(body)
         .send();
-    match tokio::time::timeout(config.attempt_deadline, send).await {
+    match tokio::time::timeout(deadline, send).await {
         Ok(Ok(response)) if response.status().is_success() => Ok(()),
         Ok(Ok(response)) => Err(format!("http_{}", response.status().as_u16())),
         Ok(Err(error)) => Err(probe::classify(&error).to_owned()),
         Err(_elapsed) => Err("deadline".to_owned()),
     }
+}
+
+/// "Send test alert" (S2): one send through the exact D-017 gate — the same
+/// scheme/literal check, a client built from the validating `PolicyResolver` (so
+/// DNS is re-resolved and revalidated inside the connect), no proxy, no redirects,
+/// the workspace's own secret on the signature. `kind: "test"` tells receivers this
+/// is a probe of the plumbing, not an incident; the row it stands on is synthetic
+/// and never lands in the outbox. `Err(detail)` is the classified reason, shown
+/// to the member verbatim.
+pub async fn test_send(
+    allow_local_targets: bool,
+    target: &Url,
+    secret: Option<&[u8]>,
+    deadline: Duration,
+) -> Result<(), String> {
+    let policy = probe::ProbePolicy {
+        allow_local_targets,
+        extra_roots: Vec::new(),
+    };
+    policy
+        .check(target)
+        .map_err(|rejected| probe::rejected_detail(rejected).to_owned())?;
+    let client =
+        tenant_client(probe::PolicyResolver::new(allow_local_targets)).map_err(|error| {
+            warn!(%error, "test-alert client could not be built");
+            "connect".to_owned()
+        })?;
+    let now = OffsetDateTime::now_utc();
+    let row = DeliveryRow {
+        event_id: format!("test_{}", Uuid::now_v7().simple()),
+        kind: "test".to_owned(),
+        channel: "tenant_webhook".to_owned(),
+        attempts: 0,
+        created_at: now,
+        monitor_id: "test".to_owned(),
+        monitor_name: "Test alert".to_owned(),
+        monitor_url: String::new(),
+        incident_id: 0,
+        opened_at: now,
+        first_fail_at: None,
+        last_fail_at: None,
+        resolved_at: None,
+        webhook_url: None,
+        webhook_secret: None,
+    };
+    let body = serde_json::to_vec(&Payload::from(&row)).map_err(|error| {
+        warn!(%error, "test-alert payload serialize failed");
+        "serialize".to_owned()
+    })?;
+    post_signed(&client, target, secret, &row.event_id, body, deadline).await
 }
 
 /// One plaintext message per event. The monitor name is made one line ([`one_line`]) in

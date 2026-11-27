@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# The shipped systemd unit is part of the security boundary — a process that parses
+# network responses and holds alert credentials gets no privileges it doesn't need.
+# This checks what deploy_unit.rs pins statically, from the shell: every hardening
+# directive the runbook promises, plus — on a host that has systemd — `systemd-analyze
+# verify` and `systemd-analyze security` against the installed unit.
+#
+#   deploy/droplet/check-unit-hardening.sh [path-to-unit] [installed-unit-name]
+#
+# Runs anywhere: the directive checks are portable bash; the systemd-analyze half runs
+# when the tool exists and is skipped loudly otherwise. Run by tests/deploy_scripts.rs
+# (static half on the dev machine) and by the deploy-check workflow (full half on a VM).
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+unit_file="${1:-$here/../monitor-server.service}"
+unit_name="${2:-monitor-server.service}"
+failures=0; pass=0
+ok()  { printf '  ok    %s\n' "$1"; pass=$((pass + 1)); }
+bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
+
+[[ -f "$unit_file" ]] || { echo "error: no unit file at $unit_file" >&2; exit 2; }
+
+# The setting one section carries (last wins, like systemd).
+setting() { # setting <section> <key>
+  awk -v sec="$1" -v key="$2" '
+    /^\[/ { insec = ($0 == "[" sec "]"); next }
+    insec && $0 ~ ("^" key "[[:space:]]*=") { sub("^[^=]*=[[:space:]]*", ""); v = $0 }
+    END { if (v != "") print v }' "$unit_file"
+}
+want() { # want <section> <key> <expected>
+  got=$(setting "$1" "$2")
+  if [[ "$got" == "$3" ]]; then ok "$2 = ${3:-<empty>}"; else bad "$2: want '${3:-<empty>}', got '$got'"; fi
+}
+
+echo "identity — never root, no privileges to gain"
+want Service User smon
+want Service Group smon
+want Service NoNewPrivileges true
+want Service CapabilityBoundingSet ""
+want Service AmbientCapabilities ""
+
+echo "filesystem — a read-only system but the two directories the monitor writes"
+want Service ProtectSystem strict
+want Service ProtectHome true
+want Service PrivateTmp true
+want Service PrivateDevices true
+want Service ProtectKernelTunables true
+want Service ProtectKernelModules true
+want Service ProtectControlGroups true
+want Service RestrictSUIDSGID true
+want Service LockPersonality true
+want Service UMask 0077
+paths=$(setting Service ReadWritePaths)
+[[ "$paths" == "/opt/smon/data /opt/smon/status" ]] \
+  && ok "ReadWritePaths is exactly data + status" \
+  || bad "ReadWritePaths: want '/opt/smon/data /opt/smon/status', got '$paths'"
+families=$(setting Service RestrictAddressFamilies)
+[[ "$families" == "AF_INET AF_INET6 AF_UNIX" ]] \
+  && ok "RestrictAddressFamilies is INET+INET6+UNIX only" \
+  || bad "RestrictAddressFamilies: got '$families'"
+
+echo "bounds and lifecycle — the kernel adds its own caps; the stop outlasts the drain"
+[[ -n "$(setting Service MemoryMax)" ]] && ok "MemoryMax is set ($(setting Service MemoryMax))" || bad "no MemoryMax"
+[[ -n "$(setting Service LimitNOFILE)" ]] && ok "LimitNOFILE is set ($(setting Service LimitNOFILE))" || bad "no LimitNOFILE"
+stop=$(setting Service TimeoutStopSec); stop=${stop%s}
+[[ "$stop" =~ ^[0-9]+$ && "$stop" -gt 27 ]] \
+  && ok "TimeoutStopSec=${stop}s outlives the 12+15s drain" \
+  || bad "TimeoutStopSec=$stop must exceed the drain"
+want Service Restart on-failure
+[[ -n "$(setting Unit StartLimitBurst)" && -n "$(setting Unit StartLimitIntervalSec)" ]] \
+  && ok "a crash loop hits the start limit" || bad "no StartLimit* — a crash loop restarts forever"
+mounts=$(setting Unit RequiresMountsFor)
+for m in /opt/smon/data /opt/smon/status; do
+  [[ " $mounts " == *" $m "* ]] && ok "RequiresMountsFor has $m" || bad "RequiresMountsFor lacks $m"
+done
+want Service EnvironmentFile /opt/smon/env
+
+echo "systemd-analyze — the real checker, when this host has systemd"
+if command -v systemd-analyze >/dev/null 2>&1; then
+  # verify resolves ExecStart/EnvironmentFile against the live filesystem — on a
+  # runner that never installed, our paths don't exist and the check would fail
+  # on the host's state, not the unit's. Stage a root where the unit's paths are
+  # real so verify judges only this unit's lines, identically on any host.
+  fake=$(mktemp -d)
+  mkdir -p "$fake/opt/smon/current/bin" "$fake/opt/smon/data" "$fake/opt/smon/status" \
+           "$fake/etc/systemd/system" "$fake/etc"
+  printf '#!/bin/sh\nexit 0\n' >"$fake/opt/smon/current/bin/monitor-server"
+  chmod +x "$fake/opt/smon/current/bin/monitor-server"
+  : >"$fake/opt/smon/env"
+  printf 'smon:x:900:900:smon monitor:/nonexistent:/usr/sbin/nologin\n' >"$fake/etc/passwd"
+  printf 'smon:x:900:\n' >"$fake/etc/group"
+  cp "$unit_file" "$fake/etc/systemd/system/monitor-server.service"
+  # A bare root has no system units: every unit carries implicit deps on
+  # sysinit.target/basic.target, the unit names network-online.target and
+  # RequiresMountsFor expands to generated .mount units — verify stops at the
+  # first missing name. Stage minimal stubs for the unit's dependency closure;
+  # DefaultDependencies=no makes each stub terminate its own chain so nothing
+  # else is pulled in. Only our unit's own lines are judged.
+  for target in sysinit basic shutdown multi-user \
+                network network-pre network-online nss-lookup nss-user-lookup \
+                local-fs local-fs-pre remote-fs swap sockets timers paths \
+                umount dbus slices getty cryptsetup integritysetup; do
+    printf '[Unit]\nDefaultDependencies=no\n' >"$fake/etc/systemd/system/$target.target"
+  done
+  for mnt in opt-smon-data opt-smon-status; do
+    printf '[Unit]\nDefaultDependencies=no\n[Mount]\nWhat=/dev/sda1\nWhere=/%s\n' \
+      "${mnt//-//}" >"$fake/etc/systemd/system/$mnt.mount"
+  done
+  out=$(systemd-analyze verify --root="$fake" monitor-server.service 2>&1); rc=$?
+  rm -rf "$fake"
+  if [[ $rc -eq 0 ]]; then
+    [[ -z "$out" ]] && ok "systemd-analyze verify: clean" \
+      || { printf '%s\n' "$out" | sed 's/^/  info  /'; ok "systemd-analyze verify: no errors on our unit (notes above)"; }
+  else
+    bad "systemd-analyze verify: $out"
+  fi
+  if systemctl cat "$unit_name" >/dev/null 2>&1; then
+    level=$(systemd-analyze security "$unit_name" 2>/dev/null | sed -nE 's/.*exposure level[^:]*:[[:space:]]*([0-9.]+).*/\1/p' | tail -1)
+    systemd-analyze security "$unit_name" 2>/dev/null | sed 's/^/  info  /'
+    if [[ "$level" =~ ^[0-9.]+$ ]] && awk -v l="$level" 'BEGIN{exit !(l <= 2.0)}'; then
+      ok "systemd-analyze security: exposure $level (≤ 2.0)"
+    else
+      bad "systemd-analyze security: exposure '$level' — want ≤ 2.0"
+    fi
+  else
+    echo "  info  $unit_name isn't installed here — security score skipped (it runs on the VM install test)"
+  fi
+else
+  echo "  info  no systemd-analyze on this host — verify/security skipped (the VM install test runs them)"
+fi
+
+echo
+echo "check-unit-hardening: $pass ok, $failures failed"
+[[ $failures -eq 0 ]]

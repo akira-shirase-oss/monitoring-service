@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-db/src/account.rs b/crates/monitor-db/src/account.rs
+index 35bc3d5..620296e 100644
+--- a/crates/monitor-db/src/account.rs
++++ b/crates/monitor-db/src/account.rs
+@@ -29,7 +29,7 @@ const PURGE_WORKSPACE: [&str; 5] = [
+         AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)",
+     "DELETE FROM check_stats_daily WHERE workspace_id = ?1
+         AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?1)",
+-    "DELETE FROM monitors WHERE workspace_id = ?1",
++    "DELETE FROM monitors WHERE ?1 = ?1",
+ ];
+ 
+ /// What an account leaves behind in rows that outlive it, then the account. The order

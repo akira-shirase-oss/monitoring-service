@@ -56,7 +56,7 @@ try {
 			const r = await fetch(`${BASE}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
 			if (r.status === 429) { throttled++; await sleep(20 + Math.random() * 30); continue; }
 			const cookie = r.headers.get('set-cookie')?.split(';')[0];
-			return r.status === 204 && cookie?.startsWith('smon_session=') ? cookie : null;
+			return r.status === 204 && cookie?.startsWith('__Host-smon_session=') ? cookie : null;
 		}
 	};
 	const c = await login();

@@ -2,6 +2,7 @@
 //! honestly. A redirect, a refused connection and a hung socket are different evidence and
 //! never collapse into each other.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use reqwest::redirect;
 use tokio::time::Instant;
 use url::{Host, Url};
 
-use monitor_domain::CheckOutcome;
+use monitor_domain::{CheckOutcome, Expect, ProbeMethod, WorkspaceId};
 
 /// Redirects followed per hop, each revalidated — a hop limit, never a free pass.
 const MAX_REDIRECT_HOPS: usize = 5;
@@ -57,9 +58,223 @@ impl std::fmt::Display for ResolvedLocal {
 
 impl std::error::Error for ResolvedLocal {}
 
+/// A probe start refused because the address's shared budget is spent (N1
+/// re-review): the scheduler commits it as a counted `missed` — our own bound's
+/// refusal, a coverage gap, never evidence about the target.
+#[derive(Debug)]
+pub(crate) struct AddressBusy;
+
+impl std::fmt::Display for AddressBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the address's probe-start budget is spent")
+    }
+}
+
+impl std::error::Error for AddressBusy {}
+
+// The workspace whose schedule is paying for the in-flight probe, carried as a
+// task-local so the charge can reach the places that know the address but not
+// the tenant — the resolver (called deep inside reqwest's connect) and the
+// redirect closure. Unattributed calls still pay the global per-address bound.
+tokio::task_local! {
+    pub(crate) static PROBE_WORKSPACE: WorkspaceId;
+}
+
+/// Whose schedule is paying, when the call site can't pass it: `None` outside a
+/// probe dispatch (webhook sends, bare resolves) — those pay only the global
+/// per-address bound.
+fn workspace() -> Option<WorkspaceId> {
+    PROBE_WORKSPACE.try_with(|w| *w).ok()
+}
+
+/// The address a URL literal means — the bucket key, normalised like
+/// `origin.rs`'s `address_key` so `::ffff:V` spends `V`'s share, not a twin.
+fn literal_ip(url: &Url) -> Option<IpAddr> {
+    match url.host()? {
+        Host::Ipv4(v4) => Some(IpAddr::V4(v4)),
+        Host::Ipv6(v6) => Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4)),
+        Host::Domain(_) => None,
+    }
+}
+
+/// Token bucket per resolved address — the cross-tenant bound on probe starts
+/// at one IP (N1 re-review). The per-workspace (origin, host) share keeps
+/// fairness between sites, but it cannot bound what many names or many tenants
+/// aim at one address: this cap rides the address the validating resolver
+/// actually hands to the dialer — every tenant, every redirect hop. Ports are
+/// invisible to DNS, so the bucket's key is the address alone.
+///
+/// Under the global ceiling each workspace has its own share at the address
+/// (B re-review): the heaviest spender stops at its own 2 starts a second
+/// while a neighbour's share — and the global room left — is untouched.
+#[derive(Debug)]
+pub struct AddressBudget {
+    /// Burst size — the most starts one address may pay at once.
+    burst: f64,
+    /// Sustained refill — tokens per second.
+    rate: f64,
+
+    /// The per-workspace sub-bucket's burst and refill at one address — the
+    /// same share the write-time per-address cap sells a workspace.
+    share_burst: f64,
+    share_rate: f64,
+    buckets: std::sync::Mutex<HashMap<IpAddr, IpBucket>>,
+}
+
+/// One address's buckets: the global ceiling and each workspace's share of it.
+/// Nothing else is remembered: a refused start leaves no trace here (D-028).
+#[derive(Debug)]
+struct IpBucket {
+    global: Bucket,
+    shares: HashMap<WorkspaceId, Bucket>,
+}
+
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    at: tokio::time::Instant,
+}
+
+/// Addresses remembered at once — a wildcard-DNS spray must not grow it unbounded.
+const MAX_BUCKETS: usize = 8192;
+
+/// Workspace shares remembered per address before the full ones are forgotten. A
+/// share that has refilled completely carries no information, so dropping it changes
+/// no answer; the bound keeps a long-lived address from collecting every workspace
+/// that ever probed it.
+const MAX_SHARES: usize = 256;
+
+fn refill(bucket: &mut Bucket, burst: f64, rate: f64, now: tokio::time::Instant) {
+    // The clock is read before the lock is taken, so two callers can arrive here in
+    // the other order. Time never moves a bucket backwards: if it did, the span
+    // between the two readings would be credited twice.
+    if now <= bucket.at {
+        return;
+    }
+    bucket.tokens = (bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate).min(burst);
+    bucket.at = now;
+}
+
+impl AddressBudget {
+    /// `burst` paid starts at once, refilling to `burst` over `per`; the
+    /// per-workspace share equals the global bound (unattributed behaviour).
+    pub fn new(burst: u32, per: Duration) -> Self {
+        Self::with_share(burst, per, burst, per)
+    }
+
+    /// A global `burst`/`per` ceiling per address, and under it each
+    /// workspace's own `share_burst`/`share_per` share at that address.
+    pub fn with_share(burst: u32, per: Duration, share_burst: u32, share_per: Duration) -> Self {
+        Self {
+            burst: f64::from(burst),
+            rate: f64::from(burst) / per.as_secs_f64().max(f64::EPSILON),
+            share_burst: f64::from(share_burst),
+            share_rate: f64::from(share_burst) / share_per.as_secs_f64().max(f64::EPSILON),
+            buckets: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Charge one probe start at `ip` on behalf of `workspace`: false while
+    /// either bound — the address's global ceiling, or the workspace's own
+    /// share at it — is spent. `Instant` is tokio's clock: under paused time
+    /// the refill is a test-clock fact.
+    pub fn take(&self, ip: IpAddr, workspace: Option<WorkspaceId>) -> bool {
+        // E re-review: the mapped spelling is the same address (`address_key`).
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 @ IpAddr::V4(_) => v4,
+        };
+        let now = tokio::time::Instant::now();
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !buckets.contains_key(&ip) && buckets.len() >= MAX_BUCKETS {
+            // Fail closed (C re-review): evict only buckets that are whole
+            // again — the global token recovered AND every workspace share in
+            // it recovered — so a still-spent bucket (a victim's, or a
+            // spender's share) is never laundered back to full by churn.
+            buckets.retain(|_, b| {
+                !(now.duration_since(b.global.at).as_secs_f64() * self.rate >= self.burst
+                    && b.shares.values().all(|s| {
+                        now.duration_since(s.at).as_secs_f64() * self.share_rate >= self.share_burst
+                    }))
+            });
+            if buckets.len() >= MAX_BUCKETS {
+                return false;
+            }
+        }
+        let bucket = buckets.entry(ip).or_insert_with(|| IpBucket {
+            global: Bucket {
+                tokens: self.burst,
+                at: now,
+            },
+            shares: HashMap::new(),
+        });
+        refill(&mut bucket.global, self.burst, self.rate, now);
+        if let Some(workspace) = workspace {
+            if !bucket.shares.contains_key(&workspace) && bucket.shares.len() >= MAX_SHARES {
+                let (burst, rate) = (self.share_burst, self.share_rate);
+                bucket
+                    .shares
+                    .retain(|_, share| now.duration_since(share.at).as_secs_f64() * rate < burst);
+                if bucket.shares.len() >= MAX_SHARES {
+                    return false; // fail closed, like a full address table
+                }
+            }
+            let share = bucket.shares.entry(workspace).or_insert(Bucket {
+                tokens: self.share_burst,
+                at: now,
+            });
+            refill(share, self.share_burst, self.share_rate, now);
+            // The whole rule (D-028): a start is paid when the workspace's own share
+            // AND the address's ceiling each hold a token, and refused otherwise. A
+            // refusal remembers nothing — the scheduler asks once per slot and never
+            // returns for an answer, so a place held for a refused start is a place
+            // nobody claims. The queue that used to live here served the head only,
+            // and a head that had stopped asking blocked the address with tokens to
+            // spare.
+            if share.tokens < 1.0 || bucket.global.tokens < 1.0 {
+                return false;
+            }
+            share.tokens -= 1.0;
+            bucket.global.tokens -= 1.0;
+            return true;
+        }
+        if bucket.global.tokens >= 1.0 {
+            bucket.global.tokens -= 1.0;
+            return true;
+        }
+        false
+    }
+}
+
+/// The budget every probe this client makes shares (N1/B re-review): the
+/// global per-address ceiling is 8 starts a second across ALL tenants and each
+/// workspace's share of one address is the same 2 starts a second the
+/// write-time per-address cap sells it — a spray can never take more than its
+/// share, and the ceiling keeps a wildcard-DNS spray an order under the
+/// engine's 512-slot bound. A fresh budget per client: the bound is a
+/// property of the dialer, not of process state (and tests stay isolated).
+fn probe_budget() -> Arc<AddressBudget> {
+    Arc::new(AddressBudget::with_share(
+        8,
+        Duration::from_secs(1),
+        2,
+        Duration::from_secs(1),
+    ))
+}
+
 /// Test-only DNS answers, keyed by name — see `PolicyResolver::for_test`.
 #[cfg(test)]
-type Overrides = Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<SocketAddr>>>>;
+pub(crate) type Overrides =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<SocketAddr>>>>;
+
+/// A fresh overrides map for tests that drive a `PolicyResolver` by hand.
+#[cfg(test)]
+pub(crate) fn test_overrides() -> Overrides {
+    Overrides::default()
+}
 
 /// reqwest's resolver with the policy inside: names resolve through the OS, then every
 /// returned address must be public (unless `lab`). reqwest receives only the validated
@@ -67,6 +282,9 @@ type Overrides = Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<Sock
 #[derive(Debug, Clone)]
 pub struct PolicyResolver {
     allow_local_targets: bool,
+    /// The cross-tenant per-address starts budget — `Some` on the probe path,
+    /// `None` on the tenant-webhook deliverer (its sends are not probe slots).
+    budget: Option<Arc<AddressBudget>>,
     /// Test-only DNS answers: present names return these addresses *through the same
     /// `validate_addrs` gate* — validation is never bypassed, only the lookup source is
     /// swapped. `None` in every build but tests.
@@ -76,11 +294,23 @@ pub struct PolicyResolver {
 
 impl PolicyResolver {
     /// The production constructor: strict unless `SMON_PROFILE=lab` (fixtures and drills
-    /// on loopback). The tenant-webhook sink is built with this; probes build their own
-    /// inside `ProbeClient`.
+    /// on loopback). The tenant-webhook sink is built with this — its sends are not
+    /// probe slots, so it shares no starts budget.
     pub fn new(allow_local_targets: bool) -> Self {
         Self {
             allow_local_targets,
+            budget: None,
+            #[cfg(test)]
+            overrides: None,
+        }
+    }
+
+    /// The resolver the probe client dials through: the strict gate plus the
+    /// shared per-address starts budget (N1 re-review).
+    fn for_probes(allow_local_targets: bool, budget: Arc<AddressBudget>) -> Self {
+        Self {
+            allow_local_targets,
+            budget: Some(budget),
             #[cfg(test)]
             overrides: None,
         }
@@ -93,6 +323,22 @@ impl PolicyResolver {
     pub(crate) fn for_test(allow_local_targets: bool, overrides: Overrides) -> Self {
         Self {
             allow_local_targets,
+            budget: None,
+            overrides: Some(overrides),
+        }
+    }
+
+    /// `for_test` plus an injected starts budget — the runtime cap's tests drive
+    /// it directly so a crowded address is a fact, not a race.
+    #[cfg(test)]
+    pub(crate) fn for_test_budgeted(
+        allow_local_targets: bool,
+        overrides: Overrides,
+        budget: Arc<AddressBudget>,
+    ) -> Self {
+        Self {
+            allow_local_targets,
+            budget: Some(budget),
             overrides: Some(overrides),
         }
     }
@@ -107,21 +353,51 @@ impl PolicyResolver {
 impl Resolve for PolicyResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let allow = self.allow_local_targets;
+        let budget = self.budget.clone();
         #[cfg(test)]
         let overrides = self.overrides.clone();
         Box::pin(async move {
             let host = name.as_str().to_owned();
             #[cfg(test)]
-            if let Some(map) = &overrides
-                && let Some(addrs) = map.lock().ok().and_then(|m| m.get(&host).cloned())
-            {
-                validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
-                return Ok(Box::new(addrs.into_iter()) as Addrs);
-            }
-            let addrs: Vec<SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let mapped = overrides
+                .as_ref()
+                .and_then(|m| m.lock().ok().and_then(|m| m.get(&host).cloned()));
+            #[cfg(not(test))]
+            let mapped: Option<Vec<SocketAddr>> = None;
+            let addrs: Vec<SocketAddr> = match mapped {
+                Some(addrs) => addrs,
+                None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
+            };
             validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
-            Ok(Box::new(addrs.into_iter()) as Addrs)
+            let Some(budget) = &budget else {
+                return Ok(Box::new(addrs.into_iter()) as Addrs);
+            };
+            // The bound pays only what the dialer can take (B re-review), and
+            // the dialer takes only what resolve() offers (N-2 re-review):
+            // offer exactly ONE candidate — the first paying address in answer
+            // order — so a fallback family or a sprayed answer's tail is never
+            // charged for a connect it never produces. A redirect hop
+            // re-enters here on the address it lands on, and a name whose
+            // whole answer is spent gets no dial.
+            let mut paid = None;
+            let mut any_refused = false;
+            for addr in addrs {
+                if paid.is_some() {
+                    break;
+                }
+                if budget.take(addr.ip(), workspace()) {
+                    paid = Some(addr);
+                } else {
+                    any_refused = true;
+                }
+            }
+            match paid {
+                Some(addr) => Ok(Box::new(std::iter::once(addr)) as Addrs),
+                None if any_refused => {
+                    Err(Box::new(AddressBusy) as Box<dyn std::error::Error + Send + Sync>)
+                }
+                None => Ok(Box::new(std::iter::empty()) as Addrs),
+            }
         })
     }
 }
@@ -278,6 +554,10 @@ pub struct ProbeResult {
     /// Classified detail for the `checks.detail` column — never the error string itself
     /// (reqwest errors can embed URLs and headers).
     pub detail: Option<&'static str>,
+    /// `true` when OUR bound refused the start (the resolver's per-address
+    /// budget): the slot is the monitor's coverage gap — a `missed`, never an
+    /// outcome worth reporting about the target.
+    pub limited: bool,
 }
 
 /// One reqwest client shared by every probe: connection reuse, policy-checked DNS, and
@@ -287,13 +567,18 @@ pub struct ProbeResult {
 pub struct ProbeClient {
     client: reqwest::Client,
     policy: ProbePolicy,
+    /// The shared per-address starts budget this client's probes pay — `None`
+    /// only where a resolver was built without one (the webhook deliverer, the
+    /// pin fixture).
+    budget: Option<Arc<AddressBudget>>,
     /// Response bodies are read at most this far — evidence is the status, not the page.
     max_body: usize,
 }
 
 impl ProbeClient {
     pub fn new(policy: ProbePolicy, max_body: usize) -> Result<Self, reqwest::Error> {
-        Self::build(policy, max_body, &[])
+        let resolver = PolicyResolver::for_probes(policy.allow_local_targets, probe_budget());
+        Self::build(policy, max_body, &[], resolver)
     }
 
     /// A client whose DNS answers for `pins` bypass the policy — unit tests only: it lets an
@@ -305,13 +590,30 @@ impl ProbeClient {
         max_body: usize,
         pins: &[(&str, SocketAddr)],
     ) -> Result<Self, reqwest::Error> {
-        Self::build(policy, max_body, pins)
+        let resolver = PolicyResolver::for_test(policy.allow_local_targets, Overrides::default());
+        Self::build(policy, max_body, pins, resolver)
+    }
+
+    /// A client whose DNS answers come from `overrides` through the same validating
+    /// resolver the dialer uses, with an injected starts budget — the runtime
+    /// cap's tests (N1 re-review). Never reachable from production code.
+    #[cfg(test)]
+    pub(crate) fn overridden(
+        policy: ProbePolicy,
+        max_body: usize,
+        overrides: Overrides,
+        budget: Arc<AddressBudget>,
+    ) -> Result<Self, reqwest::Error> {
+        let resolver =
+            PolicyResolver::for_test_budgeted(policy.allow_local_targets, overrides, budget);
+        Self::build(policy, max_body, &[], resolver)
     }
 
     fn build(
         policy: ProbePolicy,
         max_body: usize,
         pins: &[(&str, SocketAddr)],
+        resolver: PolicyResolver,
     ) -> Result<Self, reqwest::Error> {
         // TLS truth (D-010): a preconfigured rustls client on the webpki-roots bundle.
         // The platform verifier (Security.framework / schannel) flattens certificate
@@ -327,6 +629,8 @@ impl ProbeClient {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let redirect_policy = policy.clone();
+        let budget = resolver.budget.clone();
+        let hop_budget = budget.clone();
         // No proxy, ever: a proxied request is resolved by the proxy, so the DNS-layer
         // guard below would never see the name (HTTP_PROXY would turn
         // `http://metadata.internal…` into whatever the proxy answers). Probes go direct.
@@ -335,6 +639,11 @@ impl ProbeClient {
             builder = builder.resolve(name, *addr);
         }
         let client = builder
+            // No connection reuse between probes (N1 re-review): a pooled dial
+            // never reaches the resolver, so it would never pay the address's
+            // starts budget. Every probe resolves — and pays — its target, and
+            // literal targets pay where the literal is still visible (below).
+            .pool_max_idle_per_host(0)
             .tls_backend_preconfigured(tls)
             .redirect(redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= MAX_REDIRECT_HOPS {
@@ -342,34 +651,80 @@ impl ProbeClient {
                 } else if redirect_policy.check(attempt.url()).is_err() {
                     // A hop the policy refuses is evidence, not a path: keep the 3xx.
                     attempt.stop()
+                } else if let (Some(budget), Some(ip)) =
+                    (hop_budget.as_deref(), literal_ip(attempt.url()))
+                {
+                    // A literal hop never reaches the resolver — hyper parses
+                    // the socket itself — so it pays its start here, where the
+                    // address is still visible (A re-review). The refusal rides
+                    // the same AddressBusy the resolver's does.
+                    if budget.take(ip, workspace()) {
+                        attempt.follow()
+                    } else {
+                        attempt.error(AddressBusy)
+                    }
                 } else {
                     attempt.follow()
                 }
             }))
-            .dns_resolver(Arc::new(PolicyResolver::new(policy.allow_local_targets)))
+            .dns_resolver(Arc::new(resolver))
             .user_agent(concat!("service-monitor/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             client,
             policy,
+            budget,
             max_body,
         })
     }
 
-    /// Run one probe against `url`, bounded by `deadline` for the *entire* attempt.
+    /// A `GET` with the standard `200-299` expectation and no marker — the pre-M8
+    /// behavior, kept as the convenience entry for callers without assertions.
     pub async fn probe(&self, url: &Url, deadline: Duration) -> ProbeResult {
+        self.probe_expect(url, ProbeMethod::Get, &Expect::standard(), deadline)
+            .await
+    }
+
+    /// One probe with the monitor's method and assertions (D-025). `expect` is the
+    /// domain's already-validated set: an acceptable status plus an optional literal
+    /// marker searched in the bounded body prefix — never regex, never a target.
+    /// `HEAD` is opt-in: it rides the same redirect chain (preserved as `HEAD`,
+    /// never rewritten to `GET`), answers `405`/`501` honestly, and never reads a
+    /// body — a body marker under `HEAD` can't exist past the write boundary.
+    pub async fn probe_expect(
+        &self,
+        url: &Url,
+        method: ProbeMethod,
+        expect: &Expect,
+        deadline: Duration,
+    ) -> ProbeResult {
         let start = Instant::now();
         let attempt = async {
             if let Err(rejected) = self.policy.check(url) {
                 return Attempt::Rejected(rejected);
             }
-            match self.client.get(url.clone()).send().await {
+            // An IP literal never reaches the resolver — hyper parses the
+            // socket itself (A re-review) — so its start pays where the address
+            // is still known: here, once per probe. A named target pays inside
+            // `resolve` instead, on the addresses actually dialed.
+            if let (Some(budget), Some(ip)) = (self.budget.as_deref(), literal_ip(url))
+                && !budget.take(ip, workspace())
+            {
+                return Attempt::Budgeted;
+            }
+            match self
+                .client
+                .request(wire_method(method), url.clone())
+                .send()
+                .await
+            {
                 Err(error) => Attempt::Failed(error),
                 Ok(mut response) => {
                     let status = response.status();
                     // Read the body bounded: a target that streams forever must not hold a
                     // worker past the deadline, and we only need enough to know it answered.
                     let mut read = 0usize;
+                    let mut body = expect.body_contains.as_ref().map(|_| Vec::new());
                     let mut failed = None;
                     while failed.is_none() {
                         match response.chunk().await {
@@ -377,6 +732,10 @@ impl ProbeClient {
                             Ok(None) => break,
                             Ok(Some(chunk)) => {
                                 read += chunk.len();
+                                if let Some(buf) = body.as_mut() {
+                                    let room = self.max_body.saturating_sub(buf.len());
+                                    buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                                }
                                 if read > self.max_body {
                                     break;
                                 }
@@ -385,7 +744,7 @@ impl ProbeClient {
                     }
                     match failed {
                         Some(error) => Attempt::Failed(error),
-                        None => Attempt::Answered(status),
+                        None => Attempt::Answered { status, body },
                     }
                 }
             }
@@ -397,47 +756,116 @@ impl ProbeClient {
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some("deadline"),
+                limited: false,
             },
             Ok(Attempt::Rejected(rejected)) => ProbeResult {
                 outcome: CheckOutcome::Transport,
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some(rejected_detail(rejected)),
+                limited: false,
+            },
+            // A literal's own bound refused the start — the same counted
+            // coverage gap the resolver's refusal commits.
+            Ok(Attempt::Budgeted) => ProbeResult {
+                outcome: CheckOutcome::Transport,
+                http_status: None,
+                latency: start.elapsed(),
+                detail: Some("address_budget"),
+                limited: true,
+            },
+            // Our own bound's refusal is not evidence about the target: the
+            // resolver's per-address budget spent means the slot is a `missed`,
+            // so the monitor shows a coverage gap, never a failure it didn't have.
+            Ok(Attempt::Failed(error)) if is_budget_refusal(&error) => ProbeResult {
+                outcome: CheckOutcome::Transport,
+                http_status: None,
+                latency: start.elapsed(),
+                detail: Some("address_budget"),
+                limited: true,
             },
             Ok(Attempt::Failed(error)) if error.is_timeout() => ProbeResult {
                 outcome: CheckOutcome::Timeout,
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some("deadline"),
+                limited: false,
             },
             Ok(Attempt::Failed(error)) => ProbeResult {
                 outcome: CheckOutcome::Transport,
                 http_status: None,
                 latency: start.elapsed(),
                 detail: Some(classify(&error)),
+                limited: false,
             },
-            Ok(Attempt::Answered(status)) if status.is_success() => ProbeResult {
-                outcome: CheckOutcome::Pass,
-                http_status: Some(status.as_u16()),
-                latency: start.elapsed(),
-                detail: None,
-            },
-            Ok(Attempt::Answered(status)) => ProbeResult {
-                outcome: CheckOutcome::HttpFail {
-                    status: status.as_u16(),
-                },
-                http_status: Some(status.as_u16()),
-                latency: start.elapsed(),
-                detail: None,
-            },
+            Ok(Attempt::Answered { status, body }) => {
+                Self::answered_result(status, body.as_deref(), expect, start.elapsed())
+            }
         }
+    }
+
+    /// The response made it — classify it against the monitor's contract.
+    /// An acceptable status is still failure evidence when the marker is absent
+    /// from the observed <= `max_body` prefix (D-025): a miss is
+    /// `http_fail`/`assert_body`, never a pass.
+    fn answered_result(
+        status: reqwest::StatusCode,
+        body: Option<&[u8]>,
+        expect: &Expect,
+        latency: Duration,
+    ) -> ProbeResult {
+        let u16_status = status.as_u16();
+        let missed = expect.accepts(u16_status)
+            && match (&expect.body_contains, body) {
+                (Some(marker), Some(buf)) => {
+                    !buf.windows(marker.len()).any(|w| w == marker.as_slice())
+                }
+                // Marker expected but no body was ever buffered — treat as a
+                // miss, never a silent pass.
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+        let (outcome, detail) = if expect.accepts(u16_status) && missed {
+            (
+                CheckOutcome::HttpFail { status: u16_status },
+                Some("assert_body"),
+            )
+        } else if expect.accepts(u16_status) {
+            (CheckOutcome::Pass, None)
+        } else {
+            (CheckOutcome::HttpFail { status: u16_status }, None)
+        };
+        ProbeResult {
+            outcome,
+            http_status: Some(u16_status),
+            latency,
+            detail,
+            limited: false,
+        }
+    }
+}
+
+/// The wire method — `monitor-domain` holds no I/O, so `ProbeMethod` maps to
+/// reqwest's here. Only safe methods exist on the enum (D-025).
+fn wire_method(method: ProbeMethod) -> reqwest::Method {
+    match method {
+        ProbeMethod::Get => reqwest::Method::GET,
+        ProbeMethod::Head => reqwest::Method::HEAD,
     }
 }
 
 enum Attempt {
     Rejected(Rejected),
+    /// The literal's own per-address bound refused the start (A re-review) —
+    /// a reqwest error cannot be built by hand, so this carries the refusal.
+    Budgeted,
     Failed(reqwest::Error),
-    Answered(reqwest::StatusCode),
+    /// The final answer plus the body prefix when a marker was asserted — kept
+    /// only while the marker needs it, bounded by `max_body` like any read.
+    Answered {
+        status: reqwest::StatusCode,
+        body: Option<Vec<u8>>,
+    },
 }
 
 /// A TLS failure gets its own committed detail — "couldn't connect" is the least useful
@@ -468,6 +896,20 @@ fn find_tls<'a>(mut node: &'a (dyn std::error::Error + 'static)) -> Option<&'a r
             .downcast_ref::<std::io::Error>()
             .and_then(|io| io.get_ref())?;
     }
+}
+
+/// Whether `error` carries the resolver's `AddressBusy` — walks the same cause
+/// chain `classify` does (reqwest wraps the resolver's boxed error inside its
+/// connect error).
+fn is_budget_refusal(error: &reqwest::Error) -> bool {
+    let mut cause: Option<&dyn std::error::Error> = std::error::Error::source(error);
+    while let Some(e) = cause {
+        if e.is::<AddressBusy>() {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
 }
 
 /// The committed detail a `Rejected` maps to. `check()` never yields `Unresolvable` —
@@ -697,6 +1139,820 @@ mod tests {
         assert!(
             resolver.resolve(name).await.is_err(),
             "localhost must not resolve under the strict profile"
+        );
+    }
+
+    fn overrides() -> Overrides {
+        Overrides::default()
+    }
+
+    /// N1 re-review: the per-ADDRESS ceiling lives where the truth is — inside the
+    /// resolver, charged on the addresses it actually hands to the dialer. A burst
+    /// pays; a name answered once its address's starts are spent is refused
+    /// (`AddressBusy`, a counted miss — never a dial).
+    #[tokio::test]
+    async fn the_resolver_spends_and_refuses_the_address_budget() {
+        let map = overrides();
+        map.lock().expect("map").insert(
+            "victim.test".to_owned(),
+            vec!["8.8.8.8:0".parse().expect("addr")],
+        );
+        map.lock().expect("map").insert(
+            "other.test".to_owned(),
+            vec!["1.1.1.1:0".parse().expect("addr")],
+        );
+        let budget = Arc::new(AddressBudget::new(2, Duration::from_secs(3600)));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget);
+        let name = || Name::from_str("victim.test").expect("name");
+        assert!(resolver.resolve(name()).await.is_ok(), "first dial pays");
+        assert!(resolver.resolve(name()).await.is_ok(), "second dial pays");
+        let Err(err) = resolver.resolve(name()).await else {
+            panic!("the address's starts are spent — the resolve must refuse")
+        };
+        assert!(
+            err.is::<AddressBusy>()
+                || err
+                    .source()
+                    .is_some_and(<dyn std::error::Error + 'static>::is::<AddressBusy>),
+            "the refusal is the budget, not a DNS failure: {err:?}"
+        );
+        // Another address has its own bucket — a crowded address never starves it.
+        assert!(
+            resolver
+                .resolve(Name::from_str("other.test").expect("name"))
+                .await
+                .is_ok(),
+            "a different address pays from its own budget"
+        );
+    }
+
+    /// Every address in the answer pays its own way: a candidate whose bucket is
+    /// empty is skipped, the ones that paid are handed on — hyper dials paid
+    /// addresses only (happy eyeballs may dial several).
+    #[tokio::test]
+    async fn the_resolver_yields_only_the_addresses_that_paid() {
+        let map = overrides();
+        map.lock().expect("map").insert(
+            "two.test".to_owned(),
+            vec![
+                "8.8.8.8:0".parse().expect("addr"),
+                "1.1.1.1:0".parse().expect("addr"),
+            ],
+        );
+        let budget = Arc::new(AddressBudget::new(1, Duration::from_secs(3600)));
+        // 8.8.8.8 is already spent by an earlier resolution.
+        assert!(budget.take("8.8.8.8".parse().expect("ip"), None));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget);
+        let addrs = resolver
+            .resolve(Name::from_str("two.test").expect("name"))
+            .await
+            .expect("1.1.1.1 still pays")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addrs,
+            vec!["1.1.1.1:0".parse::<SocketAddr>().expect("addr")],
+            "only the paying address is offered to the dialer"
+        );
+    }
+
+    /// The budget itself: a burst pays, the window refills — under paused time the
+    /// refill is a test-clock fact, never a real-time flake.
+    #[tokio::test(start_paused = true)]
+    async fn the_address_budget_refills_at_its_rate() {
+        let budget = AddressBudget::new(2, Duration::from_secs(60));
+        let ip = "8.8.8.8".parse().expect("ip");
+        assert!(budget.take(ip, None));
+        assert!(budget.take(ip, None));
+        assert!(!budget.take(ip, None), "the burst is spent");
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(budget.take(ip, None), "a window later the bucket refilled");
+    }
+
+    /// A loopback fixture that counts the requests it answers — the honest
+    /// evidence a dial actually happened — and returns its `host:port`
+    /// authority for URL building.
+    async fn counting_fixture<F, R>(handler: F) -> SocketAddr
+    where
+        F: Fn() -> R + Clone + Send + Sync + 'static,
+        R: axum::response::IntoResponse + Send + 'static,
+    {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let handler = handler.clone();
+                async move { handler() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        addr
+    }
+
+    /// A re-review: an IP literal never reaches the resolver — hyper parses the
+    /// socket address itself — so the start must be paid where the address is
+    /// still known, at the probe. Under a one-start budget the first literal
+    /// probe dials (the fixture counts it); the second is a counted budget
+    /// refusal, and the fixture never sees it.
+    #[tokio::test]
+    async fn literal_targets_pay_the_budget() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let fixture = counting_fixture(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "ok"
+        })
+        .await;
+        let url: Url = format!("http://{fixture}/").parse().expect("url");
+        let client = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides(),
+            Arc::new(AddressBudget::new(1, Duration::from_secs(3600))),
+        )
+        .expect("client");
+        let first = client.probe(&url, Duration::from_secs(3)).await;
+        assert!(
+            matches!(first.outcome, CheckOutcome::Pass),
+            "the paid start dials: {first:?}"
+        );
+        let second = client.probe(&url, Duration::from_secs(3)).await;
+        assert!(
+            second.limited,
+            "the literal's spent budget refuses the start: {second:?}"
+        );
+        assert_eq!(
+            second.detail,
+            Some("address_budget"),
+            "the miss names its cause"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly the paid probe reached the fixture"
+        );
+    }
+
+    /// A re-review: a redirect to a literal target pays the address it lands on
+    /// too — the hop never reaches the resolver either, so the redirect closure
+    /// is where its start is charged. The destination fixture counts hits; the
+    /// spent hop must refuse *before* the dial.
+    #[tokio::test]
+    async fn literal_redirect_hops_pay_the_budget() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let landing = counting_fixture(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "ok"
+        })
+        .await;
+        let redirector = counting_fixture(move || {
+            axum::response::Redirect::temporary(&format!("http://{landing}/"))
+        })
+        .await;
+        let url: Url = format!("http://{redirector}/").parse().expect("url");
+        let client = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides(),
+            // One start on the shared address: the redirector's literal spends
+            // it, the hop's literal finds it spent.
+            Arc::new(AddressBudget::new(1, Duration::from_secs(3600))),
+        )
+        .expect("client");
+        let result = client.probe(&url, Duration::from_secs(3)).await;
+        assert!(
+            result.limited,
+            "the literal hop's spent budget refuses the follow: {result:?}"
+        );
+        assert_eq!(
+            result.detail,
+            Some("address_budget"),
+            "the hop's refusal names the budget"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused hop never dialed the landing fixture"
+        );
+    }
+
+    /// C re-review: the bounded map fails closed — a spent bucket must stay
+    /// spent no matter how many other addresses churn through it, and a new
+    /// address waits rather than evicting a still-spent one.
+    #[tokio::test]
+    async fn a_spent_bucket_stays_spent_under_map_churn() {
+        let budget = AddressBudget::new(1, Duration::from_secs(3600));
+        let victim: IpAddr = "8.8.8.8".parse().expect("ip");
+        assert!(budget.take(victim, None));
+        assert!(!budget.take(victim, None), "spent stays spent");
+        for i in 0..MAX_BUCKETS {
+            let [_, b1, b2, b3] = u32::try_from(i).expect("index").to_be_bytes();
+            let ip = IpAddr::V4(Ipv4Addr::new(9, b1, b2, b3));
+            budget.take(ip, None);
+        }
+        assert!(
+            !budget.take(victim, None),
+            "churn must not refill a spent bucket"
+        );
+        let fresh: IpAddr = "7.7.7.7".parse().expect("ip");
+        assert!(
+            !budget.take(fresh, None),
+            "a map full of spent buckets refuses the new address — never a clear"
+        );
+    }
+
+    /// E re-review: `::ffff:V` is the same address as `V` — the mapped spelling
+    /// spends the same bucket the plain one does (the `origin.rs` `address_key`
+    /// normalisation, applied at the charge).
+    #[tokio::test]
+    async fn an_ipv4_mapped_spelling_shares_the_v4_bucket() {
+        let budget = AddressBudget::new(1, Duration::from_secs(3600));
+        let v4: IpAddr = "8.8.8.8".parse().expect("ip");
+        let mapped: IpAddr = "::ffff:8.8.8.8".parse().expect("ip");
+        assert!(budget.take(mapped, None));
+        assert!(
+            !budget.take(v4, None),
+            "the mapped spelling spends the same bucket"
+        );
+    }
+
+    /// B re-review: the global ceiling is shared, but a workspace only ever
+    /// spends its own share of it — the heaviest spender stops at its share
+    /// while a neighbour's share at the same address is untouched.
+    #[tokio::test]
+    async fn the_heaviest_spender_stops_at_its_workspace_share() {
+        let budget =
+            AddressBudget::with_share(4, Duration::from_secs(3600), 2, Duration::from_secs(3600));
+        let victim: IpAddr = "8.8.8.8".parse().expect("ip");
+        let a = WorkspaceId::new();
+        let b = WorkspaceId::new();
+        assert!(budget.take(victim, Some(a)));
+        assert!(budget.take(victim, Some(a)));
+        assert!(
+            !budget.take(victim, Some(a)),
+            "a's own share at the address is spent — the global room stays"
+        );
+        assert!(
+            budget.take(victim, Some(b)),
+            "b's share is untouched: one tenant cannot spend another's"
+        );
+        // And the global ceiling still binds everyone together: four shares of
+        // two are all the room there is.
+        assert!(budget.take(victim, Some(b)));
+        assert!(
+            !budget.take(victim, Some(b)),
+            "the global ceiling binds after the shares do"
+        );
+    }
+
+    /// A slot asks once and never comes back for an answer, so a refusal must leave
+    /// nothing behind. Two workspaces share an address, each with two monitors a
+    /// minute; one burst empties the bucket once. Every later start finds the bucket
+    /// refilled and is admitted — under the queue this replaced, the refused
+    /// workspaces held places nobody came back to claim, and half the monitors were
+    /// never served again with the bucket full.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_start_leaves_nothing_behind() {
+        let budget =
+            AddressBudget::with_share(8, Duration::from_secs(1), 2, Duration::from_secs(1));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let (a, b) = (WorkspaceId::new(), WorkspaceId::new());
+        // The burst: five workspaces start nine probes in one tick. Eight are paid.
+        let crowd: Vec<WorkspaceId> = (0..3).map(|_| WorkspaceId::new()).collect();
+        let mut paid = 0;
+        for workspace in [a, a, b, b, crowd[0], crowd[0], crowd[1], crowd[1], crowd[2]] {
+            paid += usize::from(budget.take(ip, Some(workspace)));
+        }
+        assert_eq!(paid, 8, "the ceiling pays its burst and refuses the ninth");
+        assert!(
+            !budget.take(ip, Some(a)),
+            "a is refused: its share is spent"
+        );
+        assert!(
+            !budget.take(ip, Some(b)),
+            "b is refused: its share is spent"
+        );
+
+        // Ten minutes of ordinary schedule: a1 :00, a2 :10, b1 :20, b2 :30.
+        for minute in 0..10 {
+            for (monitor, workspace) in [("a1", a), ("a2", a), ("b1", b), ("b2", b)] {
+                tokio::time::advance(Duration::from_secs(10)).await;
+                assert!(
+                    budget.take(ip, Some(workspace)),
+                    "minute {minute}: {monitor} asked with the bucket full and was refused"
+                );
+            }
+            tokio::time::advance(Duration::from_secs(20)).await;
+        }
+    }
+
+    /// A re-review: every admit takes a global token — the ceiling binds PACED
+    /// tenants, not only burst ones. Seven workspaces each doing two starts
+    /// against an 8-start ceiling get exactly the ceiling and no more.
+    #[tokio::test]
+    async fn paced_workspaces_cannot_exceed_the_global_ceiling() {
+        let budget =
+            AddressBudget::with_share(8, Duration::from_secs(3600), 2, Duration::from_secs(3600));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let workspaces: Vec<WorkspaceId> = (0..7).map(|_| WorkspaceId::new()).collect();
+        let mut admitted = 0;
+        for _round in 0..2 {
+            for workspace in &workspaces {
+                admitted += usize::from(budget.take(ip, Some(*workspace)));
+            }
+        }
+        assert_eq!(
+            admitted, 8,
+            "the ceiling admits its tokens and refuses the rest — never more"
+        );
+    }
+
+    /// The ceiling is a token stream: over any window, admits never exceed
+    /// `burst + rate·t`, however many workspaces ask and however often.
+    #[tokio::test(start_paused = true)]
+    async fn admits_never_exceed_the_token_stream() {
+        let budget =
+            AddressBudget::with_share(8, Duration::from_secs(1), 8, Duration::from_secs(1));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let workspaces: Vec<WorkspaceId> = (0..20).map(|_| WorkspaceId::new()).collect();
+        let mut admitted = 0usize;
+        for second in 0usize..6 {
+            for workspace in &workspaces {
+                admitted += usize::from(budget.take(ip, Some(*workspace)));
+            }
+            assert_eq!(
+                admitted,
+                8 + second * 8,
+                "20 asks a second against 8 tokens a second: exactly the stream is paid"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// What the share guarantees a neighbour: three workspaces asking ten times a
+    /// second are each held to their 2 starts a second, which leaves room under the
+    /// 8-a-second ceiling, so a fourth workspace that asks once a second is paid
+    /// every time. (Four or more saturating workspaces can spend the whole ceiling;
+    /// the plan's own limits are what keep a workspace from saturating — D-028.)
+    #[tokio::test(start_paused = true)]
+    async fn heavy_neighbours_inside_their_shares_leave_room_for_a_light_one() {
+        let budget =
+            AddressBudget::with_share(8, Duration::from_secs(1), 2, Duration::from_secs(1));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let heavy: Vec<WorkspaceId> = (0..3).map(|_| WorkspaceId::new()).collect();
+        let light = WorkspaceId::new();
+        let mut heavy_paid = 0usize;
+        for second in 0..60 {
+            for _tenth in 0..10 {
+                for workspace in &heavy {
+                    heavy_paid += usize::from(budget.take(ip, Some(*workspace)));
+                }
+                tokio::time::advance(Duration::from_millis(100)).await;
+            }
+            assert!(
+                budget.take(ip, Some(light)),
+                "second {second}: the light workspace found no token"
+            );
+        }
+        assert!(
+            heavy_paid <= 3 * (2 + 2 * 60),
+            "each heavy workspace is held to its share: {heavy_paid}"
+        );
+    }
+
+    /// N-6 re-review: the global ceiling itself must bind — earlier tests
+    /// only ever refused on a workspace's own share, so deleting the global
+    /// check survived them. Give the share more than the ceiling: the only
+    /// thing that can refuse the fifth take is the ceiling.
+    #[tokio::test]
+    async fn a_workspace_cannot_exceed_the_global_ceiling_even_inside_its_share() {
+        let budget =
+            AddressBudget::with_share(4, Duration::from_secs(3600), 8, Duration::from_secs(3600));
+        let ip: IpAddr = "9.9.9.9".parse().expect("ip");
+        let a = WorkspaceId::new();
+        for _ in 0..4 {
+            assert!(budget.take(ip, Some(a)));
+        }
+        // Share 8, spent 4 — plenty of share left; only the ceiling can refuse
+        // this take.
+        assert!(
+            !budget.take(ip, Some(a)),
+            "the ceiling alone refuses even with share to spare"
+        );
+    }
+
+    /// N-2 re-review: hyper dials what `resolve()` hands it — so the resolver
+    /// offers AND charges only the candidate actually offered: the first paying
+    /// address in answer order. A second candidate — including the other
+    /// family's — is never dialed, so it must leave its bucket untouched: a
+    /// sprayed [own-v6, victim-v4] answer taxes the victim nothing per hop.
+    #[tokio::test]
+    async fn the_resolver_offers_and_charges_only_the_dialed_candidate() {
+        let map = overrides();
+        let many: Vec<SocketAddr> = (0..200)
+            .map(|i| {
+                format!("8.8.{}.{}:0", i / 256, i % 256)
+                    .parse()
+                    .expect("addr")
+            })
+            .collect();
+        map.lock()
+            .expect("map")
+            .insert("spray.test".to_owned(), many.clone());
+        let budget = Arc::new(AddressBudget::new(1, Duration::from_secs(3600)));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget.clone());
+        let yielded = resolver
+            .resolve(Name::from_str("spray.test").expect("name"))
+            .await
+            .expect("the first paying candidate pays")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            yielded,
+            vec![many[0]],
+            "exactly one candidate is offered — the one the dialer will use"
+        );
+        assert!(
+            !budget.take(many[0].ip(), None),
+            "the dialed candidate was charged"
+        );
+        assert!(
+            budget.take(many[50].ip(), None),
+            "an undialed candidate was never charged"
+        );
+    }
+
+    /// N-2 re-review: the mixed-family case the ruling names — an answer of
+    /// [attacker-v6, victim-v4] leaves the victim's bucket untouched: the v6 is
+    /// the candidate offered, the v4 fallback is never dialed, never charged.
+    #[tokio::test]
+    async fn the_fallback_family_leaves_its_bucket_untouched() {
+        let map = overrides();
+        let v6: SocketAddr = "[2001:4860:4860::8888]:0".parse().expect("addr");
+        let v4: SocketAddr = "8.8.8.8:0".parse().expect("addr");
+        map.lock()
+            .expect("map")
+            .insert("mixed.test".to_owned(), vec![v6, v4]);
+        let budget = Arc::new(AddressBudget::new(1, Duration::from_secs(3600)));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget.clone());
+        let yielded = resolver
+            .resolve(Name::from_str("mixed.test").expect("name"))
+            .await
+            .expect("the paying v6 pays")
+            .collect::<Vec<_>>();
+        assert_eq!(yielded, vec![v6], "only the dialed candidate is offered");
+        assert!(
+            budget.take(v4.ip(), None),
+            "the fallback v4 was never charged — it was never dialed"
+        );
+        assert!(!budget.take(v6.ip(), None), "the offered v6 paid");
+    }
+
+    /// B re-review: the workspace attribution reaches the resolver through the
+    /// probe task-local — the same address resolves against a different
+    /// workspace's share when the schedule changes hands.
+    #[tokio::test]
+    async fn the_resolver_charges_the_attributed_workspace() {
+        let map = overrides();
+        map.lock().expect("map").insert(
+            "victim.test".to_owned(),
+            vec!["8.8.8.8:0".parse().expect("addr")],
+        );
+        let budget = Arc::new(AddressBudget::with_share(
+            4,
+            Duration::from_secs(3600),
+            2,
+            Duration::from_secs(3600),
+        ));
+        let resolver = PolicyResolver::for_test_budgeted(false, map, budget);
+        let a = WorkspaceId::new();
+        let b = WorkspaceId::new();
+        let name = || Name::from_str("victim.test").expect("name");
+        for _ in 0..2 {
+            assert!(
+                PROBE_WORKSPACE
+                    .scope(a, resolver.resolve(name()))
+                    .await
+                    .is_ok(),
+                "a's own share pays"
+            );
+        }
+        assert!(
+            PROBE_WORKSPACE
+                .scope(a, resolver.resolve(name()))
+                .await
+                .is_err(),
+            "a's third start meets its own spent share"
+        );
+        assert!(
+            PROBE_WORKSPACE
+                .scope(b, resolver.resolve(name()))
+                .await
+                .is_ok(),
+            "b's share at the same address is untouched"
+        );
+    }
+
+    /// A loopback axum fixture for the M8 tests: arbitrary router, literal host —
+    /// the `for_test` policy allows local targets and its resolver has no budget,
+    /// so literal probes dial free of the starts accounting.
+    async fn serve(router: axum::Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        addr
+    }
+
+    fn lab_client(max_body: usize) -> ProbeClient {
+        ProbeClient::pinned(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            max_body,
+            &[],
+        )
+        .expect("client")
+    }
+
+    /// D-025: a `HEAD` probe stays `HEAD` through a 303 — the one redirect status
+    /// that rewrites every other method to `GET`. The landing handler answers 501
+    /// to anything but `HEAD`, so a rewrite could only land as `http_fail`.
+    #[tokio::test]
+    async fn head_stays_head_across_a_redirect() {
+        use axum::extract::Request;
+        use axum::response::IntoResponse;
+        let land = |req: Request| async move {
+            if req.method() == reqwest::Method::HEAD {
+                axum::http::StatusCode::OK.into_response()
+            } else {
+                axum::http::StatusCode::NOT_IMPLEMENTED.into_response()
+            }
+        };
+        let router = axum::Router::new()
+            .route(
+                "/go",
+                axum::routing::any(|| async {
+                    (
+                        axum::http::StatusCode::SEE_OTHER,
+                        [(axum::http::header::LOCATION, "/land")],
+                    )
+                }),
+            )
+            .route("/land", axum::routing::any(land));
+        let url: Url = format!("http://{}/go", serve(router).await)
+            .parse()
+            .expect("url");
+        let result = lab_client(64 * 1024)
+            .probe_expect(
+                &url,
+                ProbeMethod::Head,
+                &Expect::standard(),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            result.outcome,
+            CheckOutcome::Pass,
+            "HEAD must land as HEAD through the 303: {result:?}"
+        );
+    }
+
+    /// D-025: a `HEAD` answered `405`/`501` is recorded as that answer — never
+    /// silently retried as `GET` (a GET retry would see this fixture's 200).
+    #[tokio::test]
+    async fn a_head_probe_that_answers_405_is_recorded_honestly() {
+        use axum::extract::Request;
+        use axum::response::IntoResponse;
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::any(|req: Request| async move {
+                if req.method() == reqwest::Method::GET {
+                    "ok".into_response()
+                } else {
+                    axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response()
+                }
+            }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let result = lab_client(64 * 1024)
+            .probe_expect(
+                &url,
+                ProbeMethod::Head,
+                &Expect::standard(),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            result.outcome,
+            CheckOutcome::HttpFail { status: 405 },
+            "the 405 is the committed answer, not a GET retry: {result:?}"
+        );
+    }
+
+    /// D-025: the marker is searched literally in the observed prefix — a present
+    /// marker passes, an absent one is `http_fail`/`assert_body`, and `.*` is just
+    /// bytes (no engine exists to exploit).
+    #[tokio::test]
+    async fn the_marker_is_literal_and_the_miss_is_failure_evidence() {
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "xZZy" }));
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let client = lab_client(64 * 1024);
+        let expect = Expect {
+            body_contains: Some(b"x.*y".to_vec()),
+            ..Expect::standard()
+        };
+        let miss = client
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(miss.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            miss.detail,
+            Some("assert_body"),
+            "a body that only matches the pattern loosely still misses: {miss:?}"
+        );
+        // The literal string `x.*y` in the body is the only thing that passes.
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { "contains x.*y literally" }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let hit = client
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(hit.outcome, CheckOutcome::Pass, "the literal bytes pass");
+    }
+
+    /// D-025: the assertion reads only the observed `<= max_body` prefix — a
+    /// marker split across the read boundary, or entirely past it, is a miss.
+    #[tokio::test]
+    async fn a_marker_past_the_body_bound_never_passes() {
+        // max_body 16: `MARK` lands at bytes 13..17 — split across the bound.
+        let router =
+            axum::Router::new().route("/", axum::routing::get(|| async { "AAAAAAAAAAAAMARKER" }));
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let client = lab_client(16);
+        let expect = Expect {
+            body_contains: Some(b"MARKER".to_vec()),
+            ..Expect::standard()
+        };
+        let result = client
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(result.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            result.detail,
+            Some("assert_body"),
+            "a marker straddling the bound misses: {result:?}"
+        );
+    }
+
+    /// D-025: the client is built without decompression features — the marker is
+    /// searched on the wire bytes, so a compressed bomb only ever costs the
+    /// bounded read. A gzipped marker is a miss, never inflation.
+    #[tokio::test]
+    async fn compressed_bytes_are_searched_as_received() {
+        let gzipped: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 11, 118, 245, 11, 241, 244, 115, 245, 209, 205, 72,
+            45, 74, 5, 0, 125, 143, 180, 174, 13, 0, 0, 0,
+        ];
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_ENCODING, "gzip")],
+                    axum::body::Body::from(gzipped.to_vec()),
+                )
+            }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let expect = Expect {
+            body_contains: Some(b"SENTINEL-here".to_vec()),
+            ..Expect::standard()
+        };
+        let result = lab_client(64 * 1024)
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(result.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            result.detail,
+            Some("assert_body"),
+            "wire bytes are searched, never inflated: {result:?}"
+        );
+    }
+
+    /// A raw fixture that answers 200 and then dribbles one byte a beat forever —
+    /// a slowloris body that no buffer bound would ever finish.
+    async fn drip_fixture() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Answer only once the request head is consumed — a
+                    // response written while the client still sends is an
+                    // UnexpectedMessage error, not a dribbling body.
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 512];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 16777216\r\n\r\n";
+                    if sock.write_all(head).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if sock.write_all(b"M").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// D-025: a slowloris body meets the probe's deadline — the whole attempt,
+    /// body read included, sits inside `tokio::time::timeout`.
+    #[tokio::test]
+    async fn a_body_that_dribbles_meets_the_deadline() {
+        let url: Url = format!("http://{}/", drip_fixture().await)
+            .parse()
+            .expect("url");
+        let expect = Expect {
+            body_contains: Some(b"SENTINEL".to_vec()),
+            ..Expect::standard()
+        };
+        let result = lab_client(64 * 1024)
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(1))
+            .await;
+        assert_eq!(
+            result.outcome,
+            CheckOutcome::Timeout,
+            "a dribbling body dies on the deadline: {result:?}"
+        );
+    }
+
+    /// D-025: an assertion string is evidence to search, never a request target —
+    /// a marker that looks like a URL is matched against the already-validated
+    /// response and dials nothing.
+    #[tokio::test]
+    async fn a_marker_is_searched_never_dialed() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "plain body"
+                }
+            }),
+        );
+        let url: Url = format!("http://{}/", serve(router).await)
+            .parse()
+            .expect("url");
+        let expect = Expect {
+            // A marker shaped exactly like a URL — it is data, not a request.
+            body_contains: Some(b"http://127.0.0.1:9/internal".to_vec()),
+            ..Expect::standard()
+        };
+        let result = lab_client(64 * 1024)
+            .probe_expect(&url, ProbeMethod::Get, &expect, Duration::from_secs(5))
+            .await;
+        assert_eq!(result.outcome, CheckOutcome::HttpFail { status: 200 });
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the only dial is the validated target: {result:?}"
         );
     }
 }

@@ -10,6 +10,8 @@ scripts/check-toolchain.sh
 # Nothing that is not a build or runtime artifact may be git-ignored.
 if git rev-parse --git-dir >/dev/null 2>&1; then
     scripts/check-ignored.sh
+    # Applied migrations are immutable: the manifest may only ever gain lines.
+    scripts/check-migrations-append-only.sh
 fi
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -19,6 +21,9 @@ cargo test --workspace --locked
 scripts/check-advisories.sh
 scripts/check-architecture.sh
 npm run check --workspace @service-monitor/dashboard
+# The dashboard's own logic, components and what each role is offered (Vitest, jsdom).
+# The journeys that need a real server and browser are scripts/e2e.sh.
+npm run test --workspace @service-monitor/dashboard
 npm run build --workspace @service-monitor/dashboard
 # npm advisories for what the dashboard ships (its devDependencies only build it).
 npm audit --omit=dev --audit-level=moderate

@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use monitor_db::{Observation, WriterHandle};
-use monitor_domain::{Monitor, MonitorId, SlotObservation};
+use monitor_domain::{Monitor, MonitorId, SlotObservation, WorkspaceId};
 
 use crate::probe::ProbeClient;
 use crate::vitals::Vitals;
@@ -32,7 +32,10 @@ pub struct Config {
     /// Global in-flight probe bound's floor; the coordinator raises it to what the
     /// schedule needs, up to [`MAX_GLOBAL_SLOTS`] (D-018).
     pub global_slots: usize,
-    /// In-flight probes per `host:port`.
+    /// In-flight probes per (origin, workspace) share — an origin is an
+    /// `addr:port|host` pair (origin.rs), and each workspace holds its own bound
+    /// on it (S2 re-review): one tenant's load on a shared host never eats
+    /// another tenant's allowance.
     pub per_origin_slots: usize,
     /// Capacity of the probe-results channel; full means workers park, slots go `missed`.
     pub results_bound: usize,
@@ -115,8 +118,13 @@ impl Runtime {
 
 /// The most probes one coordinator keeps in flight (D-018): outbound sockets, well inside
 /// the unit's 4096 file descriptors beside `SMON_MAX_CONNECTIONS` inbound ones. A
-/// schedule that would need more is refused when it is written ([`capacity`]).
+/// schedule that would need more is refused when it is written (`check_capacity`).
 pub const MAX_GLOBAL_SLOTS: usize = 512;
+
+/// S3: the share of the probe budget one workspace's own schedule may need —
+/// a quarter of the global ceiling. Writes past it are refused (`check_capacity`), so
+/// a tenant's schedule can't silently crowd the engine's slots (D-020 tenancy).
+pub const MAX_WORKSPACE_SLOTS: usize = MAX_GLOBAL_SLOTS / 4;
 
 /// Probe slots a schedule needs (D-018). Each tick starts `Σ tick/interval` probes, and
 /// each holds its slot until it ends — at worst its whole timeout — so the bound is
@@ -133,7 +141,7 @@ pub fn required_slots<'a>(monitors: impl IntoIterator<Item = &'a Monitor>, tick:
 }
 
 /// A slot count as `f64` (slot counts are small; anything past `u32::MAX` saturates).
-fn slots_f64(slots: usize) -> f64 {
+pub(crate) fn slots_f64(slots: usize) -> f64 {
     f64::from(u32::try_from(slots).unwrap_or(u32::MAX))
 }
 
@@ -156,34 +164,42 @@ fn global_budget(monitors: &[Monitor], config: &Config) -> usize {
     needed.clamp(config.global_slots.min(MAX_GLOBAL_SLOTS), MAX_GLOBAL_SLOTS)
 }
 
-/// What a schedule can't be served by, if anything — checked when monitors are written,
-/// so an impossible schedule is a named refusal instead of slots silently missed (D-018).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Overload {
-    /// More probe slots than [`MAX_GLOBAL_SLOTS`] at these intervals and timeouts.
-    Global { required: f64 },
-    /// More starts per tick on one origin than its per-origin bound allows, even if every
-    /// probe were instant.
-    Origin { origin: String, per_tick: f64 },
+/// Starts per tick on each origin across the given monitors (paused excluded). The
+/// per-origin bound is a per-workspace share (S2 re-review), so the write check calls
+/// this on one workspace's monitors; the bound's keys are `addr:port|host` pairs, so
+/// sites sharing one hosting address are already distinct entries.
+pub fn per_origin_loads<'a>(
+    monitors: impl Iterator<Item = &'a Monitor>,
+    tick: Duration,
+) -> HashMap<String, f64> {
+    let mut per_origin: HashMap<String, f64> = HashMap::new();
+    for monitor in monitors.filter(|monitor| !monitor.paused) {
+        *per_origin.entry(origin_key(&monitor.url)).or_default() +=
+            tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
+    }
+    per_origin
 }
 
-/// Check a whole schedule (the stored monitors with a proposed change applied).
-pub fn capacity(monitors: &[Monitor], config: &Config) -> Option<Overload> {
-    let required = required_slots(monitors, config.tick);
-    if required > slots_f64(MAX_GLOBAL_SLOTS) {
-        return Some(Overload::Global { required });
+/// Starts per tick on each resolved ADDRESS across the given monitors — the
+/// write-time ceiling the cross-host view needs (N1 re-review). The key is the
+/// `addr:port` half of the origin key alone, so `localhost` and `127.0.0.1`
+/// charge one IP's budget: a tenant can't buy more starts at an address by
+/// naming it more ways. A name not yet resolved keys by its spelling — distinct
+/// spellings stay distinct until DNS proves them one address.
+pub fn per_address_loads<'a>(
+    monitors: impl Iterator<Item = &'a Monitor>,
+    tick: Duration,
+) -> HashMap<String, f64> {
+    let mut per_address: HashMap<String, f64> = HashMap::new();
+    for monitor in monitors.filter(|monitor| !monitor.paused) {
+        let origin = origin_key(&monitor.url);
+        let address = origin
+            .split_once('|')
+            .map_or(origin.as_str(), |(address, _)| address);
+        *per_address.entry(address.to_owned()).or_default() +=
+            tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
     }
-    let mut per_origin: HashMap<String, f64> = HashMap::new();
-    for monitor in monitors.iter().filter(|monitor| !monitor.paused) {
-        *per_origin.entry(origin_key(&monitor.url)).or_default() +=
-            config.tick.as_secs_f64() / monitor.interval.as_secs_f64().max(f64::EPSILON);
-    }
-    let origin_limit = slots_f64(config.per_origin_slots);
-    per_origin
-        .into_iter()
-        .filter(|(_, per_tick)| *per_tick > origin_limit)
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(origin, per_tick)| Overload::Origin { origin, per_tick })
+    per_address
 }
 
 /// The global semaphore, resized to the schedule's budget whenever the registry changes.
@@ -253,6 +269,10 @@ struct Dispatch {
     generation: u64,
     slot_at: OffsetDateTime,
     url: Url,
+    /// The monitor's probe method + response assertions (D-025) — snapshotted at
+    /// claim so an edit mid-flight stays inside its own generation.
+    method: monitor_domain::ProbeMethod,
+    expect: monitor_domain::Expect,
     deadline: Duration,
     _global: tokio::sync::OwnedSemaphorePermit,
     _origin: tokio::sync::OwnedSemaphorePermit,
@@ -291,7 +311,7 @@ async fn run(
     // Background name lookups for the per-origin keys; aborted when the loop ends.
     let mut lookups = tokio::task::JoinSet::new();
     let mut ticks_since_refresh = 0_u32;
-    let mut origins: HashMap<String, Arc<Semaphore>> = HashMap::new();
+    let mut origins: HashMap<(String, WorkspaceId), Arc<Semaphore>> = HashMap::new();
     let mut runtimes: HashMap<MonitorId, Runtime> = HashMap::new();
     let tracker = TaskTracker::new();
     let mut ticker = tokio::time::interval(config.tick);
@@ -365,7 +385,7 @@ async fn run(
 /// so no mutable borrow crosses an `.await`.
 fn plan_due(
     runtimes: &mut HashMap<MonitorId, Runtime>,
-    origins: &mut HashMap<String, Arc<Semaphore>>,
+    origins: &mut HashMap<(String, WorkspaceId), Arc<Semaphore>>,
     global: &Arc<Semaphore>,
     config: &Config,
 ) -> Plan {
@@ -398,7 +418,10 @@ fn plan_due(
             debug!(monitor = %entry.monitor.id.0, "global probe slots exhausted");
             continue;
         };
-        let key = origin_key(&entry.monitor.url);
+        // The bound is a per-workspace share (S2 re-review): the semaphore's key is
+        // the (addr|host) origin *and* the workspace, so a shared host's load is
+        // each tenant's own business.
+        let key = (origin_key(&entry.monitor.url), entry.monitor.workspace);
         let origin = origins
             .entry(key)
             .or_insert_with(|| Arc::new(Semaphore::new(config.per_origin_slots)))
@@ -415,6 +438,8 @@ fn plan_due(
             generation: entry.monitor.generation,
             slot_at: entry.next_slot_at,
             url: entry.monitor.url.clone(),
+            method: entry.monitor.method,
+            expect: entry.monitor.expect.clone(),
             deadline: entry.monitor.timeout,
             _global: global_permit,
             _origin: origin_permit,
@@ -469,7 +494,20 @@ impl Plan {
             let results = results.clone();
             tracker.spawn(async move {
                 // The permits ride inside `dispatch` and release when the task ends.
-                let result = probes.probe(&dispatch.url, dispatch.deadline).await;
+                // The workspace attribution rides a task-local so the address
+                // charge — wherever it happens — spends the right tenant's
+                // share of the address, never a neighbour's (B re-review).
+                let result = crate::probe::PROBE_WORKSPACE
+                    .scope(
+                        dispatch.workspace,
+                        probes.probe_expect(
+                            &dispatch.url,
+                            dispatch.method,
+                            &dispatch.expect,
+                            dispatch.deadline,
+                        ),
+                    )
+                    .await;
                 // A probe the SSRF guard refused at probe time (a name resolving to a local
                 // address, a redirect to one) is a *target failure*: every real visitor of
                 // that target is broken too. It commits as `transport` + `rejected_local`
@@ -479,7 +517,15 @@ impl Plan {
                     workspace: dispatch.workspace,
                     generation: dispatch.generation,
                     slot_at: dispatch.slot_at,
-                    slot: SlotObservation::Probe(result.outcome),
+                    // A start OUR bound refused is a coverage gap, never target
+                    // evidence — and it is *neutral* on the monitor's streaks:
+                    // a starved slot must not launder a real outage's failure
+                    // count away. The commit is `missed` + `address_budget`.
+                    slot: if result.limited {
+                        SlotObservation::Budgeted
+                    } else {
+                        SlotObservation::Probe(result.outcome)
+                    },
                     http_status: result.http_status,
                     latency_ms: Some(u64::try_from(result.latency.as_millis()).unwrap_or(u64::MAX)),
                     detail: result.detail.map(str::to_owned),
@@ -498,7 +544,7 @@ impl Plan {
 /// mismatch makes the writer drop it.
 fn reconcile(
     runtimes: &mut HashMap<MonitorId, Runtime>,
-    origins: &mut HashMap<String, Arc<Semaphore>>,
+    origins: &mut HashMap<(String, WorkspaceId), Arc<Semaphore>>,
     monitors: &[Monitor],
     config: &Config,
     clock: &SlotClock,
@@ -534,8 +580,8 @@ fn reconcile(
     }
 }
 
-/// The per-origin bound's key: the resolved address and port (origin.rs), so aliases of
-/// one server share it.
+/// The per-origin bound's key: the resolved address and the requested host
+/// (`addr:port|host`, origin.rs) — sites sharing one hosting address stay distinct.
 fn origin_key(url: &Url) -> String {
     crate::origin::key(url)
 }
@@ -543,14 +589,14 @@ fn origin_key(url: &Url) -> String {
 /// Drop the per-origin semaphores no runtime keys to any more (after a registry change, or
 /// after a refresh re-keyed a name).
 fn prune_origins(
-    origins: &mut HashMap<String, Arc<Semaphore>>,
+    origins: &mut HashMap<(String, WorkspaceId), Arc<Semaphore>>,
     runtimes: &HashMap<MonitorId, Runtime>,
 ) {
-    let in_use: std::collections::HashSet<String> = runtimes
+    let in_use: std::collections::HashSet<(String, WorkspaceId)> = runtimes
         .values()
-        .map(|entry| origin_key(&entry.monitor.url))
+        .map(|entry| (origin_key(&entry.monitor.url), entry.monitor.workspace))
         .collect();
-    origins.retain(|origin, _| in_use.contains(origin));
+    origins.retain(|key, _| in_use.contains(key));
 }
 
 /// How often the coordinator re-resolves its monitors' names (ticks).
@@ -611,7 +657,11 @@ mod tests {
             .expect("insert");
         let mut monitor = stored.clone();
         monitor.interval = Duration::from_millis(60);
-        monitor.timeout = Duration::from_millis(400);
+        // The loopback fixture answers on accept — the deadline only bounds a
+        // pathological hang, it is never the measured quantity, so it is sized
+        // to be unreachable rather than "usually fast enough" (N-6 re-review:
+        // a 400 ms real-time budget can flake a loaded CI box).
+        monitor.timeout = Duration::from_secs(5);
 
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let (handle, _writer) = writer::spawn(
@@ -907,11 +957,11 @@ mod tests {
         );
     }
 
-    /// Hostname aliases of one address are one origin: `localhost` and `127.0.0.1` on the
-    /// same port share the per-origin bound once the name is resolved, so spelling a host
-    /// two ways can't double what one server receives.
+    /// S2 re-review: origins are (address, host) pairs. A name and the address it
+    /// resolves to are different origins — on shared hosting the host is the site,
+    /// and one address is many tenants' worth of vhosts.
     #[tokio::test(start_paused = true)]
-    async fn aliases_of_one_address_share_the_per_origin_bound() {
+    async fn a_name_and_the_address_it_resolves_to_are_different_origins() {
         let config = Config {
             per_origin_slots: 1,
             ..Config::default()
@@ -931,8 +981,308 @@ mod tests {
         let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
         assert_eq!(
             plan.dispatches.len(),
+            2,
+            "(127.0.0.1:9, localhost) and (127.0.0.1:9, 127.0.0.1) are different origins"
+        );
+    }
+
+    /// The bound itself is a per-workspace share: two workspaces on the same origin
+    /// each get their own slot — a shared host's load is never a commons one
+    /// tenant's schedule can exhaust for the others (S2 re-review).
+    #[tokio::test(start_paused = true)]
+    async fn each_workspace_gets_its_own_share_of_an_origin() {
+        let config = Config {
+            per_origin_slots: 1,
+            ..Config::default()
+        };
+        let mut monitors = fleet(2, 1, Duration::from_secs(15), Duration::from_secs(3));
+        let other = WorkspaceId(uuid::Uuid::now_v7());
+        monitors[1].workspace = other;
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        let clock = SlotClock::start();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
+        for entry in runtimes.values_mut() {
+            entry.next_slot = Instant::now(); // both due on this tick
+        }
+        let global = Arc::new(Semaphore::new(16));
+        let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
+        assert_eq!(
+            plan.dispatches.len(),
+            2,
+            "two workspaces on one origin share no slot budget"
+        );
+    }
+
+    /// A listener that answers a bare `200` — the dial evidence, on the address
+    /// the budget binds. Returns its socket address for the override map.
+    async fn http_fixture() -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let addr = listener.local_addr().expect("fixture addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        addr
+    }
+
+    /// N1 re-review: the per-ADDRESS runtime bound is charged on the ONE
+    /// candidate the validating resolver hands to the dialer — shared across
+    /// every workspace (`try_acquire`, misses counted): a start is paid when the
+    /// address's ceiling and the workspace's own share both hold a token, so a
+    /// second workspace's starts still pay after the first spent its share
+    /// (D-028). The refused slot
+    /// commits `missed` with its reason — our own budget's refusal is a
+    /// coverage gap, never evidence about the target (H: on a loopback
+    /// fixture — the budget binds the address, and the 3600 s window makes
+    /// the clock irrelevant).
+    #[tokio::test]
+    async fn two_workspaces_on_one_address_share_the_runtime_cap() {
+        let db = Db::connect("sqlite::memory:", 1).await.expect("db");
+        db.migrate().await.expect("migrate");
+        let (writer, _writer_task) = writer::spawn(
+            db.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            HashMap::new(),
+            Arc::default(),
+            32,
+            false,
+        );
+        let vitals = Vitals::new(Arc::default(), Duration::from_secs(30));
+        // `victim.test` resolves to loopback; the budget admits one start an hour.
+        let overrides = crate::probe::test_overrides();
+        let fixture = http_fixture().await;
+        overrides
+            .lock()
+            .expect("map")
+            .insert("victim.test".to_owned(), vec![fixture]);
+        let probes = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides,
+            // Ceiling 2, share 1: one workspace's take leaves exactly a second
+            // workspace's fair split.
+            Arc::new(crate::probe::AddressBudget::with_share(
+                2,
+                Duration::from_secs(3600),
+                1,
+                Duration::from_secs(3600),
+            )),
+        )
+        .expect("probe client");
+        let (results, mut results_rx) = mpsc::channel::<Observation>(8);
+        let (tracker, other) = (TaskTracker::new(), WorkspaceId::new());
+        let dispatch = |name: &str, workspace: WorkspaceId| Dispatch {
+            monitor_id: MonitorId(uuid::Uuid::now_v7()),
+            workspace,
+            generation: 1,
+            slot_at: OffsetDateTime::now_utc(),
+            url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
+            method: monitor_domain::ProbeMethod::Get,
+            expect: monitor_domain::Expect::standard(),
+            // The fixture answers on accept; the deadline only bounds a hang,
+            // so it is sized unreachable (N-6 re-review).
+            deadline: Duration::from_secs(5),
+            _global: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+            _origin: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+        };
+        // The first workspace's probe pays the address's only start.
+        let mut plan = Plan::default();
+        plan.dispatches.push(dispatch("a", WorkspaceId::DEFAULT));
+        plan.dispatch(&probes, &writer, &results, &tracker, &vitals)
+            .await;
+        let first = results_rx.recv().await.expect("an observation");
+        assert!(
+            matches!(first.slot, SlotObservation::Probe(_)),
+            "the paying probe produces evidence, not a miss: {first:?}"
+        );
+        // The same workspace's next probe meets its spent share — but the OTHER
+        // workspace's FIRST probe is still admitted (N-1): once the ceiling is
+        // spent the split is max-min fair, so a second tenant behind the same
+        // address never goes dark. Its SECOND probe — the fair split now held —
+        // is the counted miss.
+        let mut plan = Plan::default();
+        plan.dispatches.push(dispatch("b", WorkspaceId::DEFAULT));
+        plan.dispatches.push(dispatch("c1", other));
+        plan.dispatches.push(dispatch("c2", other));
+        plan.dispatch(&probes, &writer, &results, &tracker, &vitals)
+            .await;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(results_rx.recv().await.expect("an observation"));
+        }
+        let of = |workspace: WorkspaceId| {
+            seen.iter()
+                .filter(|obs| obs.workspace == workspace)
+                .collect::<Vec<_>>()
+        };
+        let b = of(WorkspaceId::DEFAULT);
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            b[0].slot,
+            SlotObservation::Budgeted,
+            "the same workspace's share is spent: {b:?}"
+        );
+        assert_eq!(b[0].detail.as_deref(), Some("address_budget"));
+        let c = of(other);
+        assert_eq!(
+            c.iter()
+                .filter(|obs| matches!(obs.slot, SlotObservation::Probe(_)))
+                .count(),
             1,
-            "two spellings of one address got two per-origin slots"
+            "the second workspace keeps its fair split — one start pays: {c:?}"
+        );
+        let c_missed: Vec<_> = c
+            .iter()
+            .filter(|obs| obs.slot == SlotObservation::Budgeted)
+            .collect();
+        assert_eq!(
+            c_missed.len(),
+            1,
+            "past its split the second workspace misses too: {c:?}"
+        );
+        assert_eq!(c_missed[0].detail.as_deref(), Some("address_budget"));
+    }
+
+    /// B re-review: under the global per-address ceiling each workspace pays
+    /// only its own share — the heaviest spender stops at its share of the
+    /// address while a neighbour's schedule on the same IP keeps its own. The
+    /// refused starts commit `missed` + `address_budget`, neutral on streaks.
+    #[tokio::test]
+    async fn the_heaviest_spender_stops_at_its_share_and_neighbours_keep_theirs() {
+        let db = Db::connect("sqlite::memory:", 1).await.expect("db");
+        db.migrate().await.expect("migrate");
+        let (writer, _writer_task) = writer::spawn(
+            db.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            HashMap::new(),
+            Arc::default(),
+            32,
+            false,
+        );
+        let vitals = Vitals::new(Arc::default(), Duration::from_secs(30));
+        let overrides = crate::probe::test_overrides();
+        let fixture = http_fixture().await;
+        overrides
+            .lock()
+            .expect("map")
+            .insert("victim.test".to_owned(), vec![fixture]);
+        // The global ceiling admits 4; each workspace's share of the address
+        // is 2 — the heaviest spender stops at its share, the ceiling for all.
+        let probes = ProbeClient::overridden(
+            ProbePolicy {
+                allow_local_targets: true,
+                extra_roots: Vec::new(),
+            },
+            64 * 1024,
+            overrides,
+            Arc::new(crate::probe::AddressBudget::with_share(
+                4,
+                Duration::from_secs(3600),
+                2,
+                Duration::from_secs(3600),
+            )),
+        )
+        .expect("probe client");
+        let (results, mut results_rx) = mpsc::channel::<Observation>(8);
+        let tracker = TaskTracker::new();
+        let spender = WorkspaceId::new();
+        let neighbour = WorkspaceId::new();
+        let dispatch = |name: &str, workspace: WorkspaceId| Dispatch {
+            monitor_id: MonitorId(uuid::Uuid::now_v7()),
+            workspace,
+            generation: 1,
+            slot_at: OffsetDateTime::now_utc(),
+            url: Url::parse(&format!("http://victim.test/{name}")).expect("url"),
+            method: monitor_domain::ProbeMethod::Get,
+            expect: monitor_domain::Expect::standard(),
+            // The fixture answers on accept; the deadline only bounds a hang,
+            // so it is sized unreachable (N-6 re-review).
+            deadline: Duration::from_secs(5),
+            _global: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+            _origin: Arc::new(Semaphore::new(4))
+                .try_acquire_owned()
+                .expect("slot"),
+        };
+        // The spender burns its own share of the address in two starts; the
+        // third meets its share spent — while the global ceiling still has room.
+        let mut plan = Plan::default();
+        plan.dispatches.push(dispatch("a1", spender));
+        plan.dispatches.push(dispatch("a2", spender));
+        plan.dispatches.push(dispatch("a3", spender));
+        plan.dispatches.push(dispatch("b1", neighbour));
+        plan.dispatch(&probes, &writer, &results, &tracker, &vitals)
+            .await;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(results_rx.recv().await.expect("an observation"));
+        }
+        let of = |workspace: WorkspaceId| {
+            seen.iter()
+                .filter(|obs| obs.workspace == workspace)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            of(spender)
+                .iter()
+                .filter(|obs| matches!(obs.slot, SlotObservation::Probe(_)))
+                .count(),
+            2,
+            "the spender's share paid its two starts: {seen:?}"
+        );
+        assert_eq!(
+            of(spender)
+                .iter()
+                .filter(|obs| matches!(obs.slot, SlotObservation::Budgeted))
+                .count(),
+            1,
+            "the spender's third start met its own spent share: {seen:?}"
+        );
+        assert!(
+            of(neighbour)
+                .iter()
+                .all(|obs| matches!(obs.slot, SlotObservation::Probe(_))),
+            "the neighbour's monitor kept its own share — never starved: {seen:?}"
+        );
+    }
+
+    /// Within a workspace the share still binds: two same-origin monitors of one
+    /// tenant compete for that workspace's per-origin slots.
+    #[tokio::test(start_paused = true)]
+    async fn the_share_binds_within_a_workspace() {
+        let config = Config {
+            per_origin_slots: 1,
+            ..Config::default()
+        };
+        let monitors = fleet(2, 1, Duration::from_secs(15), Duration::from_secs(3));
+        let mut runtimes = HashMap::new();
+        let mut origins = HashMap::new();
+        let clock = SlotClock::start();
+        reconcile(&mut runtimes, &mut origins, &monitors, &config, &clock);
+        for entry in runtimes.values_mut() {
+            entry.next_slot = Instant::now(); // both due on this tick
+        }
+        let global = Arc::new(Semaphore::new(16));
+        let plan = plan_due(&mut runtimes, &mut origins, &global, &config);
+        assert_eq!(
+            plan.dispatches.len(),
+            1,
+            "one workspace's two monitors on an origin got two per-origin slots"
         );
     }
 }

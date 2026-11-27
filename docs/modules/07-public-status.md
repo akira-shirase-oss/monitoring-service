@@ -10,6 +10,25 @@ it in-app (M6.7) — identical artifact, identical expiry semantics.
 `fixtures/status-check.mjs` is the independent checker: expired/missing snapshot →
 "unavailable", never "targets down".
 
+**Per-workspace pages (S2, D-021):** a workspace can publish `GET
+/s/<workspace-slug>/status.json` — migration `0014` adds `workspaces.status_title`
+(NULL/empty = off) and `status_monitors` (the owner's allowlist, in display order).
+The beat writes one `s/<slug>.json` per *enabled* page with the same heartbeat
+(`generated_at`/`expires_at`, `monitoring`, born-expired when the engine isn't
+observing) and removes a page's file when it turns off. The payload is owner-chosen:
+the published monitor's *name*, `status`, `incident_open_since`, coverage/success —
+no ids, no URLs. The route is unauthenticated with the same per-address throttle as
+`/status.json`; malformed, unknown and disabled slugs answer one uniform
+`{"error":{"code":"not_found"}}` 404 — a disabled page is indistinguishable from one
+that never existed. An enabled page with no file yet answers 200 born-expired
+(`monitoring: "unavailable"`, empty services) — "nothing written" can never read as
+healthy. Caching (S2 hardening): the served beat carries `Cache-Control: public,
+max-age=30` — cacheable only until the next beat lands, its own `expires_at` the
+real freshness claim; every other answer (born-expired, 404) is `no-store` so a
+shared cache can never keep "unavailable" or "missing" past the truth. `GET
+/s/{slug}` itself is the dashboard's static fallback; the editor is
+`PUT /api/workspace/status-page` (member work, module 05).
+
 ## Purpose
 
 Let users of the monitored services check availability without a login — and let them tell

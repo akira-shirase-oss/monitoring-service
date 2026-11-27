@@ -1,0 +1,74 @@
+# The fuzz harness for every decoder of outside input in monitor-server — a detached
+# package (own lockfile, own workspace) so the instrumented build can run under the
+# nightly toolchain libFuzzer needs without touching the workspace's pinned stable.
+# Model: labs/minibtc/tests/attacks/fuzz. Run: `cargo fuzz run <target>`;
+# CI runs each target against its seed corpus for a bounded smoke.
+[package]
+name = "smon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+monitor-server = { path = "../crates/monitor-server" }
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+url = "2"
+
+# Detached from the parent workspace — fuzz targets build under nightly.
+[workspace]
+
+[[bin]]
+name = "client_key"
+path = "fuzz_targets/client_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_cookie"
+path = "fuzz_targets/session_cookie.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "origin_check"
+path = "fuzz_targets/origin_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe_url"
+path = "fuzz_targets/probe_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_json"
+path = "fuzz_targets/api_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_query"
+path = "fuzz_targets/api_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "valid_slug"
+path = "fuzz_targets/valid_slug.rs"
+test = false
+doc = false
+bench = false

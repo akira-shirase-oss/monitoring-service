@@ -1,6 +1,6 @@
 //! Management auth (M5.1 + M7.2): every `/api/**` route requires a credential once
 //! `SMON_ADMIN_TOKEN` is configured — either `Authorization: Bearer <token>` (CLI,
-//! scripts) or the `HttpOnly` `smon_session` cookie the dashboard earns at `/api/login`.
+//! scripts) or the `HttpOnly` `__Host-smon_session` cookie the dashboard earns at `/api/login`.
 //! Denied means denied — there is no bypass path inside the middleware; the only
 //! unauthenticated mode is dev-on-loopback, and boot refuses a tokenless
 //! non-loopback listen rather than leave the store open.
@@ -37,7 +37,9 @@ use crate::AppState;
 pub type AdminToken = Option<Arc<str>>;
 
 /// The `HttpOnly` cookie name the session id rides on.
-pub const SESSION_COOKIE: &str = "smon_session";
+/// `__Host-` pinned: the cookie is only ever valid with `Secure`, `Path=/` and no
+/// `Domain` — a subdomain or a man-in-the-middle can't overwrite it (S2 review).
+pub const SESSION_COOKIE: &str = "__Host-smon_session";
 
 /// When the session cookie carries `Secure` (`SMON_COOKIE_SECURE`). The server itself
 /// speaks plain HTTP; TLS is terminated in front of it, so "was this request TLS" is what
@@ -54,36 +56,17 @@ pub enum CookieSecure {
 }
 
 impl CookieSecure {
-    /// The cookie attribute for this request: `"; Secure"` or nothing.
-    pub fn attribute(self, headers: &header::HeaderMap) -> &'static str {
-        if self == Self::Always || came_over_tls(headers) {
-            "; Secure"
-        } else {
-            ""
-        }
+    /// The cookie's name — the `__Host-` pin in every mode (D re-review: there
+    /// is no `off` — a plain-name fallback would re-open the fixation hole).
+    pub fn name(self) -> &'static str {
+        SESSION_COOKIE
     }
-}
 
-/// Any `https` in `X-Forwarded-Proto` (a list when proxies chain) or a `proto=https` pair
-/// in `Forwarded` (RFC 7239). "Any", because adding `Secure` is the safe direction.
-fn came_over_tls(headers: &header::HeaderMap) -> bool {
-    let values = |name| {
-        headers
-            .get_all(name)
-            .into_iter()
-            .filter_map(|value| value.to_str().ok())
-    };
-    let forwarded_proto = values("x-forwarded-proto")
-        .flat_map(|value| value.split(','))
-        .any(|proto| proto.trim().eq_ignore_ascii_case("https"));
-    let forwarded = values("forwarded")
-        .flat_map(|value| value.split([',', ';']))
-        .filter_map(|pair| pair.split_once('='))
-        .any(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("proto")
-                && value.trim().trim_matches('"').eq_ignore_ascii_case("https")
-        });
-    forwarded_proto || forwarded
+    /// The cookie attribute: `"; Secure"` in every mode — `__Host-` names are
+    /// rejected without it, so the choice no longer exists.
+    pub fn attribute(self, _headers: &header::HeaderMap) -> &'static str {
+        "; Secure"
+    }
 }
 
 pub async fn require_auth(
@@ -427,7 +410,7 @@ async fn session_principal(
     state: &AppState,
     cookie: Option<&header::HeaderValue>,
 ) -> Result<Option<Session>, Box<Response>> {
-    let Some(session) = session_cookie(cookie) else {
+    let Some(session) = session_cookie(cookie, state.cookie_secure.name()) else {
         return Ok(None);
     };
     if let Some(token) = &state.admin_token {
@@ -529,12 +512,14 @@ fn is_mutation(method: &Method) -> bool {
     )
 }
 
-/// The session id from the Cookie header — name-prefix match, value must be non-empty.
-/// `pub` so `logout` parses the cookie through the same code the middleware trusts.
-pub fn session_cookie(cookie: Option<&header::HeaderValue>) -> Option<&str> {
+/// The session id from the Cookie header — name-prefix match on the configured
+/// cookie name (`CookieSecure::name()`, so the dev escape parses what it emits),
+/// value must be non-empty. `pub` so `logout` parses the cookie through the same
+/// code the middleware trusts.
+pub fn session_cookie<'a>(cookie: Option<&'a header::HeaderValue>, name: &str) -> Option<&'a str> {
     cookie?.to_str().ok()?.split(';').find_map(|pair| {
         let pair = pair.trim();
-        let value = pair.strip_prefix(SESSION_COOKIE)?.strip_prefix('=')?;
+        let value = pair.strip_prefix(name)?.strip_prefix('=')?;
         (!value.is_empty()).then_some(value)
     })
 }
@@ -812,18 +797,34 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_parses_its_own_name_only() {
-        let header = HeaderValue::from_static("other=1; smon_session=abc-123 ; theme=dark");
-        assert_eq!(session_cookie(Some(&header)), Some("abc-123"));
+    fn session_cookie_parses_its_configured_name_only() {
+        let name = CookieSecure::Auto.name();
+        let header = HeaderValue::from_static("other=1; __Host-smon_session=abc-123 ; theme=dark");
+        assert_eq!(session_cookie(Some(&header), name), Some("abc-123"));
         assert_eq!(
-            session_cookie(Some(&HeaderValue::from_static("smon_session="))),
+            session_cookie(
+                Some(&HeaderValue::from_static("__Host-smon_session=")),
+                name
+            ),
             None
         );
         assert_eq!(
-            session_cookie(Some(&HeaderValue::from_static("smon_sessionx=abc"))),
+            session_cookie(
+                Some(&HeaderValue::from_static("__Host-smon_sessionx=abc")),
+                name
+            ),
             None
         );
-        assert_eq!(session_cookie(None), None);
+        assert_eq!(session_cookie(None, name), None);
+        // The plain `smon_session` name is never the session in any mode — the
+        // dev escape is gone, so a plain-name cookie presented is a stranger's.
+        assert_eq!(
+            session_cookie(
+                Some(&HeaderValue::from_static("smon_session=abc-123")),
+                name
+            ),
+            None
+        );
     }
 
     /// Known answer (computed independently with Python's hashlib): a sha2 upgrade that
@@ -927,25 +928,34 @@ mod password_tests {
         drop(permits);
     }
 
+    /// Retry a password-work call while a sibling test holds the permits — a `Busy`
+    /// is the bound doing its job, not a hash failure. The queue contract itself is
+    /// `a_full_work_queue_answers_busy_within_the_deadline`.
+    async fn until_slot<T, F, Fut>(call: F) -> T
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, PasswordWorkError>>,
+    {
+        for _ in 0..20 {
+            match call().await {
+                Err(PasswordWorkError::Busy) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                other => return other.expect("password work"),
+            }
+        }
+        panic!("the password-work permits never freed")
+    }
+
     #[tokio::test]
     async fn a_hash_verifies_and_a_wrong_password_does_not() {
-        let hash = hash_password("s3cret long password", PASSWORD_WORK_WAIT)
-            .await
-            .expect("hash");
+        let hash = until_slot(|| hash_password("s3cret long password", PASSWORD_WORK_WAIT)).await;
         assert!(
-            verify_password(&hash, "s3cret long password", PASSWORD_WORK_WAIT)
-                .await
-                .expect("verify")
+            until_slot(|| verify_password(&hash, "s3cret long password", PASSWORD_WORK_WAIT)).await
         );
+        assert!(!until_slot(|| verify_password(&hash, "wrong", PASSWORD_WORK_WAIT)).await);
         assert!(
-            !verify_password(&hash, "wrong", PASSWORD_WORK_WAIT)
-                .await
-                .expect("verify")
-        );
-        assert!(
-            !verify_password("not-a-phc", "x", PASSWORD_WORK_WAIT)
-                .await
-                .expect("verify"),
+            !until_slot(|| verify_password("not-a-phc", "x", PASSWORD_WORK_WAIT)).await,
             "bad store → closed"
         );
     }

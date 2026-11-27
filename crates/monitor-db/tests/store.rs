@@ -70,6 +70,21 @@ fn missed(monitor: &Monitor) -> Observation {
     }
 }
 
+/// A monitor-owned coverage gap: `missed` on the wire, `address_budget` in the
+/// detail column — the scheduler's commit for a start the per-address bound refused.
+fn budgeted(monitor: &Monitor, at: OffsetDateTime) -> Observation {
+    Observation {
+        monitor_id: monitor.id,
+        workspace: monitor.workspace,
+        generation: monitor.generation,
+        slot_at: at,
+        slot: SlotObservation::Budgeted,
+        http_status: None,
+        latency_ms: None,
+        detail: Some("address_budget".to_owned()),
+    }
+}
+
 /// M6.2: the incident machine reads thresholds from the same committed gate row as the
 /// generation — a strict monitor opens on its first failure while a default one waits
 /// for three, and an edit takes effect on the next observation.
@@ -398,6 +413,162 @@ async fn a_missed_slot_is_stored_but_resets_the_streak() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// N-5 re-review: a budget gap is neutral in the SQL too. `first_fail_at`
+/// must span it — a `missed`+`address_budget` row is not a streak boundary —
+/// and the rebuild tail must hand `Health::rebuild` the window of *real*
+/// evidence with its gaps interleaved, never a tail of nothing but budget
+/// rows (a starved restart would lose the streak it was holding).
+#[tokio::test]
+async fn a_budget_gap_is_neutral_in_first_fail_at_and_the_rebuild_tail() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let base = OffsetDateTime::now_utc();
+    let slot = |offset_s: i64| base + time::Duration::seconds(offset_s);
+    // The streak starts at slot 1; a budget gap at slot 3 sits inside it.
+    for offset in 1..=2 {
+        writer
+            .record(probe_at(&monitor, CheckOutcome::Transport, slot(offset)))
+            .await?;
+    }
+    writer.record(budgeted(&monitor, slot(3))).await?;
+    writer
+        .record(probe_at(&monitor, CheckOutcome::Transport, slot(4)))
+        .await?;
+
+    let incident = db
+        .workspace(WorkspaceId::DEFAULT)
+        .open_incident(monitor.id)
+        .await?
+        .expect("three real failures around one gap open the incident");
+    assert_eq!(
+        incident.first_fail_at.map(OffsetDateTime::unix_timestamp),
+        Some(slot(1).unix_timestamp()),
+        "the gap is not a boundary — the streak began at slot 1"
+    );
+
+    // The rebuild tail: starve the tail harder than rebuild_tail() is long —
+    // the real evidence must survive inside its own window, gaps included.
+    for offset in 5..=8 {
+        writer.record(budgeted(&monitor, slot(offset))).await?;
+    }
+    writer
+        .record(probe_at(&monitor, CheckOutcome::Transport, slot(9)))
+        .await?;
+    for offset in 10..=20 {
+        writer.record(budgeted(&monitor, slot(offset))).await?;
+    }
+    let tail = db
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, monitor.thresholds.rebuild_tail())
+        .await?;
+    let real: Vec<_> = tail
+        .iter()
+        .filter(|o| matches!(o, SlotObservation::Probe(_)))
+        .collect();
+    assert_eq!(
+        real.len(),
+        3,
+        "the tail kept the last rebuild_tail real slots — gaps never crowd out evidence: {tail:?}"
+    );
+    assert!(
+        tail.contains(&SlotObservation::Budgeted),
+        "the gaps stay in the window — they are freshness truth"
+    );
+    Ok(())
+}
+
+/// C re-review: ordinary `missed` rows carry no `detail` — under the old
+/// windowed query they were silently dropped from the real-row count, so a
+/// host outage (one missed row per slot) made every restart fetch the whole
+/// outage as "inside the window". The tail is now strictly bounded and those
+/// misses count as the real evidence they are.
+#[tokio::test]
+async fn an_outage_of_ordinary_misses_keeps_the_rebuild_tail_bounded() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(30 * 60);
+    let slot = |offset: i64| base + time::Duration::seconds(offset);
+    for offset in 0..3 {
+        let mut real = pass(&monitor);
+        real.slot_at = slot(offset);
+        writer.record(real).await?;
+    }
+    for offset in 3..3 + 5_000 {
+        let mut gap = missed(&monitor);
+        gap.slot_at = slot(offset);
+        writer.record(gap).await?;
+    }
+
+    let limit: i64 = 3;
+    let tail = db
+        .workspace(WorkspaceId::DEFAULT)
+        .recent_outcomes(monitor.id, limit)
+        .await?;
+    assert!(
+        tail.len() <= usize::try_from(limit).expect("limit") + 64,
+        "limit + GAP_TAIL bounds every tail, outage history or not: {}",
+        tail.len()
+    );
+    // And the misses are real evidence: the newest `limit` rows of history are
+    // exactly the newest `limit` ordinary misses.
+    assert!(
+        tail.iter().all(|o| matches!(o, SlotObservation::Missed)),
+        "the newest {limit} observations are the outage's own misses: {tail:?}"
+    );
+    Ok(())
+}
+
+/// G3 re-review: the rebuild tail must be index-served, not sorted — the only
+/// checks index before 0020 ordered by `slot_at`, so every monitor's boot
+/// rebuild pushed its whole match set through a temp B-tree and restart time
+/// grew with fleet history until upgrades out-waited the readiness poll.
+/// These are the exact queries `recent_outcomes` runs; both must come back as
+/// an index SEARCH — a temp B-tree or a full-table scan fails the test.
+#[tokio::test]
+async fn the_rebuild_tail_queries_use_the_0020_indexes() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("plan.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let queries = [
+        "EXPLAIN QUERY PLAN
+         SELECT id, outcome, http_status, detail FROM checks
+         WHERE monitor_id = ? AND workspace_id = ?
+           AND NOT (outcome = 'missed' AND detail IS 'address_budget')
+         ORDER BY id DESC LIMIT ?",
+        "EXPLAIN QUERY PLAN
+         SELECT id, outcome, http_status, detail FROM checks
+         WHERE monitor_id = ? AND workspace_id = ?
+           AND outcome = 'missed' AND detail IS 'address_budget'
+         ORDER BY id DESC LIMIT ?",
+    ];
+    for sql in queries {
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sql)
+            .bind("m")
+            .bind("w")
+            .bind(10_i64)
+            .fetch_all(&pool)
+            .await?;
+        let detail = plan
+            .iter()
+            .map(|(.., step)| step.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            !detail.contains("USE TEMP B-TREE"),
+            "the rebuild tail sorts in memory — no index served its ORDER BY: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN checks"),
+            "the rebuild tail scans the whole checks table: {detail}"
+        );
+        assert!(
+            detail.contains("checks"),
+            "the plan does not even touch the checks table: {detail}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn check_stats_counts_window_rows_and_leaves_expected_to_the_caller() -> anyhow::Result<()> {
     let (db, monitor, writer) = store().await?;
@@ -471,7 +642,10 @@ async fn retention_aggregates_then_deletes_and_spares_open_incidents() -> anyhow
     writer.record(pass(&monitor)).await?;
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await?;
     assert_eq!(report.rows_deleted, 4, "monitor A's four expired rows");
     assert_eq!(report.days_written, 1, "one monitor-day aggregated");
@@ -1203,7 +1377,7 @@ async fn sessions_validate_expire_and_sweep() -> anyhow::Result<()> {
         .await?;
     // `dead` was already deleted by the lazy guard above — the sweep takes what's left.
     assert_eq!(
-        db.sweep_expired_sessions().await?,
+        db.sweep_expired_sessions(100).await?,
         1,
         "the untouched expired row swept"
     );
@@ -1296,7 +1470,10 @@ async fn an_open_incident_keeps_only_its_birth_streak_past_retention() -> anyhow
     writer.record(fail(&monitor)).await?;
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await?;
     assert_eq!(
         report.rows_deleted, 9,
@@ -1408,7 +1585,10 @@ async fn retention_prunes_delivered_outbox_old_incidents_aggregates_and_windows(
     .await?;
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(now))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(now),
+        )])
         .await?;
     assert_eq!(report.incidents_deleted, 1);
     assert_eq!(
@@ -1502,7 +1682,10 @@ async fn retention_frees_space_in_a_store_filled_to_its_cap() -> anyhow::Result<
     assert!(write_health.load(std::sync::atomic::Ordering::Relaxed) > 0);
 
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await
         .expect("retention must run at the cap");
     assert_eq!(report.rows_deleted, stored, "every expired row is freed");
@@ -1534,7 +1717,10 @@ async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
     }
     let now = OffsetDateTime::now_utc();
     let first = writer
-        .retain(RetentionPolicy::default().cutoffs(now))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(now),
+        )])
         .await?;
     assert_eq!((first.rows_deleted, first.aggregates_deleted), (4, 0));
     assert_eq!(
@@ -1549,7 +1735,9 @@ async fn aggregates_age_out_on_their_own_horizon() -> anyhow::Result<()> {
         aggregates: std::time::Duration::from_hours(24 * 10),
         ..RetentionPolicy::default()
     };
-    let second = writer.retain(short.cutoffs(now)).await?;
+    let second = writer
+        .retain(&[(WorkspaceId::DEFAULT, short.cutoffs(now))])
+        .await?;
     assert!(second.aggregates_deleted >= 1, "{second:?}");
     assert_eq!(
         db.workspace(WorkspaceId::DEFAULT)
@@ -1582,7 +1770,10 @@ async fn only_failed_observation_commits_count_as_write_failures() -> anyhow::Re
 
     assert!(
         writer
-            .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+            .retain(&[(
+                WorkspaceId::DEFAULT,
+                RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc())
+            )])
             .await
             .is_err()
     );
@@ -1614,7 +1805,9 @@ async fn retention_runs_in_bounded_batches_and_converges() -> anyhow::Result<()>
             .await?;
     }
     let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
-    let report = writer.retain_in_batches(cutoffs, 10).await?;
+    let report = writer
+        .retain_in_batches(&[(WorkspaceId::DEFAULT, cutoffs)], 10)
+        .await?;
     assert_eq!(report.rows_deleted, 25);
     assert_eq!(
         db.workspace(WorkspaceId::DEFAULT)
@@ -1654,7 +1847,11 @@ async fn an_observation_lands_while_a_large_retention_pass_is_still_running() ->
     let cutoffs = RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc());
     let retention = {
         let writer = writer.clone();
-        tokio::spawn(async move { writer.retain_in_batches(cutoffs, 10).await })
+        tokio::spawn(async move {
+            writer
+                .retain_in_batches(&[(WorkspaceId::DEFAULT, cutoffs)], 10)
+                .await
+        })
     };
     tokio::task::yield_now().await;
     writer.record(pass(&monitor)).await?;
@@ -1746,7 +1943,10 @@ async fn retention_at_the_cap_has_room_for_summaries_of_a_thin_expired_slice() -
         false,
     );
     let report = writer
-        .retain(RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()))
+        .retain(&[(
+            WorkspaceId::DEFAULT,
+            RetentionPolicy::default().cutoffs(OffsetDateTime::now_utc()),
+        )])
         .await
         .expect("retention must have room for the summaries at the cap");
     assert_eq!(report.rows_deleted, 150);
@@ -2179,8 +2379,18 @@ async fn membership_roles() -> anyhow::Result<()> {
     ));
     assert!(scope.set_member_role(owner, Role::Viewer).await?);
     assert_eq!(db.member_role(ws, owner).await?, Some(Role::Viewer));
-    assert!(scope.remove_member(owner).await?);
-    assert_eq!(db.member_role(ws, owner).await?, None);
+    // It may step down, but it is never removed from its own workspace: its requests
+    // resolve here by default, so without a seat it could reach nothing at all.
+    assert!(matches!(
+        scope.remove_member(owner).await,
+        Err(QueryError::Invalid(_))
+    ));
+    assert_eq!(db.member_role(ws, owner).await?, Some(Role::Viewer));
+    // An account whose own workspace is elsewhere leaves cleanly, once it is not the
+    // last owner.
+    assert!(scope.set_member_role(owner, Role::Owner).await?);
+    assert!(scope.remove_member(second).await?);
+    assert_eq!(db.member_role(ws, second).await?, None);
     assert!(
         !scope
             .remove_member(monitor_domain::AccountId::new())
@@ -2247,6 +2457,613 @@ async fn api_tokens_digest_and_touch() -> anyhow::Result<()> {
         db.api_token_by_digest("d-ci")
             .await?
             .is_some_and(|row| row.revoked_at == Some(later))
+    );
+    Ok(())
+}
+
+/// S3 (D-022): a retention pass reads each workspace's own horizon. A `free`
+/// workspace's evidence expires on the free plan's shorter clocks while an
+/// `operator` workspace's same-age rows are still kept — one pass, one batch
+/// bound, different truths per tier.
+#[tokio::test]
+async fn retention_ages_each_workspace_on_its_own_plan() -> anyhow::Result<()> {
+    let (db, monitor, writer) = store().await?;
+    // The seeded default workspace is the operator's own (migration 0015); a
+    // workspace a signup mints is `free`.
+    let seeded = db
+        .workspace_row(WorkspaceId::DEFAULT)
+        .await?
+        .expect("seeded default");
+    assert_eq!(seeded.plan, "operator");
+    let free = db.create_workspace("free-co", "Free Co").await?;
+    assert_eq!(
+        db.workspace_row(free).await?.expect("free workspace").plan,
+        "free"
+    );
+    let free_monitor =
+        NewMonitor::new("free", url::Url::parse("https://free.example/")?)?.into_monitor_for(free);
+    db.workspace(free).insert_monitor(&free_monitor).await?;
+
+    // Checks 3 days old: past the free plan's 2-day horizon, inside the
+    // configured 7-day one.
+    let age = OffsetDateTime::now_utc() - time::Duration::days(3);
+    for m in [&monitor, &free_monitor] {
+        let mut observation = probe(m, CheckOutcome::Pass);
+        observation.slot_at = age;
+        writer.record(observation).await?;
+    }
+
+    let configured = RetentionPolicy::default();
+    let now = OffsetDateTime::now_utc();
+    let cutoffs: Vec<(WorkspaceId, _)> = db
+        .list_workspaces()
+        .await?
+        .into_iter()
+        .map(|row| {
+            let workspace = WorkspaceId(uuid::Uuid::parse_str(&row.id)?);
+            let plan = monitor_domain::Plan::parse(&row.plan)
+                .ok_or_else(|| anyhow::anyhow!("unreadable plan"))?;
+            Ok((
+                workspace,
+                RetentionPolicy::for_plan(plan, &configured).cutoffs(now),
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let report = writer.retain(&cutoffs).await?;
+    assert_eq!(
+        report.rows_deleted, 1,
+        "only the free workspace's row expired"
+    );
+    assert!(
+        db.workspace(free)
+            .list_checks(free_monitor.id, 10)
+            .await?
+            .is_empty(),
+        "free evidence expired on the free horizon"
+    );
+    assert_eq!(
+        db.workspace(WorkspaceId::DEFAULT)
+            .list_checks(monitor.id, 10)
+            .await?
+            .len(),
+        1,
+        "operator evidence keeps the configured horizon"
+    );
+    Ok(())
+}
+
+/// The session sweep deletes in bounded batches like every other retention
+/// delete (D-012): at most `limit` rows per call, converging by repeating —
+/// so housekeeping never holds the store long.
+#[tokio::test]
+async fn the_session_sweep_deletes_in_bounded_batches() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let past = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+    for n in 0..3 {
+        db.create_session(&format!("dead-{n}"), past).await?;
+    }
+    db.create_session("live", OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .await?;
+
+    assert_eq!(db.sweep_expired_sessions(2).await?, 2, "one bounded batch");
+    assert_eq!(db.sweep_expired_sessions(2).await?, 1, "the remainder");
+    assert_eq!(db.sweep_expired_sessions(2).await?, 0, "converged");
+    assert!(
+        db.session_valid("live", IDLE).await?,
+        "the live session was never swept"
+    );
+    Ok(())
+}
+
+/// S3-8: a plan's horizons are a *ceiling*, not an override — `for_plan` takes the
+/// field-wise minimum of the plan's retention and the operator's configured
+/// ceilings, so a configured value shorter than the free plan's still wins, and
+/// the operator tier keeps the configured policy whole.
+#[test]
+fn plan_retention_never_exceeds_the_operator_ceiling() {
+    let configured = RetentionPolicy {
+        checks: std::time::Duration::from_secs(3_600), // under free's 2 d
+        aggregates: std::time::Duration::from_hours(9_600), // over free's 90 d
+        incidents: std::time::Duration::from_hours(9_600), // over free's 90 d
+        delivered_outbox: std::time::Duration::from_secs(3_600), // under free's 7 d
+    };
+    let free = RetentionPolicy::for_plan(monitor_domain::Plan::Free, &configured);
+    let free_fixed = monitor_domain::Plan::Free
+        .limits()
+        .retention
+        .expect("the free tier fixes horizons");
+    // Shorter configured values win; longer ones clamp to the plan's own horizon.
+    assert_eq!(free.checks, configured.checks);
+    assert_eq!(free.delivered_outbox, configured.delivered_outbox);
+    assert_eq!(free.aggregates, free_fixed.aggregates);
+    assert_eq!(free.incidents, free_fixed.incidents);
+    // The operator tier defers entirely: configured is the whole policy.
+    let operator = RetentionPolicy::for_plan(monitor_domain::Plan::Operator, &configured);
+    assert_eq!(operator, configured);
+}
+
+/// S3: expired invitations are honest-expired on read already — the sweep's job is
+/// keeping the table small, in bounded batches like every other retention delete
+/// (D-012). A live invitation survives the pass.
+#[tokio::test]
+async fn expired_invitations_are_swept_and_live_ones_kept() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let owner = db.owner(WorkspaceId::DEFAULT);
+    owner
+        .invite_member("a@x.example", Role::Member, "test")
+        .await?;
+    owner
+        .invite_member("b@x.example", Role::Viewer, "test")
+        .await?;
+    let now = OffsetDateTime::now_utc();
+    assert_eq!(owner.list_invitations(now).await?.len(), 2);
+    // Nothing is old yet.
+    assert_eq!(db.sweep_expired_invitations(now, 500).await?, 0);
+    // Past the 72 h TTL both rows are gone — and a one-row batch still converges.
+    let future = now + time::Duration::hours(73);
+    assert_eq!(db.sweep_expired_invitations(future, 1).await?, 1);
+    assert_eq!(db.sweep_expired_invitations(future, 500).await?, 1);
+    assert_eq!(db.sweep_expired_invitations(future, 500).await?, 0);
+    assert_eq!(owner.list_invitations(future).await?.len(), 0);
+    Ok(())
+}
+
+/// S3: a released slug stays held against other tenants — but only the newest 64
+/// per workspace, so a rename loop can't grow the tombstone table without limit.
+/// The proof is cross-tenant: once `ws`'s oldest tombstone falls out of the
+/// window, another workspace may take the name again.
+#[tokio::test]
+async fn released_slugs_are_held_but_capped_per_workspace() -> anyhow::Result<()> {
+    let db = Db::connect("sqlite::memory:", 1).await?;
+    db.migrate().await?;
+    let owner = db.owner(WorkspaceId::DEFAULT);
+    owner
+        .set_status_page(Some("ws-first"), Some("Page"), &[])
+        .await?;
+    // 70 renames: the newest tombstones cap at 64, so the earliest names come free.
+    for i in 0..70 {
+        owner
+            .set_status_page(Some(&format!("s{i}")), Some("Page"), &[])
+            .await?;
+    }
+    // A second workspace to ask the question with (the held check is cross-tenant).
+    let now = OffsetDateTime::now_utc();
+    let invite = db
+        .create_invite("digest", now, now + time::Duration::hours(1))
+        .await?;
+    let account = db
+        .signup(
+            &invite.id,
+            &monitor_db::NewAccount {
+                id: monitor_domain::AccountId(uuid::Uuid::now_v7()),
+                workspace: WorkspaceId(uuid::Uuid::now_v7()),
+                workspace_slug: "ws-other".to_owned(),
+                workspace_name: "Other".to_owned(),
+                email: "other@x.example".to_owned(),
+                password_hash: "x".to_owned(),
+            },
+            now,
+        )
+        .await?;
+    let other = db.owner(WorkspaceId(uuid::Uuid::parse_str(&account.workspace_id)?));
+    // The oldest tombstone fell out of the 64-name window → free to take.
+    other
+        .set_status_page(Some("ws-first"), Some("Theirs"), &[])
+        .await?;
+    // The most recently released name is still held → conflict.
+    let held = other
+        .set_status_page(Some("s68"), Some("Theirs"), &[])
+        .await;
+    assert!(matches!(held, Err(QueryError::Conflict(_))), "{held:?}");
+    Ok(())
+}
+
+/// S3 re-review + N3 ruling: 0018 is restored byte-for-byte to its applied
+/// content, so the hold lands in 0019 — where it can only name what survives
+/// the rename: `default`, the seeded workspace's known name. Names other
+/// workspaces lost to the backfill were already rewritten before any hold
+/// existed — on an applied database they are unrecoverable, and the test marks
+/// that residual honestly rather than pretend coverage. Fresh migrate proves
+/// `default` held; the real files are then replayed against pre-0018 fixtures.
+#[tokio::test]
+async fn the_slug_backfill_holds_every_name_it_replaces() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("store.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let raw = sqlx::SqlitePool::connect(&url).await?;
+
+    // A fresh DB: the seeded `default` is renamed, but the name stays held by the
+    // seeded workspace — another tenant can never claim /s/default.
+    let held_default: Option<String> =
+        sqlx::query_scalar("SELECT workspace_id FROM status_held_slugs WHERE slug = 'default'")
+            .fetch_optional(&raw)
+            .await?;
+    assert_eq!(
+        held_default.as_deref(),
+        Some("00000000-0000-0000-0000-000000000001"),
+        "`default` was renamed without holding it — any tenant can now claim it"
+    );
+
+    // Fixture rows standing in for a pre-0018 store: an unpublished email-derived
+    // slug (renamed, held), a published page (untouched, unheld), an already
+    // random slug (untouched), and an outsider that will try to take the name.
+    let (old, published, untouched, outsider) = (
+        uuid::Uuid::now_v7().to_string(),
+        uuid::Uuid::now_v7().to_string(),
+        uuid::Uuid::now_v7().to_string(),
+        uuid::Uuid::now_v7().to_string(),
+    );
+    for (id, slug, title) in [
+        (old.as_str(), "alice.example.com", None),
+        (published.as_str(), "bob.example.com", Some("Live")),
+        (untouched.as_str(), "ws-already-random", None),
+        (outsider.as_str(), "ws-outsider", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO workspaces (id, slug, name, created_at, status_title)
+             VALUES (?, ?, 'ws', '2026-01-01T00:00:00.000Z', ?)",
+        )
+        .bind(id)
+        .bind(slug)
+        .bind(title)
+        .execute(&raw)
+        .await?;
+    }
+    // The hold lives in its own migration (N3 ruling: 0018 is restored to its
+    // applied bytes; the hold arrives as 0019). Replay the pair in order against
+    // the pre-0018 fixtures.
+    sqlx::raw_sql(include_str!("../migrations/0018_review_followups.sql"))
+        .execute(&raw)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations/0019_hold_backfilled_slugs.sql"))
+        .execute(&raw)
+        .await?;
+
+    let new_slug: String = sqlx::query_scalar("SELECT slug FROM workspaces WHERE id = ?")
+        .bind(&old)
+        .fetch_one(&raw)
+        .await?;
+    assert!(new_slug.starts_with("ws-"), "renamed: {new_slug}");
+    let held_old: Option<String> = sqlx::query_scalar(
+        "SELECT workspace_id FROM status_held_slugs WHERE slug = 'alice.example.com'",
+    )
+    .fetch_optional(&raw)
+    .await?;
+    // The name was already rewritten by 0018 before 0019 could see it — on an
+    // applied database this residual is unrecoverable; `default` is the only
+    // replaced name the migration can still hold (N3 ruling).
+    assert_eq!(
+        held_old.as_deref(),
+        None,
+        "unrecoverable post-rename: only `default` can still be held"
+    );
+    let bob_slug: String = sqlx::query_scalar("SELECT slug FROM workspaces WHERE id = ?")
+        .bind(&published)
+        .fetch_one(&raw)
+        .await?;
+    assert_eq!(
+        bob_slug, "bob.example.com",
+        "a published page keeps its URL"
+    );
+    let held_bob: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM status_held_slugs WHERE slug = 'bob.example.com'")
+            .fetch_one(&raw)
+            .await?;
+    assert_eq!(held_bob, 0, "a name still in use is not tombstoned");
+
+    // The contract end to end on the recoverable name: `default` is held under
+    // the seeded workspace, so the outsider's claim is a conflict — while the
+    // backfilled name that was already rewritten is claimable again (the
+    // accepted residual: its old value no longer exists anywhere to hold).
+    let outsider_view = db.owner(WorkspaceId(uuid::Uuid::parse_str(&outsider)?));
+    let claimed = outsider_view
+        .set_status_page(Some("default"), Some("Theirs"), &[])
+        .await;
+    assert!(
+        matches!(claimed, Err(QueryError::Conflict(_))),
+        "another tenant took the seeded name: {claimed:?}"
+    );
+    let backfilled = outsider_view
+        .set_status_page(Some("alice.example.com"), Some("Theirs"), &[])
+        .await;
+    assert!(
+        backfilled.is_ok(),
+        "the post-rename name is unrecoverable — claimable, not held: {backfilled:?}"
+    );
+    raw.close().await;
+    Ok(())
+}
+
+/// N4: the `default` hold must not lapse. The bounded held-set (newest 64 per
+/// workspace) exists for churned tenant names, but `default` is the seeded
+/// page's name — readers who knew it must never see it serve a new tenant,
+/// however many renames the operator does afterwards.
+#[tokio::test]
+async fn the_default_slug_never_lapses_out_of_its_hold() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", tmp.path().join("store.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let seed = WorkspaceId::DEFAULT;
+    // 65 renames: one more than the per-workspace held cap. Each rename holds the
+    // name it leaves behind and prunes the oldest holds.
+    for i in 0..65 {
+        db.owner(seed)
+            .set_status_page(Some(&format!("renamed-{i}")), None, &[])
+            .await?;
+    }
+    let raw = sqlx::SqlitePool::connect(&url).await?;
+    let held: Option<String> =
+        sqlx::query_scalar("SELECT workspace_id FROM status_held_slugs WHERE slug = 'default'")
+            .fetch_optional(&raw)
+            .await?;
+    assert_eq!(
+        held.as_deref(),
+        Some(seed.0.to_string().as_str()),
+        "`default` fell out of the held set after the cap — any tenant can claim it"
+    );
+    raw.close().await;
+    Ok(())
+}
+
+/// Deleting a monitor with its evidence (D-026) works in batches so the write lock is
+/// never held long. More rows than two batches hold, in every table that names the
+/// monitor, must all go — and a second monitor's rows must all stay.
+#[tokio::test]
+async fn evidence_is_deleted_across_batches_and_only_for_that_monitor() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("delete.db").display());
+    let db = Db::connect(&url, 2).await?;
+    db.migrate().await?;
+    let scoped = db.workspace(WorkspaceId::DEFAULT);
+    let doomed =
+        NewMonitor::new("doomed", url::Url::parse("https://example.com/a")?)?.into_monitor();
+    let kept = NewMonitor::new("kept", url::Url::parse("https://example.com/b")?)?.into_monitor();
+    scoped.insert_monitor(&doomed).await?;
+    scoped.insert_monitor(&kept).await?;
+
+    // Seeded straight into the tables: enough rows to cross two batch boundaries.
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let rows = 2 * monitor_db::EVIDENCE_DELETE_BATCH + 7;
+    let workspace = WorkspaceId::DEFAULT.0.to_string();
+    for monitor in [&doomed, &kept] {
+        let id = monitor.id.0.to_string();
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+             INSERT INTO checks (monitor_id, generation, slot_at, outcome, recorded_at, workspace_id)
+             SELECT ?, 1, '2026-01-01T00:00:00Z', 'pass', '2026-01-01T00:00:00Z', ? FROM n",
+        )
+        .bind(rows)
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+             INSERT INTO incidents (monitor_id, opened_at, resolved_at, state, workspace_id)
+             SELECT ?, '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', 'resolved', ? FROM n",
+        )
+        .bind(rows)
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO notify_outbox
+                 (event_id, monitor_id, workspace_id, incident_id, kind, created_at)
+             SELECT 'evt-' || id, monitor_id, workspace_id, id, 'incident_opened',
+                    '2026-01-01T00:00:00Z'
+             FROM incidents WHERE monitor_id = ?",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO check_stats_daily (monitor_id, day, pass, workspace_id)
+             VALUES (?, '2025-12-31', 5, ?)",
+        )
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&pool)
+        .await?;
+    }
+    let count = |table: &'static str, id: String| {
+        let pool = pool.clone();
+        async move {
+            let sql = match table {
+                "checks" => "SELECT COUNT(*) FROM checks WHERE monitor_id = ?",
+                "incidents" => "SELECT COUNT(*) FROM incidents WHERE monitor_id = ?",
+                "notify_outbox" => "SELECT COUNT(*) FROM notify_outbox WHERE monitor_id = ?",
+                _ => "SELECT COUNT(*) FROM check_stats_daily WHERE monitor_id = ?",
+            };
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+        }
+    };
+
+    assert!(scoped.delete_monitor_with_evidence(doomed.id).await?);
+
+    for table in ["notify_outbox", "incidents", "checks", "check_stats_daily"] {
+        assert_eq!(
+            count(table, doomed.id.0.to_string()).await?,
+            0,
+            "{table} still holds rows of the deleted monitor"
+        );
+        let expected = if table == "check_stats_daily" {
+            1
+        } else {
+            rows
+        };
+        assert_eq!(
+            count(table, kept.id.0.to_string()).await?,
+            expected,
+            "{table} lost rows of the monitor that was not deleted"
+        );
+    }
+    assert!(scoped.monitor_generation(doomed.id).await?.is_none());
+    assert!(scoped.monitor_generation(kept.id).await?.is_some());
+    Ok(())
+}
+
+/// With foreign keys on, deleting a parent row makes SQLite look up its children. The
+/// lookups D-026's delete and the retention pass depend on must be index searches: a
+/// scan of the whole child table per deleted row is what let one workspace's delete
+/// hold the write lock against everyone.
+#[tokio::test]
+async fn child_lookups_for_deletes_use_the_0022_indexes() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("plan.db").display());
+    let db = Db::connect(&url, 1).await?;
+    db.migrate().await?;
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    for (sql, table) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM notify_outbox WHERE incident_id = ?",
+            "notify_outbox",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM notify_outbox WHERE monitor_id = ?",
+            "notify_outbox",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM incidents WHERE monitor_id = ?",
+            "incidents",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM status_monitors WHERE monitor_id = ?",
+            "status_monitors",
+        ),
+    ] {
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sql).bind("x").fetch_all(&pool).await?;
+        let detail = plan
+            .iter()
+            .map(|(.., step)| step.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.contains("SEARCH") && !detail.contains(&format!("SCAN {table}")),
+            "{table} is scanned for its parent's children: {detail}"
+        );
+    }
+    Ok(())
+}
+
+/// Maintenance windows and API tokens are rows a delete removes in one cascade, so
+/// each is capped where it is created. A monitor holds at most
+/// `MAX_WINDOWS_PER_MONITOR` windows; a workspace at `MAX_TOKENS_PER_WORKSPACE`
+/// tokens gives up its oldest revoked one for a new one, and refuses when none is
+/// revoked.
+#[tokio::test]
+async fn windows_per_monitor_and_tokens_per_workspace_are_capped() -> anyhow::Result<()> {
+    let (db, monitor, _) = store().await?;
+    let now = OffsetDateTime::now_utc();
+    let scoped = db.workspace(WorkspaceId::DEFAULT);
+    for i in 0..monitor_db::MAX_WINDOWS_PER_MONITOR {
+        let starts = now + time::Duration::hours(i);
+        scoped
+            .create_window(monitor.id, starts, starts + time::Duration::minutes(30), "")
+            .await?;
+    }
+    assert!(matches!(
+        scoped
+            .create_window(monitor.id, now, now + time::Duration::minutes(30), "")
+            .await,
+        Err(QueryError::Conflict(_))
+    ));
+    // A monitor this workspace does not have is still "unknown", not "full".
+    assert!(matches!(
+        scoped
+            .create_window(MonitorId::new(), now, now + time::Duration::minutes(30), "")
+            .await,
+        Err(QueryError::Invalid(_))
+    ));
+
+    let owner = db.owner(WorkspaceId::DEFAULT);
+    let mut first = None;
+    for i in 0..monitor_db::MAX_TOKENS_PER_WORKSPACE {
+        let row = owner
+            .create_api_token(
+                &format!("t{i}"),
+                Role::Viewer,
+                &format!("digest-{i}"),
+                None,
+                now,
+            )
+            .await?;
+        first.get_or_insert(row.id);
+    }
+    assert!(matches!(
+        owner
+            .create_api_token("over", Role::Viewer, "digest-over", None, now)
+            .await,
+        Err(QueryError::Conflict(_))
+    ));
+    // Revoking one makes room: the revoked row gives way to the new token.
+    let first = monitor_domain::ApiTokenId(uuid::Uuid::parse_str(&first.expect("minted"))?);
+    assert!(owner.revoke_api_token(first, now).await?);
+    owner
+        .create_api_token("after", Role::Viewer, "digest-after", None, now)
+        .await?;
+    assert!(db.api_token_by_digest("digest-0").await?.is_none());
+    assert!(db.api_token_by_digest("digest-after").await?.is_some());
+    Ok(())
+}
+
+/// A workspace an earlier version let grow past the cap is not stuck: a mint trims as
+/// many of its oldest revoked tokens as it takes to leave one place.
+#[tokio::test]
+async fn a_workspace_over_the_token_cap_can_mint_again() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let url = format!("sqlite://{}", tmp.path().join("tokens.db").display());
+    let db = Db::connect(&url, 2).await?;
+    db.migrate().await?;
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let workspace = WorkspaceId::DEFAULT.0.to_string();
+    // Three more rows than the cap, written straight into the table; five are revoked.
+    let over = monitor_db::MAX_TOKENS_PER_WORKSPACE + 3;
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+         INSERT INTO api_tokens (id, workspace_id, name, token_digest, role, created_at, revoked_at)
+         SELECT 'old-' || i, ?2, 'old', 'old-digest-' || i, 'viewer', '2026-01-01T00:00:00Z',
+                CASE WHEN i <= 5 THEN '2026-01-0' || i || 'T00:00:00Z' END
+           FROM n",
+    )
+    .bind(over)
+    .bind(&workspace)
+    .execute(&pool)
+    .await?;
+
+    db.owner(WorkspaceId::DEFAULT)
+        .create_api_token(
+            "new",
+            Role::Viewer,
+            "new-digest",
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?")
+        .bind(&workspace)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        held,
+        monitor_db::MAX_TOKENS_PER_WORKSPACE,
+        "trimmed to the cap, the new token included"
+    );
+    let revoked_left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE revoked_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        revoked_left, 1,
+        "the four oldest revoked made room; no active token was touched"
     );
     Ok(())
 }

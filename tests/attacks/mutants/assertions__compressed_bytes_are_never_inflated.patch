@@ -1,0 +1,14 @@
+diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
+index 6fd377f..b4e56fe 100644
+--- a/crates/monitor-server/src/probe.rs
++++ b/crates/monitor-server/src/probe.rs
+@@ -861,7 +861,8 @@ impl ProbeClient {
+         let missed = expect.accepts(u16_status)
+             && match (&expect.body_contains, body) {
+                 (Some(marker), Some(buf)) => {
+-                    !buf.windows(marker.len()).any(|w| w == marker.as_slice())
++                    let _ = (marker, buf);
++                    false
+                 }
+                 // Marker expected but no body was ever buffered — treat as a
+                 // miss, never a silent pass.

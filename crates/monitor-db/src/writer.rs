@@ -88,9 +88,10 @@ enum Command {
         reply: oneshot::Sender<Result<(), QueryError>>,
     },
     /// A retention pass: aggregate + delete expired checks in one transaction. Goes
-    /// through the writer like everything else — the store has one owner.
+    /// through the writer like everything else — the store has one owner. Each
+    /// workspace expires on its own plan's cutoffs (S3, D-022).
     Retain {
-        cutoffs: RetentionCutoffs,
+        workspaces: Arc<[(WorkspaceId, RetentionCutoffs)]>,
         batch: u32,
         reply: oneshot::Sender<Result<RetainReport, QueryError>>,
     },
@@ -147,9 +148,13 @@ impl WriterHandle {
 
     /// Run one retention pass (D-012, `Db::retain`): expired checks roll into daily
     /// aggregates; old aggregates, resolved incidents, ended windows and delivered outbox
-    /// rows are pruned — one transaction. Open incidents are never touched.
-    pub async fn retain(&self, cutoffs: RetentionCutoffs) -> Result<RetainReport, WriterError> {
-        self.retain_in_batches(cutoffs, RETAIN_BATCH).await
+    /// rows are pruned — one transaction. `workspaces` maps each workspace to the
+    /// cutoffs its plan resolves to (S3, D-022); open incidents are never touched.
+    pub async fn retain(
+        &self,
+        workspaces: &[(WorkspaceId, RetentionCutoffs)],
+    ) -> Result<RetainReport, WriterError> {
+        self.retain_in_batches(workspaces, RETAIN_BATCH).await
     }
 
     /// A full retention pass as a series of bounded writer commands — `batch` rows of each
@@ -158,15 +163,16 @@ impl WriterHandle {
     /// waiting out the whole pass. Returns the folded report.
     pub async fn retain_in_batches(
         &self,
-        cutoffs: RetentionCutoffs,
+        workspaces: &[(WorkspaceId, RetentionCutoffs)],
         batch: u32,
     ) -> Result<RetainReport, WriterError> {
+        let workspaces: Arc<[(WorkspaceId, RetentionCutoffs)]> = workspaces.into();
         let mut total = RetainReport::default();
         loop {
             let (reply, rx) = oneshot::channel();
             self.tx
                 .send(Command::Retain {
-                    cutoffs,
+                    workspaces: workspaces.clone(),
                     batch,
                     reply,
                 })
@@ -248,13 +254,13 @@ async fn run(
                 }
             }
             Command::Retain {
-                cutoffs,
+                workspaces,
                 batch,
                 reply,
             } => {
                 // Retention is a supporting duty too: a failed pass degrades the monitor
                 // (the retention task reports it), it does not make it unavailable.
-                let outcome = db.retain(&cutoffs, batch).await;
+                let outcome = db.retain(&workspaces, batch).await;
                 if reply.send(outcome).is_err() {
                     debug!("retain reply channel closed; pass still committed");
                 }
@@ -275,6 +281,43 @@ fn track_write<T>(write_health: &WriteHealth, outcome: &Result<T, QueryError>) {
     }
 }
 
+/// Commit one observation; `false` when the monitor no longer exists.
+///
+/// The gate is read before the commit's own transaction, so a delete (D-026) can land
+/// in between. The store then refuses the check row because its monitor is gone. That
+/// is not the store failing — returning the error would count against `WriteHealth`
+/// and flip every workspace's verdict to "unavailable" over one deleted monitor — so a
+/// refused commit is asked one more question: is the monitor still there? Only when it
+/// is does the error stand.
+async fn commit_unless_gone(
+    db: &Db,
+    observation: &Observation,
+    effect: Effect,
+    open_after: bool,
+    queue_email: bool,
+) -> Result<bool, QueryError> {
+    let Err(error) = db
+        .commit_observation(observation, effect, open_after, queue_email)
+        .await
+    else {
+        return Ok(true);
+    };
+    let gone = db
+        .workspace(observation.workspace)
+        .monitor_gate(observation.monitor_id)
+        .await;
+    match gone {
+        Ok(None) => Ok(false),
+        // The monitor is there but its workspace is not: a row that outlived its
+        // workspace. Nothing can be recorded for it, and that is not the store failing.
+        Ok(Some(_)) if matches!(db.workspace_row(observation.workspace).await, Ok(None)) => {
+            Ok(false)
+        }
+        // Still there, or the store can't even be asked: the commit's own error stands.
+        Ok(Some(_)) | Err(_) => Err(error),
+    }
+}
+
 async fn record(
     db: &Db,
     statuses: &SharedStatuses,
@@ -287,6 +330,11 @@ async fn record(
         .monitor_gate(observation.monitor_id)
         .await?
     else {
+        // A deleted monitor leaves nothing behind in memory either.
+        health.remove(&observation.monitor_id);
+        if let Ok(mut map) = statuses.write() {
+            map.remove(&observation.monitor_id);
+        }
         warn!(monitor = %observation.monitor_id.0, "dropping observation for unknown monitor");
         return Ok(WriteOutcome::DroppedUnknownMonitor);
     };
@@ -307,12 +355,192 @@ async fn record(
         .cloned()
         .unwrap_or_default();
     let effect = next.record(observation.slot, gate.thresholds, gate.maintenance);
-    db.commit_observation(&observation, effect, next.incident_open(), queue_email)
-        .await?;
+    let committed =
+        commit_unless_gone(db, &observation, effect, next.incident_open(), queue_email).await;
+    if matches!(committed, Err(QueryError::Corrupt(_))) {
+        // The store contradicted what memory holds about this monitor (a recovery for
+        // an incident that is not there). `health` only advances on a commit, so
+        // keeping it would repeat the same refused commit on every slot, and each one
+        // counts against the write path's health for every workspace. Forget it: the
+        // next observation starts from an empty streak, and this failure stays one.
+        health.remove(&observation.monitor_id);
+        warn!(monitor = %observation.monitor_id.0, "store and memory disagreed; streak state reset");
+    }
+    if !committed? {
+        // Deleted between the gate read and the commit: forget it here too.
+        health.remove(&observation.monitor_id);
+        if let Ok(mut map) = statuses.write() {
+            map.remove(&observation.monitor_id);
+        }
+        warn!(monitor = %observation.monitor_id.0, "dropping observation: the monitor was deleted");
+        return Ok(WriteOutcome::DroppedUnknownMonitor);
+    }
     let status = next.status();
     health.insert(observation.monitor_id, next);
     if let Ok(mut map) = statuses.write() {
         map.insert(observation.monitor_id, status);
     }
     Ok(WriteOutcome::Committed(effect))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monitor_domain::{CheckOutcome, NewMonitor, SlotObservation, WorkspaceId};
+
+    /// The second half of the delete race, made deterministic: the gate was read, the
+    /// monitor is deleted with its evidence, and only then does the commit arrive. It
+    /// reports "gone" instead of a store error — the error is what used to count as a
+    /// failed write and turn the whole engine's verdict to unavailable.
+    #[tokio::test]
+    async fn a_commit_for_a_monitor_deleted_meanwhile_reports_gone() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:", 1).await?;
+        db.migrate().await?;
+        let scoped = db.workspace(WorkspaceId::DEFAULT);
+        let monitor = NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?
+            .into_monitor();
+        scoped.insert_monitor(&monitor).await?;
+        let observation = Observation {
+            monitor_id: monitor.id,
+            workspace: monitor.workspace,
+            generation: monitor.generation,
+            slot_at: time::OffsetDateTime::now_utc(),
+            slot: SlotObservation::Probe(CheckOutcome::Pass),
+            http_status: Some(200),
+            latency_ms: Some(5),
+            detail: None,
+        };
+        let effect = Health::default().record(observation.slot, monitor.thresholds, false);
+
+        // While the monitor exists the commit lands.
+        assert!(commit_unless_gone(&db, &observation, effect, false, false).await?);
+
+        assert!(scoped.delete_monitor_with_evidence(monitor.id).await?);
+        // The raw commit is refused by the store…
+        assert!(
+            db.commit_observation(&observation, effect, false, false)
+                .await
+                .is_err(),
+            "a check row for a deleted monitor has nothing to belong to"
+        );
+        // …and the writer's wrapper turns that refusal into "gone", not an error.
+        assert!(!commit_unless_gone(&db, &observation, effect, false, false).await?);
+        Ok(())
+    }
+
+    async fn monitored() -> anyhow::Result<(Db, monitor_domain::Monitor, WriterHandle)> {
+        let db = Db::connect("sqlite::memory:", 1).await?;
+        db.migrate().await?;
+        let monitor = NewMonitor::new("fixture", url::Url::parse("https://example.com/health")?)?
+            .into_monitor();
+        db.workspace(WorkspaceId::DEFAULT)
+            .insert_monitor(&monitor)
+            .await?;
+        let (handle, _task) = spawn(
+            db.clone(),
+            std::sync::Arc::default(),
+            HashMap::new(),
+            std::sync::Arc::default(),
+            8,
+            false,
+        );
+        Ok((db, monitor, handle))
+    }
+
+    fn slot(
+        monitor: &monitor_domain::Monitor,
+        generation: u64,
+        outcome: CheckOutcome,
+    ) -> Observation {
+        Observation {
+            monitor_id: monitor.id,
+            workspace: monitor.workspace,
+            generation,
+            slot_at: time::OffsetDateTime::now_utc(),
+            slot: SlotObservation::Probe(outcome),
+            http_status: None,
+            latency_ms: Some(5),
+            detail: None,
+        }
+    }
+
+    /// Shedding a monitor's history (the first step of deleting it with its evidence)
+    /// keeps the open incident. If the delete stops there and the monitor is resumed,
+    /// the writer still believes that incident is open — and it is: the recovery
+    /// commits. Shedding it used to leave a monitor whose every later check was refused
+    /// by the store, each refusal counting against the whole engine's health.
+    #[tokio::test]
+    async fn a_monitor_resumed_after_a_half_finished_delete_still_recovers() -> anyhow::Result<()> {
+        let (db, monitor, writer) = monitored().await?;
+        let scoped = db.workspace(WorkspaceId::DEFAULT);
+        for _ in 0..3 {
+            writer
+                .record(slot(&monitor, monitor.generation, CheckOutcome::Transport))
+                .await?;
+        }
+        assert_eq!(scoped.open_incidents().await?.len(), 1);
+
+        // The delete gets as far as shedding and no further.
+        assert!(scoped.shed_evidence(monitor.id).await?);
+        assert_eq!(
+            scoped.open_incidents().await?.len(),
+            1,
+            "the open incident is not shed"
+        );
+
+        // Resume: the same row, un-paused, on its bumped generation.
+        sqlx::query("UPDATE monitors SET paused = 0 WHERE id = ?")
+            .bind(monitor.id.0.to_string())
+            .execute(&db.pool)
+            .await?;
+        let generation = scoped
+            .monitor_generation(monitor.id)
+            .await?
+            .expect("the monitor is still there");
+        let mut last = WriteOutcome::DroppedStaleGeneration;
+        for _ in 0..2 {
+            last = writer
+                .record(slot(&monitor, generation, CheckOutcome::Pass))
+                .await?;
+        }
+        assert_eq!(last, WriteOutcome::Committed(Effect::IncidentRecovered));
+        assert!(scoped.open_incidents().await?.is_empty());
+        Ok(())
+    }
+
+    /// If the store ever does contradict the writer's memory, the damage is one
+    /// refused commit, not one per slot for ever: the memory is dropped and the next
+    /// observation commits.
+    #[tokio::test]
+    async fn a_contradicted_streak_fails_once_and_then_commits() -> anyhow::Result<()> {
+        let (db, monitor, writer) = monitored().await?;
+        for _ in 0..3 {
+            writer
+                .record(slot(&monitor, monitor.generation, CheckOutcome::Transport))
+                .await?;
+        }
+        // The incident the writer believes is open disappears underneath it.
+        sqlx::query("DELETE FROM notify_outbox")
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("DELETE FROM incidents")
+            .execute(&db.pool)
+            .await?;
+
+        let pass = || slot(&monitor, monitor.generation, CheckOutcome::Pass);
+        writer.record(pass()).await?;
+        // The second pass is the recovery the store has no incident for.
+        assert!(
+            writer.record(pass()).await.is_err(),
+            "a recovery with no incident to resolve is refused"
+        );
+        // From here every observation commits again.
+        for _ in 0..3 {
+            assert!(matches!(
+                writer.record(pass()).await?,
+                WriteOutcome::Committed(_)
+            ));
+        }
+        Ok(())
+    }
 }

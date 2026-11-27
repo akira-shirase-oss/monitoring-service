@@ -207,3 +207,79 @@ fn ping_exits_1_when_the_monitor_is_unavailable() {
     let output = run(&["--server", &base, "ping"]);
     assert_eq!(output.status.code(), Some(1));
 }
+
+/// `invites create` prints the code alone on stdout — a script captures it with `$(…)` —
+/// and when it stops working on stderr.
+#[test]
+fn invites_create_prints_only_the_code_on_stdout() {
+    let base = serve(|method, path| {
+        assert_eq!((method, path), ("POST", "/api/invites"));
+        (
+            201,
+            r#"{"invite":{"code":"inv_example_code","expires_at":"2026-12-01T00:00:00Z"}}"#
+                .to_string(),
+        )
+    });
+    let output = run(&["--server", &base, "invites", "create", "--ttl-hours", "24"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "inv_example_code\n"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("2026-12-01T00:00:00Z"),
+        "{output:?}"
+    );
+}
+
+/// `workspaces list` is one tab-separated row per workspace: id, plan, role, slug, name.
+#[test]
+fn workspaces_list_prints_one_row_per_workspace() {
+    let base = serve(|method, path| {
+        assert_eq!((method, path), ("GET", "/api/workspaces"));
+        (
+            200,
+            r#"{"account":null,"workspaces":[{"id":"w1","plan":"free","role":"operator","slug":"acme","name":"Acme"}]}"#
+                .to_string(),
+        )
+    });
+    let output = run(&["--server", &base, "workspaces", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "w1\tfree\toperator\tacme\tAcme\n"
+    );
+}
+
+/// A plan the server refuses is an application error (exit 1) carrying its message, and
+/// a move it accepts says what the workspace is on now.
+#[test]
+fn workspaces_plan_reports_the_move_or_the_refusal() {
+    let base = serve(|method, path| {
+        assert_eq!(method, "PATCH");
+        if path == "/api/workspaces/w1/plan" {
+            (
+                200,
+                r#"{"workspace":{"id":"w1","name":"Acme","plan":"operator","slug":"acme"}}"#
+                    .to_string(),
+            )
+        } else {
+            (
+                422,
+                r#"{"error":{"code":"invalid_request","message":"unknown plan"}}"#.to_string(),
+            )
+        }
+    });
+    let moved = run(&["--server", &base, "workspaces", "plan", "w1", "operator"]);
+    assert_eq!(moved.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&moved.stdout),
+        "Acme is now on the operator plan\n"
+    );
+    let refused = run(&["--server", &base, "workspaces", "plan", "w2", "gold"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unknown plan"),
+        "{refused:?}"
+    );
+}

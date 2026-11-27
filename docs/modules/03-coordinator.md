@@ -16,16 +16,40 @@ it to the writer — without ever letting a slow target stall the schedule.
   already has a probe in flight), the slot is `missed` and counted — never queued as a storm.
 - **Probe bounds:** total deadline 5 s (per-monitor `timeout_s`, whole attempt including DNS,
   connect, TLS, headers and the bounded body read); response body capped at 64 KiB then the
-  connection is dropped; `GET` only in v1 (`HEAD` opt-in later).
+  connection is dropped. `GET` is the default; `HEAD` is opt-in per monitor
+  (`method`) — preserved across every redirect including 303, and a 405/501
+  answer is committed as that status, never rewritten to GET or retried.
 - **Phase (D-018):** each monitor's slots sit at a fixed phase within its interval, from its id, so monitors created together never fall due on one tick.
-- **Concurrency bounds:** global probe semaphore sized to the schedule, `Σ (tick + timeout)/interval`, 20 to 512 (D-018; a schedule past it, or past 2 starts a tick on one origin, is refused at write time with 409 `capacity_exceeded`), per-origin semaphore 2 (keyed by
-  `host:port`), one in-flight probe per monitor. Bounds are `try_acquire` — contention means
-  `missed`, not a queue.
-- **Classification:** `Pass` = acceptable status (2xx in v1; assertions later);
-  `HttpFail{status}` = any other status incl. exhausted redirects; `Transport` = connect/DNS/
+- **Concurrency bounds:** global probe semaphore sized to the schedule, `Σ (tick + timeout)/interval`, 20 to 512 (D-018; a schedule past it, or past 2 starts a tick on one origin — `(resolved addr:port, host)` per workspace, or on the resolved `addr:port` summed across hosts — is refused at write time with 409 `capacity_exceeded`), per-origin semaphore 2 (keyed by
+  `(origin, workspace)`), one in-flight probe per monitor, and a cross-tenant starts budget
+  per IP: 8/s shared across all workspaces under a 2/s per-workspace share. A start is
+  paid when both hold a token and refused otherwise; a refusal remembers nothing
+  (D-028, which replaced D-024's queue). It is charged inside the SSRF resolver on the ONE
+  candidate offered to the dialer — the first paying address in answer order, so a fallback
+  family or a sprayed answer's tail is never dialed and never pays (the trade-off: no
+  multi-address fallback — a dual-stack target whose first answer is a dead family records
+  a transport failure rather than falling back; D-024) — on IP-literal URLs and
+  on every redirect hop's literal host: a literal never skips the charge because it never
+  touched DNS. A refusal commits `missed` + `address_budget`: a *neutral* coverage gap that
+  shows `unknown` but never resets an outage's streaks — in memory and in the SQL
+  (`first_fail_at`, rebuild tail), so a starved tenant's alert can't be laundered away by a
+  neighbour's load. Bounds are `try_acquire` — contention means `missed`, never a parked
+  request; nothing waits.
+  Webhook/test-alert sends are outbox-bounded, not on this budget (D-024).
+- **Classification:** `Pass` = status inside the monitor's expectation (default
+  200–299) plus the literal body marker found, when one is configured, within the
+  first 64 KiB received inside the deadline; `HttpFail{status}` = any status
+  outside the set incl. exhausted redirects, or an acceptable status whose
+  bounded body prefix lacked the marker (`detail = 'assert_body'`, D-025 —
+  evidence the contract failed, not a coverage gap); `Transport` = connect/DNS/
   TLS/body failure; `Timeout` = deadline exceeded. Never infer. `Transport` carries a stable
   `detail`: `rejected_local` (SSRF), `cert_expired`, `cert_not_yet_valid`,
   `cert_name_mismatch`, `cert_untrusted`, `tls`, `connect`, `body`, `request`, or none.
+  Expectations are validated at write: ≤8 non-overlapping inclusive status
+  ranges inside 1–599, a literal 1–256-byte marker — never a regex — and no
+  body marker with `HEAD` (nothing to read). The body is searched as wire
+  bytes: the client never decompresses, so no compressed bomb inflates
+  in-process, and a marker past the 64 KiB cap misses by construction.
   Certificate classes map from rustls `CertificateError` under webpki-roots trust (D-010);
   details are fixed strings — no cert contents, URLs, or raw error text are committed.
 - **Generation invalidation:** probe carries `generation`; the writer drops results whose

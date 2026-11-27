@@ -180,6 +180,34 @@ fn the_perf_harnesses_never_target_the_default_port_and_guard_their_own() {
     }
 }
 
+/// The server's header-read deadline doubles as hyper's keep-alive idle bound —
+/// the connection closes silently at it, and a client that holds it longer races
+/// the close (Go's `readLoopPeekFailLocked`, a `status 0` reading the run then
+/// counts against the gate). k6 cannot put an idle-connection timeout under the
+/// bound (grafana/k6#3466 is still open), so the scenarios never reuse a
+/// connection at all — a fresh conn per request also exercises the accept path.
+#[test]
+fn the_k6_scenarios_never_reuse_a_connection_into_the_idle_close() {
+    let dir = perf_dir().join("k6");
+    let mut found = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "js"))
+        .collect::<Vec<_>>();
+    found.sort();
+    assert!(!found.is_empty(), "no k6 scenarios under {dir:?}");
+    for path in found {
+        let text = std::fs::read_to_string(&path).expect("read the scenario");
+        assert!(
+            text.contains("noConnectionReuse: true"),
+            "{:?} must not let a connection idle into the server's close — \
+             k6 has no idle-timeout option, so disable reuse",
+            path.file_name()
+        );
+    }
+}
+
 /// Run `command` in its own process group; past `deadline`, kill the whole group (a
 /// harness that failed to refuse has started fixtures and a server of its own).
 fn output_within(command: &mut Command, deadline: Duration) -> Option<std::process::Output> {

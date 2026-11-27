@@ -2,6 +2,46 @@
 
 Newest first. `D-NNN` ids are permanent; referenced from code and build-log entries.
 
+## D-023 — Any client keep-alive lives strictly below the server's header-read bound
+
+`Limits::header_read_timeout` (10 s) is hyper's one knob and bounds two waits: the
+time a request's headers may take AND the idle wait between requests on a
+kept-alive connection. At the deadline hyper closes the connection with no
+response — a clean FIN, but silent. A client or proxy whose own idle timeout is
+longer will reuse a connection the server is about to close: Go/k6 reads
+`readLoopPeekFailLocked` (`status 0`), and Caddy answers a non-idempotent request
+with a 502 — a transport failure indistinguishable from a real outage, counted by
+the load gate and served to a real caller.
+
+The rule: the peer side expires first. Every upstream that holds connections to
+smon keeps its idle bound strictly below 10 s, or never reuses at all — the server
+bound stays a property of `Limits`, not of any client. In the deploy edge the
+`transport http { keepalive 5s }` block expires Caddy's idle upstreams at half the
+bound (the default 2 m would race every time). k6 cannot express an idle-timeout
+below it (grafana/k6#3466 is still open), so the load scenarios set
+`noConnectionReuse: true` — a fresh connection per request, which never races and
+exercises the accept path anyway. `tests/serve.rs` pins the server's side of the
+contract: idled past the bound, the connection ends in a clean close before any
+bytes of a reuse — never a reset mid-request — and a fresh connection is served
+whole.
+
+## D-022 — Plan tiers live on the workspace row; limits enforce at write time
+
+`workspaces.plan` is the closed set `free`/`operator` (migration 0015). Signup mints
+`free`; the seeded default workspace is `operator`, so migrating never downgrades
+the maintainer's own monitoring. A plan is a `monitor_domain::Plan` resolved
+server-side on every write that could cross a limit: monitor count and interval
+floor (`409 limit_reached` / `plan_limit`), evidence horizons (a plan-fixed
+`RetentionPolicy`), while `operator` defers to the server's configured ceilings
+(`SMON_MAX_MONITORS`, the 15 s domain floor, `SMON_RETENTION_*`). Retention reads
+each workspace's resolved cutoffs per pass — a `free` workspace's rows expire on
+the free clocks while an `operator` workspace's same-age rows are kept — and every
+delete stays bounded per batch (D-012), sessions included. Only the operator moves
+a workspace between plans (`PATCH /api/workspaces/{id}/plan`); a downgrade changes
+what the next write may do, never pauses or deletes what already runs. Every
+number on the free tier is provisional until droplet measurements exist.
+Closes SAAS_PLAN open question 4.
+
 ## D-021 — Public status pages live at `/s/<workspace-slug>` on the same origin
 
 One page per workspace, served from the monitor's own origin — no wildcard DNS, no
@@ -58,11 +98,17 @@ starts it got were up to 5 s late — most of the measured commit lag.
   more starts per tick on one origin than its 2 per-origin slots (more than 30 monitors
   at 15 s on one host:port), is refused with 409 `capacity_exceeded` naming the bound —
   never accepted and then missed in silence. The check and its write run under one lock.
-  An origin is the **resolved address and port**, not the URL's spelling (`origin.rs`):
-  `localhost:9` and `127.0.0.1:9` are one origin, for the per-origin bound and for this
-  check. Names are resolved through a process-wide cache (5 min; the coordinator refreshes
-  every monitor's name in the background, a write resolves its own within 3 s); a name
-  not resolved yet keys by its spelling.
+  A write-time origin is the **resolved address and port plus the requested host**
+  (`origin.rs` key `addr:port|host`): spelling variants of one host collapse (case,
+  trailing dot), but `localhost:9` and `127.0.0.1:9` are distinct origins — shared
+  hosting puts thousands of sites on one address. The workspace's own ceiling is
+  judged on the **resolved address alone** summed across hosts (the write refuses
+  once the caller's share of the IP:port is spent), and the cross-tenant runtime
+  ceiling lives where the connection's target is first known — inside the SSRF
+  resolver's per-address starts budget (misses counted). Names are resolved through
+  a process-wide cache (5 min; the coordinator refreshes every monitor's name in
+  the background, a write resolves its own within 3 s); a name not resolved yet
+  keys by its spelling.
   Slow targets can still miss slots (a probe holds its slot up to its timeout); those
   misses are counted, as always.
 - **Writer connection.** The single writer commits on a connection of its own instead
@@ -363,6 +409,12 @@ directly — bounded at 4 connections.
 shadcn-svelte ("sera" style), npm workspaces, and the Rust rules (typed errors in libs,
 `anyhow` only in binaries, every I/O await bounded, nothing external unwrapped).
 
+Scope (amended 2026-11-19): this covers structure and conventions only — never the visual
+system. Per the maintainer, Colophon's look is Colophon's: Service Monitor must not use its
+palette, its Geist Pixel + Inter pairing, its panels or its motifs. Smon's own design system
+is chosen later and replaces `apps/dashboard/src/lib/components/ui/styles.css`, which holds
+neutral placeholder tokens until then.
+
 ## D-001 — The old implementation's baseline is unavailable
 
 The rebuild guide's step 1 ("preserve the old repository; port the black-box failure fixtures")
@@ -376,3 +428,331 @@ maintainer confirms it is gone. Consequences:
   claimed — say "rebuilt contract" instead.
 - If the old repository resurfaces, archive it under `references/` unchanged and port its
   fixtures before touching internals.
+
+## D-024 — The per-address probe budget is a global ceiling with a per-workspace share
+
+*The round-robin queue described below was removed by D-028; the ceiling, the share
+and where the charge is made still stand.*
+
+Every probe start pays one resolved IP's token bucket — 8/s shared across all
+workspaces (the ceiling the write-time `addr:port` bound assumes), under a 2/s
+per-workspace share so the heaviest spender stops at its own rate. While the
+ceiling has room the static share is the whole rule; once it is spent the
+ceiling becomes a **round-robin queue**, not arithmetic: every workspace
+whose start waits on the ceiling holds its place in a bounded FIFO per
+address (128 waiters), and each global token goes to the head in arrival
+order — first-come can never starve a newcomer, because every waiting
+workspace reaches the head within ⌈waiters ÷ ceiling⌉ seconds while it keeps
+asking (the fifth re-review killed the max-min-split arithmetic: under it a
+hard cap of 8 active workspaces made every newcomer's split < 1 start, so
+twenty paced tenants starved twelve of themselves and eight greedy tenants
+starved their ninth). A claim costs nothing while it waits — no tokens are
+spent — and it leaves the queue when its turn arrives, when its own share
+cannot pay, or when it stops asking for five minutes (a >5-minute-interval
+workspace under contention that long can lose its place; it re-queues, never
+silences). Total admits stay a pure token stream — burst + rate·t over any
+window — because a queued claim pays its global token only when served. The charge lives inside the SSRF validating resolver on the
+ONE candidate offered to the dialer — the first paying address in answer
+order; a fallback family or a sprayed answer's tail is never dialed and never
+pays. The honest trade-off of offering one: hyper collects the offered
+addresses eagerly and reqwest exposes no dial hook, so a multi-candidate
+answer could only be charged upfront — paying for addresses never dialed
+(the N-2 hole) — and there is no Happy-Eyeballs fallback: a dual-stack
+target whose first answer is a dead family records a transport failure
+instead of falling back. That misclassification can page, and it is the
+chosen price of never charging the victim for connections that never happen.
+Beside the resolver, for the paths that never touch DNS: an IP-literal URL
+pays its own literal, and the redirect closure pays each hop's literal host
+before following it, refusing the hop as `address_budget`. IPv4-mapped IPv6 spellings normalize to
+the IPv4 key — `::ffff:8.8.8.8` and `8.8.8.8` share one bucket. The bucket map
+is bounded (8192 entries); when it fills it evicts only buckets that have
+fully refilled, and when none qualify it refuses the *new* address as a
+counted miss — it never clears, so a spent bucket stays spent under churn. A
+refusal commits `missed` + `address_budget`: a coverage gap that reports
+`unknown` but is neutral on the monitor's failure/recovery streaks — in memory
+AND in the SQL (`first_fail_at` never sees it as a boundary, the rebuild tail
+windows past it), so the outage evidence a restart replays matches what the
+live machine held. The webhook/test-alert channel is deliberately NOT on this
+budget: sends are member- or incident-initiated, outbox- and retry-bounded —
+a different bound for a different channel, and charging them here would let a
+busy webhook URL starve unrelated probes at the same address (explicit gap,
+N-6).
+
+## D-025 — A response-body assertion miss is `http_fail` evidence, never a new outcome
+
+A monitor can carry a bounded response contract — a status set (≤8 inclusive
+ranges over 1–599) and an optional literal body marker (1–256 wire bytes,
+searched only in the first 64 KiB actually received inside the probe deadline;
+the client never decompresses, so compressed bytes are searched exactly as they
+arrive and no compressed bomb can inflate in-process). When the status is
+acceptable but the marker is absent from that bounded prefix the check commits
+`http_fail` with `detail = 'assert_body'` and the observed status — the target
+*answered correctly* and the *observed evidence* contradicts the contract, so
+the failure is HTTP-visible, streak-counting failure evidence — a real miss,
+not a coverage gap. The alternative, a new `CheckOutcome` variant, was
+rejected: it would need a decode migration for stored `outcome` strings,
+dashboard/outbox/aggregation vocabulary churn, and a semantic claim ("the
+assertion failed") that the wire already encodes — status acceptable, content
+wrong. `assert_body` joins the detail vocabulary beside `address_budget` and
+the guide-drift pins cover it in both directions. Two honest edges: a marker
+that lands past the 64 KiB cap misses — the prefix is all the evidence there
+is — and HEAD can never pair with a body marker (refused at write, create and
+edit alike, because a HEAD probe reads nothing to assert on). Method is opt-in
+`GET`/`HEAD`; HEAD is preserved across every redirect including 303 and a 405
+or 501 answer is committed as that status — never rewritten to GET or retried.
+
+## D-026 — A monitor can be deleted with its evidence, only by saying so
+
+`DELETE /api/monitors/{id}` keeps its old answer: a monitor that has recorded a
+check or an incident is refused with 409, so no client removes history by
+accident. `DELETE /api/monitors/{id}?evidence=delete` is the explicit form: it
+removes the monitor's queued alerts, incidents, checks and daily aggregates and
+then the monitor, whose maintenance windows and status-page listing cascade.
+Any other value of `evidence` is 422. Member work, like every other monitor
+write, and it spends the same per-workspace write budget. The dashboard always
+asks through a confirmation that names what is removed.
+
+It is not one transaction, on purpose. The store has one write lock and every
+workspace's observation commits wait on it, so the delete first pauses the
+monitor and bumps its generation, then removes the evidence in batches of 2,000
+rows, each its own short transaction, and only the last step (whatever arrived
+meanwhile, plus the monitor row) is atomic. A failure part-way leaves a paused
+monitor with some evidence gone; asking again finishes it. The batches shed only
+what is finished (checks, aggregates, resolved incidents and their alerts): an
+open incident stays until the last step, so a monitor resumed after a
+half-finished delete still has the incident the observation writer believes is
+open. The delete and the schedule's republish run in their own task, so a
+dropped request cannot leave a paused monitor on the schedule. The child-side
+indexes this needs (outbox by incident and by monitor, incidents by monitor,
+status listing by monitor) came with it: without them SQLite scanned a whole
+child table for every parent row deleted.
+
+Why the earlier rule (the gap log's "history is preserved by not deleting") had
+to bend for the hosted product: a workspace's evidence is the workspace's own
+data, the plan caps monitors and paused ones count, and a monitor registered
+with a typo recorded a check within one interval and then occupied a slot for
+ever. The hosted plan also names "delete workspace (and its evidence)" as a
+requirement; this is the same right at the size of one monitor.
+
+What is given up, stated plainly: after such a delete the incidents and checks
+of that monitor are gone and no export can bring them back, an open incident's
+pending alerts are dropped with it (no "recovered" alert follows), and the
+aggregates no longer show that the monitor existed. A probe in flight at that
+moment is dropped: as stale once the generation is bumped, and, if its commit
+lands after the monitor row is gone, as "monitor deleted" rather than as a
+failed write (a failed write counts against the whole engine's health).
+Every statement is bound to the caller's workspace: another workspace's monitor
+id deletes nothing, and a test weakening that binding fails.
+
+## D-027 — An account can change its password, delete itself, and take its data with it
+
+Until now an account could sign up, sign in and sign out. It could not change its
+password, could not leave, and a workspace could not take its record anywhere. The
+hosted plan names "delete workspace (and its evidence), export evidence" as a
+requirement; these three routes are that requirement.
+
+**Who may ask.** `POST /api/account/password` and `DELETE /api/account` answer only an
+account session. A workspace API token is the workspace's credential and the operator
+has no account, so both get 403. Both routes ask for the account's password again, and
+that check is a credential guess like a sign-in: it takes a guess from the caller's
+address before anything is compared (429 once the address has none left), runs under
+the same password-work limit (503 `busy` when the queue is full), answers a wrong
+password with the sign-in's own 401, and gives the guess back when the password is
+right. `GET /api/workspace/export` is owner work; the operator acts at owner level in
+the workspace it picks, and a token never holds owner, so every token gets 403.
+
+**Changing a password.** The new password follows the sign-up rule (8 to 256 bytes),
+checked by the same function. One transaction stores the new hash and ends every other
+session of the account; the session that made the change stays signed in. Sign-in now
+creates its session only while the hash it verified is still the stored one, so a
+sign-in that was verifying the old password while the change committed gets a 401, not
+a session that outlives the change.
+
+**Deleting an account — what is deleted.** In one transaction:
+
+- every workspace whose only member is the account, with everything recorded in it:
+  monitors, checks, daily aggregates, incidents, queued alerts, maintenance windows,
+  the status page's listing and the slugs it held, API tokens, pending invitations and
+  the member row;
+- the account's seat in every other workspace;
+- invitations addressed to its email;
+- all its sessions, and the account row.
+
+After the commit the schedule is republished without the deleted monitors, the deleted
+workspaces' status pages stop resolving at once and their snapshot files are removed,
+and the response expires the session cookie.
+
+**What is refused.** While the account is the only owner of a workspace that has other
+members the answer is 409: `the workspace "<name>" needs an owner: make another member
+an owner, then delete your account`. The same rule as demoting or removing the last
+owner, for the same reason: the others would be left in a workspace nobody can
+administer. Nothing is deleted and the account stays signed in.
+
+Also 409, the same way, while a workspace that would be deleted holds more than 50,000
+rows of evidence (raw checks, incidents and queued alerts together): `the workspace "<name>" holds too much history to delete in one step:
+delete its monitors with their history, then delete your account`. The deletion is one
+transaction and every workspace's check results wait on the store's one write lock
+while it runs, so it has to stay small. Deleting a monitor with its history works in
+batches (D-026) and brings a workspace under the bound. A free-plan workspace at its
+limits holds about 29,000 (ten monitors, one check a minute, kept two days).
+
+**What is kept on purpose.**
+
+- The seeded default workspace is never deleted, whoever sits in it: it is the
+  operator's. An account that is its only member just leaves it.
+- A shared workspace keeps the API tokens the leaver minted. They are the workspace's
+  credentials and its remaining owners can revoke them; only "created by" is cleared.
+- The signup invite the account used stays spent.
+- `accounts.workspace_id` (where a session lands when it names no workspace) has no
+  cascade. An account can no longer be removed from its own workspace, but a row
+  written before that rule can still call a workspace home without a seat in it. If
+  such a workspace is deleted, that *other* account is moved to the workspace it joined
+  first, or to the seeded default workspace when it has no seat anywhere. It gets no
+  seat it did not have: an account with no membership answers `not_a_member` before
+  and after. Without the move the foreign key would refuse the deletion for ever.
+
+**What is given up, stated plainly.**
+
+- There is no undo and no grace period. The checks, incidents and aggregates of a
+  deleted workspace are gone, and only an export taken beforehand has them.
+- Open incidents' pending alerts are dropped with the workspace: no "recovered" alert
+  follows. A probe in flight at that moment commits against a monitor that is gone,
+  which the writer already drops.
+- The workspace's status-page slug, and the slugs it held, are free again. A later
+  workspace can publish under a name readers knew. Holding names for ever on behalf
+  of workspaces that no longer exist was judged the worse trade.
+- The delete is one write transaction on a single-writer store, bounded at 50,000
+  evidence rows per workspace (checks, incidents and queued alerts together). Probe commits wait behind it for that long, which is far more
+  than one batch of a monitor's deletion (2,000 rows) and far less than their busy
+  timeout. The deletes reach checks and aggregates through the per-monitor indexes,
+  never by scanning other tenants' rows. A workspace above the bound is not shed
+  automatically: its owner deletes monitors first. Doing that for them in batches
+  would need a way to stop anyone joining the workspace half-way, and was left out.
+- Backups taken before the deletion still hold the account and its data. Deleting an
+  account does not reach into them.
+- The deletion and what follows it (republishing the schedule, retiring the status
+  pages) run in one task that finishes even if the request is dropped. If the process
+  dies between the commit and those steps, the next boot reads the schedule and the
+  pages from the store, so nothing of the deleted workspace comes back.
+
+**The export.** One JSON document for the caller's workspace: the workspace (id, name,
+slug, plan), the roster as email and role, the monitors as the API shows them,
+maintenance windows, incidents, daily aggregates and raw checks. It never carries the
+webhook URL or its signing secret, API tokens or their digests, password hashes,
+sessions or invitations, and every read goes through the workspace's own view of the
+store. It is bounded: each monitor's newest 5,000 checks and at most 50,000 checks in
+all (`checks[].truncated` says when a monitor has more), the newest 5,000 incidents
+and 5,000 maintenance windows and 40,000 daily rows (the top-level `truncated` object
+says when there are more), and one export per workspace every 10 seconds (429 with
+`Retry-After` inside that). It is sent as an attachment named
+`service-monitor-export-<slug>.json` and marked `no-store`.
+
+Pinned by `tests/account.rs` in both crates: the store tests count every tenant-owned
+table through a second connection before and after a deletion, and the API tests
+assert each refusal by its sentence and re-read the stored state afterwards.
+
+## D-028 — The per-address budget is two token buckets and nothing else (replaces D-024's queue)
+
+D-024's ceiling and share stay: 8 probe starts a second at one resolved address
+across every workspace, and 2 a second for each workspace there. What goes is
+the queue that took over once the ceiling was spent. A start is now paid when
+the address's bucket and the workspace's own bucket each hold a token, and
+refused otherwise. A refusal remembers nothing.
+
+Why the queue went. The scheduler asks once per slot and never comes back for
+an answer, so a "place in line" was only the memory of a refused call, and only
+the head of the line could be paid. A head that was not asking at that moment
+blocked the address until it had been silent for five minutes, with tokens in
+the bucket the whole time. Two workspaces with two monitors each on one address
+were enough: after one burst emptied the bucket once, half their monitors were
+never served again. Each refusal is recorded as `missed` with `address_budget`,
+which is neutral to streaks, so a real outage on those monitors would not have
+opened an incident. A test now runs that schedule for ten minutes and requires
+every start to be paid.
+
+What this rule guarantees: below the ceiling every start is paid; no workspace
+takes more than its share at an address, so three workspaces at their full share
+still leave room for a fourth; total starts at an address never exceed
+`burst + rate·t`. What it does not guarantee: an order. If workspaces together
+ask for more than 8 starts a second at one address for a sustained time, the
+tokens go to whoever asks when one is there, and the rest are recorded as
+missed with the reason. Reaching that takes four workspaces each running their
+full 2 starts a second at one address, which the free plan's limits (10
+monitors, one check a minute) cannot do: it needs operator-plan workspaces or
+about fifty free ones aimed at the same address. The coverage figure shows it
+when it happens. A bounded-wait guarantee would need refused starts to wait for
+a token, with a claim per monitor released on cancel; that is a scheduler
+change to make when real load asks for it, not a queue beside a caller that
+does not wait.
+
+Also fixed here: a bucket's clock never moves backwards (the clock is read
+before the lock, and a reversed arrival used to credit the gap twice), and an
+address forgets workspace shares that have fully refilled once it holds 256.
+
+## D-029 — A probe's source address is not a credential, and body text is checked wherever the redirect ends
+
+A monitor may follow redirects to another public host, and a body expectation
+is checked against the final response. A workspace could therefore register a
+URL of its own that redirects to someone else's public URL and learn, one bit
+per check, whether the first 64 KiB of that response contains a string. The
+same is already true of the status code. The bound is unchanged: only public
+addresses are ever dialed, every hop is revalidated, and the request carries no
+credential of anyone's. The remaining exposure is a third party that serves
+different content to this service's egress address because it trusts that
+address, and such trust is the third party's mistake to make: the egress
+addresses of a public monitoring service are published facts, not secrets.
+Restricting the check to the registered origin was rejected because ordinary
+sites redirect between origins (to `https`, to `www`), and those are exactly
+the pages a body expectation is for.
+
+## D-030 — What a second review of account deletion changed (amends D-026 and D-027)
+
+An independent review of the account-lifecycle work found these, and each is now a
+rule the code keeps:
+
+- **A monitor is only ever inserted into a workspace that exists.** A create waits on
+  a DNS answer before its insert; an account deletion could remove the workspace in
+  that wait, and `monitors.workspace_id` has no foreign key, so the monitor outlived
+  its workspace: reachable by nobody, probed for ever, and failing its commit on every
+  slot once it opened an incident. The insert now checks the workspace in the same
+  statement; queueing an alert no longer fails when the workspace row is missing; the
+  writer treats a monitor without a workspace as gone; and a migration removes any
+  that were left.
+- **Everything a delete cascades over is bounded where it is created.** A maintenance
+  window's reason is one line of at most 200 characters, a monitor holds at most 50
+  windows, creating one spends the monitor write budget, and a workspace holds at most
+  100 API tokens (at the cap, the oldest revoked token makes room). Before this a
+  member could store unbounded rows that a later delete removed in one transaction
+  under the store's write lock.
+- **Account deletion's 50,000-row bound counts all of it**: checks, incidents, queued
+  alerts, maintenance windows and API tokens, summed across every workspace the
+  deletion removes, not per workspace.
+- **A password change or a deletion only lands while the password it verified is still
+  the stored one.** A request that proved an older password, and was overtaken by a
+  change, is answered 401 and changes nothing.
+- **At most two exports are assembled at once across the whole server** (429
+  otherwise, with a message that says the server is busy), on top of the
+  per-workspace cooldown. Reading the rows and building the document is where an
+  export's memory peaks; the permit is released once the document is built, so a slow
+  reader cannot hold one.
+- **Accepted password changes have their own budget, per account**: five per ten
+  minutes. A right password gives its address guess back, so nothing else bounded a
+  loop of them, and each costs password hashing on a pool every sign-in shares. The
+  budget is asked before the password is verified (a spent budget costs no hashing)
+  and charged, in one step, as soon as the password has verified; the charge is given
+  back only when the server itself could not do the work. It is keyed by the account and never by a workspace: a workspace is shared
+  and the caller names it, so a workspace key let one member spend everyone's changes.
+- **An invitation's address is at most 254 characters**, and pending invitations count
+  toward account deletion's row bound, like windows and tokens.
+- **The API-token cap is one transaction**, so concurrent mints cannot each see room.
+  At the cap it removes as many of the oldest revoked tokens as it takes to leave one
+  place, so a workspace that grew past the cap earlier is not stuck.
+- **The schedule is read and published as one step**, so two publishers cannot leave
+  the coordinator on the older of two reads.
+
+Not changed, and stated: an account that has no seat in the workspace it calls home (a
+state only rows from before D-027 can be in, and only when it holds no seat anywhere)
+cannot reach the account routes to change its password or delete itself; an operator
+has to remove it. And a co-owner can demote the founding account in its own workspace
+but not remove it.
+

@@ -14,14 +14,20 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use monitor_domain::{
-    AccountId, ApiTokenId, CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, Role,
+    AccountId, ApiTokenId, CheckOutcome, CoverageStats, Effect, Monitor, MonitorId, Plan, Role,
     SlotObservation, Thresholds, WorkspaceId,
 };
 
+mod account;
 pub mod writer;
+pub use account::DailyStatsRow;
 pub use writer::{
     Observation, SharedStatuses, WriteHealth, WriteOutcome, WriterError, WriterHandle,
 };
+
+/// How long an unaccepted workspace invitation lives (S2-4): long enough for a
+/// real person to find it, short enough that a forgotten ask can't seat later.
+const INVITATION_TTL: time::Duration = time::Duration::hours(72);
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -57,6 +63,9 @@ pub enum QueryError {
     OutOfRange(&'static str),
     #[error("invalid input: {0}")]
     Invalid(String),
+    /// A uniqueness or guard conflict — maps to the API's 409, not a validation 422.
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -158,6 +167,19 @@ impl Default for RetentionPolicy {
 }
 
 impl RetentionPolicy {
+    /// The policy one workspace's plan resolves to (S3, D-022): a plan that fixes its
+    /// own horizons uses them *bounded by the configured ceilings* — a plan may shed
+    /// earlier than the server's policy, never keep longer. One that defers
+    /// (`operator`) keeps the configured policy whole.
+    pub fn for_plan(plan: Plan, configured: &Self) -> Self {
+        plan.limits().retention.map_or(*configured, |plan| Self {
+            checks: plan.checks.min(configured.checks),
+            aggregates: plan.aggregates.min(configured.aggregates),
+            incidents: plan.incidents.min(configured.incidents),
+            delivered_outbox: plan.delivered_outbox.min(configured.delivered_outbox),
+        })
+    }
+
     /// The expiry instants for a pass run at `now`. A horizon too large to subtract
     /// saturates to "keep everything".
     pub fn cutoffs(&self, now: OffsetDateTime) -> RetentionCutoffs {
@@ -432,6 +454,39 @@ impl Db {
             .unwrap_or(0)
     }
 
+    /// The migrations compiled into this build as `version|sha384-hex|file`
+    /// lines — the deploy-time `_sqlx_migrations` inspection
+    /// (`deploy/droplet/inspect-migrations.sh`) compares a database's applied
+    /// checksums against these without needing the source tree on the host.
+    /// sqlx's stored checksum is SHA-384, so `hex(checksum)` in SQLite compares
+    /// directly against what `shasum -a 384` prints for a file.
+    pub fn migration_manifest() -> String {
+        sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|migration| {
+                let checksum = migration.checksum.iter().fold(
+                    String::with_capacity(migration.checksum.len() * 2),
+                    |mut hex, byte| {
+                        let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                        hex
+                    },
+                );
+                format!(
+                    "{}|{}|{:04}_{}.sql",
+                    migration.version,
+                    checksum,
+                    migration.version,
+                    // sqlx renders the filename's description with spaces
+                    // ("check stats daily") — the manifest column must be the
+                    // real file name, so the transform runs back (G5).
+                    migration.description.replace(' ', "_"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Online backup: `VACUUM INTO` writes one consistent snapshot file — the WAL-aware
     /// way to copy a live database without quiescing it. This reads the store; it does
     /// not write it, so the single-writer invariant is untouched. Returns the backup's
@@ -500,7 +555,8 @@ impl Db {
     pub async fn list_monitors_engine(&self) -> Result<Vec<MonitorRow>, QueryError> {
         let rows = sqlx::query_as::<_, MonitorRow>(
             "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
-                    recover_threshold, generation, paused, created_at
+                    recover_threshold, generation, paused, method, expect_statuses, expect_body,
+                    created_at
              FROM monitors ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -540,7 +596,7 @@ impl Db {
         workspace: WorkspaceId,
     ) -> Result<Option<WorkspaceRow>, QueryError> {
         sqlx::query_as::<_, WorkspaceRow>(
-            "SELECT id, slug, name, created_at FROM workspaces WHERE id = ?",
+            "SELECT id, slug, name, plan, created_at FROM workspaces WHERE id = ?",
         )
         .bind(workspace.0.to_string())
         .fetch_optional(&self.pool)
@@ -551,11 +607,26 @@ impl Db {
     /// Every workspace, oldest first — an inventory for the (single-tenant-today) console.
     pub async fn list_workspaces(&self) -> Result<Vec<WorkspaceRow>, QueryError> {
         sqlx::query_as::<_, WorkspaceRow>(
-            "SELECT id, slug, name, created_at FROM workspaces ORDER BY created_at",
+            "SELECT id, slug, name, plan, created_at FROM workspaces ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Move a workspace to another plan (S3, D-022) — operator work only; `false`
+    /// means the id doesn't exist. The new tier gates the workspace's next write.
+    pub async fn set_workspace_plan(
+        &self,
+        workspace: WorkspaceId,
+        plan: Plan,
+    ) -> Result<bool, QueryError> {
+        let done = sqlx::query("UPDATE workspaces SET plan = ? WHERE id = ?")
+            .bind(plan.as_str())
+            .bind(workspace.0.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() == 1)
     }
 
     /// Persist an invite: the row keeps the code's digest, never the code — the plaintext
@@ -679,6 +750,91 @@ impl Db {
         })
     }
 
+    /// Every invitation addressed to `account`'s own stored email (S2-4). The match
+    /// is on the account's email, so an invitation sent to a mistyped address can
+    /// never be claimed by whoever it bounced to.
+    pub async fn invitations_for_account(
+        &self,
+        account: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<Vec<PendingInvitation>, QueryError> {
+        sqlx::query_as::<_, PendingInvitation>(
+            "SELECT i.id, i.workspace_id, w.name AS workspace_name, i.role, i.created_at
+               FROM workspace_invitations i
+               JOIN accounts a ON a.email = i.email
+               JOIN workspaces w ON w.id = i.workspace_id
+              WHERE a.id = ? AND i.expires_at > ? ORDER BY i.created_at",
+        )
+        .bind(account.0.to_string())
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Accept an invitation — only ever one addressed to `account`'s email, and the
+    /// seat it grants is the invitation's stored role, not anything the request
+    /// asked for. `Some(role)` = seated; `None` = no such invitation or it was
+    /// addressed to someone else — the answer stays uniform (S2-4). Already-seated
+    /// is success too: the acceptance is idempotent and the invitation still clears.
+    pub async fn accept_invitation(
+        &self,
+        id: &str,
+        account: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<Option<String>, QueryError> {
+        let mut tx = self.pool.begin().await?;
+        let invitation = sqlx::query_as::<_, (String, String)>(
+            "SELECT i.workspace_id, i.role FROM workspace_invitations i
+               JOIN accounts a ON a.email = i.email
+              WHERE i.id = ? AND a.id = ? AND i.expires_at > ?",
+        )
+        .bind(id)
+        .bind(account.0.to_string())
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workspace, role)) = invitation else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO members (workspace_id, account_id, role, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&workspace)
+        .bind(account.0.to_string())
+        .bind(&role)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM workspace_invitations WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(role))
+    }
+
+    /// Decline an invitation — same addressing rule as accept: only one addressed to
+    /// `account`'s email may be touched. `bool` = it was there (S2-4).
+    pub async fn decline_invitation(
+        &self,
+        id: &str,
+        account: AccountId,
+    ) -> Result<bool, QueryError> {
+        let gone = sqlx::query(
+            "DELETE FROM workspace_invitations
+              WHERE id = ?
+                AND email IN (SELECT email FROM accounts WHERE id = ?)",
+        )
+        .bind(id)
+        .bind(account.0.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(gone > 0)
+    }
+
     /// An account row by its normalized email — the sign-in lookup. `password_hash` is
     /// the argon2id PHC string; it never leaves the store's caller.
     pub async fn account_by_email(&self, email: &str) -> Result<Option<AccountRow>, QueryError> {
@@ -687,6 +843,21 @@ impl Db {
                FROM accounts WHERE email = ?",
         )
         .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// An account row by id — who a session belongs to (the `who` the account menu
+    /// shows). Reads no credential material: the hash column stays unselected.
+    pub async fn account_by_id(
+        &self,
+        account: AccountId,
+    ) -> Result<Option<AccountRow>, QueryError> {
+        sqlx::query_as::<_, AccountRow>(
+            "SELECT id, workspace_id, email, created_at FROM accounts WHERE id = ?",
+        )
+        .bind(account.0.to_string())
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
@@ -807,6 +978,77 @@ impl Db {
             .transpose()
     }
 
+    /// Every workspace `account` belongs to, with its role in each (S2) — the credential's
+    /// own claim, so the lookup is scoped *by* it, like `member_role`. The workspace
+    /// switcher renders exactly this list; it can never name a workspace the account
+    /// isn't in.
+    pub async fn memberships(&self, account: AccountId) -> Result<Vec<MembershipRow>, QueryError> {
+        sqlx::query_as::<_, MembershipRow>(
+            "SELECT w.id, w.slug, w.name, w.plan, m.role
+               FROM members m JOIN workspaces w ON w.id = m.workspace_id
+              WHERE m.account_id = ? ORDER BY w.name, w.created_at",
+        )
+        .bind(account.0.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// The enabled status pages — the snapshot writer's sweep (S2, D-021). A page is
+    /// enabled iff `status_title` is set non-empty; its monitors are the allowlist the
+    /// owner chose, in display order.
+    pub async fn status_pages(&self) -> Result<Vec<StatusPage>, QueryError> {
+        let workspaces = sqlx::query_as::<_, StatusPageRow>(
+            "SELECT id, slug, status_title AS title FROM workspaces
+              WHERE status_title IS NOT NULL AND status_title != ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut pages = Vec::with_capacity(workspaces.len());
+        for row in workspaces {
+            pages.push(self.status_page_of(row).await?);
+        }
+        Ok(pages)
+    }
+
+    /// The page behind one slug — the public route's lookup (S2). `None` covers both
+    /// "no such workspace" and "page off": the public answers them identically.
+    pub async fn status_page_by_slug(&self, slug: &str) -> Result<Option<StatusPage>, QueryError> {
+        let row = sqlx::query_as::<_, StatusPageRow>(
+            "SELECT id, slug, status_title AS title FROM workspaces
+              WHERE slug = ? AND status_title IS NOT NULL AND status_title != ''",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => Ok(Some(self.status_page_of(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// One enabled page's row plus its allowlisted monitors, ordered for display.
+    async fn status_page_of(&self, row: StatusPageRow) -> Result<StatusPage, QueryError> {
+        let workspace = Uuid::parse_str(&row.id)
+            .map(WorkspaceId)
+            .map_err(|_| QueryError::Corrupt(format!("workspace id {:?}", row.id)))?;
+        let monitors = sqlx::query_as::<_, StatusMonitorRow>(
+            "SELECT sm.monitor_id, m.name, sm.position
+               FROM status_monitors sm JOIN monitors m
+                 ON m.id = sm.monitor_id AND m.workspace_id = sm.workspace_id
+              WHERE sm.workspace_id = ? ORDER BY sm.position, m.name",
+        )
+        .bind(&row.id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(StatusPage {
+            workspace,
+            slug: row.slug,
+            title: row.title,
+            monitors,
+        })
+    }
+
     /// The API-token row behind a presented token's digest (S1c). Unscoped on purpose:
     /// the credential itself carries the workspace it authorizes — the row's
     /// `workspace_id` *is* the scope.
@@ -884,6 +1126,17 @@ impl WorkspaceDb<'_> {
         self.workspace
     }
 
+    /// This workspace's plan (S3, D-022) — the tier whose limits gate its writes. An
+    /// unreadable stored value is corruption, never quietly the free tier.
+    pub async fn plan(&self) -> Result<Plan, QueryError> {
+        let stored: String = sqlx::query_scalar("SELECT plan FROM workspaces WHERE id = ?")
+            .bind(self.workspace.0.to_string())
+            .fetch_one(&self.db.pool)
+            .await?;
+        Plan::parse(&stored)
+            .ok_or_else(|| QueryError::Corrupt(format!("unreadable plan {stored:?}")))
+    }
+
     pub async fn insert_monitor(&self, monitor: &Monitor) -> Result<(), QueryError> {
         if self.insert_monitor_within(monitor, u64::MAX).await? {
             Ok(())
@@ -907,9 +1160,11 @@ impl WorkspaceDb<'_> {
         }
         let inserted = sqlx::query(
             "INSERT INTO monitors (id, workspace_id, name, url, interval_s, timeout_s,
-                                  fail_threshold, recover_threshold, generation, paused, created_at)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?
-             WHERE (SELECT COUNT(*) FROM monitors WHERE workspace_id = ?) < ?",
+                                  fail_threshold, recover_threshold, generation, paused,
+                                  method, expect_statuses, expect_body, created_at)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?
+             WHERE (SELECT COUNT(*) FROM monitors WHERE workspace_id = ?) < ?
+               AND EXISTS (SELECT 1 FROM workspaces WHERE id = ?)",
         )
         .bind(monitor.id.0.to_string())
         .bind(monitor.workspace.0.to_string())
@@ -926,9 +1181,18 @@ impl WorkspaceDb<'_> {
         .bind(i64::from(monitor.thresholds.failures_to_open))
         .bind(i64::from(monitor.thresholds.passes_to_recover))
         .bind(i64::try_from(monitor.generation).map_err(|_| QueryError::OutOfRange("generation"))?)
+        .bind(monitor.method.as_str())
+        .bind(monitor_domain::encode_statuses(&monitor.expect.statuses))
+        .bind(monitor.expect.body_contains.as_deref())
         .bind(OffsetDateTime::now_utc())
         .bind(self.workspace.0.to_string())
         .bind(i64::try_from(max_monitors).unwrap_or(i64::MAX))
+        // The workspace must still exist when the row lands. A create waits on a DNS
+        // answer before it gets here, and an account deletion can remove the
+        // workspace meanwhile; `monitors.workspace_id` has no foreign key, so without
+        // this the monitor would outlive its workspace, unreachable and probed for
+        // ever. One statement, so it is serialised against the deletion's write lock.
+        .bind(self.workspace.0.to_string())
         .execute(&self.db.pool)
         .await?;
         Ok(inserted.rows_affected() == 1)
@@ -937,7 +1201,8 @@ impl WorkspaceDb<'_> {
     pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
         let rows = sqlx::query_as::<_, MonitorRow>(
             "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
-                    recover_threshold, generation, paused, created_at
+                    recover_threshold, generation, paused, method, expect_statuses, expect_body,
+                    created_at
              FROM monitors WHERE workspace_id = ? ORDER BY created_at",
         )
         .bind(self.workspace.0.to_string())
@@ -951,7 +1216,8 @@ impl WorkspaceDb<'_> {
     pub async fn monitor_row(&self, monitor: MonitorId) -> Result<Option<MonitorRow>, QueryError> {
         let row = sqlx::query_as::<_, MonitorRow>(
             "SELECT id, workspace_id, name, url, interval_s, timeout_s, fail_threshold,
-                    recover_threshold, generation, paused, created_at
+                    recover_threshold, generation, paused, method, expect_statuses, expect_body,
+                    created_at
              FROM monitors WHERE id = ? AND workspace_id = ?",
         )
         .bind(monitor.0.to_string())
@@ -995,6 +1261,7 @@ impl WorkspaceDb<'_> {
             "UPDATE monitors
              SET name = ?, url = ?, interval_s = ?, timeout_s = ?, paused = ?,
                  fail_threshold = ?, recover_threshold = ?,
+                 method = ?, expect_statuses = ?, expect_body = ?,
                  generation = generation + 1
              WHERE id = ? AND generation = ? AND workspace_id = ?",
         )
@@ -1011,6 +1278,9 @@ impl WorkspaceDb<'_> {
         .bind(monitor.paused)
         .bind(i64::from(monitor.thresholds.failures_to_open))
         .bind(i64::from(monitor.thresholds.passes_to_recover))
+        .bind(monitor.method.as_str())
+        .bind(monitor_domain::encode_statuses(&monitor.expect.statuses))
+        .bind(monitor.expect.body_contains.as_deref())
         .bind(monitor.id.0.to_string())
         .bind(i64::try_from(expected_generation).map_err(|_| QueryError::OutOfRange("generation"))?)
         .bind(self.workspace.0.to_string())
@@ -1039,6 +1309,107 @@ impl WorkspaceDb<'_> {
         .execute(&self.db.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete a monitor together with everything recorded about it (D-026): its queued
+    /// alerts, incidents, checks and daily aggregates, then the monitor itself, whose
+    /// maintenance windows and status-page listing go with it. Every statement is bound
+    /// to this workspace, so a monitor id from elsewhere deletes nothing. `false` means
+    /// this workspace has no such monitor.
+    ///
+    /// The work is done in two steps so that no single statement holds the store's one
+    /// write lock for long — every workspace's observation commits wait on it:
+    /// [`Self::shed_evidence`] pauses the monitor and removes its history in small
+    /// batches, then one last transaction removes what is left and the monitor.
+    ///
+    /// A failure part-way leaves a paused monitor with some of its history gone; asking
+    /// again finishes the job. What is left is always a state the monitor can run from:
+    /// an OPEN incident and its queued alerts are never shed, only removed with the
+    /// monitor itself, so a monitor resumed after a half-finished delete still has the
+    /// incident the observation writer believes is open.
+    pub async fn delete_monitor_with_evidence(
+        &self,
+        monitor: MonitorId,
+    ) -> Result<bool, QueryError> {
+        if !self.shed_evidence(monitor).await? {
+            return Ok(false);
+        }
+        let id = monitor.0.to_string();
+        let workspace = self.workspace.0.to_string();
+        let mut tx = self.db.pool.begin().await?;
+        // Children before parents: the foreign keys refuse any other order.
+        for statement in [
+            "DELETE FROM notify_outbox WHERE monitor_id = ? AND workspace_id = ?",
+            "DELETE FROM incidents WHERE monitor_id = ? AND workspace_id = ?",
+            "DELETE FROM checks WHERE monitor_id = ? AND workspace_id = ?",
+            "DELETE FROM check_stats_daily WHERE monitor_id = ? AND workspace_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&id)
+                .bind(&workspace)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let deleted = sqlx::query("DELETE FROM monitors WHERE id = ? AND workspace_id = ?")
+            .bind(&id)
+            .bind(&workspace)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted > 0)
+    }
+
+    /// The first step of [`Self::delete_monitor_with_evidence`]: pause the monitor and
+    /// bump its generation (nothing new is scheduled, a probe in flight is dropped as
+    /// stale), then remove its history in batches of [`EVIDENCE_DELETE_BATCH`] rows,
+    /// each its own short transaction. `false` means this workspace has no such monitor.
+    ///
+    /// Only what is finished is shed: checks, daily aggregates, RESOLVED incidents and
+    /// their alerts. The open incident stays with the monitor until both go together.
+    pub(crate) async fn shed_evidence(&self, monitor: MonitorId) -> Result<bool, QueryError> {
+        let id = monitor.0.to_string();
+        let workspace = self.workspace.0.to_string();
+        let stopped = sqlx::query(
+            "UPDATE monitors SET paused = 1, generation = generation + 1
+             WHERE id = ? AND workspace_id = ?",
+        )
+        .bind(&id)
+        .bind(&workspace)
+        .execute(&self.db.pool)
+        .await?
+        .rows_affected();
+        if stopped == 0 {
+            return Ok(false);
+        }
+        // Static statements, one per table: no SQL is ever assembled at run time.
+        // Alerts before the incidents they belong to: the foreign key says so.
+        for statement in [
+            "DELETE FROM notify_outbox WHERE id IN (
+                 SELECT o.id FROM notify_outbox o JOIN incidents i ON i.id = o.incident_id
+                  WHERE o.monitor_id = ? AND o.workspace_id = ? AND i.state = 'resolved'
+                  LIMIT ?)",
+            "DELETE FROM incidents WHERE id IN (SELECT id FROM incidents
+                 WHERE monitor_id = ? AND workspace_id = ? AND state = 'resolved' LIMIT ?)",
+            "DELETE FROM checks WHERE id IN (SELECT id FROM checks
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+            "DELETE FROM check_stats_daily WHERE rowid IN (SELECT rowid FROM check_stats_daily
+                 WHERE monitor_id = ? AND workspace_id = ? LIMIT ?)",
+        ] {
+            loop {
+                let removed = sqlx::query(statement)
+                    .bind(&id)
+                    .bind(&workspace)
+                    .bind(EVIDENCE_DELETE_BATCH)
+                    .execute(&self.db.pool)
+                    .await?
+                    .rows_affected();
+                if removed < EVIDENCE_DELETE_BATCH.unsigned_abs() {
+                    break;
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Whether the monitor has any recorded evidence (checks or incidents). The FKs would
@@ -1211,13 +1582,39 @@ impl Db {
         Ok(())
     }
 
-    /// Delete every session past its expiry — the retention tick's housekeeping so
-    /// forgotten rows can't accumulate forever.
-    pub async fn sweep_expired_sessions(&self) -> Result<u64, QueryError> {
-        let done = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
-            .bind(OffsetDateTime::now_utc())
-            .execute(&self.pool)
-            .await?;
+    /// Delete up to `limit` sessions past their expiry — the retention tick's
+    /// housekeeping, bounded per call like every other retention delete (D-012) so a
+    /// forgotten backlog can't hold the store. The caller repeats until the count
+    /// comes back short; `0`/`1` bounds still delete exactly the expired.
+    pub async fn sweep_expired_sessions(&self, limit: u32) -> Result<u64, QueryError> {
+        let done = sqlx::query(
+            "DELETE FROM sessions WHERE id IN (
+               SELECT id FROM sessions WHERE expires_at <= ? LIMIT ?)",
+        )
+        .bind(OffsetDateTime::now_utc())
+        .bind(i64::from(limit.max(1)))
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    /// Delete up to `limit` invitations past `now` — same retention-tick
+    /// housekeeping as [`sweep_expired_sessions`], same bound (D-012): expired rows
+    /// are honest-expired on read already, this just keeps the table small. The
+    /// caller passes `now` so a test can sweep a future instant.
+    pub async fn sweep_expired_invitations(
+        &self,
+        now: OffsetDateTime,
+        limit: u32,
+    ) -> Result<u64, QueryError> {
+        let done = sqlx::query(
+            "DELETE FROM workspace_invitations WHERE id IN (
+               SELECT id FROM workspace_invitations WHERE expires_at <= ? LIMIT ?)",
+        )
+        .bind(now)
+        .bind(i64::from(limit.max(1)))
+        .execute(&self.pool)
+        .await?;
         Ok(done.rows_affected())
     }
 }
@@ -1239,6 +1636,7 @@ impl WorkspaceDb<'_> {
             "INSERT INTO maintenance_windows (monitor_id, workspace_id, starts_at, ends_at, reason, created_at)
              SELECT ?, ?, ?, ?, ?, ?
              WHERE EXISTS (SELECT 1 FROM monitors WHERE id = ? AND workspace_id = ?)
+               AND (SELECT COUNT(*) FROM maintenance_windows WHERE monitor_id = ?) < ?
              RETURNING id, monitor_id, starts_at, ends_at, reason, created_at",
         )
         .bind(monitor.0.to_string())
@@ -1249,9 +1647,20 @@ impl WorkspaceDb<'_> {
         .bind(OffsetDateTime::now_utc())
         .bind(monitor.0.to_string())
         .bind(self.workspace.0.to_string())
+        .bind(monitor.0.to_string())
+        .bind(MAX_WINDOWS_PER_MONITOR)
         .fetch_one(&self.db.pool)
-        .await
-        .map_err(|e| {
+        .await;
+        if matches!(row, Err(sqlx::Error::RowNotFound))
+            && self.monitor_generation(monitor).await?.is_some()
+        {
+            // The monitor is there, so it was the cap that refused the row.
+            return Err(QueryError::Conflict(format!(
+                "a monitor holds at most {MAX_WINDOWS_PER_MONITOR} maintenance windows; \
+                 cancel one first"
+            )));
+        }
+        let row = row.map_err(|e| {
             if let sqlx::Error::RowNotFound = e {
                 return QueryError::Invalid("unknown monitor".into());
             }
@@ -1315,25 +1724,61 @@ impl WorkspaceDb<'_> {
         Ok(last)
     }
 
-    /// The `limit` most recent slot observations for a monitor, oldest→newest — the tail the
-    /// restart rebuild replays through `Health`.
+    /// Coverage-gap rows kept in the rebuild tail on top of the `limit` real
+    /// rows — the tail's hard bound is `limit + GAP_TAIL` (C re-review).
+    const GAP_TAIL: i64 = 64;
+
+    /// The tail the restart rebuild replays through `Health`, oldest→newest: the
+    /// `limit` most recent *real* slot observations — everything but the monitor's
+    /// own `address_budget` coverage gaps — plus up to `GAP_TAIL` of the newest
+    /// gaps, merged in commit order (N-5 re-review: a starving address could
+    /// otherwise fill the whole tail with gaps and a restart would rebuild a
+    /// shorter streak than the live machine was holding; the gaps stay because
+    /// they are freshness truth). C re-review: the tail is strictly bounded —
+    /// `limit + GAP_TAIL` rows no matter how much history lies behind it — and
+    /// ordinary `missed` rows (no `detail`) count as real evidence, matching
+    /// the live machine's own accounting.
     pub async fn recent_outcomes(
         &self,
         monitor: MonitorId,
         limit: i64,
     ) -> Result<Vec<SlotObservation>, QueryError> {
-        let rows = sqlx::query_as::<_, (String, Option<i64>)>(
-            "SELECT outcome, http_status FROM checks
-             WHERE monitor_id = ? AND workspace_id = ? ORDER BY slot_at DESC, id DESC LIMIT ?",
+        // Real rows: `IS` is NULL-safe equality — an ordinary missed row has
+        // NULL detail and `NULL IS 'address_budget'` is false, so it counts
+        // toward the limit like any other real observation.
+        let mut rows = sqlx::query_as::<_, (i64, String, Option<i64>, Option<String>)>(
+            "SELECT id, outcome, http_status, detail FROM checks
+             WHERE monitor_id = ? AND workspace_id = ?
+               AND NOT (outcome = 'missed' AND detail IS 'address_budget')
+             ORDER BY id DESC LIMIT ?",
         )
         .bind(monitor.0.to_string())
         .bind(self.workspace.0.to_string())
         .bind(limit)
         .fetch_all(&self.db.pool)
         .await?;
+        // The newest coverage gaps — freshness truth, bounded so starvation
+        // history cannot crowd the real rows out of memory or the replay.
+        let gaps = sqlx::query_as::<_, (i64, String, Option<i64>, Option<String>)>(
+            "SELECT id, outcome, http_status, detail FROM checks
+             WHERE monitor_id = ? AND workspace_id = ?
+               AND outcome = 'missed' AND detail IS 'address_budget'
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(monitor.0.to_string())
+        .bind(self.workspace.0.to_string())
+        .bind(Self::GAP_TAIL)
+        .fetch_all(&self.db.pool)
+        .await?;
+        rows.extend(gaps);
+        // id is COMMIT order, not slot order — a slot written late lands where
+        // it was committed; the replay wants the evidence in the order the
+        // machine actually saw it.
+        rows.sort_by_key(|(id, ..)| *id);
         rows.iter()
-            .rev()
-            .map(|(outcome, http_status)| decode_outcome(outcome, *http_status))
+            .map(|(_, outcome, http_status, detail)| {
+                decode_outcome(outcome, *http_status, detail.as_deref())
+            })
             .collect()
     }
 
@@ -1414,17 +1859,23 @@ impl Db {
     /// behind it) for seconds: the caller repeats until `RetainReport::exhausted(batch)`,
     /// one writer command per batch, and observations interleave between them.
     ///
+    /// **Per-workspace horizons (S3, D-022).** `workspaces` maps each workspace to the
+    /// cutoffs its plan resolves to; every delete joins it, so a `free` workspace's
+    /// evidence expires on the free plan's shorter clocks while an operator workspace's
+    /// same-age rows are kept. A workspace absent from the map keeps everything —
+    /// missing a tenant is "keep", never "delete".
+    ///
     /// Open incidents and undelivered rows of kept incidents are never touched. Called
     /// only by the single writer.
     pub async fn retain(
         &self,
-        cutoffs: &RetentionCutoffs,
+        workspaces: &[(WorkspaceId, RetentionCutoffs)],
         batch: u32,
     ) -> Result<RetainReport, QueryError> {
         let batch = i64::from(batch.max(1));
         let mut conn = self.pool.acquire().await?;
         let Some(cap) = self.max_db_bytes else {
-            return retain_batch(&mut conn, cutoffs, batch).await;
+            return retain_batch(&mut conn, workspaces, batch).await;
         };
         // Lift the ceiling on this one connection for this one transaction, then put it
         // back whatever happened: SQLite clamps the restored ceiling up to the file's size,
@@ -1444,7 +1895,7 @@ impl Db {
         )))
         .execute(&mut *conn)
         .await?;
-        let result = retain_batch(&mut conn, cutoffs, batch).await;
+        let result = retain_batch(&mut conn, workspaces, batch).await;
         if let Err(error) = apply_max_bytes(&mut conn, cap).await {
             tracing::error!(%error, "could not restore the size ceiling; closing the connection");
             let _ = conn.close().await;
@@ -1604,8 +2055,8 @@ impl Db {
             }
             Effect::IncidentOpened => {
                 // first_fail_at = the streak's start: the oldest consecutive failing
-                // slot since the last pass/missed — derived from committed rows, so it
-                // is right no matter when the machine was last in memory.
+                // slot since the last pass/missed — derived from committed rows. A
+                // budget gap (missed + address_budget) is neutral (N-5 re-review).
                 let first_fail_at: Option<OffsetDateTime> = sqlx::query_scalar(
                     "SELECT MIN(slot_at) FROM checks
                      WHERE monitor_id = ?1
@@ -1613,7 +2064,7 @@ impl Db {
                        AND slot_at > COALESCE(
                              (SELECT MAX(slot_at) FROM checks
                               WHERE monitor_id = ?1
-                                AND outcome IN ('pass', 'missed')),
+                                AND (outcome = 'pass' OR (outcome = 'missed' AND detail IS NOT 'address_budget'))),
                              '')",
                 )
                 .bind(observation.monitor_id.0.to_string())
@@ -1694,42 +2145,66 @@ fn reserve_ceiling(cap_pages: i64, page_count: i64) -> i64 {
 }
 
 /// One bounded retention batch, in one transaction on `conn` (see `Db::retain`).
+/// `workspaces` lands in `temp.plan_cutoffs` first — every expiry join below keys a
+/// row's `workspace_id` to the horizons its workspace's plan resolved to.
 async fn retain_batch(
     conn: &mut sqlx::SqliteConnection,
-    cutoffs: &RetentionCutoffs,
+    workspaces: &[(WorkspaceId, RetentionCutoffs)],
     batch: i64,
 ) -> Result<RetainReport, QueryError> {
     use sqlx::Connection as _;
     let mut tx = conn.begin().await?;
+    sqlx::query("DROP TABLE IF EXISTS temp.plan_cutoffs")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "CREATE TEMP TABLE plan_cutoffs (
+            workspace_id TEXT PRIMARY KEY,
+            checks TEXT NOT NULL, aggregates TEXT NOT NULL,
+            incidents TEXT NOT NULL, outbox TEXT NOT NULL)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    for (workspace, cutoffs) in workspaces {
+        sqlx::query("INSERT INTO temp.plan_cutoffs VALUES (?, ?, ?, ?, ?)")
+            .bind(workspace.0.to_string())
+            .bind(cutoffs.checks)
+            .bind(cutoffs.aggregates)
+            .bind(cutoffs.incidents)
+            .bind(cutoffs.delivered_outbox)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("DROP TABLE IF EXISTS temp.expiring")
         .execute(&mut *tx)
         .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TEMP TABLE expiring AS
-         SELECT id, monitor_id, workspace_id, date(slot_at) AS day, outcome FROM checks
-         WHERE slot_at < ?1 AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
-         ORDER BY id LIMIT ?2"
+         SELECT checks.id, checks.monitor_id, checks.workspace_id, date(slot_at) AS day, outcome
+         FROM checks JOIN temp.plan_cutoffs pc ON pc.workspace_id = checks.workspace_id
+         WHERE slot_at < pc.checks AND NOT {BIRTH_STREAK_OF_OPEN_INCIDENT}
+         ORDER BY checks.id LIMIT ?1"
     )))
-    .bind(cutoffs.checks)
     .bind(batch)
     .execute(&mut *tx)
     .await?;
     let deleted = sqlx::query("DELETE FROM checks WHERE id IN (SELECT id FROM temp.expiring)")
         .execute(&mut *tx)
         .await?;
-    let aggregate_day = cutoffs.aggregates.date().to_string();
-    let pruned = prune_expired(&mut tx, cutoffs, &aggregate_day, batch).await?;
-    // Space is free now; write the aggregates of what was deleted.
+    let pruned = prune_expired(&mut tx, batch).await?;
+    // Space is free now; write the aggregates of what was deleted — days younger than
+    // that workspace's own aggregate horizon.
     let aggregated = sqlx::query(
         "INSERT INTO check_stats_daily
             (monitor_id, workspace_id, day, pass, http_fail, transport, timeout, missed)
-         SELECT monitor_id, workspace_id, day,
+         SELECT monitor_id, temp.expiring.workspace_id, day,
                 SUM(outcome = 'pass'), SUM(outcome = 'http_fail'),
                 SUM(outcome = 'transport'), SUM(outcome = 'timeout'),
                 SUM(outcome = 'missed')
          FROM temp.expiring
-         WHERE day >= ?1
-         GROUP BY monitor_id, workspace_id, day
+         JOIN temp.plan_cutoffs pc ON pc.workspace_id = temp.expiring.workspace_id
+         WHERE day >= date(pc.aggregates)
+         GROUP BY monitor_id, temp.expiring.workspace_id, day
          ON CONFLICT (monitor_id, day) DO UPDATE SET
             pass = check_stats_daily.pass + excluded.pass,
             http_fail = check_stats_daily.http_fail + excluded.http_fail,
@@ -1737,7 +2212,6 @@ async fn retain_batch(
             timeout = check_stats_daily.timeout + excluded.timeout,
             missed = check_stats_daily.missed + excluded.missed",
     )
-    .bind(&aggregate_day)
     .execute(&mut *tx)
     .await?;
     sqlx::query("DROP TABLE temp.expiring")
@@ -1756,15 +2230,14 @@ async fn retain_batch(
 /// Returns a report with only those counts set.
 async fn prune_expired(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    cutoffs: &RetentionCutoffs,
-    aggregate_day: &str,
     batch: i64,
 ) -> Result<RetainReport, QueryError> {
     let old_days = sqlx::query(
         "DELETE FROM check_stats_daily WHERE rowid IN (
-           SELECT rowid FROM check_stats_daily WHERE day < ?1 LIMIT ?2)",
+           SELECT d.rowid FROM check_stats_daily d
+           JOIN temp.plan_cutoffs pc ON pc.workspace_id = d.workspace_id
+           WHERE d.day < date(pc.aggregates) LIMIT ?1)",
     )
-    .bind(aggregate_day)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
@@ -1774,10 +2247,11 @@ async fn prune_expired(
         .await?;
     sqlx::query(
         "CREATE TEMP TABLE expired_incidents AS
-         SELECT id FROM incidents WHERE state = 'resolved' AND resolved_at < ?1
-         ORDER BY id LIMIT ?2",
+         SELECT i.id FROM incidents i
+         JOIN temp.plan_cutoffs pc ON pc.workspace_id = i.workspace_id
+         WHERE i.state = 'resolved' AND i.resolved_at < pc.incidents
+         ORDER BY i.id LIMIT ?1",
     )
-    .bind(cutoffs.incidents)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
@@ -1795,18 +2269,19 @@ async fn prune_expired(
         .await?;
     let windows = sqlx::query(
         "DELETE FROM maintenance_windows WHERE id IN (
-           SELECT id FROM maintenance_windows WHERE ends_at < ?1 LIMIT ?2)",
+           SELECT w.id FROM maintenance_windows w
+           JOIN temp.plan_cutoffs pc ON pc.workspace_id = w.workspace_id
+           WHERE w.ends_at < pc.incidents LIMIT ?1)",
     )
-    .bind(cutoffs.incidents)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
     let delivered = sqlx::query(
         "DELETE FROM notify_outbox WHERE id IN (
-           SELECT id FROM notify_outbox
-           WHERE delivered_at IS NOT NULL AND delivered_at < ?1 LIMIT ?2)",
+           SELECT o.id FROM notify_outbox o
+           JOIN temp.plan_cutoffs pc ON pc.workspace_id = o.workspace_id
+           WHERE o.delivered_at IS NOT NULL AND o.delivered_at < pc.outbox LIMIT ?1)",
     )
-    .bind(cutoffs.delivered_outbox)
     .bind(batch)
     .execute(&mut **tx)
     .await?;
@@ -1856,11 +2331,15 @@ async fn enqueue_outbox(
     if queue_email {
         channels.push("email");
     }
+    // `fetch_optional`: a monitor whose workspace row is missing has no webhook to plan
+    // for. Failing here would fail the observation's whole commit on every slot, and a
+    // failed commit counts against the write path's health for every workspace.
     let tenant_webhook: Option<String> =
         sqlx::query_scalar("SELECT webhook_url FROM workspaces WHERE id = ?")
             .bind(workspace.0.to_string())
-            .fetch_one(&mut **tx)
-            .await?;
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
     if tenant_webhook.is_some() {
         channels.push("tenant_webhook");
     }
@@ -1888,7 +2367,9 @@ async fn enqueue_outbox(
 pub fn encode_slot(slot: SlotObservation, http_status: Option<u16>) -> (&'static str, Option<i64>) {
     let status = http_status.map(i64::from);
     match slot {
-        SlotObservation::Missed => ("missed", None),
+        // A budget-refused gap is still a `missed` on the wire — the detail
+        // column (`address_budget`) is what decodes it back to `Budgeted`.
+        SlotObservation::Missed | SlotObservation::Budgeted => ("missed", None),
         SlotObservation::Probe(CheckOutcome::Pass) => ("pass", status),
         SlotObservation::Probe(CheckOutcome::HttpFail { .. }) => ("http_fail", status),
         SlotObservation::Probe(CheckOutcome::Transport) => ("transport", None),
@@ -1897,13 +2378,20 @@ pub fn encode_slot(slot: SlotObservation, http_status: Option<u16>) -> (&'static
 }
 
 /// Rebuild a `SlotObservation` from a stored row; unknown text is corruption, not a default.
-fn decode_outcome(outcome: &str, http_status: Option<i64>) -> Result<SlotObservation, QueryError> {
+/// A `missed` row whose committed detail is `address_budget` decodes to the
+/// streak-neutral `Budgeted` — the gap our own bound committed (B re-review).
+fn decode_outcome(
+    outcome: &str,
+    http_status: Option<i64>,
+    detail: Option<&str>,
+) -> Result<SlotObservation, QueryError> {
     let status = http_status
         .map(|value| {
             u16::try_from(value).map_err(|_| QueryError::Corrupt("http_status out of range".into()))
         })
         .transpose()?;
     Ok(match outcome {
+        "missed" if detail == Some("address_budget") => SlotObservation::Budgeted,
         "missed" => SlotObservation::Missed,
         "pass" => SlotObservation::Probe(CheckOutcome::Pass),
         "http_fail" => SlotObservation::Probe(CheckOutcome::HttpFail {
@@ -1924,6 +2412,20 @@ pub struct Gate {
     pub maintenance: bool,
 }
 
+/// Maintenance windows one monitor may hold at once, finished ones included until
+/// retention prunes them. Windows go with their monitor in one cascade when it is
+/// deleted, so their number has to be bounded like everything else a delete removes.
+pub const MAX_WINDOWS_PER_MONITOR: i64 = 50;
+
+/// API tokens one workspace may hold, revoked ones included. They go with the workspace
+/// in one cascade when it is deleted.
+pub const MAX_TOKENS_PER_WORKSPACE: i64 = 100;
+
+/// Rows removed per statement when a monitor is deleted with its evidence (D-026). Small
+/// enough that one batch holds the write lock for milliseconds, so the observation
+/// writer never waits its busy timeout behind a delete.
+pub const EVIDENCE_DELETE_BATCH: i64 = 2_000;
+
 /// One `maintenance_windows` row — schedule-scoped suppression. `active` is computed at
 /// read time so the API never has to re-derive it.
 #[derive(Debug, FromRow)]
@@ -1942,6 +2444,8 @@ pub struct WorkspaceRow {
     pub id: String,
     pub slug: String,
     pub name: String,
+    /// The stored plan tier (S3, D-022) — `Plan::parse` reads it.
+    pub plan: String,
     pub created_at: OffsetDateTime,
 }
 
@@ -1982,6 +2486,26 @@ pub struct NewAccount {
     pub password_hash: String,
 }
 
+/// A pending invitation as the inviting workspace's owner sees it (S2-4).
+#[derive(Debug, FromRow)]
+pub struct InvitationRow {
+    pub id: String,
+    pub email: String,
+    pub role: String,
+    pub created_at: String,
+}
+
+/// A pending invitation as the invitee sees it: the workspace's name, never more of
+/// the inviter's side than the seat being offered needs (S2-4).
+#[derive(Debug, FromRow)]
+pub struct PendingInvitation {
+    pub id: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub role: String,
+    pub created_at: String,
+}
+
 /// One `members` row joined to its account's email — the roster the API lists (S1c).
 /// `role()` parses the stored role; an unreadable one is corruption, not a viewer.
 #[derive(Debug, FromRow)]
@@ -1990,6 +2514,61 @@ pub struct MemberRow {
     pub email: String,
     pub role: String,
     pub created_at: OffsetDateTime,
+}
+
+/// One membership row of `GET /api/workspaces` — the workspace the account sits in
+/// and its role there (S2). `plan` is the workspace's tier (S3).
+#[derive(Debug, FromRow)]
+pub struct MembershipRow {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub plan: String,
+    pub role: String,
+}
+
+/// A `status_monitors` row joined to its monitor's name — the page's allowlist, in
+/// display order (S2).
+#[derive(Debug, FromRow)]
+pub struct StatusMonitorRow {
+    pub monitor_id: String,
+    pub name: String,
+    pub position: i64,
+}
+
+/// The workspaces row's page fields for the public/config lookups.
+#[derive(Debug, FromRow)]
+struct StatusPageRow {
+    id: String,
+    slug: String,
+    title: String,
+}
+
+/// The workspaces row's page fields for the member-facing config read.
+#[derive(Debug, FromRow)]
+struct PageConfigRow {
+    slug: String,
+    title: Option<String>,
+}
+
+/// An enabled public status page (S2, D-021): which workspace, at which slug, under
+/// which title, showing which monitors. `title` is always non-empty — enabled pages
+/// are the only ones this type represents.
+#[derive(Debug)]
+pub struct StatusPage {
+    pub workspace: WorkspaceId,
+    pub slug: String,
+    pub title: String,
+    pub monitors: Vec<StatusMonitorRow>,
+}
+
+/// The status-page configuration as the editor reads it (S2): title `None` means the
+/// page is off; the monitor set is kept so re-enabling restores it.
+#[derive(Debug)]
+pub struct StatusPageConfig {
+    pub slug: String,
+    pub title: Option<String>,
+    pub monitors: Vec<StatusMonitorRow>,
 }
 
 impl MemberRow {
@@ -2056,6 +2635,11 @@ impl ViewerDb<'_> {
         self.view.id()
     }
 
+    /// This workspace's plan tier (S3, D-022).
+    pub async fn plan(&self) -> Result<Plan, QueryError> {
+        self.view.plan().await
+    }
+
     pub async fn list_monitors(&self) -> Result<Vec<MonitorRow>, QueryError> {
         self.view.list_monitors().await
     }
@@ -2107,6 +2691,32 @@ impl ViewerDb<'_> {
 
     pub async fn list_outbox(&self, monitor: MonitorId) -> Result<Vec<OutboxRow>, QueryError> {
         self.view.list_outbox(monitor).await
+    }
+
+    /// The workspace's status-page configuration as saved (S2): slug, title (`None` =
+    /// the page is off) and the allowlisted monitors, in display order. Reads like this
+    /// are workspace state any member may see.
+    pub async fn status_page(&self) -> Result<StatusPageConfig, QueryError> {
+        let row = sqlx::query_as::<_, PageConfigRow>(
+            "SELECT slug, status_title AS title FROM workspaces WHERE id = ?",
+        )
+        .bind(self.view.workspace.0.to_string())
+        .fetch_one(&self.view.db.pool)
+        .await?;
+        let monitors = sqlx::query_as::<_, StatusMonitorRow>(
+            "SELECT sm.monitor_id, m.name, sm.position
+               FROM status_monitors sm JOIN monitors m
+                 ON m.id = sm.monitor_id AND m.workspace_id = sm.workspace_id
+              WHERE sm.workspace_id = ? ORDER BY sm.position, m.name",
+        )
+        .bind(self.view.workspace.0.to_string())
+        .fetch_all(&self.view.db.pool)
+        .await?;
+        Ok(StatusPageConfig {
+            slug: row.slug,
+            title: row.title,
+            monitors,
+        })
     }
 
     /// The workspace's roster, oldest membership first — membership itself is
@@ -2165,6 +2775,15 @@ impl MemberDb<'_> {
     /// monitor isn't in this workspace.
     pub async fn delete_monitor(&self, monitor: MonitorId) -> Result<bool, QueryError> {
         self.view.view.delete_monitor(monitor).await
+    }
+
+    /// Delete a monitor and everything recorded about it (D-026); `false` = the
+    /// monitor isn't in this workspace.
+    pub async fn delete_monitor_with_evidence(
+        &self,
+        monitor: MonitorId,
+    ) -> Result<bool, QueryError> {
+        self.view.view.delete_monitor_with_evidence(monitor).await
     }
 
     pub async fn create_window(
@@ -2226,6 +2845,134 @@ impl MemberDb<'_> {
             .await?;
         Ok(())
     }
+
+    /// Rename the workspace (S2 onboarding step 1: the signup name is the account's
+    /// email — the first thing a new tenant fixes). Returns the updated row.
+    pub async fn rename_workspace(&self, name: &str) -> Result<WorkspaceRow, QueryError> {
+        sqlx::query_as::<_, WorkspaceRow>(
+            "UPDATE workspaces SET name = ? WHERE id = ?
+             RETURNING id, slug, name, plan, created_at",
+        )
+        .bind(name)
+        .bind(self.view.view.workspace.0.to_string())
+        .fetch_one(&self.view.view.db.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Write the status page configuration in one transaction (S2, D-021): `slug`
+    /// (`Some` renames the page's public path), `title` (`None` or empty turns the
+    /// page off without losing the monitor set), and the allowlisted monitors in
+    /// display order. Monitors that aren't this workspace's are refused — a PUT can
+    /// never publish another tenant's target.
+    pub async fn set_status_page(
+        &self,
+        slug: Option<&str>,
+        title: Option<&str>,
+        monitors: &[MonitorId],
+    ) -> Result<(), QueryError> {
+        let ws = &self.view.view;
+        let mut tx = ws.db.pool.begin().await?;
+        if let Some(slug) = slug {
+            // Held slugs count as taken — except ones this workspace itself released,
+            // which it may pick back up (S2 review).
+            let taken = sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT COUNT(*) FROM workspaces WHERE slug = ? AND id != ?)
+                      + (SELECT COUNT(*) FROM status_held_slugs
+                          WHERE slug = ? AND workspace_id != ?)",
+            )
+            .bind(slug)
+            .bind(ws.workspace.0.to_string())
+            .bind(slug)
+            .bind(ws.workspace.0.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if taken > 0 {
+                return Err(QueryError::Conflict("that slug is already taken".into()));
+            }
+            // The name being left behind stays held by this workspace — another
+            // tenant can never serve their page under a name readers associate with
+            // the previous owner's.
+            let released =
+                sqlx::query_scalar::<_, String>("SELECT slug FROM workspaces WHERE id = ?")
+                    .bind(ws.workspace.0.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if released != slug {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO status_held_slugs (slug, workspace_id, released_at)
+                     VALUES (?, ?, ?)",
+                )
+                .bind(&released)
+                .bind(ws.workspace.0.to_string())
+                .bind(
+                    OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|e| QueryError::Corrupt(format!("released_at: {e}")))?,
+                )
+                .execute(&mut *tx)
+                .await?;
+                // The held set stays bounded per workspace (S3 review): a rename
+                // loop would otherwise grow a tombstone per call. The newest 64
+                // stay — a name older than that has been recycled so many times
+                // the association is gone anyway. `default` is exempt from the
+                // cap (N4 review): it is the seeded page's name, so every reader
+                // who ever knew it keeps it pointing at the seeded workspace —
+                // a rename loop must never free it for another tenant.
+                sqlx::query(
+                    "DELETE FROM status_held_slugs
+                      WHERE workspace_id = ? AND slug != 'default' AND slug NOT IN (
+                        SELECT slug FROM status_held_slugs
+                         WHERE workspace_id = ?
+                         ORDER BY released_at DESC, slug DESC LIMIT 64)",
+                )
+                .bind(ws.workspace.0.to_string())
+                .bind(ws.workspace.0.to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query("UPDATE workspaces SET slug = ? WHERE id = ?")
+                .bind(slug)
+                .bind(ws.workspace.0.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        let title = title.filter(|t| !t.is_empty());
+        sqlx::query("UPDATE workspaces SET status_title = ? WHERE id = ?")
+            .bind(title)
+            .bind(ws.workspace.0.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM status_monitors WHERE workspace_id = ?")
+            .bind(ws.workspace.0.to_string())
+            .execute(&mut *tx)
+            .await?;
+        for (position, monitor) in monitors.iter().enumerate() {
+            // The scoped insert is the isolation: a monitor_id outside this
+            // workspace matches nothing and cannot be published through this view.
+            let position = i64::try_from(position)
+                .map_err(|_| QueryError::Invalid("more monitors than a page can order".into()))?;
+            let inserted = sqlx::query(
+                "INSERT INTO status_monitors (workspace_id, monitor_id, position)
+                 SELECT ?, m.id, ? FROM monitors m
+                  WHERE m.id = ? AND m.workspace_id = ?",
+            )
+            .bind(ws.workspace.0.to_string())
+            .bind(position)
+            .bind(monitor.0.to_string())
+            .bind(ws.workspace.0.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if inserted == 0 {
+                return Err(QueryError::Invalid(
+                    "a listed monitor is not in this workspace".into(),
+                ));
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// Member plus the workspace's people and keys — the owner role and the operator
@@ -2270,6 +3017,76 @@ impl OwnerDb<'_> {
             QueryError::Sql(e)
         })?;
         Ok(())
+    }
+
+    /// Record an invitation for `email` at `role` (S2-4): the seat is earned by the
+    /// invitee's acceptance — this only ever queues one. Re-inviting the same
+    /// address refreshes the pending row, which is what lets the handler's answer
+    /// stay uniform. An invitation can never carry `owner` — ownership is granted
+    /// by `set_member_role` on a seated member, never by consent of the inviter alone.
+    pub async fn invite_member(
+        &self,
+        email: &str,
+        role: Role,
+        invited_by: &str,
+    ) -> Result<(), QueryError> {
+        if role == Role::Owner {
+            return Err(QueryError::Invalid(
+                "an invitation can grant member or viewer, never owner".into(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        sqlx::query(
+            "INSERT INTO workspace_invitations
+                 (id, workspace_id, email, role, invited_by, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workspace_id, email)
+             DO UPDATE SET role = excluded.role,
+                           invited_by = excluded.invited_by,
+                           created_at = excluded.created_at,
+                           expires_at = excluded.expires_at",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(self.view.view.view.workspace.0.to_string())
+        .bind(email)
+        .bind(role.as_str())
+        .bind(invited_by)
+        .bind(now)
+        .bind(now + INVITATION_TTL)
+        .execute(&self.view.view.view.db.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// This workspace's pending invitations, oldest first — owner visibility, so a
+    /// roster read shows who has been asked but not yet seated (S2-4).
+    pub async fn list_invitations(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Vec<InvitationRow>, QueryError> {
+        sqlx::query_as::<_, InvitationRow>(
+            "SELECT id, email, role, created_at FROM workspace_invitations
+              WHERE workspace_id = ? AND expires_at > ? ORDER BY created_at",
+        )
+        .bind(self.view.view.view.workspace.0.to_string())
+        .bind(now)
+        .fetch_all(&self.view.view.view.db.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Withdraw a pending invitation — the owner's undo for a mistyped address or a
+    /// changed mind before the invitee ever sees it. `Ok(false)` = no such pending
+    /// invitation in this workspace.
+    pub async fn revoke_invitation(&self, id: &str) -> Result<bool, QueryError> {
+        let gone =
+            sqlx::query("DELETE FROM workspace_invitations WHERE id = ? AND workspace_id = ?")
+                .bind(id)
+                .bind(self.view.view.view.workspace.0.to_string())
+                .execute(&self.view.view.view.db.pool)
+                .await?
+                .rows_affected();
+        Ok(gone > 0)
     }
 
     /// Change `account`'s role. The last-owner rule is enforced inside the
@@ -2319,6 +3136,23 @@ impl OwnerDb<'_> {
                 return Err(QueryError::Invalid("the workspace needs an owner".into()));
             }
         }
+        if role.is_none() {
+            // An account's requests resolve to its own workspace by default, so a
+            // seat there is what lets it reach anything at all — its invitations and
+            // its other workspaces included. It leaves by deleting the account.
+            let own: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ? AND workspace_id = ?)",
+            )
+            .bind(account.0.to_string())
+            .bind(ws.workspace.0.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if own {
+                return Err(QueryError::Invalid(
+                    "this is the account's own workspace; it can't be removed from it".into(),
+                ));
+            }
+        }
         let affected = match role {
             Some(role) => {
                 sqlx::query("UPDATE members SET role = ? WHERE workspace_id = ? AND account_id = ?")
@@ -2355,21 +3189,50 @@ impl OwnerDb<'_> {
             return Err(QueryError::Invalid("tokens cannot hold owner".into()));
         }
         let view = &self.view.view.view;
+        // Bounded like every other row a workspace owns, in one transaction so that
+        // concurrent mints cannot each see room and all land. Revoked tokens are kept
+        // as a record, so at the cap the oldest revoked one makes room; with none
+        // revoked the insert finds no room, and dropping the transaction undoes the
+        // attempt. The first statement is a write, which takes the store's write lock
+        // before anything is counted.
+        let workspace = view.workspace.0.to_string();
         let id = ApiTokenId::new();
+        let mut tx = view.db.pool.begin().await?;
         sqlx::query(
+            "DELETE FROM api_tokens
+              WHERE id IN (SELECT id FROM api_tokens
+                            WHERE workspace_id = ?1 AND revoked_at IS NOT NULL
+                            ORDER BY revoked_at
+                            LIMIT MAX(0, (SELECT COUNT(*) FROM api_tokens
+                                           WHERE workspace_id = ?1) - ?2 + 1))",
+        )
+        .bind(&workspace)
+        .bind(MAX_TOKENS_PER_WORKSPACE)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
             "INSERT INTO api_tokens
                 (id, workspace_id, created_by, name, token_digest, role, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+              WHERE (SELECT COUNT(*) FROM api_tokens WHERE workspace_id = ?2) < ?8",
         )
         .bind(id.0.to_string())
-        .bind(view.workspace.0.to_string())
+        .bind(&workspace)
         .bind(created_by.map(|a| a.0.to_string()))
         .bind(name)
         .bind(digest)
         .bind(role.as_str())
         .bind(now)
-        .execute(&view.db.pool)
-        .await?;
+        .bind(MAX_TOKENS_PER_WORKSPACE)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(QueryError::Conflict(format!(
+                "a workspace holds at most {MAX_TOKENS_PER_WORKSPACE} API tokens; revoke one first"
+            )));
+        }
+        tx.commit().await?;
         Ok(ApiTokenRow {
             id: id.0.to_string(),
             workspace_id: view.workspace.0.to_string(),
@@ -2448,6 +3311,12 @@ pub struct MonitorRow {
     pub recover_threshold: i64,
     pub generation: i64,
     pub paused: bool,
+    /// `GET`/`HEAD` — validated at write; anything else is corruption (D-025).
+    pub method: String,
+    /// Canonical "200-299,418" status set (D-025).
+    pub expect_statuses: String,
+    /// Literal byte marker for the bounded body read; NULL = none (D-025).
+    pub expect_body: Option<Vec<u8>>,
     pub created_at: OffsetDateTime,
 }
 
@@ -2484,6 +3353,16 @@ impl TryFrom<MonitorRow> for Monitor {
             thresholds,
             generation,
             paused: row.paused,
+            method: monitor_domain::ProbeMethod::parse(&row.method)
+                .map_err(|_| QueryError::Corrupt("monitor method".into()))?,
+            expect: monitor_domain::Expect {
+                statuses: monitor_domain::parse_statuses(&row.expect_statuses)
+                    .map_err(|_| QueryError::Corrupt("expect_statuses".into()))?,
+                // An empty marker can't be written through the API; a row that holds
+                // one anyway (edited by hand, or restored from somewhere else) is read
+                // as "no marker" rather than handed to a search that can't take it.
+                body_contains: row.expect_body.filter(|marker| !marker.is_empty()),
+            },
         })
     }
 }

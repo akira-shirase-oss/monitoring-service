@@ -37,6 +37,7 @@ const USAGE: &str = "usage: monitor-server            serve (the store must exis
        monitor-server --init     create and migrate the store of a new install, then exit
        monitor-server --version  print the version
        monitor-server --db-version  print the newest schema migration this build knows
+       monitor-server --migration-manifest  print this build's migrations as version|sha384|file lines
        monitor-server --help     print this help
 configuration: SMON_* environment variables (README, Configuration)";
 
@@ -53,6 +54,10 @@ fn parse_mode() -> Result<Mode, std::process::ExitCode> {
         }
         [flag] if flag == "--db-version" => {
             println!("{}", monitor_db::Db::known_schema_version());
+            Err(std::process::ExitCode::SUCCESS)
+        }
+        [flag] if flag == "--migration-manifest" => {
+            println!("{}", monitor_db::Db::migration_manifest());
             Err(std::process::ExitCode::SUCCESS)
         }
         [flag] if flag == "--help" || flag == "-h" => {
@@ -197,11 +202,6 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
     spawn_deliverers(&config, &db, &writer, smtp, &shutdown, &supervisor);
 
     supervisor.watch(
-        "snapshot",
-        Role::Supporting,
-        spawn_snapshot(&config, &db, &statuses, &vitals, &shutdown),
-    );
-    supervisor.watch(
         "retention",
         Role::Supporting,
         spawn_retention(&config, &db, &writer, &vitals, &shutdown),
@@ -217,6 +217,8 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         vitals.clone(),
         admin_token,
     );
+    // After the state exists: the writer shares its "a status page was saved" signal.
+    watch_snapshot(&supervisor, &config, &state, &shutdown);
     let app = assemble_app(state, &config, &supervisor, &shutdown).await?;
 
     // Install the stop signals before serving: a registration failure is a boot error,
@@ -340,11 +342,20 @@ fn app_state(
         session_idle: config.session_idle,
         password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
         token_use: std::sync::Arc::default(),
+        status_dir: config.status_dir.clone().into(),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: monitor_server::snapshot::Wake::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: config.trusted_proxy,
         backup_dir: config.backup_dir.clone(),
         cookie_secure: config.cookie_secure,
         max_monitors: config.max_monitors,
+        workspace_slots: monitor_server::schedule::MAX_WORKSPACE_SLOTS,
         allow_local_targets: config.lab,
         version: env!("CARGO_PKG_VERSION"),
     }
@@ -474,31 +485,36 @@ fn init_logging(config: &Config) -> anyhow::Result<()> {
 
 /// The public status snapshot — the heartbeat. `SMON_STATUS_DIR` points at wherever the
 /// static status page is hosted; an expired snapshot there reads "monitoring unavailable".
-fn spawn_snapshot(
+/// Starts the public snapshot writer under the supervisor. It reads the same store,
+/// statuses and verdict the API serves, and wakes on the API's status-page saves.
+fn watch_snapshot(
+    supervisor: &Supervisor,
     config: &Config,
-    db: &monitor_db::Db,
-    statuses: &SharedStatuses,
-    vitals: &Vitals,
+    state: &AppState,
     shutdown: &CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) {
     tracing::info!(dir = %config.status_dir, "writing status snapshots");
-    monitor_server::snapshot::spawn(
-        db.clone(),
-        Arc::clone(statuses),
-        vitals.clone(),
+    let task = monitor_server::snapshot::spawn_woken(
+        state.db.clone(),
+        Arc::clone(&state.statuses),
+        state.vitals.clone(),
         monitor_server::snapshot::Config {
             dir: config.status_dir.clone().into(),
             interval: config.status_interval,
             ttl: config.status_ttl,
         },
+        Arc::clone(&state.status_changed),
         shutdown.clone(),
-    )
+    );
+    supervisor.watch("snapshot", Role::Supporting, task);
 }
 
 /// Retention (M4.1, D-012): one pass every `SMON_RETENTION_INTERVAL_S` (default hourly)
-/// through the single writer — raw checks past `SMON_RETENTION_S` roll into daily
-/// aggregates (an open incident keeps only its birth streak raw), then old aggregates,
-/// resolved incidents, ended windows and delivered outbox rows are pruned per the policy.
+/// through the single writer — raw checks past their workspace's own horizon roll into
+/// daily aggregates (an open incident keeps only its birth streak raw), then old
+/// aggregates, resolved incidents, ended windows and delivered outbox rows are pruned.
+/// Each workspace ages on its plan's policy (S3, D-022): `free` sheds evidence earlier,
+/// `operator` keeps the configured `SMON_RETENTION_*` horizons.
 fn spawn_retention(
     config: &Config,
     db: &monitor_db::Db,
@@ -528,8 +544,10 @@ fn spawn_retention(
                 _ = ticks.tick() => {}
                 () = shutdown.cancelled() => return,
             }
-            let cutoffs = policy.cutoffs(time::OffsetDateTime::now_utc());
-            let pass = writer.retain(cutoffs).await;
+            let pass = match workspace_cutoffs(&db, &policy).await {
+                Ok(cutoffs) => writer.retain(&cutoffs).await,
+                Err(error) => Err(error),
+            };
             // A failing pass degrades the monitor (D-011) until a pass succeeds again; the
             // error is logged there, and `faults` gets a fixed cause (it is public).
             vitals.retention_outcome(pass.as_ref().map(|_| ()));
@@ -555,14 +573,84 @@ fn spawn_retention(
                 Ok(_) | Err(_) => {}
             }
             // Expired dashboard sessions are the same class of garbage: honest expiry
-            // needs no lazy-lookup to be correct, it just keeps the table small.
-            match db.sweep_expired_sessions().await {
-                Ok(n) if n > 0 => tracing::debug!(sessions = n, "swept expired sessions"),
-                Ok(_) => {}
-                Err(error) => tracing::error!(%error, "session sweep failed"),
+            // needs no lazy-lookup to be correct, it just keeps the table small. The
+            // sweep is bounded per call (D-012) — a backlog clears across iterations,
+            // never in one long delete.
+            let mut swept = 0;
+            loop {
+                match db.sweep_expired_sessions(SESSION_SWEEP_BATCH).await {
+                    Ok(n) => {
+                        swept += n;
+                        if n < u64::from(SESSION_SWEEP_BATCH) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "session sweep failed");
+                        break;
+                    }
+                }
+            }
+            if swept > 0 {
+                tracing::debug!(sessions = swept, "swept expired sessions");
+            }
+            // Expired invitations are the same housekeeping: reads already treat
+            // them as absent (`expires_at > now`), the sweep keeps the table from
+            // accumulating them forever (S3 review). Bounded per call, same rule.
+            let mut swept = 0;
+            loop {
+                match db
+                    .sweep_expired_invitations(time::OffsetDateTime::now_utc(), SESSION_SWEEP_BATCH)
+                    .await
+                {
+                    Ok(n) => {
+                        swept += n;
+                        if n < u64::from(SESSION_SWEEP_BATCH) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "invitation sweep failed");
+                        break;
+                    }
+                }
+            }
+            if swept > 0 {
+                tracing::debug!(invitations = swept, "swept expired invitations");
             }
         }
     })
+}
+
+/// Sessions a single sweep call may delete — the same "bounded per batch" rule the
+/// rest of retention follows, so a backlog never holds a lock long.
+const SESSION_SWEEP_BATCH: u32 = 500;
+
+/// The per-workspace expiry instants for one pass (S3, D-022): each workspace's plan
+/// resolves to a policy (`for_plan`), and a workspace with an unreadable id or plan
+/// fails the whole pass — guessing a tenant's horizon is worse than keeping data.
+async fn workspace_cutoffs(
+    db: &monitor_db::Db,
+    configured: &monitor_db::RetentionPolicy,
+) -> Result<
+    Vec<(monitor_domain::WorkspaceId, monitor_db::RetentionCutoffs)>,
+    monitor_db::writer::WriterError,
+> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut cutoffs = Vec::new();
+    for row in db.list_workspaces().await? {
+        let workspace = uuid::Uuid::parse_str(&row.id)
+            .map(monitor_domain::WorkspaceId)
+            .map_err(|_| monitor_db::QueryError::Corrupt(format!("workspace id {:?}", row.id)))?;
+        let plan = monitor_domain::Plan::parse(&row.plan).ok_or_else(|| {
+            monitor_db::QueryError::Corrupt(format!("unreadable plan {:?}", row.plan))
+        })?;
+        cutoffs.push((
+            workspace,
+            monitor_db::RetentionPolicy::for_plan(plan, configured).cutoffs(now),
+        ));
+    }
+    Ok(cutoffs)
 }
 
 /// API-token last-used stamps (S1c): the auth path records them in `state.token_use`;

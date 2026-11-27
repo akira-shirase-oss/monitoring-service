@@ -1,7 +1,26 @@
 # Service Monitor as a SaaS — plan
 
-Status: **plan, not built.** Written 2026-11-13. Nothing here is deployed yet; numbers measured on the droplet do
-not exist yet and are marked *unmeasured*.
+Status (2026-11-27): **built and tested locally and on CI; not deployed.** Accounts, workspaces, roles, tokens,
+per-workspace alerts and status pages, plan limits and the hosted dashboard all exist (see "Where it stands"
+below). Nothing runs on a server yet, so every number that needs the droplet is still *unmeasured*. Written
+2026-11-13.
+
+## Where it stands
+
+| Area | State |
+|---|---|
+| Accounts | Invite-gated sign-up, sign-in, sign-out, sessions per account. An account changes its own password (every other device is signed out) and deletes itself (D-027). **Missing:** email verification and a "forgot password" email (there is no mail to an account yet). |
+| Workspaces | Every row carries its workspace and every query is scoped by type. Owner, member and viewer roles; invitations a person accepts; a workspace switcher. |
+| Tokens | Per-workspace API tokens (viewer or member), shown once, revocable. |
+| Alerts | One webhook per workspace, checked for private addresses at save and at every send (D-017), signed, with a test send. **Missing:** email recipients per workspace (email alerts are still the operator's single SMTP destination). |
+| Public status | One public page per workspace at `/s/<slug>` with its JSON at `/s/<slug>/status.json`; the owner picks the title, the address and the monitors. |
+| Limits | Free plan: 10 monitors, 60 s shortest interval, checks kept 2 days, incidents 90 days (D-022). Per-workspace share of the probe budget (D-024). The workspace sees its limits on the General page. |
+| Dashboard | Every API operation a workspace has is in the dashboard: setup guide, monitors (method, passing statuses, body text), incidents, maintenance, members, tokens, alerts, status page, general. **Placeholder look:** neutral tokens until Service Monitor's own design is chosen; it changes one stylesheet. |
+| Monitor deletion | A monitor can be deleted with its history by asking for exactly that (D-026). |
+| Account lifecycle | Deleting an account deletes the workspaces only it is in, with their evidence; shared workspaces stay, and the only owner of one must hand it over first. An owner exports a workspace's data as one JSON file (D-027). **Missing:** deleting a workspace without deleting the account. |
+| Tests | Unit and in-process API tests, a running-instance attack suite with a mutation proof, fuzz targets, and 32 browser journeys; all run on CI on every push. |
+| Deploy | Install, upgrade, rollback, backup and smoke scripts exist and pass local drills. **No host yet.** |
+| Docs site, landing page | A docs repository exists locally without a remote; the landing page is not committed. Neither is published. |
 
 ## The goal
 
@@ -18,9 +37,9 @@ Decisions already made (2026-11-13, by the maintainer):
 - **Landing page content is edited in Colophon** and served as a static site.
 - **Payments are bypassed:** a free plan with limits.
 
-## Where Service Monitor is today
+## Where Service Monitor was when this plan was written (2026-11-13)
 
-- One operator: `SMON_ADMIN_TOKEN` bearer for CLI/scripts, or the `smon_session` cookie from `POST /api/login`.
+- One operator: `SMON_ADMIN_TOKEN` bearer for CLI/scripts, or the `__Host-smon_session` cookie from `POST /api/login`.
   There are no user accounts or workspaces.
 - API: `/monitors`, `/monitors/{id}/checks`, `/monitors/{id}/stats`, `/incidents`, `/maintenance/{id}`, `/backup`,
   `/livez`, `/readyz`, `/version`.
@@ -88,10 +107,24 @@ Monitor token, Colophon registers its sites in that user's workspace through the
 | S4 Load on the droplet | ≥1M checks across many workspaces, plus the API under load, generated from another machine. | Results committed under `perf/results/` with droplet spec and commit hash. |
 | S5 Friends beta | Invite codes go out. | The 24-hour soak on the droplet; runbook exercised (restore, workspace deletion). |
 
+## What is left before a friends beta
+
+1. **A host.** Deploy with `deploy/droplet/` and point a name at it (one level under the zone, for the
+   certificate). Then S0's evidence: a week of coverage and alert delivery watching Colophon and Durable Runner.
+2. **Mail to accounts.** A provider for `SMON_SMTP_*`, then email verification, "forgot password", and
+   invitation mail. Until then a lost password needs the operator.
+3. **Its own look.** Choose Service Monitor's design system; apply it to the dashboard, the landing page and
+   the docs.
+4. **Docs site and landing page**, published.
+5. **Evidence on the host**, when asked for: the 1M-check load run (S4) and the 24-hour soak (S5).
+
 ## Open questions
 
 1. ~~Accounts in Neon, or keep the whole product on SQLite?~~ Decided (D-020): everything in the same SQLite store; no Neon.
 2. ~~Status pages on a path (`/s/<workspace>`) or on subdomains?~~ Decided (D-021): `/s/<workspace-slug>` on the same origin; subdomains only if asked later.
 3. Email provider for alerts and verification? Stays lettre SMTP; the provider is a deploy-time choice, not a code decision.
-4. Free-plan limits: monitors, minimum interval, retention? Deferred to S3.
+4. ~~Free-plan limits: monitors, minimum interval, retention?~~ Decided (D-022):
+   `workspaces.plan` tiers (`free`/`operator`) — provisionally 10 monitors, a 60 s
+   interval floor and shorter evidence horizons on `free`; the operator tier
+   defers to the configured ceilings. All provisional until droplet measurements.
 5. ~~S4's ≥1M checks: one server dispatches at most 20 probes per 1 s tick.~~ Decided (D-018): phases are spread per monitor and the global budget follows the schedule up to 512 slots, with a named refusal past it. One server now serves up to ~1,900 monitors at 15 s (~128 checks/s, ≈2.2 h for 1M checks); the long run itself is still to do.

@@ -33,13 +33,14 @@ const TOKEN: &str = "inventory-token-0123456789abcdef0123456789";
 /// The routes that are public by design: health, the build version, and the
 /// endpoints that exchange a credential for a session (login, signup, logout —
 /// they enforce their own rules: invite validation, throttling, password work).
-const PUBLIC: [&str; 6] = [
+const PUBLIC: [&str; 7] = [
     "/livez",
     "/readyz",
     "/version",
     "/api/login",
     "/api/signup",
     "/api/logout",
+    "/s/{slug}/status.json",
 ];
 
 /// The string literal each `marker` call opens with, in source order.
@@ -161,13 +162,22 @@ async fn authed_router(dir: &std::path::Path) -> (axum::Router, Db) {
         admin_token: Some(Arc::from(TOKEN)),
         session_ttl: Duration::from_hours(1),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: dir.join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     };
@@ -200,7 +210,10 @@ async fn assert_denied(app: &axum::Router, method: &str, template: &str, path: &
         ("wrong bearer", Some(("authorization", "Bearer wrong"))),
         ("lower-case scheme", Some(("authorization", "bearer x"))),
         ("bare token", Some(("authorization", TOKEN))),
-        ("unknown session", Some(("cookie", "smon_session=deadbeef"))),
+        (
+            "unknown session",
+            Some(("cookie", "__Host-smon_session=deadbeef")),
+        ),
     ] {
         let mut request = Request::builder()
             .method(Method::from_bytes(method.as_bytes()).expect("method"))
@@ -295,6 +308,9 @@ async fn every_api_route_and_method_denies_a_request_without_a_valid_credential(
         ("/api/maintenance/{id}", "DELETE"),
         ("/api/incidents", "GET"),
         ("/api/backup", "POST"),
+        ("/api/account", "DELETE"),
+        ("/api/account/password", "POST"),
+        ("/api/workspace/export", "GET"),
     ] {
         assert!(
             inventory.get(template).is_some_and(|m| m.contains(method)),

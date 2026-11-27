@@ -1,0 +1,151 @@
+# The droplet install is real work — packages, a system user, systemd units, Caddy,
+# the backup pipeline — so it's exercised on a hosted VM, not only statically pinned
+# on the laptop (deploy_scripts.rs). Dispatch it by hand; it also runs on pushes that
+# touch deploy/. rclone is replaced by a filesystem stub so install.sh's first backup
+# exercises the whole pipeline (server /api/backup → age → upload → prune) without a
+# real R2 account; the droplet run uses the real remote.
+name: deploy-check
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/deploy-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: install.sh on a clean VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build the release binaries
+        run: cargo build --release -p monitor-server -p monitor-cli --locked
+      - name: Stage a release dir, test secrets and the rclone stub
+        run: |
+          work="$RUNNER_TEMP/install-check"
+          mkdir -p "$work/release/bin" "$work/secrets"
+          cp target/release/monitor-server target/release/monitor "$work/release/bin/"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$work/secrets/origin.key" -out "$work/secrets/origin.pem" \
+            -subj "/CN=monitor.example.com"
+          printf 'ci-not-a-real-r2-secret\n' > "$work/secrets/s3_secret_key"
+          printf 'SMON_R2_ENDPOINT=%s\nSMON_R2_ACCESS_KEY=%s\n' "https://ci.invalid" "ci-run" \
+            > "$work/secrets/r2.env"
+          sudo tee /usr/local/bin/rclone >/dev/null <<'STUB'
+          #!/usr/bin/env bash
+          # deploy-check's filesystem remote: implements just the verbs smon-backup uses,
+          # against a local directory — the pipeline under test is real, the remote is not.
+          set -euo pipefail
+          remote=/opt/smon-rclone-remote
+          verb="$1"; shift
+          last_arg() { for a in "$@"; do spec="$a"; done; echo "${spec#*:}"; }
+          case "$verb" in
+            lsf) d=$(last_arg "$@"); ls -1 "$remote/${d#/}" 2>/dev/null || true ;;
+            copyto) src="$1"; d=$(last_arg "$@"); mkdir -p "$remote/$(dirname "${d#/}")"; cp "$src" "$remote/${d#/}" ;;
+            deletefile) d=$(last_arg "$@"); rm -f "$remote/${d#/}" ;;
+            *) echo "rclone-stub: unsupported verb $verb" >&2; exit 1 ;;
+          esac
+          STUB
+          sudo chmod 0755 /usr/local/bin/rclone
+          sudo install -d /opt/smon-rclone-remote
+      - name: Run install.sh (non-interactive, as root)
+        run: |
+          work="$RUNNER_TEMP/install-check"
+          sudo env "PATH=$PATH" "SMOKE_LOCAL=1" deploy/droplet/install.sh \
+            --release-dir "$work/release" \
+            --origin-cert "$work/secrets/origin.pem" --origin-key "$work/secrets/origin.key" \
+            --r2-secret "$work/secrets/s3_secret_key" --r2-env "$work/secrets/r2.env" \
+            2>&1 | tee "$work/install.log"
+      - name: Re-run install.sh — the promised property is idempotence
+        run: |
+          work="$RUNNER_TEMP/install-check"
+          sudo env "PATH=$PATH" "SMOKE_LOCAL=1" deploy/droplet/install.sh \
+            --release-dir "$work/release" \
+            --r2-secret "$work/secrets/s3_secret_key" --r2-env "$work/secrets/r2.env" \
+            2>&1 | tee "$work/install-rerun.log"
+      - name: The install is live and the unit is what was checked in
+        run: |
+          systemctl is-active monitor-server
+          systemctl is-active smon-backup.timer
+          curl -fsS --max-time 10 http://127.0.0.1:58400/livez
+          sudo /usr/local/bin/smon-backup latest
+          deploy/droplet/check-unit-hardening.sh
+      - name: Run upgrade.sh end to end — a divergent database must refuse, a clean one must switch
+        run: |
+          work="$RUNNER_TEMP/install-check"
+          mkdir -p "$work/release2/bin" "$work/release2/dashboard"
+          cp target/release/monitor-server target/release/monitor "$work/release2/bin/"
+          db=$(sudo sed -n 's/^SMON_DATABASE_URL=sqlite://p' /opt/smon/env | tail -n 1)
+          db=${db:-/opt/smon/data/monitor.db}
+          before=$(readlink -f /opt/smon/current)
+          # Negative: corrupt one applied checksum — the upgrade must refuse
+          # BEFORE the atomic switch and leave `current` exactly where it was.
+          v=$(sudo sqlite3 -batch -readonly "$db" "SELECT min(version) FROM _sqlx_migrations;")
+          sudo sqlite3 "$db" "UPDATE _sqlx_migrations SET checksum = randomblob(48) WHERE version = $v;"
+          pid_before=$(systemctl show monitor-server -p MainPID --value)
+          if sudo deploy/droplet/upgrade.sh --release-dir "$work/release2" > "$work/refused.log" 2>&1; then
+            echo "upgrade.sh switched releases on a divergent _sqlx_migrations" >&2
+            exit 1
+          fi
+          # G4: the refusal must come from the migration inspector itself —
+          # the same exit code a later boot-refusal would give proves nothing —
+          # and the running process must be the one that was there before.
+          grep -q "diverges" "$work/refused.log" || {
+            echo "the refusal did not come from the migration inspector" >&2
+            cat "$work/refused.log"; exit 1; }
+          [[ "$(systemctl show monitor-server -p MainPID --value)" == "$pid_before" ]] || {
+            echo "the service restarted on a refused upgrade" >&2; exit 1; }
+          [[ "$(readlink -f /opt/smon/current)" == "$before" ]] || {
+            echo "upgrade.sh moved \`current\` despite refusing" >&2; exit 1; }
+          # Restore and prove the clean path completes the switch + restart.
+          want=$("$work/release2/bin/monitor-server" --migration-manifest \
+            | awk -F'|' -v v="$v" '$1 == v { print $2; exit }')
+          sudo sqlite3 "$db" "UPDATE _sqlx_migrations SET checksum = x'$want' WHERE version = $v;"
+          sudo deploy/droplet/upgrade.sh --release-dir "$work/release2"
+          [[ "$(readlink -f /opt/smon/current)" != "$before" ]]
+          curl -fsS --max-time 10 http://127.0.0.1:58400/livez
+          # G2: the same --release-dir name again computes the same destination,
+          # which is now the live release — it must refuse before touching
+          # releases/, never swap the live dir out from under the service.
+          pid_before=$(systemctl show monitor-server -p MainPID --value)
+          if sudo deploy/droplet/upgrade.sh --release-dir "$work/release2" > "$work/refused2.log" 2>&1; then
+            echo "upgrade.sh re-ran a release name that is already live" >&2
+            exit 1
+          fi
+          grep -q "already exists" "$work/refused2.log" || {
+            echo "the repeated-name refusal did not come from the unique-name guard" >&2
+            cat "$work/refused2.log"; exit 1; }
+          [[ "$(systemctl show monitor-server -p MainPID --value)" == "$pid_before" ]] || {
+            echo "the service restarted on a repeated-name refusal" >&2; exit 1; }
+          [[ "$(readlink -f /opt/smon/current)" == "$(readlink -f /opt/smon/releases/release2)" ]] || {
+            echo "the repeated-name refusal moved \`current\`" >&2; exit 1; }
+          curl -fsS --max-time 10 http://127.0.0.1:58400/livez
+      - name: Keep the evidence
+        run: |
+          mkdir -p deploy-check-artifacts
+          cp "$RUNNER_TEMP/install-check"/*.log deploy-check-artifacts/ 2>/dev/null || true
+          systemd-analyze security monitor-server.service > deploy-check-artifacts/security.txt 2>&1 || true
+          sudo journalctl -u monitor-server --no-pager -n 80 > deploy-check-artifacts/monitor-server.journal 2>/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: deploy-check-${{ github.run_id }}
+          path: deploy-check-artifacts/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index aa63b3e..27b760a 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -90,7 +90,7 @@ fn owner_for<'a>(
+ ) -> Result<monitor_db::OwnerDb<'a>, ApiError> {
+     match principal {
+         auth::Principal::Operator { .. } => Ok(state.db.owner(principal.workspace())),
+-        auth::Principal::Account { role, .. } if role.at_least(Role::Owner) => {
++        auth::Principal::Account { role, .. } if role.at_least(Role::Viewer) => {
+             Ok(state.db.owner(principal.workspace()))
+         }
+         _ => Err(ApiError::Forbidden(

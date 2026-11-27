@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-domain/src/lib.rs b/crates/monitor-domain/src/lib.rs
+index 7e94f78..871837a 100644
+--- a/crates/monitor-domain/src/lib.rs
++++ b/crates/monitor-domain/src/lib.rs
+@@ -496,7 +496,7 @@ pub fn validate_expect(
+         if body.len() > MAX_EXPECT_BODY {
+             return Err(ValidationError::ExpectBodyTooLong { len: body.len() });
+         }
+-        if method == ProbeMethod::Head {
++        if method == ProbeMethod::Head && body.is_empty() {
+             return Err(ValidationError::HeadCannotAssertBody);
+         }
+     }

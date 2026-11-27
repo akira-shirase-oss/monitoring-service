@@ -215,13 +215,22 @@ async fn the_api_never_reaches_another_workspaces_monitor() -> anyhow::Result<()
         admin_token: None,
         session_ttl: Duration::from_hours(12),
         session_idle: Duration::from_hours(1),
-        password_work_wait: monitor_server::auth::PASSWORD_WORK_WAIT,
+        password_work_wait: Duration::from_secs(600),
         token_use: std::sync::Arc::default(),
+        status_dir: tmp.path().join("status"),
+        test_sends: std::sync::Arc::default(),
+        status_writes: std::sync::Arc::default(),
+        status_slugs: std::sync::Arc::default(),
+        status_slug_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        status_changed: std::sync::Arc::default(),
+        monitor_writes: std::sync::Arc::default(),
+        invite_writes: std::sync::Arc::default(),
         clock: monitor_server::system_clock(),
         trusted_proxy: None,
         backup_dir: None,
         cookie_secure: monitor_server::auth::CookieSecure::Auto,
         max_monitors: 100,
+        workspace_slots: usize::MAX,
         allow_local_targets: false,
         version: "test",
     });
@@ -372,5 +381,41 @@ async fn the_engine_observes_every_workspace_with_independent_coverage() -> anyh
         )
         .await?;
     assert_eq!((a_stats.observed, a_stats.missed), (0, 0));
+    Ok(())
+}
+
+/// Deleting a monitor with its evidence (D-026) is the most destructive write there
+/// is, so the store's own binding is tried directly: workspace A's scope, handed B's
+/// monitor id, deletes nothing of B's — and B's own scope then deletes all of it.
+#[tokio::test]
+async fn a_scope_deletes_only_its_own_monitors_evidence() -> anyhow::Result<()> {
+    let db = store().await?;
+    let (b, foreign) = second_workspace(&db).await?;
+    record(&db, &foreign, CheckOutcome::HttpFail { status: 500 }).await?;
+
+    assert!(
+        !db.workspace(A)
+            .delete_monitor_with_evidence(foreign.id)
+            .await?,
+        "A's scope finds no such monitor"
+    );
+    assert!(
+        db.workspace(b).has_history(foreign.id).await?,
+        "B's evidence survives A's attempt"
+    );
+
+    assert!(
+        db.workspace(b)
+            .delete_monitor_with_evidence(foreign.id)
+            .await?
+    );
+    assert!(!db.workspace(b).has_history(foreign.id).await?);
+    assert!(
+        db.workspace(b)
+            .monitor_generation(foreign.id)
+            .await?
+            .is_none(),
+        "the monitor row went with its evidence"
+    );
     Ok(())
 }

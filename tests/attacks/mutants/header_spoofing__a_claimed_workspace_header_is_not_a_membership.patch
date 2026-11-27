@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/auth.rs b/crates/monitor-server/src/auth.rs
+index 046b9e4..8566fc7 100644
+--- a/crates/monitor-server/src/auth.rs
++++ b/crates/monitor-server/src/auth.rs
+@@ -229,7 +229,7 @@ async fn scope_operator(
+     match workspace_pick(headers) {
+         Ok(Some(workspace)) => match state.db.workspace_row(workspace).await {
+             Ok(Some(_)) => Ok(workspace),
+-            Ok(None) => Err(Box::new(deny_not_a_member())),
++            Ok(None) => Ok(workspace),
+             Err(error) => {
+                 tracing::error!(%error, "workspace lookup failed");
+                 Err(Box::new(deny(

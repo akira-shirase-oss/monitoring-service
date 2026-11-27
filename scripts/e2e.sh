@@ -4,9 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-export PATH="$(brew --prefix rustup)/bin:$PATH"
+# A Mac with Homebrew's cargo first on PATH needs rustup's proxies ahead of it (the
+# toolchain pin); CI's runner has rustup's already and no brew at all.
+if command -v brew >/dev/null 2>&1; then
+    export PATH="$(brew --prefix rustup)/bin:$PATH"
+fi
 
-cargo build -p monitor-server
+cargo build --locked -p monitor-server
 npm --prefix apps/dashboard run build
 # Run from apps/dashboard — playwright resolves its config (baseURL + webServers) by cwd.
 (cd apps/dashboard && npx playwright test "$@")

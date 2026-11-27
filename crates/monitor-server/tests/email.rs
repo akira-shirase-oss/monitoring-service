@@ -284,7 +284,11 @@ async fn a_rejected_email_is_a_scheduled_retry() -> anyhow::Result<()> {
 async fn a_name_with_line_breaks_cannot_inject_a_header_or_a_line() -> anyhow::Result<()> {
     let (db, writer) = rig().await?;
     let name = "web\r\nBcc: attacker@example.net\nX-Injected: 1";
-    let monitor = NewMonitor::new(name, url::Url::parse("https://example.com")?)?.into_monitor();
+    // The API refuses such a name at write. The mailer must still be safe with one: a
+    // row can predate that rule or come from a restored store.
+    let mut monitor =
+        NewMonitor::new("web", url::Url::parse("https://example.com")?)?.into_monitor();
+    monitor.name = name.to_owned();
     db.workspace(WorkspaceId::DEFAULT)
         .insert_monitor(&monitor)
         .await?;
@@ -387,7 +391,11 @@ async fn a_name_with_line_breaks_cannot_inject_a_header_or_a_line() -> anyhow::R
 async fn a_dot_terminated_name_cannot_splice_a_second_message() -> anyhow::Result<()> {
     let (db, writer) = rig().await?;
     let name = "web\n.\r\nMAIL FROM:<x@evil>\r\nRCPT TO:<x@evil>\r\nDATA\r\n.\r\npwned";
-    let monitor = NewMonitor::new(name, url::Url::parse("https://example.com")?)?.into_monitor();
+    // The API refuses such a name at write. The mailer must still be safe with one: a
+    // row can predate that rule or come from a restored store.
+    let mut monitor =
+        NewMonitor::new("web", url::Url::parse("https://example.com")?)?.into_monitor();
+    monitor.name = name.to_owned();
     db.workspace(WorkspaceId::DEFAULT)
         .insert_monitor(&monitor)
         .await?;

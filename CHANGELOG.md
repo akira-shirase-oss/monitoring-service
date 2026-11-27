@@ -2,6 +2,93 @@
 
 ## Unreleased
 
+### The hosted dashboard is usable end to end (2026-11-27)
+
+- **Seven dashboard pages that were placeholders now work:** API tokens (the secret is
+  shown once), members and invitations, alerts (connect a webhook, copy its signing
+  secret, send a test alert), the status page editor, incidents, maintenance windows
+  across every monitor, and a four-step setup guide a new account lands on.
+- **A public status page at `/s/<slug>`.** It says "up" only for a service whose latest
+  checks passed, "unknown" for one nobody checked, and "monitoring unavailable" when
+  the monitor itself has stopped reporting.
+- **A General page** shows the workspace's plan and its limits; `GET /api/workspaces`
+  now returns `limits` for each workspace.
+- **The monitor form sets the request method, the passing statuses and body text.**
+- **A monitor can be deleted with its history** (D-026):
+  `DELETE /api/monitors/{id}?evidence=delete`. Without the parameter a monitor with
+  history is still refused. The dashboard asks through a confirmation first.
+- **Fix: `PATCH /api/monitors/{id}` with `"expect_body": null` now clears the body
+  expectation.** It was read as "not sent", so the expectation could never be removed
+  and such a monitor could never switch to `HEAD`.
+- **Fix: a status page is written when it is saved**, not at the next heartbeat. A page
+  that was just published used to read "monitoring unavailable" for up to an interval.
+- **Fix: token, member and invite times are RFC 3339 strings.** They were returned as
+  arrays of numbers.
+- **`url` 2.5.9** (RUSTSEC-2026-0592, a stack overflow in `Url::origin()`).
+- **Fixes from an independent review before this reached `main`:**
+  - Monitors sharing a target address could stop being checked while capacity was
+    free. The per-address budget kept a queue of refused starts that nobody came back
+    to claim; it is now two token buckets and nothing else (D-028).
+  - Deleting a monitor with a long history could hold the store's write lock long
+    enough to stall every workspace's checks. It now works in small batches, with the
+    indexes it needs, on the write budget.
+  - A check result arriving just after its monitor was deleted counted as a storage
+    failure and could mark monitoring unavailable for everyone.
+  - A browser that remembered a workspace its account had been removed from was
+    locked out of the dashboard. An account that had joined a second workspace could
+    see that workspace's name over its own data. A form kept its values across a
+    workspace switch and could save them into the other workspace.
+  - An account could be removed from its own workspace and then reach nothing.
+  - Two published monitors with the same name broke the public status page.
+  - Redirect codes can no longer be named as passing statuses, and monitor names are
+    bounded. Both rules apply to what an edit names, so a monitor saved before them
+    can still be paused, resumed and rescheduled.
+  - A second pass over those fixes found that a delete interrupted half-way and then
+    resumed could leave a monitor whose checks were refused on every slot. An open
+    incident now stays until the monitor itself goes, and the delete finishes even if
+    the request is dropped.
+- **Fixes from an independent review of the account work:**
+  - A monitor created at the moment its workspace was being deleted could outlive it,
+    unreachable and still probed, and later fail its saves on every check. Monitors
+    are now only created in a workspace that exists, and any left behind are removed.
+  - Maintenance windows had no limits. A reason is now one line of up to 200
+    characters, a monitor holds up to 50 windows, and creating them is rate-limited
+    like other monitor writes. A workspace holds up to 100 API tokens.
+  - Account deletion's size limit now counts everything it removes, across all the
+    workspaces it removes.
+  - At most two data exports are assembled at once across the server.
+  - A password change or account deletion is refused if the password changed while
+    the request was being checked. Accepted password changes are limited to five per
+    ten minutes.
+- **Sign-out says when the server did not confirm it**, and role and plan changes ask
+  for confirmation instead of applying on a dropdown change.
+- **Operators no longer need curl.** `monitor invites create` and
+  `monitor workspaces list|plan` in the CLI, and an Operator page in the dashboard for
+  sign-up codes and workspace plans.
+- **An account can change its password**: `POST /api/account/password` with the current
+  and the new password. Every other device is signed out; the one that made the change
+  stays signed in. The new password follows the sign-up rule.
+- **An account can delete itself**: `DELETE /api/account` with its password. A workspace
+  that only this account is in is deleted with its monitors, checks, incidents and
+  status page; shared workspaces stay, minus the seat. The only owner of a workspace
+  that has other members is asked to make someone else an owner first, and a workspace
+  holding more than 50,000 checks, incidents and queued alerts is asked to delete monitors first, so one deletion
+  can't stall everyone's checks. There is no undo.
+- **A workspace's owner can export its data**: `GET /api/workspace/export` downloads one
+  JSON file with the monitors, maintenance windows, incidents, daily totals and each
+  monitor's newest 5,000 checks. It contains no webhook secret, token or password hash.
+- **An Account page in the dashboard**, opened from the menu at the foot of the sidebar:
+  change the password there, or delete the account through a confirmation that names
+  what is deleted, asks for the password and shows the server's refusal as it came.
+  General has an **Export data** button for owners.
+- Asking for the password on these routes counts against the same per-address limit as
+  a sign-in, so they can't be used to guess a password any faster.
+- **Fix: a sign-in that was in flight while the password changed no longer gets a
+  session.** The session is created only if the password it checked is still the
+  stored one.
+- CI now drives the dashboard in a real browser on every push, and runs a unit test
+  layer for the dashboard's own logic and components.
+
 ### Scheduler capacity (2026-11-17, D-018) — behaviour changes
 
 - **Monitors no longer fall due together.** Each monitor's slots sit at a fixed phase

@@ -5,6 +5,8 @@
 //
 // Routes:
 //   /ok                    -> 200 immediately
+//   /marked                -> 200 with the SMON-ALIVE assertion marker in the body
+//   /unmarked              -> 200 without it (assert_body miss fixture)
 //   /fail                  -> 500 immediately
 //   /status/<n>            -> HTTP <n> immediately (400..599), anything else -> 400
 //   /slow?ms=<n>           -> 200 after <n> milliseconds
@@ -83,6 +85,14 @@ const server = http.createServer((request, response) => {
 		return;
 	}
 	if (url.pathname === '/ok') {
+		response.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
+		return;
+	}
+	if (url.pathname === '/marked') {
+		response.writeHead(200, { 'content-type': 'text/plain' }).end('ok SMON-ALIVE');
+		return;
+	}
+	if (url.pathname === '/unmarked') {
 		response.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
 		return;
 	}

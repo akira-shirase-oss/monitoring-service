@@ -1,0 +1,19 @@
+diff --git a/crates/monitor-server/src/lib.rs b/crates/monitor-server/src/lib.rs
+index 032dab6..60d2527 100644
+--- a/crates/monitor-server/src/lib.rs
++++ b/crates/monitor-server/src/lib.rs
+@@ -2150,14 +2150,6 @@ async fn patch_monitor(
+     let view = member_for(&state, &principal)?;
+     let row = find_monitor(&view, &id).await?;
+     let monitor = Monitor::try_from(row).map_err(|_| ApiError::Corrupt)?;
+-    if input
+-        .generation
+-        .is_some_and(|expected| expected != monitor.generation)
+-    {
+-        return Err(ApiError::Conflict(
+-            "monitor changed since it was read; re-read and retry".into(),
+-        ));
+-    }
+     let patch = MonitorPatch {
+         name: input.name,
+         url: input

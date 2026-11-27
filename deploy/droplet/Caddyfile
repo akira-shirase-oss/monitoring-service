@@ -9,6 +9,14 @@
 		# Cloudflare's ranges, so Caddy passes the visitor's address on in X-Forwarded-For
 		# (cloudflare-ips.sh writes this file).
 		import /etc/caddy/cloudflare-trusted.caddy
+		# The visitor's address comes only from CF-Connecting-IP — the default
+		# client_ip_headers reads the left-most X-Forwarded-For, which a client can
+		# write anything into (Cloudflare then appends to it), letting one caller mint
+		# a fresh throttle key per request. trusted_proxies_strict drops requests
+		# whose immediate peer is not a listed proxy — nothing reaches the app
+		# claiming a visitor address except Cloudflare itself.
+		client_ip_headers CF-Connecting-IP
+		trusted_proxies_strict
 	}
 }
 
@@ -27,5 +35,19 @@ monitor.example.com:443 {
 	reverse_proxy 127.0.0.1:58400 {
 		lb_try_duration 15s
 		lb_try_interval 250ms
+		# smon closes a kept-alive upstream at its 10 s header-read deadline — hyper's
+		# one knob doubles as the idle bound — without a response. Reusing a
+		# connection that is closing races the shutdown and a non-idempotent request
+		# comes back 502. Idle upstreams must expire BELOW that bound (5 s) so Caddy
+		# always closes first and never hands smon a racing reuse.
+		transport http {
+			keepalive 5s
+		}
+		# X-Forwarded-For must carry the visitor, not the Cloudflare edge that talked to
+		# us: with the trusted_proxies block above, {client_ip} resolves through CF's
+		# ranges to the real client. Without this, Caddy appends its own peer (a CF
+		# edge IP) right-most — the monitor would throttle a whole CF location as one
+		# address.
+		header_up X-Forwarded-For {client_ip}
 	}
 }

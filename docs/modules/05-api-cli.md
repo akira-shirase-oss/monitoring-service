@@ -22,20 +22,51 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
   `backup_disabled`). Incidents are system-created evidence — there is deliberately no
   `POST`. `IncidentView` carries all four times (M6.3): `first_fail_at`, `opened_at`,
   `last_fail_at`, `resolved_at` — RFC3339, nullable for pre-M6.3 rows.
+  Workspace management (S1–S2, D-020/D-021): `GET|PUT|DELETE /api/workspace/webhook`
+  (the tenant channel, SSRF-validated at save); `POST /api/workspace/webhook/test`
+  (one real send through the same gate — no outbox row, classified result, one per
+  15 s per workspace); `PATCH /api/workspace` (rename, 1–80 visible chars);
+  `GET /api/workspaces` (the caller's memberships — account rows + account identity,
+  a token's one workspace, the operator's inventory); `GET|PUT
+  /api/workspace/status-page` (`{slug, title, monitor_ids}` — `title` empty/null is
+  the page's off switch, the monitor set is workspace-scoped, a taken slug is 409).
+  Status-page bounds (S2 hardening): ≤ 64 `monitor_ids` (duplicates collapse to
+  their first occurrence — never a PK error), title ≤ 120 visible chars, and a
+  per-workspace write budget of 6 per rolling 60 s — past it, 429 + `Retry-After`;
+  validation refusals don't spend. The public read is outside `/api`:
+  `GET /s/{slug}/status.json` (module 07).
+- **Per-workspace probe share (S3):** a monitor create/edit is also refused
+  `capacity_exceeded` (409) when the workspace's *own* unpaused schedule would need
+  more than `MAX_WORKSPACE_SLOTS` (= `MAX_GLOBAL_SLOTS` / 4 = 128) probes in
+  flight — one tenant's schedule can't silently crowd the engine; pausing frees
+  the share.
+- **Plan tiers (S3, D-022):** `workspaces.plan` is `free` (signup's default) or
+  `operator`; `PATCH /api/workspaces/{id}/plan` moves a workspace — operator-only
+  (a tenant gets 403 trying to lift its own limits). Free is provisionally
+  10 monitors and a 60 s interval floor: a create below the floor, or an edit
+  proposing one, is refused 409 `plan_limit`; the eleventh monitor is 409
+  `limit_reached` on the plan cap. `operator` defers to the server's ceilings —
+  the 15 s domain floor, `SMON_MAX_MONITORS` — and to the configured
+  `SMON_RETENTION_*` horizons, while `free` sheds evidence on shorter plan-fixed
+  ones (2 d checks / 90 d aggregates+incidents / 7 d delivered outbox). Floors
+  gate writes only: downgrading a workspace never pauses or deletes what runs.
+  `GET /api/workspaces` rows carry `plan`.
 - **Error envelope:** `{"error": {"code": stable, "message": safe}}`; internals log-only.
 - **Bounds:** 16 KiB bodies, 10 s request deadline, request id set+propagated, panic→500.
 - **Auth (M5.1 + M7.2, live):** every `/api/**` route requires a credential —
   `Authorization: Bearer $SMON_ADMIN_TOKEN` (sha256-digest compare) for CLI/scripts,
-  or the HttpOnly `smon_session` cookie for the dashboard. `/livez`, `/readyz` and
+  or the HttpOnly `__Host-smon_session` cookie for the dashboard. `/livez`, `/readyz` and
   static files stay open. Token unset = dev mode on loopback only; a tokenless
   public bind refuses to boot. Denied means denied — no unauthenticated path once
   enabled.
 - **Session login (M7.2):** `POST /api/login {token}` exchanges the admin token for a
-  `sessions` row (migration 0007) + `Set-Cookie: smon_session=<id>; HttpOnly;
-  SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>[; Secure]` —
-  `Secure` whenever the TLS proxy reports the request as https (`X-Forwarded-Proto`,
-  `Forwarded: proto=`), or always with `SMON_COOKIE_SECURE=always`; logout's expiring
-  cookie carries the same flag (`the_session_cookie_is_secure_whenever_the_request_came_over_tls`). Store-side
+  `sessions` row (migration 0007) + `Set-Cookie: __Host-smon_session=<id>; HttpOnly;
+  SameSite=Strict; Path=/; Max-Age=<SMON_SESSION_TTL_S, default 43200>; Secure` —
+  the `__Host-` pin means `Secure` is unconditional (browsers reject the name without
+  it) — there is no `off`: sign-in is HTTPS-only in every profile, so a self-hosted
+  `http://` install must put TLS in front before the dashboard can be used. Logout's
+  expiring cookie carries the
+  same shape. Store-side
   `expires_at` is the authority — the cookie's Max-Age is a browser hint. The token
   itself never lands in browser storage; it can be rotated without stranding copies.
   `POST /api/logout` deletes the row and expires the cookie — idempotent. A wrong
@@ -58,6 +89,21 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Writes bump generation** on any schedule/target/threshold/paused change (module 01
   invariant). `failures_to_open` / `passes_to_recover` (`1..=10`, default 3/2) are settable
   on create and patch; out-of-range → `invalid_request`.
+- **Probe contract (M8):** `method` is `GET` (default) or `HEAD`, and `expect`
+  carries `statuses` — ≤8 non-overlapping inclusive ranges (`"200-299,418"`,
+  each endpoint 1–599, `lo ≤ hi`) — and `body_contains`, a literal 1–256-byte
+  marker searched in the first 64 KiB received inside the probe deadline
+  (never a regex; the client never decompresses, so compressed wire bytes are
+  searched as-is). `HEAD` + `body_contains` is refused at write — there is no
+  body to read — and a marker miss on an acceptable status commits
+  `http_fail` + `detail: "assert_body"` (D-025). Create and PATCH apply the
+  same rules — an edit proposing bad ranges or a HEAD/marker pair is 422 —
+  and the patch can shrink but never skip validation. None of it reaches the
+  public `status.json` (module 07's allowlist).
+- **Hosted operations in the CLI:** `monitor invites create [--ttl-hours N]` prints one
+  sign-up code on stdout (and its expiry on stderr); `monitor workspaces list` prints
+  id, plan, role, slug and name per workspace; `monitor workspaces plan <id> <plan>`
+  moves a workspace between plans. All three use the same API and exit codes as the rest.
 - **CLI parity:** `monitor ping`, `monitors list|add|show|edit|pause|unpause|delete`,
   `maintenance add|list|rm`, `backup` — every management operation the API offers.
   `monitor maintenance add <id> --from now|<rfc3339> --to <rfc3339> [--reason s]` — a bad
@@ -90,3 +136,54 @@ One HTTP API for every client — CLI, dashboard, future agents. No private path
 - **Auth (M5):** missing/wrong/right credential matrix.
 - **Load:** management API at 50 rps while probes run — no probe slot starvation (soak
   assertion); body-limit and timeout behavior under k6.
+
+- **Deleting a monitor (D-026):** `DELETE /api/monitors/{id}` removes a monitor that has
+  recorded nothing and answers 409 for one that has. `?evidence=delete` removes the
+  monitor together with its checks, incidents, queued alerts, aggregates and
+  maintenance windows, in short batches so other workspaces' commits never wait
+  long; any other value is 422. Member work, on the monitor write budget.
+- **Write-time refusals added with the form:** `expect_statuses` may not include 301,
+  302, 303, 307 or 308 (redirects are followed, so one as the final answer means the
+  chain broke); a monitor name is at most 120 characters with no control characters.
+- **`GET /api/workspaces`** also returns `current`, the workspace the request was served
+  from. Asked without `X-Smon-Workspace` it is the caller's default scope.
+- **An account can't be removed from its own workspace** (409); it leaves by deleting
+  the account.
+- **Clearing a body expectation:** `PATCH` with `"expect_body": null` removes it; a
+  patch that leaves the field out keeps it.
+- **Plan limits:** each row of `GET /api/workspaces` carries `limits`
+  (`max_monitors`, `min_interval_s`, `check_retention_days`,
+  `incident_retention_days`); `null` means the plan sets no figure of its own.
+- **Account lifecycle (D-027):** account sessions only; a token or the operator gets
+  403 `forbidden`. Both routes confirm the account's password under the sign-in
+  throttle and password-work limit: wrong → 401 `unauthenticated` ("invalid
+  credentials"), address out of guesses → 429 + `Retry-After`, hashing queue full →
+  503 `busy`.
+  - `POST /api/account/password` `{current_password, new_password}` → 204. The new
+    password follows the sign-up rule (422 otherwise). Every other session of the
+    account ends; the calling one stays.
+  - `DELETE /api/account` `{password}` → 204 and an expired session cookie. Deletes
+    the account, every workspace only it is a member of (with all its data), its seats
+    elsewhere and invitations addressed to it. 409 `conflict` while it is the only
+    owner of a workspace that has other members, and while a workspace it would
+    delete holds more than 50,000 rows of evidence (checks, incidents and queued alerts together) (delete monitors with their history
+    first: that works in batches, this is one transaction).
+- **Workspace export (D-027):** `GET /api/workspace/export` → the caller's workspace as
+  one JSON attachment (`service-monitor-export-<slug>.json`, `no-store`): `workspace`,
+  `members` (email, role), `monitors`, `maintenance_windows`, `incidents`,
+  `daily_aggregates`, and `checks` as `[{monitor_id, truncated, rows}]`. Owner work
+  (the operator included); members, viewers and every token get 403. Bounds: 5,000
+  checks per monitor and 50,000 per export, 5,000 incidents, 5,000 windows, 40,000
+  daily rows, newest first; one export per workspace per 10 s (429 + `Retry-After`).
+  No secret of any kind is in it: no webhook URL or signing secret, no token, no hash.
+- **Limits added after review (D-030):** a maintenance window's `reason` is at most 200
+  characters on one line (422), a monitor holds at most 50 windows (409), and creating
+  a window spends the monitor write budget (429); a workspace holds at most 100 API
+  tokens, the oldest revoked one making room at the cap (409 when none is revoked);
+  `GET /api/workspace/export` answers 429 while two exports are already being
+  assembled; `POST /api/account/password` accepts five changes per account per ten
+  minutes (429); an invitation's email is at most 254 characters (422); a monitor
+  create whose workspace was deleted meanwhile answers 404;
+  both account routes answer 401 if the password changed while the request was being
+  verified.
+

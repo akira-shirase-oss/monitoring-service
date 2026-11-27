@@ -70,6 +70,7 @@ fn every_slot_outcome_is_in_the_guide() {
     // is whatever commit actually writes.
     for slot in [
         SlotObservation::Missed,
+        SlotObservation::Budgeted,
         SlotObservation::Probe(CheckOutcome::Pass),
         SlotObservation::Probe(CheckOutcome::HttpFail { status: 500 }),
         SlotObservation::Probe(CheckOutcome::Transport),
@@ -101,6 +102,7 @@ fn every_transport_detail_is_in_the_guide() {
         "cert_name_mismatch",
         "cert_untrusted",
         "cert_revoked",
+        "assert_body",
     ] {
         assert!(details.contains(detail), "guide missing detail {detail}");
     }
@@ -149,6 +151,7 @@ fn the_guide_has_no_stale_words() {
         "body",
         "request",
         "rejected_local",
+        "assert_body",
         "cert_expired",
         "cert_not_yet_valid",
         "cert_name_mismatch",

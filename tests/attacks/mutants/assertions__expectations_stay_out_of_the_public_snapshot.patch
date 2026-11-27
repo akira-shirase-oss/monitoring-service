@@ -1,0 +1,24 @@
+diff --git a/crates/monitor-server/src/snapshot.rs b/crates/monitor-server/src/snapshot.rs
+index f5314fd..90b6fec 100644
+--- a/crates/monitor-server/src/snapshot.rs
++++ b/crates/monitor-server/src/snapshot.rs
+@@ -152,6 +152,9 @@ pub enum BeatError {
+ struct PageServiceView {
+     name: String,
+     status: Status,
++    method: String,
++    expect_statuses: String,
++    expect_body: Option<String>,
+     #[serde(with = "time::serde::rfc3339::option")]
+     incident_open_since: Option<OffsetDateTime>,
+     /// `null` when the window owes no slots or nothing was observed — "can't say",
+@@ -196,6 +199,9 @@ fn build_page(
+             Some(PageServiceView {
+                 name: row.name.clone(),
+                 status: committed.get(&id).copied().unwrap_or(Status::Unknown),
++                method: "GET".to_owned(),
++                expect_statuses: "200-299,418".to_owned(),
++                expect_body: Some("LEAKME".to_owned()),
+                 incident_open_since: open.get(&id).copied(),
+                 coverage_bps,
+                 success_bps,

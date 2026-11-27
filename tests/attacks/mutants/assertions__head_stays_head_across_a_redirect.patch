@@ -1,0 +1,13 @@
+diff --git a/crates/monitor-server/src/probe.rs b/crates/monitor-server/src/probe.rs
+index f10e12a..6316826 100644
+--- a/crates/monitor-server/src/probe.rs
++++ b/crates/monitor-server/src/probe.rs
+@@ -892,7 +892,7 @@ impl ProbeClient {
+ fn wire_method(method: ProbeMethod) -> reqwest::Method {
+     match method {
+         ProbeMethod::Get => reqwest::Method::GET,
+-        ProbeMethod::Head => reqwest::Method::HEAD,
++        ProbeMethod::Head => reqwest::Method::GET,
+     }
+ }
+ 

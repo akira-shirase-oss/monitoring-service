@@ -208,6 +208,24 @@ impl<F: Fn(&str) -> Option<String>> Reader<F> {
         }
     }
 
+    /// `SMON_COOKIE_SECURE` — the emitted session cookie's `Secure` mode.
+    /// There is no `off` (D re-review): the lab gate that once scoped it only
+    /// moved the hole — lab also turns the SSRF guard off, and lab + loopback +
+    /// a tunnel is the same plain-cookie fixation shape production refused.
+    /// Sign-in is HTTPS-only in every profile.
+    fn cookie_secure(&mut self) -> crate::auth::CookieSecure {
+        match self.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
+            None | Some("auto") => crate::auth::CookieSecure::Auto,
+            Some("always") => crate::auth::CookieSecure::Always,
+            Some(other) => {
+                self.problems.push(format!(
+                    "SMON_COOKIE_SECURE={other:?}: expected `auto` or `always`"
+                ));
+                crate::auth::CookieSecure::Auto
+            }
+        }
+    }
+
     /// The backup confinement root (D-019): absolute only — a relative one would let
     /// the service's cwd decide where an admin write lands.
     fn backup_dir(&mut self) -> Option<std::path::PathBuf> {
@@ -415,16 +433,7 @@ impl Config {
             Duration::from_hours(1),
             60..=MAX_HORIZON_S,
         );
-        let cookie_secure = match env.raw("SMON_COOKIE_SECURE").as_deref().map(str::trim) {
-            None | Some("auto") => crate::auth::CookieSecure::Auto,
-            Some("always") => crate::auth::CookieSecure::Always,
-            Some(other) => {
-                env.problems.push(format!(
-                    "SMON_COOKIE_SECURE={other:?}: expected `auto` or `always`"
-                ));
-                crate::auth::CookieSecure::Auto
-            }
-        };
+        let cookie_secure = env.cookie_secure();
         let max_monitors = env.ranged("SMON_MAX_MONITORS", 100, 1..=100_000);
         let max_connections =
             usize::try_from(env.ranged("SMON_MAX_CONNECTIONS", 1024, 8..=65_535)).unwrap_or(1024);
@@ -632,6 +641,48 @@ mod tests {
         assert!(error.to_string().contains("must exceed"));
         let error = load(&[("SMON_SMTP_FROM", "a@example.com")]).expect_err("partial smtp");
         assert!(error.to_string().contains("set together"));
+    }
+
+    /// D re-review: `off` is gone entirely — the lab gate that once scoped it
+    /// only moved the hole (lab + loopback + a tunnel is the same plain-cookie
+    /// shape), so every spelling and profile refuses it now. Sign-in is
+    /// HTTPS-only in every profile.
+    #[test]
+    fn the_cookie_off_escape_is_refused_everywhere() {
+        for pairs in [
+            &[("SMON_COOKIE_SECURE", "off")][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_LISTEN", "0.0.0.0:8080"),
+            ][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_TRUSTED_PROXY", "127.0.0.1"),
+            ][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_LISTEN", "127.0.0.1:8080"),
+            ][..],
+            // The shapes that once escaped — lab included — refuse identically.
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_PROFILE", "lab"),
+                ("SMON_LISTEN", "127.0.0.1:8080"),
+            ][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_PROFILE", "lab"),
+                ("SMON_LISTEN", "[::1]:8080"),
+            ][..],
+            &[
+                ("SMON_COOKIE_SECURE", "off"),
+                ("SMON_PROFILE", "production"),
+                ("SMON_LISTEN", "127.0.0.1:8080"),
+            ][..],
+        ] {
+            let error = load(pairs).expect_err("off must be refused in every shape");
+            assert!(error.to_string().contains("SMON_COOKIE_SECURE"), "{error}");
+        }
     }
 
     #[test]

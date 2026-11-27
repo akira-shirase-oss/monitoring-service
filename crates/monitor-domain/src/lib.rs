@@ -141,6 +141,99 @@ impl Default for WorkspaceId {
     }
 }
 
+/// The workspace's plan tier (S3, D-022). Payments are bypassed for the beta, so a
+/// plan is just the set of limits the server enforces — monitors, interval floor,
+/// evidence horizons — read from the `workspaces.plan` column on every write that
+/// could cross one. `free` is what signup mints; `operator` is the maintainer's own
+/// tier, which defers to the server's configured ceilings instead of adding its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    Free,
+    Operator,
+}
+
+/// The limits one plan carries (S3). Every number is a provisional bound, not a
+/// measurement — the droplet's real capacity is unmeasured, and these tighten it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanLimits {
+    /// Monitors the workspace may register (paused ones count — they keep history).
+    /// `u64::MAX` defers to the server's `SMON_MAX_MONITORS` ceiling.
+    pub max_monitors: u64,
+    /// The tightest probe interval the plan allows. Stricter than `MIN_INTERVAL` only
+    /// on `free` — a tenant can't hammer a third-party site through us.
+    pub min_interval: Duration,
+    /// Evidence horizons the plan fixes outright, or `None` to follow the server's
+    /// configured `RetentionPolicy` (`SMON_RETENTION_*` — the operator tier's answer).
+    pub retention: Option<PlanRetention>,
+}
+
+/// The evidence horizons a plan fixes (S3) — the same four kinds a
+/// `RetentionPolicy` covers, so the retention task can translate one into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanRetention {
+    pub checks: Duration,
+    pub aggregates: Duration,
+    pub incidents: Duration,
+    pub delivered_outbox: Duration,
+}
+
+/// The free plan's monitor cap (provisional — sized to the friends beta, not the
+/// droplet's measured capacity).
+pub const FREE_MAX_MONITORS: u64 = 10;
+
+/// The free plan's interval floor — the "e.g. 60 s" the plan document's gap table names.
+pub const FREE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The free plan's evidence horizons (provisional): raw checks two days, daily
+/// aggregates and resolved incidents a quarter, delivered outbox a week. Always
+/// shorter than the configured defaults — a free workspace can't out-keep the
+/// operator's policy, it can only shed evidence earlier.
+pub const FREE_RETENTION: PlanRetention = PlanRetention {
+    checks: Duration::from_hours(48),
+    aggregates: Duration::from_hours(24 * 90),
+    incidents: Duration::from_hours(24 * 90),
+    delivered_outbox: Duration::from_hours(24 * 7),
+};
+
+impl Plan {
+    /// The stored value in `workspaces.plan` (the migration's CHECK constraint is
+    /// exactly this set).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Operator => "operator",
+        }
+    }
+
+    /// Parse a stored or submitted plan name; anything else is not a plan.
+    #[must_use]
+    pub fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "free" => Some(Self::Free),
+            "operator" => Some(Self::Operator),
+            _ => None,
+        }
+    }
+
+    /// This plan's limits — the server's own ceilings still apply on top.
+    #[must_use]
+    pub fn limits(self) -> PlanLimits {
+        match self {
+            Self::Free => PlanLimits {
+                max_monitors: FREE_MAX_MONITORS,
+                min_interval: FREE_MIN_INTERVAL,
+                retention: Some(FREE_RETENTION),
+            },
+            Self::Operator => PlanLimits {
+                max_monitors: u64::MAX,
+                min_interval: MIN_INTERVAL,
+                retention: None,
+            },
+        }
+    }
+}
+
 /// The smallest interval the contract allows; the lab profile runs at 60 seconds.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(15);
 /// The default probe interval from the guide's probe contract.
@@ -215,6 +308,11 @@ pub struct Monitor {
     pub timeout: Duration,
     /// Incident sensitivity — read by the writer per committed observation.
     pub thresholds: Thresholds,
+    /// `GET` (default) or an opt-in `HEAD` — safe methods only (D-025).
+    pub method: ProbeMethod,
+    /// Response assertions on the *final* hop: the acceptable status set and an
+    /// optional literal byte marker inside the bounded body read (D-025).
+    pub expect: Expect,
     /// Bumped on every edit or pause; a probe result carrying an older generation is stale and
     /// must not update current status (the "edit/pause during a probe" failure case).
     pub generation: u64,
@@ -231,12 +329,225 @@ pub struct NewMonitor {
     pub interval: Duration,
     pub timeout: Duration,
     pub thresholds: Thresholds,
+    /// `GET` (default) or opt-in `HEAD` (D-025).
+    pub method: ProbeMethod,
+    /// Response assertions — `Expect::standard()` keeps the pre-M8 contract.
+    pub expect: Expect,
+}
+
+/// How the health URL is probed. Only safe methods exist — the type cannot
+/// express `POST`/`PUT`/`DELETE`, so nothing downstream re-checks (D-025).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProbeMethod {
+    #[default]
+    Get,
+    Head,
+}
+
+impl ProbeMethod {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+        }
+    }
+
+    /// The exact wire token — any other method word is refused (D-025).
+    pub fn parse(value: &str) -> Result<Self, ValidationError> {
+        match value {
+            "GET" => Ok(Self::Get),
+            "HEAD" => Ok(Self::Head),
+            _ => Err(ValidationError::UnknownMethod {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+/// The most acceptable-status ranges one monitor may name (D-025).
+pub const MAX_STATUS_RANGES: usize = 8;
+/// The byte bound on `expect.body_contains` (D-025).
+pub const MAX_EXPECT_BODY: usize = 256;
+
+/// One inclusive range of acceptable response statuses, validated `1..=599`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusRange {
+    pub lo: u16,
+    pub hi: u16,
+}
+
+/// What one probe asserts about the *final* response of its redirect chain (D-025):
+/// an acceptable status set plus an optional literal byte marker the bounded body
+/// read must contain. The marker is never a regex — there is no engine, so no
+/// `ReDoS` class exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expect {
+    /// Sorted, non-overlapping, `1..=MAX_STATUS_RANGES` ranges — the contract's
+    /// `200-299` default is `Expect::standard`.
+    pub statuses: Vec<StatusRange>,
+    /// Literal bytes searched in the observed `<= 64 KiB` body prefix.
+    pub body_contains: Option<Vec<u8>>,
+}
+
+impl Expect {
+    /// The default assertion set: any `2xx` is acceptable, no marker — exactly the
+    /// pre-assertion behavior (D-025).
+    #[must_use]
+    pub fn standard() -> Self {
+        Self {
+            statuses: vec![StatusRange { lo: 200, hi: 299 }],
+            body_contains: None,
+        }
+    }
+
+    /// Whether `status` lands inside the acceptable set.
+    #[must_use]
+    pub fn accepts(&self, status: u16) -> bool {
+        self.statuses
+            .iter()
+            .any(|r| r.lo <= status && status <= r.hi)
+    }
+}
+
+impl Default for Expect {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+/// Parse one `lo`/`lo-hi` spec into a validated `StatusRange`.
+pub fn parse_status_range(spec: &str) -> Result<StatusRange, ValidationError> {
+    let invalid = || ValidationError::StatusSpecInvalid {
+        spec: spec.to_owned(),
+    };
+    let (lo_s, hi_s) = spec
+        .split_once('-')
+        .map_or((spec, spec), |(lo, hi)| (lo, hi));
+    let lo: u16 = lo_s.trim().parse().map_err(|_| invalid())?;
+    let hi: u16 = hi_s.trim().parse().map_err(|_| invalid())?;
+    if lo == 0 || hi > 599 || lo > hi {
+        return Err(invalid());
+    }
+    Ok(StatusRange { lo, hi })
+}
+
+/// Canonical wire/storage form: `"200-299,418"` — ranges sorted by `lo`, a bare
+/// integer when `lo == hi`.
+#[must_use]
+pub fn encode_statuses(statuses: &[StatusRange]) -> String {
+    statuses
+        .iter()
+        .map(|r| {
+            if r.lo == r.hi {
+                r.lo.to_string()
+            } else {
+                format!("{}-{}", r.lo, r.hi)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse the storage form back — the same rules as the write boundary (stored
+/// rows were written through it; anything else is corruption, not a default).
+pub fn parse_statuses(spec: &str) -> Result<Vec<StatusRange>, ValidationError> {
+    let mut statuses = spec
+        .split(',')
+        .map(|s| parse_status_range(s.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    statuses.sort_by_key(|r| r.lo);
+    validate_statuses(&mut statuses)?;
+    Ok(statuses)
+}
+
+/// Sort the caller's set in place, then bound it: nonempty, at most
+/// `MAX_STATUS_RANGES`, and non-overlapping (adjacent is allowed, overlapping is not).
+pub fn validate_statuses(statuses: &mut [StatusRange]) -> Result<(), ValidationError> {
+    statuses.sort_by_key(|r| r.lo);
+    if statuses.is_empty() {
+        return Err(ValidationError::StatusRangesEmpty);
+    }
+    if statuses.len() > MAX_STATUS_RANGES {
+        return Err(ValidationError::StatusRangesTooMany {
+            count: statuses.len(),
+        });
+    }
+    for pair in statuses.windows(2) {
+        if pair[0].hi >= pair[1].lo {
+            return Err(ValidationError::StatusRangesOverlap);
+        }
+    }
+    Ok(())
+}
+
+/// The redirect statuses the prober follows. They can't be named as passing.
+pub const FOLLOWED_REDIRECTS: [u16; 5] = [301, 302, 303, 307, 308];
+
+/// The longest monitor name. It is shown in lists, alerts and on public status pages.
+pub const MAX_NAME_CHARS: usize = 120;
+
+/// A status set a write NAMES may not include a followed redirect. Redirects with a
+/// usable target are always followed, so one of these can only be the final answer
+/// when the chain broke: a loop cut at the hop limit, or a target the address policy
+/// refused. Accepting it would report a broken redirect as up.
+///
+/// This and [`validate_name`] are rules for what is being written, not for what is
+/// already stored: an edit that doesn't touch the statuses or the name must not be
+/// refused over a value an earlier version accepted, or such a monitor could never be
+/// paused, resumed or rescheduled again.
+pub fn refuse_followed_redirects(statuses: &[StatusRange]) -> Result<(), ValidationError> {
+    if statuses.iter().any(|range| {
+        FOLLOWED_REDIRECTS
+            .iter()
+            .any(|code| range.lo <= *code && *code <= range.hi)
+    }) {
+        return Err(ValidationError::StatusCoversRedirect);
+    }
+    Ok(())
+}
+
+/// A name a write gives a monitor: bounded and free of control characters. It is shown
+/// in lists, in alerts and on public status pages.
+pub fn validate_name(name: &str) -> Result<(), ValidationError> {
+    if name.chars().count() > MAX_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(ValidationError::NameInvalid);
+    }
+    Ok(())
+}
+
+/// The whole expectations bundle, including the cross-field rule: a `HEAD` probe
+/// carries no body, so a body marker under `HEAD` is a write-time refusal (D-025).
+pub fn validate_expect(
+    method: ProbeMethod,
+    statuses: &mut [StatusRange],
+    body_contains: Option<&[u8]>,
+) -> Result<(), ValidationError> {
+    validate_statuses(statuses)?;
+    if let Some(body) = body_contains {
+        if body.is_empty() {
+            return Err(ValidationError::ExpectBodyEmpty);
+        }
+        if body.len() > MAX_EXPECT_BODY {
+            return Err(ValidationError::ExpectBodyTooLong { len: body.len() });
+        }
+        if method == ProbeMethod::Head {
+            return Err(ValidationError::HeadCannotAssertBody);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
     #[error("monitor name is empty")]
     EmptyName,
+    #[error("monitor name is longer than {MAX_NAME_CHARS} characters or has control characters")]
+    NameInvalid,
+    #[error(
+        "expect_statuses can't include 301, 302, 303, 307 or 308: redirects are followed, so one of them as the final answer means the chain broke"
+    )]
+    StatusCoversRedirect,
     #[error("monitor URL must be http or https, got `{scheme}`")]
     UrlNotHttp { scheme: String },
     #[error("interval {interval:?} is below the minimum {MIN_INTERVAL:?}")]
@@ -248,6 +559,22 @@ pub enum ValidationError {
     },
     #[error("{field} {value} is outside 1..={MAX_THRESHOLD}")]
     ThresholdOutOfRange { field: &'static str, value: u8 },
+    #[error("probe method `{value}` is not GET or HEAD")]
+    UnknownMethod { value: String },
+    #[error("status spec `{spec}` is not `lo`/`lo-hi` of statuses 1..=599 with low <= high")]
+    StatusSpecInvalid { spec: String },
+    #[error("expect_statuses must name at least one range")]
+    StatusRangesEmpty,
+    #[error("expect_statuses has {count} ranges, over the {MAX_STATUS_RANGES} bound")]
+    StatusRangesTooMany { count: usize },
+    #[error("status ranges overlap")]
+    StatusRangesOverlap,
+    #[error("expect_body is empty")]
+    ExpectBodyEmpty,
+    #[error("expect_body is {len} bytes, over the {MAX_EXPECT_BODY} bound")]
+    ExpectBodyTooLong { len: usize },
+    #[error("a HEAD probe carries no body to assert")]
+    HeadCannotAssertBody,
 }
 
 fn validate_fields(
@@ -287,13 +614,35 @@ impl NewMonitor {
     ) -> Result<Self, ValidationError> {
         let name = name.into();
         validate_fields(&name, &url, interval, timeout)?;
+        validate_name(&name)?;
         Ok(Self {
             name,
             url,
             interval,
             timeout,
             thresholds: Thresholds::default(),
+            method: ProbeMethod::Get,
+            expect: Expect::standard(),
         })
+    }
+
+    /// Probe method + response assertions (D-025). `statuses` is sorted and bounded
+    /// here (`1..=599`, nonempty, `<= MAX_STATUS_RANGES`, non-overlapping); `HEAD` +
+    /// a body marker refuses — a `HEAD` response has no body to search.
+    pub fn with_expect(
+        mut self,
+        method: ProbeMethod,
+        mut statuses: Vec<StatusRange>,
+        body_contains: Option<Vec<u8>>,
+    ) -> Result<Self, ValidationError> {
+        validate_expect(method, &mut statuses, body_contains.as_deref())?;
+        refuse_followed_redirects(&statuses)?;
+        self.method = method;
+        self.expect = Expect {
+            statuses,
+            body_contains,
+        };
+        Ok(self)
     }
 
     /// Override the default 3-fail / 2-pass sensitivity for this monitor.
@@ -322,6 +671,8 @@ impl NewMonitor {
             interval: self.interval,
             timeout: self.timeout,
             thresholds: self.thresholds,
+            method: self.method,
+            expect: self.expect,
             generation: 1,
             paused: false,
         }
@@ -341,6 +692,13 @@ pub struct MonitorPatch {
     pub failures_to_open: Option<u8>,
     pub passes_to_recover: Option<u8>,
     pub paused: Option<bool>,
+    /// Probe method swap (D-025). Merging `HEAD` onto a monitor that holds a body
+    /// marker fails the same cross-field check a create would.
+    pub method: Option<ProbeMethod>,
+    /// Replacement status set — validated like a create (sorted, bounded, no overlap).
+    pub expect_statuses: Option<Vec<StatusRange>>,
+    /// `Some(None)` clears the marker; `Some(Some(_))` sets it; `None` keeps the stored one.
+    pub expect_body: Option<Option<Vec<u8>>>,
 }
 
 impl MonitorPatch {
@@ -361,8 +719,33 @@ impl MonitorPatch {
             )?,
             generation: monitor.generation,
             paused: self.paused.unwrap_or(monitor.paused),
+            method: self.method.unwrap_or(monitor.method),
+            expect: Expect {
+                statuses: self
+                    .expect_statuses
+                    .clone()
+                    .unwrap_or_else(|| monitor.expect.statuses.clone()),
+                body_contains: match &self.expect_body {
+                    Some(body) => body.clone(),
+                    None => monitor.expect.body_contains.clone(),
+                },
+            },
         };
         validate_fields(&merged.name, &merged.url, merged.interval, merged.timeout)?;
+        if self.name.is_some() {
+            validate_name(&merged.name)?;
+        }
+        if self.expect_statuses.is_some() {
+            refuse_followed_redirects(&merged.expect.statuses)?;
+        }
+        // The merged bundle faces the same cross-field rule a create does — a patch
+        // swapping GET->HEAD onto a monitor that holds a marker fails here (D-025).
+        let mut statuses = merged.expect.statuses.clone();
+        validate_expect(
+            merged.method,
+            &mut statuses,
+            merged.expect.body_contains.as_deref(),
+        )?;
         Ok(merged)
     }
 }
@@ -438,6 +821,13 @@ impl CheckOutcome {
 pub enum SlotObservation {
     Probe(CheckOutcome),
     Missed,
+    /// The slot never ran because the monitor's own bound refused the start —
+    /// the shared per-address probe budget was spent (B re-review). A coverage
+    /// gap like `Missed` — no evidence either way, the display goes back to
+    /// `unknown` — but **neutral on the streaks**: a shared address starved by
+    /// a neighbour must not launder a real outage's failure streak into
+    /// silence. It commits as `missed` + `address_budget` like any refusal.
+    Budgeted,
 }
 
 /// The displayed status of a monitor (D-005, provisional).
@@ -472,8 +862,10 @@ pub type Statuses = std::collections::HashMap<MonitorId, Status>;
 /// The per-monitor incident state machine: streaks plus whether an incident is open.
 ///
 /// Recovery passes count only while an incident is open — passes before it mean nothing — and a
-/// missed slot clears *both* streaks: a gap in coverage is not evidence in either direction.
-/// What a missed slot does **not** clear is the open incident itself.
+/// missed slot clears *both* streaks: a gap in coverage is not evidence in either direction —
+/// except a `Budgeted` one, which clears neither streak: our own bound's refusal must not
+/// launder a real outage's count away. What a missed slot does **not** clear is the open
+/// incident itself.
 #[derive(Debug, Clone, Default)]
 pub struct Health {
     consecutive_failures: u8,
@@ -543,6 +935,14 @@ impl Health {
                 // incident is open. The incident itself is untouched — only new evidence closes it.
                 self.consecutive_failures = 0;
                 self.recovery_passes = 0;
+                self.fresh = false;
+                Effect::Unchanged
+            }
+            SlotObservation::Budgeted => {
+                // Same coverage gap — still no evidence, display `unknown` —
+                // but OUR bound's refusal is neutral on the streaks: it is not
+                // the target's doing and must not launder a real outage's
+                // failure count away (B re-review).
                 self.fresh = false;
                 Effect::Unchanged
             }
@@ -710,6 +1110,26 @@ mod tests {
             Effect::Unchanged
         );
         assert!(!health.incident_open());
+    }
+
+    /// B re-review: our own bound's refusal is a coverage gap — `unknown`, no
+    /// evidence — but never a streak reset: a starved monitor's real failures
+    /// still add up across the gap.
+    #[test]
+    fn a_budget_refusal_gap_is_neutral_on_the_streak() {
+        let mut health = Health::new();
+        for _ in 0..2 {
+            health.rec(SlotObservation::Probe(CheckOutcome::HttpFail {
+                status: 500,
+            }));
+        }
+        health.rec(SlotObservation::Budgeted);
+        // The third failure still opens — the gap laundered nothing away.
+        assert_eq!(
+            health.rec(SlotObservation::Probe(CheckOutcome::Transport)),
+            Effect::IncidentOpened
+        );
+        assert!(health.incident_open());
     }
 
     #[test]

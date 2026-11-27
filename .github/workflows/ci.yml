@@ -39,6 +39,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The migration manifest's append-only check compares head against
+          # origin/main — a depth-1 checkout carries no base ref to compare.
+          fetch-depth: 0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
@@ -74,3 +77,64 @@ jobs:
         run: scripts/check-advisories.sh
       - name: npm advisories for what the dashboard ships
         run: npm audit --omit=dev --audit-level=moderate
+
+  # The dashboard driven in a real browser against the real server and the fault
+  # fixture: sign-up to a public status page, tokens, invitations, alerts, incidents,
+  # and every older journey. Its own job, so a red gate above never hides it.
+  browser:
+    name: browser journeys (Playwright, real server)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: npm ci
+      - name: The browser the journeys drive
+        working-directory: apps/dashboard
+        run: npx playwright install --with-deps chromium
+      - name: Every dashboard journey
+        run: scripts/e2e.sh
+
+  fuzz-smoke:
+    name: fuzz smoke (cargo-fuzz, seeded, bounded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The pinned fuzz nightly (fuzz/rust-toolchain.toml) + rust-src
+        run: |
+          rustup toolchain install nightly-2026-09-05 --profile minimal --component rust-src
+          cd fuzz && cargo --version
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Every outside-input decoder, 20 s seeded each
+        run: scripts/check-fuzz.sh
+
+  attack-mutants:
+    name: attack tests die without their protections (mutation proof)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Every attack test must fail with its named mutant applied
+        run: scripts/check-attack-mutants.sh

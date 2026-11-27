@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import type { MonitorPayload } from '#lib/monitor-form.js';
+	import { statusSpecs, type MonitorPayload } from '#lib/monitor-form.js';
 
 	// Shared schedule/threshold editor for create (list page) and patch (detail page).
 	// Numeric fields are parsed here — empty means "leave unset", the API applies its
@@ -19,6 +19,9 @@
 			timeout_s: number;
 			failures_to_open: number;
 			passes_to_recover: number;
+			method: string;
+			expect_statuses: string;
+			expect_body: string | null;
 		}>;
 		showIdentity?: boolean;
 		submitLabel: string;
@@ -34,6 +37,12 @@
 	let timeout = $state(untrack(() => initial.timeout_s?.toString() ?? ''));
 	let failures = $state(untrack(() => initial.failures_to_open?.toString() ?? ''));
 	let passes = $state(untrack(() => initial.passes_to_recover?.toString() ?? ''));
+	let method = $state<'GET' | 'HEAD'>(untrack(() => (initial.method === 'HEAD' ? 'HEAD' : 'GET')));
+	let statuses = $state(untrack(() => initial.expect_statuses ?? ''));
+	let body = $state(untrack(() => initial.expect_body ?? ''));
+	// Whether a body expectation is stored: clearing the field then has to say so
+	// (`null`), where a new monitor simply leaves it out.
+	const hadBody = untrack(() => (initial.expect_body ?? '') !== '');
 	let busy = $state(false);
 
 	function num(value: string): number | undefined {
@@ -51,7 +60,15 @@
 				interval_s: num(interval),
 				timeout_s: num(timeout),
 				failures_to_open: num(failures),
-				passes_to_recover: num(passes)
+				passes_to_recover: num(passes),
+				method,
+				expect_statuses: statusSpecs(statuses),
+				// A HEAD response has no body to search, so the expectation goes with it.
+				...(method === 'GET' && body !== ''
+					? { expect_body: body }
+					: hadBody
+						? { expect_body: null }
+						: {})
 			});
 		} finally {
 			busy = false;
@@ -102,7 +119,36 @@
 		<span class={label}>passes to recover</span>
 		<input bind:value={passes} inputmode="numeric" class={field} placeholder="2" />
 	</div>
-	<div class="col-span-2 flex items-end justify-end gap-2">
+	<div>
+		<label class={label} for="monitor-method">request</label>
+		<select id="monitor-method" bind:value={method} class={field} data-testid="monitor-method">
+			<option value="GET">GET (read the response)</option>
+			<option value="HEAD">HEAD (status only)</option>
+		</select>
+	</div>
+	<div>
+		<label class={label} for="monitor-statuses">passing statuses</label>
+		<input
+			id="monitor-statuses"
+			bind:value={statuses}
+			class={`${field} font-mono`}
+			placeholder="200-299"
+			data-testid="monitor-statuses"
+		/>
+	</div>
+	<div>
+		<label class={label} for="monitor-body">body must contain</label>
+		<input
+			id="monitor-body"
+			bind:value={body}
+			maxlength={256}
+			disabled={method === 'HEAD'}
+			class={`${field} disabled:opacity-50`}
+			placeholder={method === 'HEAD' ? 'not available with HEAD' : 'optional text'}
+			data-testid="monitor-body"
+		/>
+	</div>
+	<div class="col-span-2 flex items-end justify-end gap-2 sm:col-span-3">
 		{#if onCancel}
 			<button
 				type="button"

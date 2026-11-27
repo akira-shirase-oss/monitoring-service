@@ -30,6 +30,13 @@ backup_dir=$(setting SMON_BACKUP_DIR "$env_file")
 [ -n "$backup_dir" ] || { echo "error: SMON_BACKUP_DIR unset in $env_file" >&2; exit 1; }
 
 r2() {
+  # A backup that silently can't reach its bucket is the failure this script exists
+  # to prevent: missing R2 credentials is a named error, never a sed "can't read"
+  # or a redirect complaint leaked out of a command substitution.
+  if [[ ! -f "$creds/r2.env" || ! -s "$creds/s3_secret_key" ]]; then
+    echo "error: R2 credentials not configured — want $creds/r2.env and a non-empty $creds/s3_secret_key (install.sh's --r2-secret/--r2-env, DEPLOY.md step 9)" >&2
+    exit 1
+  fi
   RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare \
     RCLONE_CONFIG_R2_ENDPOINT="$(setting SMON_R2_ENDPOINT "$creds/r2.env")" \
     RCLONE_CONFIG_R2_ACCESS_KEY_ID="$(setting SMON_R2_ACCESS_KEY "$creds/r2.env")" \
@@ -79,16 +86,23 @@ latest() {
 
 run() {
   [[ -s "$recipient_file" ]] || { echo "error: no age recipient in $recipient_file (DEPLOY.md step 9)" >&2; exit 1; }
-  local token name
+  local token name hdr
   token=$(setting SMON_ADMIN_TOKEN "$env_file")
   [[ -n "$token" ]] || { echo "error: no SMON_ADMIN_TOKEN in $env_file" >&2; exit 1; }
+  # The token travels in a root-only header file — argv is visible to every local
+  # user via `ps` (S2 review). The path is baked into an EXIT trap: a RETURN trap
+  # does not run when `set -e` aborts inside the function, which would strand the
+  # token file on a curl failure.
+  hdr=$(mktemp); trap "rm -f '$hdr'" EXIT
+  printf 'authorization: Bearer %s\n' "$token" >"$hdr"
   name=$(curl -fsS --max-time 30 -X POST "$local_url/api/backup" \
-    -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{}' \
+    -H "@$hdr" -H 'content-type: application/json' -d '{}' \
     | jq -r '.name // empty')
+  rm -f "$hdr"; trap - EXIT
   [[ -n "$name" && -s "$backup_dir/$name" ]] \
     || { echo "error: the server did not produce a snapshot in $backup_dir" >&2; exit 1; }
 
-  work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+  work=$(mktemp -d); trap "rm -rf '$work'" EXIT
   age --encrypt --recipients-file "$recipient_file" -o "$work/$name.age" "$backup_dir/$name"
   [[ -s "$work/$name.age" ]] || { echo "error: the encrypted snapshot is empty" >&2; exit 1; }
   r2 copyto "$work/$name.age" "r2:$bucket/snapshots/$name.age"

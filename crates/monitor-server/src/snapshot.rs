@@ -144,6 +144,100 @@ pub enum BeatError {
     Io(#[from] std::io::Error),
 }
 
+/// A service on a workspace's public page (S2, D-021): the allowlist is the monitor's
+/// *name* — the owner chose to publish it — plus the committed status, the open
+/// incident's evidence time, and the coverage/success pair the detail page reports.
+/// No ids, no URLs.
+#[derive(Debug, Serialize)]
+struct PageServiceView {
+    name: String,
+    status: Status,
+    #[serde(with = "time::serde::rfc3339::option")]
+    incident_open_since: Option<OffsetDateTime>,
+    /// `null` when the window owes no slots or nothing was observed — "can't say",
+    /// never a fabricated 0%.
+    coverage_bps: Option<u32>,
+    success_bps: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct PageSnapshot {
+    title: String,
+    #[serde(with = "time::serde::rfc3339")]
+    generated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: OffsetDateTime,
+    monitoring: &'static str,
+    services: Vec<PageServiceView>,
+}
+
+/// The per-workspace page beat (S2): same heartbeat, same born-expired rule, scoped to
+/// the owner's allowlist. A monitor nobody published simply does not exist here.
+fn build_page(
+    page: &monitor_db::StatusPage,
+    statuses: &SharedStatuses,
+    open: &HashMap<MonitorId, OffsetDateTime>,
+    coverage: &HashMap<MonitorId, (Option<u32>, Option<u32>)>,
+    ttl: Duration,
+    observing: bool,
+) -> serde_json::Value {
+    let now = OffsetDateTime::now_utc();
+    let committed = if observing {
+        statuses.read().map(|map| map.clone()).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let services = page
+        .monitors
+        .iter()
+        .filter_map(|row| {
+            let id = MonitorId(uuid::Uuid::parse_str(&row.monitor_id).ok()?);
+            let (coverage_bps, success_bps) = coverage.get(&id).copied().unwrap_or((None, None));
+            Some(PageServiceView {
+                name: row.name.clone(),
+                status: committed.get(&id).copied().unwrap_or(Status::Unknown),
+                incident_open_since: open.get(&id).copied(),
+                coverage_bps,
+                success_bps,
+            })
+        })
+        .collect();
+    let expires_at = if observing {
+        now + time::Duration::try_from(ttl).unwrap_or(time::Duration::MAX)
+    } else {
+        now
+    };
+    serde_json::to_value(PageSnapshot {
+        title: page.title.clone(),
+        generated_at: now,
+        expires_at,
+        monitoring: if observing {
+            "available"
+        } else {
+            "unavailable"
+        },
+        services,
+    })
+    .unwrap_or_else(|_| serde_json::json!({"services": []}))
+}
+
+/// Write `bytes` to `dir/name` atomically and world-readable — the shared discipline
+/// behind `status.json` and every `s/<slug>.json` page.
+fn write_snapshot(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<(), BeatError> {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &tmp,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )?;
+    std::fs::rename(&tmp, dir.join(name))?;
+    Ok(())
+}
+
+/// Coverage/success window the public pages report — the dashboard's own default.
+const PAGE_STATS_WINDOW: time::Duration = time::Duration::days(1);
+
 /// Write one beat now. `observing = false` writes the born-expired, all-`unknown` form —
 /// the process's last word before it exits on an engine failure.
 pub async fn write_beat(
@@ -152,9 +246,7 @@ pub async fn write_beat(
     config: &Config,
     observing: bool,
 ) -> Result<(), BeatError> {
-    // The public beat is the operator's view — the default workspace until per-workspace
-    // status pages land (D-021, S2). `load_registry` is the engine's all-workspace sweep;
-    // this page never shows another tenant's monitors.
+    // The global page is the operator's view — the default workspace (D-021).
     let scoped = db.workspace(monitor_domain::WorkspaceId::DEFAULT);
     let monitors = scoped
         .list_monitors()
@@ -166,20 +258,61 @@ pub async fn write_beat(
     let json = build(&monitors, statuses, &open, config.ttl, observing);
     let bytes = serde_json::to_vec_pretty(&json)?;
     std::fs::create_dir_all(&config.dir)?;
+    std::fs::create_dir_all(config.dir.join("s"))?;
     // Write-then-rename: a reader mid-beat sees the old file or the new one, never a torn
     // half-snapshot.
-    let tmp = config.dir.join(".status.json.tmp");
-    std::fs::write(&tmp, bytes)?;
-    // The snapshot is public by design and the static host that publishes it may read it
-    // as another user: 0644 even under the unit's owner-only UMask=0077.
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &tmp,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
-    )?;
-    std::fs::rename(&tmp, config.dir.join("status.json"))?;
+    write_snapshot(&config.dir, "status.json", &bytes)?;
+
+    // Per-workspace pages (S2): one `s/<slug>.json` per enabled page, on the same
+    // heartbeat. A page that turned off since the last beat has its file removed —
+    // a disabled page serves 404, never last-known data.
+    let pages = db.status_pages().await?;
+    let mut live = std::collections::HashSet::with_capacity(pages.len());
+    let since = OffsetDateTime::now_utc() - PAGE_STATS_WINDOW;
+    for page in &pages {
+        // Files are named by workspace, not slug: a released or renamed slug resolves
+        // to this workspace's file, never a previous owner's bytes (S2 review).
+        live.insert(page.workspace.0.to_string());
+        let scoped = db.workspace(page.workspace);
+        let open = scoped.open_incidents().await?;
+        let mut coverage = HashMap::with_capacity(page.monitors.len());
+        for row in &page.monitors {
+            let Ok(id) = uuid::Uuid::parse_str(&row.monitor_id) else {
+                continue;
+            };
+            let stats = scoped.check_stats(MonitorId(id), since).await?;
+            coverage.insert(MonitorId(id), (stats.coverage_bps(), stats.success_bps()));
+        }
+        let json = build_page(page, statuses, &open, &coverage, config.ttl, observing);
+        write_snapshot(
+            &config.dir.join("s"),
+            &format!("{}.json", page.workspace.0),
+            &serde_json::to_vec_pretty(&json)?,
+        )?;
+    }
+    if let Ok(entries) = std::fs::read_dir(config.dir.join("s")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            if !live.contains(id) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     Ok(())
 }
+
+/// Asks the writer for a beat now instead of at its next tick. A status-page save
+/// signals it, so a page someone just published answers with real data at once
+/// rather than reading "monitoring unavailable" until the heartbeat comes round.
+pub type Wake = std::sync::Arc<tokio::sync::Notify>;
+
+/// The least time between two woken beats. A beat reads every enabled page, so saves
+/// arriving in a burst share one beat instead of each buying a full pass: at most
+/// twelve extra passes a minute, whatever any workspace does.
+const WAKE_FLOOR: Duration = Duration::from_secs(5);
 
 /// Periodic snapshot writer. Its failures are honest: a stopped writer means an expiring
 /// snapshot, which the reader reads as "monitoring unavailable" — the correct verdict.
@@ -190,6 +323,18 @@ pub fn spawn(
     config: Config,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_woken(db, statuses, vitals, config, Wake::default(), shutdown)
+}
+
+/// [`spawn`], plus a [`Wake`] that brings the next beat forward.
+pub fn spawn_woken(
+    db: Db,
+    statuses: SharedStatuses,
+    vitals: Vitals,
+    config: Config,
+    wake: Wake,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = std::fs::create_dir_all(&config.dir) {
             tracing::error!(%error, dir = %config.dir.display(), "status dir unusable; no snapshots");
@@ -197,9 +342,18 @@ pub fn spawn(
         }
         let mut ticks = tokio::time::interval(config.interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut wake_from = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = ticks.tick() => {}
+                // A wake that arrives inside the floor is kept (`Notify` holds one
+                // permit) and answered when the floor has passed.
+                () = async {
+                    tokio::time::sleep_until(wake_from).await;
+                    wake.notified().await;
+                } => {
+                    wake_from = tokio::time::Instant::now() + WAKE_FLOOR;
+                }
                 () = shutdown.cancelled() => return,
             }
             let observing = vitals.verdict().observing();
