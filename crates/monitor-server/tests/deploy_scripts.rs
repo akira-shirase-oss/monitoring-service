@@ -198,7 +198,7 @@ fn the_deploy_scripts_carry_their_promised_properties() {
         "install -m 0644 \"$aop_one\" /etc/caddy/cloudflare-origin-pull-ca.pem",
         // A second run must not copy over the binary the service is running from.
         "install -m 0755 \"$bin\" \"$PREFIX/releases/$name/bin/\"",
-        "caddy version",      // >= 2.7 floor: {client_ip}/trusted-proxies need it
+        "caddy version", // >= 2.7 floor: {client_ip}/trusted-proxies need it
         // S3: the sources line is written inline with signed-by — a fetched list
         // could arrive carrying `trusted=yes` and undo the fingerprint pin.
         "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg]",

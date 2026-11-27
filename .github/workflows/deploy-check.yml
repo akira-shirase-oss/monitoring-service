@@ -140,12 +140,20 @@ jobs:
           [[ "$(readlink -f /opt/smon/current)" == "$(readlink -f /opt/smon/releases/release2)" ]] || {
             echo "the repeated-name refusal moved \`current\`" >&2; exit 1; }
           curl -fsS --max-time 10 http://127.0.0.1:58400/livez
+      # Runs after a failure too: the evidence matters most when a step above went red.
       - name: Keep the evidence
+        if: ${{ !cancelled() }}
         run: |
           mkdir -p deploy-check-artifacts
           cp "$RUNNER_TEMP/install-check"/*.log deploy-check-artifacts/ 2>/dev/null || true
           systemd-analyze security monitor-server.service > deploy-check-artifacts/security.txt 2>&1 || true
           sudo journalctl -u monitor-server --no-pager -n 80 > deploy-check-artifacts/monitor-server.journal 2>/dev/null || true
+          sudo journalctl -u caddy --no-pager -n 80 > deploy-check-artifacts/caddy.journal 2>/dev/null || true
+          # In the log as well, so a red run can be read without downloading anything.
+          echo "== caddy"; systemctl is-active caddy || true
+          tail -n 40 deploy-check-artifacts/caddy.journal || true
+          echo "== monitor-server"; systemctl is-active monitor-server || true
+          tail -n 15 deploy-check-artifacts/monitor-server.journal || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
